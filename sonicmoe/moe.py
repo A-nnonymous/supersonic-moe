@@ -34,13 +34,13 @@ def _geglu(x: torch.Tensor) -> torch.Tensor:
 
 
 def _gelu(x: torch.Tensor) -> torch.Tensor:
-    return F.gelu(x).to(dtype=x.dtype)
+    return F.gelu(x.to(dtype=torch.float32)).to(dtype=x.dtype)
 
 
 def _reglu(x: torch.Tensor) -> torch.Tensor:
     u = x[..., 1::2]
     g = x[..., ::2]
-    return (F.gelu(g.to(dtype=torch.float32)) * u).to(dtype=g.dtype)
+    return (F.relu(g) * u).to(dtype=g.dtype)
 
 
 def _relu(x: torch.Tensor) -> torch.Tensor:
