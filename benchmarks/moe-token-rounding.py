@@ -242,7 +242,6 @@ def run(
             hidden_size=H,
             intermediate_size=I,
             activation_function=ActivationType.SWIGLU,
-            is_glu=True,
             add_bias=add_bias,
             std=0.02,
         )

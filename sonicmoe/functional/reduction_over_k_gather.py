@@ -145,7 +145,7 @@ class Token_gather_and_sum_over_k:
 
         handled_rows_per_block = self.num_threads // thread_per_row
 
-        # smem caches gX and gW. Assumed gW is either FP32 or BF16
+        # smem caches gX and gW. Assumed gW is in either FP32 or BF16
         handled_row_size = (
             (self.SMEM_LIMIT // (self.num_threads * K_STAGED * self.universal_copy_bytes))
             * thread_per_row
@@ -284,7 +284,7 @@ class Token_gather_and_sum_over_k:
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
 
-        # !!! This impl assumes 1 thread will cover all K for 1 slice of row.
+        # !!! This impl assumes 1 thread will fetch all K for 1 slice of row.
         while work_tile.is_valid_tile:
             tile_coord_mnkl = work_tile.tile_idx
             M_idx, _, _, _ = tile_coord_mnkl
@@ -403,9 +403,9 @@ class Token_gather_and_sum_over_k:
             work_tile = tile_scheduler.get_current_work()
 
 
-### This triton impl is equivalent as the cute-dsl impl above,
+### This triton impl is equivalent as the cute-dsl impl shown above,
 # and also achieves similar memory bandwidth on H100 for large K and H.
-# However, for small K and H, this impl is better by autotuning so we use it as default.
+# However, for small K and H, this impl is better by autotuning so we use it as the default.
 def _get_triton_autotune_configs() -> list[triton.Config]:
     configs = []
     for BLOCK_H in get_powers_of_2(256, 4096):

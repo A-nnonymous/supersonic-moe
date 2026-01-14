@@ -130,7 +130,6 @@ def run(
             hidden_size=H,
             intermediate_size=I,
             activation_function=activation,
-            is_glu=is_glu(activation),
             add_bias=add_bias,
             std=0.02,
         )
