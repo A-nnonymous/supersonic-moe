@@ -49,10 +49,10 @@ def run(args):
         w = torch.randn(shape, device=dev, dtype=torch.bfloat16)
         return w.transpose(-1, -2).contiguous().transpose(-1, -2)
     wg = make_weight(H, E)
-    w1 = make_weight(E, H, I)
-    w2 = make_weight(E, I // 2, H)
+    w1 = make_weight(E, H, 2 * I)
+    w2 = make_weight(E, I, H)
     bg = torch.randn((E,), device=dev)
-    b1 = torch.randn((E, I), device=dev)
+    b1 = torch.randn((E, 2 * I), device=dev)
     b2 = torch.randn((E, H), device=dev)
     pc = PrecisionConfig()
 
