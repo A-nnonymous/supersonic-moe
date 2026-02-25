@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sonic-moe"
+dynamic = ["version"]
+requires-python = ">=3.12"
+dependencies = [
+    "nvidia-cutlass-dsl==4.4.0",
+    "torch>=2.7.1,<=2.9.1",
+    "quack-kernels==0.2.5",
+    "ninja"
+]
+
+[project.optional-dependencies]
+cu13 = ["nvidia-cutlass-dsl[cu13]>=4.4.0"]
+dev = [
+    "pre-commit",
+    "ruff",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sonicmoe*"]
+
+[tool.setuptools.dynamic]
+version = {attr = "sonicmoe.__version__"}
