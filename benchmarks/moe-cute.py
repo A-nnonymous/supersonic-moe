@@ -237,8 +237,52 @@ def run(
 
     time.sleep(0.5)
 
-    @torch.compile
-    def forward_only(is_inference_mode_enabled):
+    # Warmup — populate all CuTe compile caches and Triton autotune
+    moe_TC_softmax_topk_layer(
+        x,
+        router_w,
+        w1.permute(1, 2, 0),
+        b1,
+        w2.permute(1, 2, 0),
+        b2,
+        moe.top_k,
+        moe.stream_id,
+        activation,
+        True,
+    )
+
+    cuda_graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+
+    # Redirect CuTe kernels to capture stream
+    old_stream_id = moe.stream_id
+    moe.stream_id = stream.cuda_stream
+
+    # ── Inference mode, Forward only (with cudagraphs) ──
+    with torch.cuda.stream(stream):
+        with torch.cuda.graph(cuda_graph, stream=stream):
+            o, _, _ = moe_TC_softmax_topk_layer(
+                x,
+                router_w,
+                w1.permute(1, 2, 0),
+                b1,
+                w2.permute(1, 2, 0),
+                b2,
+                moe.top_k,
+                moe.stream_id,
+                activation,
+                True,
+            )
+
+    moe.stream_id = old_stream_id  # restore
+
+    fwd_timing = do_bench(lambda: cuda_graph.replay(), warmup=warmup, rep=repeats)
+    tflops = flops / (fwd_timing * 1e9)
+    print0(f" Cute-DSL Fwd (inference mode + cudagraph) Average time: {fwd_timing:.3f} ms, TFLOPS: {tflops:.1f}")
+
+    # ── Training mode, Forward only ──
+    def forward_only_training_mode():
         o, router_logits, expert_frequency = moe_TC_softmax_topk_layer(
             x,
             router_w,
@@ -249,21 +293,12 @@ def run(
             moe.top_k,
             moe.stream_id,
             activation,
-            is_inference_mode_enabled,
+            False,
         )
         return o
 
-    fwd_timing = do_bench(lambda: forward_only(False), warmup=warmup, rep=repeats)
-    tflops = flops / (fwd_timing * 1e9)  # Convert to TFlops
-    print0(f"[bold green][/bold green] Cute-DSL Fwd Average time: {fwd_timing:.3f} ms, TFLOPS: {tflops:.1f}")
-
-    time.sleep(0.5)
-
-    timing = do_bench(lambda: forward_only(True), warmup=warmup, rep=repeats)
-    tflops = flops / (timing * 1e9)  # Convert to TFlops
-    print0(
-        f"[bold green][/bold green] Cute-DSL Fwd, inference mode, Average time: {timing:.3f} ms, TFLOPS: {tflops:.1f}"
-    )
+    fwd_no_cg_timing = do_bench(forward_only_training_mode, warmup=warmup, rep=repeats)
+    print0(f" Cute-DSL Fwd (training mode) Average time: {fwd_no_cg_timing:.3f} ms")
 
     if is_glu(activation):
         flops = 18 * T * I * H * K
@@ -272,7 +307,6 @@ def run(
 
     time.sleep(0.5)
 
-    @torch.compile
     def forward_and_backward():
         o, router_logits, expert_frequency = moe_TC_softmax_topk_layer(
             x,

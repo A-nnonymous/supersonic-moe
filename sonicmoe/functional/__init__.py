@@ -444,8 +444,18 @@ def moe_TC_softmax_topk_layer(
     router_logits = F.linear(x, router_w)
     topk_scores, topk_indices = TC_Softmax_Topk_Router_Function.apply(router_logits, E, K)
 
-    (expert_frequency, expert_frequency_offset, x_gather_idx, s_scatter_idx, s_reverse_scatter_idx) = (
-        TC_topk_router_metadata_triton(topk_indices, E)
+    T, K = topk_indices.size()
+    TK = T * K
+    device = topk_indices.device
+
+    s_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
+    s_reverse_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
+    expert_frequency = torch.empty(E, dtype=torch.int32, device=device)
+    expert_frequency_offset = torch.empty(E + 1, dtype=torch.int32, device=device)
+    x_gather_idx = torch.empty(TK, dtype=torch.int32, device=device)
+
+    TC_topk_router_metadata_triton(
+        topk_indices, E, expert_frequency, expert_frequency_offset, x_gather_idx, s_scatter_idx, s_reverse_scatter_idx
     )
 
     T = x.size(0)
