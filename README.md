@@ -78,7 +78,17 @@ make test
 
 This repository includes a local multi-agent control plane under `control_plane/fp8/` for planning, launching, and monitoring FP8 delivery work.
 
-### Main agent startup
+### Control Plane Deployment
+
+The default deployment target is a Linux machine with NVIDIA Hopper or Blackwell GPUs already available, with the full SonicMoE runtime environment installed and ready for direct testing.
+
+- recommended hardware: H100, H200, B200, or GB200
+- recommended runtime state: CUDA, PyTorch, Triton, and SonicMoE dependencies already installed in the active environment
+- recommended workflow: launch the control plane from the same provisioned repository checkout that will run FP8 tests and benchmarks
+
+If you are testing Blackwell kernels directly on B200 or GB200, export `USE_QUACK_GEMM=1` in the worker environment before running Blackwell-specific commands.
+
+### Control Plane Quickstart
 
 1. Copy the runtime template:
 
@@ -92,38 +102,44 @@ cp control_plane/fp8/runtime/config_template.yaml control_plane/fp8/runtime/loca
 - provider and model assignments
 - Paddle absolute path
 - worker worktree paths and branches
-- test commands
+- real `test_command` values that can run immediately on the local Hopper or Blackwell host
 
-3. Start only the local dashboard backend+frontend:
+3. Start only the local dashboard backend and frontend from the fully provisioned project environment:
 
 ```bash
-uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/control_plane.py serve --config control_plane/fp8/runtime/local_config.yaml --open-browser
+python control_plane/fp8/runtime/control_plane.py serve --config control_plane/fp8/runtime/local_config.yaml --open-browser
 ```
 
 4. Start the dashboard and launch configured workers in one step:
 
 ```bash
-uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/control_plane.py up --config control_plane/fp8/runtime/local_config.yaml --open-browser
+python control_plane/fp8/runtime/control_plane.py up --config control_plane/fp8/runtime/local_config.yaml --open-browser
 ```
 
 5. Override bind address when needed:
 
 ```bash
-uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/control_plane.py serve --config control_plane/fp8/runtime/local_config.yaml --host 127.0.0.1 --port 8233
+python control_plane/fp8/runtime/control_plane.py serve --config control_plane/fp8/runtime/local_config.yaml --host 0.0.0.0 --port 8233
 ```
 
-### Provider scheduling
+6. Optional compatibility path for non-GPU manager machines:
 
-- every resource pool has a static priority
-- the manager evaluates runtime connection quality for each provider
-- the manager tracks work quality from launch success and process health
+```bash
+uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/control_plane.py serve --config control_plane/fp8/runtime/local_config.yaml --open-browser
+```
+
+### Control Plane Behavior
+
+- the first screen shows every manager and worker agent as a status card
+- the dashboard can save config, launch workers, restart workers, stop workers, and copy startup commands
+- worker launch decisions use static pool priority plus runtime connection-quality and work-quality scoring
 - every worker may declare a `resource_pool_queue` for fallback ordering
-- the dashboard shows the current provider queue, runtime topology, heartbeats, and launch commands
+- provider queue, runtime topology, heartbeats, and validation errors remain available in the dashboard
 
-### Operator notes
+### Control Plane Notes
 
-- on macOS manager machines, use the `uv --no-project` command above so the control plane does not try to install the full CUDA stack
-- actual GPU workers should still run inside their own Linux/CUDA worktrees and environments
+- on a real Hopper or Blackwell deployment host, the direct `python ...` commands above are the default path
+- keep worker `test_command` and benchmark commands pointed at the same CUDA-capable environment that will run real validation on the target GPU
 - the control plane source of truth remains `control_plane/fp8/README.md`
 
 ### Example usage

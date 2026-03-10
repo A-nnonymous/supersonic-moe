@@ -41,15 +41,30 @@ No work is considered active unless it is reflected here.
 - run integrated frontend and backend: `runtime/control_plane.py`
 - current production snapshot: `reports/manager_report.md`
 
+## Deployment assumption
+
+The default target is a Linux machine with Hopper or Blackwell GPUs and a fully provisioned SonicMoE runtime environment.
+
+- expected hardware: H100, H200, B200, or GB200
+- expected environment: CUDA, PyTorch, Triton, and SonicMoE dependencies are already installed and usable from the active shell
+- expected behavior: worker `test_command` values can run immediately on the same machine without extra bootstrap steps
+
+If you are validating Blackwell kernels directly on B200 or GB200, set `USE_QUACK_GEMM=1` in the worker environment before launching those jobs.
+
 ## Quickstart
 
 1. Copy `runtime/config_template.yaml` to `runtime/local_config.yaml`.
-2. For the control plane itself, you can run a standalone runtime with `uv run --no-project --with 'PyYAML>=6.0.2' python ...` even on machines that cannot install the full CUDA stack.
-3. Fill resource pool api keys, provider/model assignments, worktree paths, and `paddle_repo_path`.
-4. Run `uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/control_plane.py serve --config control_plane/fp8/runtime/local_config.yaml --open-browser` to start only the local web control plane.
-5. Run `uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/control_plane.py up --config control_plane/fp8/runtime/local_config.yaml --open-browser` to start the web control plane and launch workers in one process.
-6. Override the bind address if needed with `--host` and `--port`, for example `--port 9000`.
-7. Open `http://127.0.0.1:8233` if the browser does not open automatically.
+2. Fill resource pool api keys, provider/model assignments, worktree paths, `paddle_repo_path`, and real GPU test commands.
+3. Run `python control_plane/fp8/runtime/control_plane.py serve --config control_plane/fp8/runtime/local_config.yaml --open-browser` to start only the local web control plane.
+4. Run `python control_plane/fp8/runtime/control_plane.py up --config control_plane/fp8/runtime/local_config.yaml --open-browser` to start the web control plane and launch workers in one process.
+5. Override the bind address if needed with `--host` and `--port`, for example `--host 0.0.0.0 --port 9000`.
+6. Open `http://127.0.0.1:8233` if the browser does not open automatically.
+
+### Compatibility fallback
+
+If you need to run the control plane from a lightweight manager machine that does not carry the full CUDA stack, use the standalone path below instead of the default GPU-host deployment path above:
+
+`uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/control_plane.py serve --config control_plane/fp8/runtime/local_config.yaml --open-browser`
 
 ## Dashboard capabilities
 
