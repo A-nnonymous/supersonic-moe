@@ -6,6 +6,7 @@ import os
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -85,6 +86,66 @@ class WorkerProcess:
     log_handle: TextIO
     process: subprocess.Popen[str]
     started_at: float
+
+
+class DualStackThreadingHTTPServer(ThreadingHTTPServer):
+    address_family = socket.AF_INET6
+
+    def server_bind(self) -> None:
+        if hasattr(socket, "IPPROTO_IPV6") and hasattr(socket, "IPV6_V6ONLY"):
+            try:
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            except OSError:
+                pass
+        super().server_bind()
+
+
+def bind_targets(host: str) -> list[str]:
+    if host == "0.0.0.0":
+        return ["::", host]
+    return [host]
+
+
+def create_http_server(host: str, port: int, handler: type[BaseHTTPRequestHandler]) -> ThreadingHTTPServer:
+    attempts: list[str] = []
+    for bind_host in bind_targets(host):
+        try:
+            infos = socket.getaddrinfo(bind_host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE)
+        except socket.gaierror as exc:
+            attempts.append(f"{bind_host}:{port} ({exc})")
+            continue
+
+        for family, _, _, _, sockaddr in infos:
+            server_cls: type[ThreadingHTTPServer]
+            if family == socket.AF_INET6:
+                server_cls = DualStackThreadingHTTPServer
+            elif family == socket.AF_INET:
+                server_cls = ThreadingHTTPServer
+            else:
+                continue
+
+            try:
+                server = server_cls(sockaddr, handler, bind_and_activate=False)
+                server.server_bind()
+                server.server_activate()
+                return server
+            except OSError as exc:
+                attempts.append(f"{sockaddr} ({exc})")
+
+    detail = "; ".join(attempts) if attempts else "no compatible address families"
+    raise OSError(f"failed to bind control plane on {host}:{port}: {detail}")
+
+
+def browser_open_host(host: str) -> str:
+    if host in {"0.0.0.0", "::"}:
+        return "127.0.0.1"
+    return host
+
+
+def format_endpoint(host: str, port: int) -> str:
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]:{port}"
+    return f"{host}:{port}"
 
 
 class ControlPlaneService:
@@ -797,12 +858,20 @@ Primary test command:
             def log_message(self, format: str, *args: object) -> None:  # noqa: A003
                 return
 
-        self.httpd = ThreadingHTTPServer((host, port), Handler)
+        self.httpd = create_http_server(host, port, Handler)
         self.server_thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self.server_thread.start()
+        listen_host, listen_port = self.httpd.server_address[:2]
+        print(f"control plane listening on {format_endpoint(listen_host, listen_port)}", file=sys.stderr, flush=True)
+        if host in {"0.0.0.0", "::"}:
+            print(
+                f"remote access URL: http://<server-hostname-or-ip>:{listen_port}",
+                file=sys.stderr,
+                flush=True,
+            )
         if open_browser:
-            webbrowser.open(f"http://{host}:{port}")
-        self.last_event = f"dashboard:{host}:{port}"
+            webbrowser.open(f"http://{browser_open_host(host)}:{listen_port}")
+        self.last_event = f"dashboard:{format_endpoint(listen_host, listen_port)}"
 
     def wait_forever(self) -> None:
         while not self.stop_event.is_set():
@@ -1342,10 +1411,14 @@ def main() -> int:
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
-    if args.command == "up":
-        service.run_up(open_browser=args.open_browser)
-    else:
-        service.run_serve(open_browser=args.open_browser)
+    try:
+        if args.command == "up":
+            service.run_up(open_browser=args.open_browser)
+        else:
+            service.run_serve(open_browser=args.open_browser)
+    except OSError as exc:
+        print(f"control plane startup failed: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 

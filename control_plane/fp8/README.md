@@ -58,13 +58,18 @@ If you are validating Blackwell kernels directly on B200 or GB200, set `USE_QUAC
 3. Run `python control_plane/fp8/runtime/control_plane.py serve --config control_plane/fp8/runtime/local_config.yaml --open-browser` to start only the local web control plane.
 4. Run `python control_plane/fp8/runtime/control_plane.py up --config control_plane/fp8/runtime/local_config.yaml --open-browser` to start the web control plane and launch workers in one process.
 5. Override the bind address if needed with `--host` and `--port`, for example `--host 0.0.0.0 --port 9000`.
-6. Open `http://127.0.0.1:8233` if the browser does not open automatically.
+6. If you bind to `0.0.0.0`, open `http://<server-hostname-or-ip>:8233` from another machine instead of `127.0.0.1`.
+7. On startup, the runtime now prints the effective listen address and a remote access URL hint to stderr.
 
 ### Compatibility fallback
 
 If you need to run the control plane from a lightweight manager machine that does not carry the full CUDA stack, use the standalone path below instead of the default GPU-host deployment path above:
 
 `uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/control_plane.py serve --config control_plane/fp8/runtime/local_config.yaml --open-browser`
+
+### Remote access note
+
+If your deployment hostname resolves to IPv6 first, older IPv4-only listeners can look like `ERR_CONNECTION_REFUSED` from the browser even when the port is open on IPv4. The runtime now prefers a dual-stack bind when you pass `--host 0.0.0.0`, then falls back to IPv4 if dual-stack is unavailable.
 
 ## Dashboard capabilities
 
