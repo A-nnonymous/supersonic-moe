@@ -26,11 +26,18 @@ Last updated: 2026-03-10
 - A6: not-started
 - A7: not-started
 
+## Runtime Topology
+
+- Fork repository name: `supersonic-moe`
+- No worker runtime is registered yet
+- No provider-specific worktree, branch, or environment is active
+
 ## Active Blockers
 
 - FP8 protocol is not frozen
 - baseline tensor contract is not frozen
 - no worker agent has been launched yet
+- no worktree or environment topology has been registered yet
 
 ## Next Runnable Set
 

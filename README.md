@@ -16,7 +16,7 @@ Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 
 - NVIDIA Hopper GPUs (H100, H200, etc.), Blackwell GPUs (GB200, B200). **For B300, please manually upgrade the triton version to 3.6.0**. We need to manually set environment variable `USE_QUACK_GEMM=1` to use the Blackwell kernels.
 - CUDA 12.9+ (13.0+ for B300 GPUs)
-- Python 3.12+
+- Python 3.12 or 3.13
 - PyTorch 2.7+ (2.9.1 recommended)
 
 ### Install from pip
@@ -32,6 +32,9 @@ git clone https://github.com/Dao-AILab/sonic-moe.git
 cd sonic-moe
 
 # Install dependencies
+uv python install 3.13
+uv venv --python 3.13
+source .venv/bin/activate
 pip install -r requirements.txt
 
 # Install SonicMoE
@@ -70,6 +73,58 @@ Run the test suite to verify correctness:
 ```bash
 make test
 ```
+
+## Control Plane
+
+This repository includes a local multi-agent control plane under `control_plane/fp8/` for planning, launching, and monitoring FP8 delivery work.
+
+### Main agent startup
+
+1. Copy the runtime template:
+
+```bash
+cp control_plane/fp8/runtime/config_template.yaml control_plane/fp8/runtime/local_config.yaml
+```
+
+2. Fill `local_config.yaml` with:
+
+- resource pool API keys
+- provider and model assignments
+- Paddle absolute path
+- worker worktree paths and branches
+- test commands
+
+3. Start only the local dashboard backend+frontend:
+
+```bash
+uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/control_plane.py serve --config control_plane/fp8/runtime/local_config.yaml --open-browser
+```
+
+4. Start the dashboard and launch configured workers in one step:
+
+```bash
+uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/control_plane.py up --config control_plane/fp8/runtime/local_config.yaml --open-browser
+```
+
+5. Override bind address when needed:
+
+```bash
+uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/control_plane.py serve --config control_plane/fp8/runtime/local_config.yaml --host 127.0.0.1 --port 8233
+```
+
+### Provider scheduling
+
+- every resource pool has a static priority
+- the manager evaluates runtime connection quality for each provider
+- the manager tracks work quality from launch success and process health
+- every worker may declare a `resource_pool_queue` for fallback ordering
+- the dashboard shows the current provider queue, runtime topology, heartbeats, and launch commands
+
+### Operator notes
+
+- on macOS manager machines, use the `uv --no-project` command above so the control plane does not try to install the full CUDA stack
+- actual GPU workers should still run inside their own Linux/CUDA worktrees and environments
+- the control plane source of truth remains `control_plane/fp8/README.md`
 
 ### Example usage
 - SonicMoE with TC top-K choice routing (SwiGLU activation) on Hopper GPUs

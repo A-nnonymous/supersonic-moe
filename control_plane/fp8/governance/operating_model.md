@@ -31,6 +31,65 @@ Run multiple agents in parallel without relying on any single agent's conversati
 5. A6 maintains baseline traceability continuously.
 6. A7 does not request invasive optimization before functional gates pass.
 
+## Runtime topology
+
+Provider diversity is allowed. A worker may be driven by Copilot, Claude Code, OpenCode, or another provider, but runtime isolation is mandatory.
+
+Every real worker must have an entry in `state/agent_runtime.yaml` before it is treated as active.
+
+### Required runtime fields
+
+- agent id
+- repository name
+- resource pool
+- provider
+- model
+- operator or launch owner
+- local workspace root
+- worktree path
+- branch name
+- repository root
+- environment type
+- environment path
+- install or sync command
+- primary test command
+- submit strategy
+- status
+
+### Isolation policy
+
+- one worker, one worktree
+- one worker, one branch
+- one worker, one environment
+- one worker must not reuse another worker's editable worktree
+- integration work happens only through manager-controlled merge or cherry-pick
+- the fork repository name must be recorded even if local directory names differ
+
+### Environment policy
+
+- `uv` is the default recommendation for Python environments because it is fast and reproducible
+- if a provider or toolchain requires another environment manager, record it explicitly in `state/agent_runtime.yaml`
+- test and sync commands must be written exactly as the worker should run them
+
+### Branch policy
+
+- branch names should carry the agent id and task id, for example `a1_protocol_freeze` or `a3_blackwell_audit`
+- no worker should commit directly on the manager integration branch
+- if a worker produces only a patch and not a commit, record `submit_strategy: patch_handoff`
+
+### Submission policy
+
+- accepted submission modes are `cherry_pick`, `merge_commit`, or `patch_handoff`
+- the manager owns final integration and conflict resolution
+- a worker is not considered delivered until its submit mode and patch basis are recorded
+
+### Automation policy
+
+- a manager-side orchestrator may auto-create worktrees, environments, and worker sessions
+- automation must still register every worker in `state/agent_runtime.yaml`
+- provider api keys must come from a local ignored config file or local environment variables
+- automation may open a local dashboard on port `8233` for reporting
+
 ## Heartbeat control
 
 Agent startup is not assumed. The manager must distinguish between planned agents and agents that are actually alive.
@@ -60,6 +119,8 @@ For preflight and planning work, an agent is `stale` if it has not produced any 
 For active implementation or experiment phases, the manager should tighten the window and record the chosen threshold in `reports/manager_report.md`.
 
 If no worker agents are active, the manager must report that only A0 is alive instead of pretending parallel execution exists.
+
+Heartbeat alone is not enough to count a worker as valid. The worker must also have a runtime record in `state/agent_runtime.yaml`.
 
 ## Document concurrency control
 
@@ -134,6 +195,8 @@ Every worker status update must include:
 
 - Current task
 - Branch or patch scope
+- Provider and worktree
+- Environment and test command
 - Completed since last update
 - Blockers
 - Requested unlocks
@@ -144,6 +207,7 @@ Every worker checkpoint update must include:
 - Snapshot timestamp
 - Owned scope
 - Last known good state
+- Worktree, branch, and environment basis
 - Pending change set
 - Dependencies and assumptions
 - Resume instruction
@@ -170,13 +234,14 @@ The manager should run this loop at every handoff or resume:
 1. Load checkpoint
 2. Read backlog and gates
 3. Read heartbeats
-4. Read edit locks
-5. Poll agent status files
-6. Poll agent checkpoints
-7. Poll experiment registry
-8. Recompute blockers, alive agents, and next parallel set
-9. Update manager report
-10. Refresh checkpoint if anything material changed
+4. Read runtime topology
+5. Read edit locks
+6. Poll agent status files
+7. Poll agent checkpoints
+8. Poll experiment registry
+9. Recompute blockers, alive agents, and next parallel set
+10. Update manager report
+11. Refresh checkpoint if anything material changed
 
 ## Escalation cases
 
