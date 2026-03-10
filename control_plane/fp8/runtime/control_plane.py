@@ -11,6 +11,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import webbrowser
 from dataclasses import dataclass
 from datetime import datetime
@@ -30,6 +32,8 @@ CONTROL_ROOT = REPO_ROOT / "control_plane" / "fp8"
 STATE_DIR = CONTROL_ROOT / "state"
 RUNTIME_DIR = CONTROL_ROOT / "runtime"
 CONFIG_TEMPLATE_PATH = RUNTIME_DIR / "config_template.yaml"
+DEFAULT_DASHBOARD_HOST = "0.0.0.0"
+DEFAULT_DASHBOARD_PORT = 8233
 PROMPT_DIR = RUNTIME_DIR / "generated_prompts"
 LOG_DIR = RUNTIME_DIR / "logs"
 MANAGER_REPORT = CONTROL_ROOT / "reports" / "manager_report.md"
@@ -169,6 +173,52 @@ def format_endpoint(host: str, port: int) -> str:
     return f"{host}:{port}"
 
 
+def load_session_state_file() -> dict[str, Any]:
+    if not SESSION_STATE.exists():
+        return {}
+    return json.loads(SESSION_STATE.read_text(encoding="utf-8"))
+
+
+def pid_is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def terminate_pid(pid: int, sig: int = signal.SIGTERM) -> None:
+    os.kill(pid, sig)
+
+
+def control_plane_base_url(args: argparse.Namespace, session_state: dict[str, Any]) -> str:
+    server = session_state.get("server", {})
+    host = args.host or server.get("host") or DEFAULT_DASHBOARD_HOST
+    port = args.port or int(server.get("port") or DEFAULT_DASHBOARD_PORT)
+    return f"http://{browser_open_host(str(host))}:{port}"
+
+
+def post_control_plane(url: str, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    request = urllib.request.Request(
+        f"{url}{path}",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8")
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            raise RuntimeError(body or str(exc)) from exc
+        raise RuntimeError(data.get("error") or "\n".join(data.get("errors", [])) or str(exc)) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(str(exc.reason)) from exc
+
+
 class ControlPlaneService:
     def __init__(
         self,
@@ -200,6 +250,9 @@ class ControlPlaneService:
         self.provider_stats: dict[str, dict[str, Any]] = {}
         self.dry_run = False
         self.dry_run_reason = ""
+        self.listen_host = ""
+        self.listen_port = 0
+        self.listen_endpoints: list[str] = []
         self.reload_config()
 
     def refresh_runtime_mode(self) -> None:
@@ -481,6 +534,16 @@ class ControlPlaneService:
         payload = {
             "updated_at": now_iso(),
             "last_event": self.last_event,
+            "server": {
+                "pid": os.getpid(),
+                "host": self.listen_host,
+                "port": self.listen_port,
+                "endpoints": self.listen_endpoints,
+                "config_path": str(self.config_path),
+                "persist_config_path": str(self.persist_config_path),
+                "dry_run": self.dry_run,
+                "alive": not self.stop_event.is_set(),
+            },
             "workers": {
                 agent: {
                     "pid": worker.process.pid,
@@ -997,6 +1060,13 @@ Primary test command:
             self.write_json(handler, result)
             return True
 
+        if handler.path == "/api/shutdown":
+            stop_agents = bool(payload.get("stop_agents", True))
+            result = {"ok": True, "stop_agents": stop_agents}
+            self.write_json(handler, result)
+            threading.Thread(target=self.shutdown, kwargs={"stop_agents": stop_agents}, daemon=True).start()
+            return True
+
         return False
 
     def start_dashboard(self, open_browser: bool = False) -> None:
@@ -1039,6 +1109,10 @@ Primary test command:
             endpoint = format_endpoint(listen_host, listen_port)
             listen_endpoints.append(endpoint)
             print(f"control plane listening on {endpoint}", file=sys.stderr, flush=True)
+        self.listen_host = host
+        self.listen_port = listen_port
+        self.listen_endpoints = listen_endpoints
+        self.write_session_state()
         if host in {"0.0.0.0", "::"}:
             print(
                 f"remote access URL: http://<server-hostname-or-ip>:{listen_port}",
@@ -1071,12 +1145,14 @@ Primary test command:
         self.start_dashboard(open_browser=open_browser)
         self.wait_forever()
 
-    def shutdown(self) -> None:
+    def shutdown(self, stop_agents: bool = True) -> None:
         self.stop_event.set()
-        self.stop_workers()
+        if stop_agents:
+            self.stop_workers()
         for server in self.http_servers:
             server.shutdown()
             server.server_close()
+        self.write_session_state()
 
 
 DASHBOARD_HTML = """<!doctype html>
@@ -1825,12 +1901,19 @@ DASHBOARD_HTML = """<!doctype html>
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="supersonic-moe control plane runtime")
-    parser.add_argument("command", choices=["up", "serve"], help="launch server with workers, or only the server")
+    parser.add_argument(
+        "command",
+        choices=["up", "serve", "stop-agents", "stop-listener", "stop-all"],
+        help="launch the control plane, or stop agents/listener from a running session",
+    )
     parser.add_argument("--config", type=Path, default=RUNTIME_DIR / "local_config.yaml", help="runtime config path")
     parser.add_argument("--host", default=None, help="override dashboard host")
     parser.add_argument("--port", type=int, default=None, help="override dashboard port")
     parser.add_argument("--open-browser", action="store_true", help="open the dashboard in a browser")
     parser.add_argument("--detach", action="store_true", help="start the control plane in the background and return")
+    parser.add_argument(
+        "--foreground", action="store_true", help="keep the control plane attached to the current shell"
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -1843,6 +1926,80 @@ def parse_args() -> argparse.Namespace:
         help="log file used when --detach is enabled",
     )
     return parser.parse_args()
+
+
+def apply_runtime_defaults(args: argparse.Namespace, dry_run: bool) -> None:
+    if args.command == "serve" and dry_run:
+        if args.host is None:
+            args.host = DEFAULT_DASHBOARD_HOST
+        if not args.foreground:
+            args.detach = True
+
+
+def stop_agents_command(args: argparse.Namespace) -> int:
+    session_state = load_session_state_file()
+    if not session_state:
+        print(f"no active session state found at {SESSION_STATE}", file=sys.stderr)
+        return 1
+    result = post_control_plane(control_plane_base_url(args, session_state), "/api/stop", {})
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def stop_listener_command(args: argparse.Namespace) -> int:
+    session_state = load_session_state_file()
+    if not session_state:
+        print(f"no active session state found at {SESSION_STATE}", file=sys.stderr)
+        return 1
+    try:
+        result = post_control_plane(
+            control_plane_base_url(args, session_state), "/api/shutdown", {"stop_agents": False}
+        )
+        print(json.dumps(result, indent=2))
+        return 0
+    except RuntimeError:
+        server_pid = int(session_state.get("server", {}).get("pid") or 0)
+        if not server_pid or not pid_is_running(server_pid):
+            print("listener is not running", file=sys.stderr)
+            return 1
+        terminate_pid(server_pid)
+        print(json.dumps({"ok": True, "listener_pid": server_pid, "stop_agents": False}, indent=2))
+        return 0
+
+
+def stop_all_command(args: argparse.Namespace) -> int:
+    session_state = load_session_state_file()
+    if not session_state:
+        print(f"no active session state found at {SESSION_STATE}", file=sys.stderr)
+        return 1
+    try:
+        result = post_control_plane(
+            control_plane_base_url(args, session_state), "/api/shutdown", {"stop_agents": True}
+        )
+        print(json.dumps(result, indent=2))
+        return 0
+    except RuntimeError:
+        stopped_workers: list[int] = []
+        for worker in session_state.get("workers", {}).values():
+            pid = int(worker.get("pid") or 0)
+            if pid and pid_is_running(pid):
+                terminate_pid(pid)
+                stopped_workers.append(pid)
+        server_pid = int(session_state.get("server", {}).get("pid") or 0)
+        if server_pid and pid_is_running(server_pid):
+            terminate_pid(server_pid)
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "listener_pid": server_pid,
+                    "stopped_worker_pids": stopped_workers,
+                    "stop_agents": True,
+                },
+                indent=2,
+            )
+        )
+        return 0
 
 
 def resolve_runtime_config(args: argparse.Namespace) -> tuple[Path, Path, bool, str]:
@@ -1874,7 +2031,12 @@ def resolve_runtime_config(args: argparse.Namespace) -> tuple[Path, Path, bool, 
 def detach_process(args: argparse.Namespace) -> int:
     log_path = args.log_file
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    command = [sys.executable, str(Path(__file__).resolve()), args.command, "--config", str(args.config)]
+    script_path = str(Path(__file__).resolve())
+    if shutil.which("uv"):
+        command = ["uv", "run", "--no-project", "--with", "PyYAML>=6.0.2", "python", script_path, args.command]
+    else:
+        command = [sys.executable, script_path, args.command]
+    command.extend(["--config", str(args.config)])
     if args.host is not None:
         command.extend(["--host", args.host])
     if args.port is not None:
@@ -1902,6 +2064,13 @@ def detach_process(args: argparse.Namespace) -> int:
 
 def main() -> int:
     args = parse_args()
+    if args.command == "stop-agents":
+        return stop_agents_command(args)
+    if args.command == "stop-listener":
+        return stop_listener_command(args)
+    if args.command == "stop-all":
+        return stop_all_command(args)
+
     try:
         config_path, persist_config_path, force_dry_run, dry_run_reason = resolve_runtime_config(args)
     except FileNotFoundError as exc:
@@ -1911,6 +2080,8 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+
+    apply_runtime_defaults(args, force_dry_run)
 
     if args.detach and os.environ.get("CONTROL_PLANE_DETACHED") != "1":
         args.config = config_path
