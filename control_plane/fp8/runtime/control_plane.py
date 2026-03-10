@@ -239,6 +239,7 @@ class ControlPlaneService:
         self.server_threads: list[threading.Thread] = []
         self.http_servers: list[ThreadingHTTPServer] = []
         self.processes: dict[str, WorkerProcess] = {}
+        self.simulated_processes: dict[str, dict[str, Any]] = {}
         self.last_event = "initialized"
         PROMPT_DIR.mkdir(parents=True, exist_ok=True)
         LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -531,6 +532,22 @@ class ControlPlaneService:
         raise RuntimeError(f"worker {worker['agent']} has no eligible resource pool candidates")
 
     def write_session_state(self) -> None:
+        worker_payload = {
+            agent: {
+                "pid": worker.process.pid,
+                "resource_pool": worker.resource_pool,
+                "provider": worker.provider,
+                "model": worker.model,
+                "command": worker.command,
+                "worktree_path": str(worker.worktree_path),
+                "log_path": str(worker.log_path),
+                "alive": worker.process.poll() is None,
+                "returncode": worker.process.poll(),
+                "simulated": False,
+            }
+            for agent, worker in self.processes.items()
+        }
+        worker_payload.update(self.simulated_processes)
         payload = {
             "updated_at": now_iso(),
             "last_event": self.last_event,
@@ -544,20 +561,7 @@ class ControlPlaneService:
                 "dry_run": self.dry_run,
                 "alive": not self.stop_event.is_set(),
             },
-            "workers": {
-                agent: {
-                    "pid": worker.process.pid,
-                    "resource_pool": worker.resource_pool,
-                    "provider": worker.provider,
-                    "model": worker.model,
-                    "command": worker.command,
-                    "worktree_path": str(worker.worktree_path),
-                    "log_path": str(worker.log_path),
-                    "alive": worker.process.poll() is None,
-                    "returncode": worker.process.poll(),
-                }
-                for agent, worker in self.processes.items()
-            },
+            "workers": worker_payload,
         }
         SESSION_STATE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
@@ -874,8 +878,7 @@ Primary test command:
     def launch_all(self, restart: bool = False) -> dict[str, Any]:
         with self.lock:
             if self.dry_run:
-                message = self.dry_run_reason or "dry-run mode is active"
-                return {"ok": False, "errors": [f"launch disabled while dry-run mode is active: {message}"]}
+                return self.simulate_launch_all(restart=restart)
             errors = self.validation_errors()
             if errors:
                 return {"ok": False, "errors": errors}
@@ -923,6 +926,19 @@ Primary test command:
                     )
                 stopped.append(agent)
                 del self.processes[agent]
+            for agent, worker in list(self.simulated_processes.items()):
+                runtime_entry = next((w for w in self.workers if w.get("agent") == agent), None)
+                if runtime_entry:
+                    self.update_runtime_entry(
+                        runtime_entry,
+                        str(worker.get("resource_pool", "unassigned")),
+                        str(worker.get("provider", "unassigned")),
+                        str(worker.get("model", "unassigned")),
+                        "stopped",
+                    )
+                self.update_heartbeat(agent, "offline", "dry_run_stop", "none")
+                stopped.append(agent)
+                del self.simulated_processes[agent]
             self.last_event = f"stop:{len(stopped)} workers"
             self.write_session_state()
             return {"ok": True, "stopped": stopped}
@@ -941,7 +957,48 @@ Primary test command:
                 "log_path": str(worker.log_path),
                 "command": worker.command,
             }
+        snapshot.update(self.simulated_processes)
         return snapshot
+
+    def simulate_launch_all(self, restart: bool = False) -> dict[str, Any]:
+        if restart:
+            self.stop_workers()
+        launched: list[dict[str, Any]] = []
+        for worker in self.workers:
+            agent = str(worker.get("agent", "")).strip()
+            if not agent or agent in self.simulated_processes:
+                continue
+            pool_name = str(worker.get("resource_pool") or "unassigned")
+            pool = self.resource_pools.get(pool_name, {})
+            provider_name = str(worker.get("provider") or pool.get("provider") or "unassigned")
+            model = str(worker.get("model") or pool.get("model") or "unassigned")
+            self.simulated_processes[agent] = {
+                "resource_pool": pool_name,
+                "provider": provider_name,
+                "model": model,
+                "pid": "dry-run",
+                "alive": True,
+                "returncode": None,
+                "worktree_path": str(worker.get("worktree_path", "unassigned")),
+                "log_path": "dry-run",
+                "command": ["dry-run", agent],
+                "simulated": True,
+            }
+            self.update_runtime_entry(worker, pool_name, provider_name, model, "active")
+            self.update_heartbeat(agent, "healthy", "dry_run_launch", "none")
+            launched.append(
+                {
+                    "agent": agent,
+                    "resource_pool": pool_name,
+                    "provider": provider_name,
+                    "model": model,
+                    "pid": "dry-run",
+                    "command": ["dry-run", agent],
+                }
+            )
+        self.last_event = f"dry_run_launch:{len(launched)} workers"
+        self.write_session_state()
+        return {"ok": True, "launched": launched, "failures": [], "dry_run": True}
 
     def build_dashboard_state(self) -> dict[str, Any]:
         config_text = self.config_path.read_text(encoding="utf-8") if self.config_path.exists() else ""
@@ -1821,9 +1878,6 @@ DASHBOARD_HTML = """<!doctype html>
 
         async function launchWorkers(restart) {
             await runAction(restart ? 'restarting workers' : 'launching workers', async () => {
-                if (latestState.mode && latestState.mode.dry_run) {
-                    throw new Error(latestState.mode.reason || 'launch disabled while dry-run mode is active');
-                }
                 const data = await postJson('/api/launch', { restart });
                 setStatus(`launch complete: ${(data.launched || []).length} launched, ${(data.failures || []).length} failures`, !(data.ok ?? false));
                 await refresh(true);
