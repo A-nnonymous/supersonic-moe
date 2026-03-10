@@ -118,6 +118,10 @@ uv.lock
 .pdm-python
 .pdm-build/
 
+# Control plane web tooling
+control_plane/fp8/runtime/web/node_modules/
+control_plane/fp8/runtime/session_state_*.json
+
 # pixi
 #   Similar to Pipfile.lock, it is generally recommended to include pixi.lock in version control.
 #pixi.lock

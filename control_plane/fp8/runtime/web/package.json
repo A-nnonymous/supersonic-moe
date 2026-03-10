@@ -1,0 +1,19 @@
+{
+  "name": "fp8-control-plane-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/main.tsx --bundle --format=esm --target=es2020 --jsx=automatic --outdir=static --entry-names=app --loader:.css=css"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "esbuild": "^0.25.1",
+    "typescript": "^5.8.2"
+  }
+}

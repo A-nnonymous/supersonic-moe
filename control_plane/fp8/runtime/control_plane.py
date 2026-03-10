@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import mimetypes
 import os
 import shlex
 import shutil
@@ -20,6 +21,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, TextIO
+from urllib.parse import unquote, urlparse
 
 
 try:
@@ -39,6 +41,8 @@ LOG_DIR = RUNTIME_DIR / "logs"
 MANAGER_REPORT = CONTROL_ROOT / "reports" / "manager_report.md"
 SESSION_STATE = RUNTIME_DIR / "session_state.json"
 CONTROL_PLANE_RUNTIME = "uv run --no-project --with 'PyYAML>=6.0.2' python"
+WEB_STATIC_DIR = RUNTIME_DIR / "web" / "static"
+WEB_INDEX_FILE = WEB_STATIC_DIR / "index.html"
 
 
 def now_iso() -> str:
@@ -179,6 +183,18 @@ def load_session_state_file() -> dict[str, Any]:
     return json.loads(SESSION_STATE.read_text(encoding="utf-8"))
 
 
+def session_state_path_for_port(port: int) -> Path:
+    return RUNTIME_DIR / f"session_state_{port}.json"
+
+
+def load_preferred_session_state(preferred_port: int | None = None) -> dict[str, Any]:
+    if preferred_port is not None:
+        port_path = session_state_path_for_port(preferred_port)
+        if port_path.exists():
+            return json.loads(port_path.read_text(encoding="utf-8"))
+    return load_session_state_file()
+
+
 def pid_is_running(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -189,6 +205,59 @@ def pid_is_running(pid: int) -> bool:
 
 def terminate_pid(pid: int, sig: int = signal.SIGTERM) -> None:
     os.kill(pid, sig)
+
+
+def terminate_process_tree(pid: int, sig: int = signal.SIGTERM) -> None:
+    try:
+        process_group = os.getpgid(pid)
+    except OSError:
+        return
+    try:
+        os.killpg(process_group, sig)
+    except OSError:
+        return
+
+
+def wait_for_process_exit(pid: int, timeout: float) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not pid_is_running(pid):
+            return True
+        time.sleep(0.1)
+    return not pid_is_running(pid)
+
+
+def tcp_port_in_use(port: int, hosts: tuple[str, ...] = ("127.0.0.1", "::1")) -> bool:
+    for host in hosts:
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as probe:
+                probe.settimeout(0.2)
+                if probe.connect_ex((host, port)) == 0:
+                    return True
+        except OSError:
+            continue
+    return False
+
+
+def wait_for_port_release(port: int, timeout: float = 5.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not tcp_port_in_use(port):
+            return True
+        time.sleep(0.1)
+    return not tcp_port_in_use(port)
+
+
+def safe_relative_web_path(request_path: str) -> Path | None:
+    parsed = urlparse(request_path)
+    raw_path = unquote(parsed.path)
+    if raw_path in {"", "/"}:
+        return Path("index.html")
+    relative = Path(raw_path.lstrip("/"))
+    if any(part in {"..", ""} for part in relative.parts):
+        return None
+    return relative
 
 
 def control_plane_base_url(args: argparse.Namespace, session_state: dict[str, Any]) -> str:
@@ -655,7 +724,27 @@ class ControlPlaneService:
             },
             "workers": worker_payload,
         }
-        SESSION_STATE.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        encoded = json.dumps(payload, indent=2)
+        SESSION_STATE.write_text(encoded, encoding="utf-8")
+        if self.listen_port:
+            session_state_path_for_port(self.listen_port).write_text(encoded, encoding="utf-8")
+
+    def serve_static_asset(self, request_path: str) -> tuple[bytes, str] | None:
+        relative_path = safe_relative_web_path(request_path)
+        if relative_path is None:
+            return None
+        asset_path = (WEB_STATIC_DIR / relative_path).resolve()
+        web_root = WEB_STATIC_DIR.resolve()
+        try:
+            asset_path.relative_to(web_root)
+        except ValueError:
+            return None
+        if asset_path.is_dir():
+            asset_path = asset_path / "index.html"
+        if not asset_path.exists() or not asset_path.is_file():
+            return None
+        content_type, _ = mimetypes.guess_type(asset_path.name)
+        return asset_path.read_bytes(), content_type or "application/octet-stream"
 
     def build_cli_commands(self) -> dict[str, str]:
         host = self.host_override or self.project.get("dashboard", {}).get("host", "127.0.0.1")
@@ -935,6 +1024,7 @@ Primary test command:
             stderr=subprocess.STDOUT,
             text=True,
             env=env,
+            start_new_session=True,
         )
         previous = self.processes.get(worker["agent"])
         if previous and previous.process.poll() is None:
@@ -998,11 +1088,11 @@ Primary test command:
             stopped: list[str] = []
             for agent, worker in list(self.processes.items()):
                 if worker.process.poll() is None:
-                    worker.process.terminate()
+                    terminate_process_tree(worker.process.pid, signal.SIGTERM)
                     try:
                         worker.process.wait(timeout=5)
                     except subprocess.TimeoutExpired:
-                        worker.process.kill()
+                        terminate_process_tree(worker.process.pid, signal.SIGKILL)
                         worker.process.wait(timeout=5)
                 worker.log_handle.close()
                 self.update_heartbeat(agent, "offline", "manager_stop", "none")
@@ -1089,7 +1179,10 @@ Primary test command:
             handler.send_header("Content-Type", "application/json; charset=utf-8")
             handler.send_header("Content-Length", str(len(payload)))
             handler.end_headers()
-            handler.wfile.write(payload)
+            try:
+                handler.wfile.write(payload)
+            except BrokenPipeError:
+                return True
             return True
         if handler.path == "/api/config":
             payload = json.dumps(
@@ -1099,7 +1192,10 @@ Primary test command:
             handler.send_header("Content-Type", "application/json; charset=utf-8")
             handler.send_header("Content-Length", str(len(payload)))
             handler.end_headers()
-            handler.wfile.write(payload)
+            try:
+                handler.wfile.write(payload)
+            except BrokenPipeError:
+                return True
             return True
         return False
 
@@ -1116,7 +1212,10 @@ Primary test command:
         handler.send_header("Content-Type", "application/json; charset=utf-8")
         handler.send_header("Content-Length", str(len(body)))
         handler.end_headers()
-        handler.wfile.write(body)
+        try:
+            handler.wfile.write(body)
+        except BrokenPipeError:
+            return
 
     def handle_api_post(self, handler: BaseHTTPRequestHandler) -> bool:
         try:
@@ -1157,6 +1256,22 @@ Primary test command:
             self.write_json(handler, result)
             return True
 
+        if handler.path == "/api/stop-all":
+            stopped_workers = sorted(self.processes.keys())
+            listener_port = self.listen_port
+            self.write_json(
+                handler,
+                {
+                    "ok": True,
+                    "stop_agents": True,
+                    "stopped_workers": stopped_workers,
+                    "listener_port": listener_port,
+                    "listener_released": False,
+                },
+            )
+            threading.Thread(target=self.shutdown, kwargs={"stop_agents": True}, daemon=True).start()
+            return True
+
         if handler.path == "/api/shutdown":
             stop_agents = bool(payload.get("stop_agents", True))
             result = {"ok": True, "stop_agents": stop_agents}
@@ -1175,15 +1290,19 @@ Primary test command:
             def do_GET(self) -> None:  # noqa: N802
                 if service.handle_api_get(self):
                     return
-                if self.path not in {"/", "/index.html"}:
+                asset = service.serve_static_asset(self.path)
+                if asset is None:
                     self.send_error(HTTPStatus.NOT_FOUND)
                     return
-                body = DASHBOARD_HTML.encode("utf-8")
+                body, content_type = asset
                 self.send_response(HTTPStatus.OK)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Type", f"{content_type}; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-                self.wfile.write(body)
+                try:
+                    self.wfile.write(body)
+                except BrokenPipeError:
+                    return
 
             def do_POST(self) -> None:  # noqa: N802
                 if service.handle_api_post(self):
@@ -1209,6 +1328,7 @@ Primary test command:
         self.listen_host = host
         self.listen_port = listen_port
         self.listen_endpoints = listen_endpoints
+        self.last_event = f"dashboard:{', '.join(listen_endpoints)}"
         self.write_session_state()
         if host in {"0.0.0.0", "::"}:
             print(
@@ -1218,7 +1338,6 @@ Primary test command:
             )
         if open_browser:
             webbrowser.open(f"http://{browser_open_host(host)}:{listen_port}")
-        self.last_event = f"dashboard:{', '.join(listen_endpoints)}"
 
     def wait_forever(self) -> None:
         while not self.stop_event.is_set():
@@ -1250,883 +1369,13 @@ Primary test command:
         for server in self.http_servers:
             server.shutdown()
             server.server_close()
+        listener_released = wait_for_port_release(self.listen_port) if self.listen_port else True
+        self.last_event = (
+            f"shutdown:all released={listener_released}"
+            if stop_agents
+            else f"shutdown:listener released={listener_released}"
+        )
         self.write_session_state()
-
-
-DASHBOARD_HTML = """<!doctype html>
-<html lang=\"en\">
-<head>
-    <meta charset=\"utf-8\">
-    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
-    <title>supersonic-moe control plane</title>
-    <style>
-        :root { color-scheme: dark; }
-        body { font-family: "Avenir Next", "Segoe UI", sans-serif; margin: 0; background: radial-gradient(circle at top, #15345f 0%, #08111f 42%, #060b14 100%); color: #edf2ff; }
-        header { padding: 30px 24px 26px; background: linear-gradient(135deg, rgba(13, 28, 51, 0.96), rgba(13, 93, 89, 0.88)); border-bottom: 1px solid rgba(157, 196, 255, 0.12); }
-        main { max-width: 1380px; margin: 0 auto; padding: 18px 20px 36px; display: grid; gap: 14px; }
-        .card { background: rgba(16, 25, 43, 0.84); border: 1px solid rgba(87, 118, 163, 0.32); border-radius: 16px; padding: 16px; box-shadow: 0 16px 40px rgba(0, 0, 0, 0.2); backdrop-filter: blur(12px); }
-        .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
-        .summary { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
-        .metric { padding: 14px; border-radius: 12px; background: linear-gradient(180deg, rgba(12, 19, 34, 0.95), rgba(10, 17, 28, 0.88)); border: 1px solid rgba(72, 102, 145, 0.34); }
-        .metric strong { display: block; font-size: 28px; line-height: 1.1; margin-bottom: 4px; }
-        h1, h2, h3, p { margin: 0 0 10px; }
-        h2 { font-size: 18px; }
-        h3 { font-size: 14px; color: #c7d5f8; }
-        table { width: 100%; border-collapse: collapse; font-size: 13px; }
-        th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid #1e2b42; vertical-align: top; }
-        th { color: #b6c6ea; font-weight: 600; }
-        pre, textarea, code { font-family: ui-monospace, monospace; }
-        pre { white-space: pre-wrap; background: #0c1322; padding: 12px; border-radius: 10px; max-height: 320px; overflow: auto; margin: 0; }
-        textarea { width: 100%; min-height: 420px; background: #0c1322; color: #edf2ff; border: 1px solid #243252; border-radius: 10px; padding: 12px; box-sizing: border-box; resize: vertical; }
-        button { background: #1f7a6d; color: #fff; border: 0; border-radius: 8px; padding: 10px 14px; cursor: pointer; }
-        button.secondary { background: #29405f; }
-        button.ghost { background: #18243a; }
-        button.danger { background: #8a3d52; }
-        button.nav-button { background: transparent; border: 1px solid transparent; color: #b6c6ea; }
-        button.nav-button.active { background: rgba(27, 115, 101, 0.2); border-color: rgba(87, 211, 183, 0.35); color: #eefbff; }
-        button:disabled { opacity: 0.45; cursor: not-allowed; }
-        .small { color: #a7b5d6; font-size: 13px; }
-        .muted { color: #93a7cc; }
-        .status { padding: 4px 0 0; color: #9ce5c7; min-height: 22px; }
-        .error { color: #ffb2c0; }
-        .hero { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 16px; }
-        .hero-badge { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; border-radius: 999px; background: rgba(9, 18, 33, 0.46); border: 1px solid rgba(155, 203, 255, 0.18); color: #cfe1ff; font-size: 12px; letter-spacing: 0.04em; text-transform: uppercase; }
-        .tagline { max-width: 760px; }
-        .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; }
-        .toolbar-group { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-        .toggle { display: inline-flex; gap: 8px; align-items: center; color: #b6c6ea; font-size: 13px; }
-        .tab-nav { display: flex; flex-wrap: wrap; gap: 8px; }
-        .tab-panel { display: none; gap: 14px; }
-        .tab-panel.active { display: grid; }
-        .panel-title { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
-        .overview-hero { display: grid; gap: 14px; grid-template-columns: minmax(0, 1.6fr) minmax(320px, 0.8fr); }
-        .progress-card { display: grid; gap: 12px; }
-        .progress-bar { height: 12px; border-radius: 999px; background: rgba(31, 45, 70, 0.92); overflow: hidden; border: 1px solid rgba(72, 102, 145, 0.34); }
-        .progress-fill { height: 100%; background: linear-gradient(90deg, #1f7a6d, #6ad1c3); width: 0%; }
-        .progress-list { display: grid; gap: 8px; }
-        .progress-row { display: flex; justify-content: space-between; gap: 12px; font-size: 13px; }
-        .merge-board { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
-        .merge-card { padding: 14px; border-radius: 14px; background: linear-gradient(180deg, rgba(10, 18, 30, 0.96), rgba(10, 22, 39, 0.84)); border: 1px solid rgba(74, 105, 149, 0.34); display: grid; gap: 10px; }
-        .merge-card-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
-        .merge-branch { font-size: 18px; font-weight: 700; line-height: 1.2; }
-        .merge-track { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #b8c8e6; }
-        .merge-arrow { color: #6ad1c3; font-weight: 700; }
-        .merge-meta { display: grid; gap: 6px; font-size: 13px; }
-        .merge-meta strong { color: #9fbbe8; }
-        .merge-note { padding-top: 4px; color: #a7b5d6; font-size: 12px; }
-        .agent-wall { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
-        .agent-card { padding: 14px; border-radius: 14px; background: linear-gradient(180deg, rgba(11, 18, 31, 0.96), rgba(12, 21, 37, 0.84)); border: 1px solid rgba(74, 105, 149, 0.34); min-height: 148px; display: grid; gap: 10px; }
-        .agent-card header { padding: 0; background: none; border: 0; display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
-        .agent-name { font-size: 20px; font-weight: 700; line-height: 1; }
-        .agent-role { color: #9fb2d5; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
-        .agent-meta { display: grid; gap: 6px; font-size: 13px; color: #d9e5ff; }
-        .agent-meta strong { color: #9fbbe8; font-weight: 600; }
-        .chip { display: inline-flex; align-items: center; padding: 5px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; letter-spacing: 0.02em; }
-        .state-healthy, .state-active { background: rgba(31, 122, 109, 0.22); color: #9ff0d8; border: 1px solid rgba(63, 197, 170, 0.32); }
-        .state-stale, .state-launch_failed { background: rgba(160, 92, 36, 0.22); color: #ffd4a6; border: 1px solid rgba(223, 142, 76, 0.34); }
-        .state-offline, .state-stopped { background: rgba(75, 92, 124, 0.22); color: #cad6ef; border: 1px solid rgba(118, 138, 175, 0.3); }
-        .state-not_started, .state-not-started, .state-unassigned { background: rgba(50, 61, 88, 0.28); color: #d4def5; border: 1px solid rgba(111, 126, 163, 0.28); }
-        .state-error { background: rgba(138, 61, 82, 0.26); color: #ffbfd0; border: 1px solid rgba(212, 101, 133, 0.34); }
-        .section-stack { display: grid; gap: 14px; }
-        .page-header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
-        .config-layout { display: grid; gap: 14px; grid-template-columns: minmax(0, 1.3fr) minmax(320px, 0.7fr); }
-        .helper-list { display: grid; gap: 12px; }
-        .helper-card { padding: 12px; border-radius: 12px; background: rgba(12, 19, 34, 0.86); border: 1px solid rgba(72, 102, 145, 0.28); }
-        .pill-row { display: flex; flex-wrap: wrap; gap: 8px; }
-        .key-pair { display: inline-flex; align-items: center; gap: 8px; padding: 7px 10px; border-radius: 999px; background: rgba(12, 19, 34, 0.9); border: 1px solid rgba(72, 102, 145, 0.28); font-size: 12px; }
-        @media (max-width: 980px) {
-            .overview-hero, .config-layout { grid-template-columns: 1fr; }
-        }
-    </style>
-</head>
-<body>
-    <header>
-        <div class=\"hero\">
-            <div>
-                <div class=\"hero-badge\">FP8 delivery orchestration</div>
-                <h1>supersonic-moe control plane</h1>
-                <p class=\"small tagline\">Overview stays focused on agent health and program progress. Operations and settings move into dedicated pages.</p>
-            </div>
-        </div>
-    </header>
-    <main>
-        <section class=\"card\">
-            <div class=\"toolbar\">
-                <div class=\"toolbar-group\">
-                    <button data-action data-control=\"launch\">Launch</button>
-                    <button data-action data-control=\"restart\" class=\"secondary\">Restart</button>
-                    <button data-action data-control=\"stop\" class=\"danger\">Stop</button>
-                    <button data-action data-control=\"refresh\" class=\"ghost\">Refresh</button>
-                </div>
-                <div class=\"toolbar-group\">
-                    <button class=\"ghost\" data-control=\"copy-serve\">Copy Serve</button>
-                    <button class=\"ghost\" data-control=\"copy-up\">Copy Up</button>
-                    <label class=\"toggle\"><input id=\"auto_refresh\" type=\"checkbox\" checked> Auto refresh</label>
-                </div>
-            </div>
-            <div id=\"status_line\" class=\"status\"></div>
-        </section>
-
-        <section class=\"card\">
-            <div class=\"toolbar\">
-                <div class=\"tab-nav\" role=\"tablist\" aria-label=\"Dashboard sections\">
-                    <button id=\"nav_overview\" class=\"nav-button active\" type=\"button\" data-tab=\"overview\">Overview</button>
-                    <button id=\"nav_operations\" class=\"nav-button\" type=\"button\" data-tab=\"operations\">Operations</button>
-                    <button id=\"nav_settings\" class=\"nav-button\" type=\"button\" data-tab=\"settings\">Settings</button>
-                </div>
-                <div class=\"pill-row\" id=\"top_meta\"></div>
-            </div>
-        </section>
-
-        <section id=\"tab_overview\" class=\"tab-panel active\">
-            <section class=\"overview-hero\">
-                <section class=\"card progress-card\">
-                    <div class=\"page-header\">
-                        <div>
-                            <h2>Overall Progress</h2>
-                            <p class=\"small\">A compact view of delivery momentum and the current control-plane state.</p>
-                        </div>
-                        <div class=\"small muted\" id=\"progress_meta\"></div>
-                    </div>
-                    <div class=\"progress-bar\"><div id=\"progress_fill\" class=\"progress-fill\"></div></div>
-                    <div class=\"summary\" id=\"summary\"></div>
-                    <div id=\"progress_details\" class=\"progress-list\"></div>
-                </section>
-                <section class=\"card\">
-                    <div class=\"page-header\">
-                        <div>
-                            <h2>Program Snapshot</h2>
-                            <p class=\"small\">What is blocked, what is runnable, and which event happened last.</p>
-                        </div>
-                    </div>
-                    <div id=\"overview_snapshot\" class=\"helper-list\"></div>
-                </section>
-            </section>
-
-            <section class=\"card\">
-                <div class=\"panel-title\">
-                    <div>
-                        <h2>Branch Merge Status</h2>
-                        <p class=\"small\">A0-owned merge visibility for every worker branch, without requiring manual worktree management.</p>
-                    </div>
-                    <div class=\"small muted\" id=\"merge_status_meta\"></div>
-                </div>
-                <div id=\"overview_merge_board\" class=\"merge-board\"></div>
-            </section>
-
-            <section class=\"card\">
-                <div class=\"panel-title\">
-                    <div>
-                        <h2>Agent Dashboards</h2>
-                        <p class=\"small\">The home page only shows agent health and essential execution context.</p>
-                    </div>
-                    <div class=\"small muted\" id=\"agent_status_meta\"></div>
-                </div>
-                <div class=\"agent-wall\" id=\"agent_wall\"></div>
-            </section>
-        </section>
-
-        <section id=\"tab_operations\" class=\"tab-panel\">
-            <section class=\"grid\">
-                <section class=\"card\">
-                    <h2>Commands</h2>
-                    <pre id=\"commands\"></pre>
-                </section>
-                <section class=\"card\">
-                    <h2>Validation</h2>
-                    <pre id=\"validation\"></pre>
-                </section>
-            </section>
-            <section class=\"grid\">
-                <section class=\"card\">
-                    <h2>Provider Queue</h2>
-                    <div id=\"provider_queue\"></div>
-                </section>
-                <section class=\"card\">
-                    <h2>Merge Queue</h2>
-                    <div id=\"merge_queue\"></div>
-                </section>
-            </section>
-            <section class=\"grid\">
-                <section class=\"card\">
-                    <h2>Active Processes</h2>
-                    <div id=\"processes\"></div>
-                </section>
-                <section class=\"card\">
-                    <h2>Project</h2>
-                    <div id=\"project\"></div>
-                </section>
-            </section>
-            <section class=\"grid\">
-                <section class=\"card\">
-                    <h2>Runtime Topology</h2>
-                    <div id=\"runtime\"></div>
-                </section>
-                <section class=\"card\">
-                    <h2>Heartbeats</h2>
-                    <div id=\"heartbeats\"></div>
-                </section>
-            </section>
-            <section class=\"grid\">
-                <section class=\"card\">
-                    <h2>Backlog</h2>
-                    <div id=\"backlog\"></div>
-                </section>
-                <section class=\"card\">
-                    <h2>Gates</h2>
-                    <div id=\"gates\"></div>
-                </section>
-            </section>
-            <section class=\"card\">
-                <h2>Manager Report</h2>
-                <pre id=\"manager_report\"></pre>
-            </section>
-        </section>
-
-        <section id=\"tab_settings\" class=\"tab-panel\">
-            <section class=\"card\">
-                <div class=\"page-header\">
-                    <div>
-                        <h2>Settings</h2>
-                        <p class=\"small\">Edit API keys, provider routing, worktrees, Paddle path, and worker commands here.</p>
-                    </div>
-                    <button data-action data-control=\"save-config\">Save Settings</button>
-                </div>
-                <div class=\"config-layout\">
-                    <div>
-                        <textarea id=\"config_editor\"></textarea>
-                    </div>
-                    <div class=\"helper-list\">
-                        <section class=\"helper-card\">
-                            <h3>Project</h3>
-                            <div id=\"settings_project\"></div>
-                        </section>
-                        <section class=\"helper-card\">
-                            <h3>Resource Pools</h3>
-                            <div id=\"settings_resource_pools\"></div>
-                        </section>
-                        <section class=\"helper-card\">
-                            <h3>Merge Policy</h3>
-                            <div id=\"settings_merge_policy\"></div>
-                        </section>
-                        <section class=\"helper-card\">
-                            <h3>Worker Config</h3>
-                            <div id=\"settings_workers\"></div>
-                        </section>
-                    </div>
-                </div>
-            </section>
-        </section>
-    </main>
-    <script>
-        const dashboard = {
-            initialized: false,
-            editorDirty: false,
-            actionInFlight: false,
-            latestRefreshOk: false,
-            latestState: {},
-            currentCommands: { serve: '', up: '' },
-            currentTab: 'overview',
-            elements: null,
-        };
-
-        function byId(id) {
-            return document.getElementById(id);
-        }
-
-        function requireElement(id) {
-            const node = byId(id);
-            if (!node) {
-                throw new Error(`missing dashboard element: ${id}`);
-            }
-            return node;
-        }
-
-        function cacheElements() {
-            return {
-                editor: requireElement('config_editor'),
-                statusLine: requireElement('status_line'),
-                autoRefresh: requireElement('auto_refresh'),
-                topMeta: requireElement('top_meta'),
-                summary: requireElement('summary'),
-                agentWall: requireElement('agent_wall'),
-                progressFill: requireElement('progress_fill'),
-                progressMeta: requireElement('progress_meta'),
-                progressDetails: requireElement('progress_details'),
-                overviewSnapshot: requireElement('overview_snapshot'),
-                overviewMergeBoard: requireElement('overview_merge_board'),
-                mergeQueue: requireElement('merge_queue'),
-                project: requireElement('project'),
-                processes: requireElement('processes'),
-                providerQueue: requireElement('provider_queue'),
-                runtime: requireElement('runtime'),
-                heartbeats: requireElement('heartbeats'),
-                backlog: requireElement('backlog'),
-                gates: requireElement('gates'),
-                settingsProject: requireElement('settings_project'),
-                settingsResourcePools: requireElement('settings_resource_pools'),
-                settingsWorkers: requireElement('settings_workers'),
-                settingsMergePolicy: requireElement('settings_merge_policy'),
-                managerReport: requireElement('manager_report'),
-                commands: requireElement('commands'),
-                validation: requireElement('validation'),
-                mergeStatusMeta: requireElement('merge_status_meta'),
-                agentStatusMeta: requireElement('agent_status_meta'),
-            };
-        }
-
-        const actionButtons = () => Array.from(document.querySelectorAll('[data-action]'));
-        const tabButtons = () => Array.from(document.querySelectorAll('[data-tab]'));
-
-        function renderTable(rows, columns) {
-            if (!rows || !rows.length) {
-                return '<div class="small muted">No data</div>';
-            }
-            const head = columns.map((col) => `<th>${col}</th>`).join('');
-            const body = rows.map((row) => `<tr>${columns.map((col) => `<td>${row[col] ?? ''}</td>`).join('')}</tr>`).join('');
-            return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
-        }
-
-        function sortAgents(values) {
-            return values.sort((left, right) => {
-                const leftNum = Number(String(left.agent || '').replace(/[^0-9]/g, ''));
-                const rightNum = Number(String(right.agent || '').replace(/[^0-9]/g, ''));
-                return leftNum - rightNum;
-            });
-        }
-
-        function displayState(value) {
-            return String(value || 'unknown').replaceAll('_', ' ');
-        }
-
-        function stateClass(value) {
-            return `state-${String(value || 'unknown').replace(/[^a-zA-Z0-9]+/g, '_')}`;
-        }
-
-        function buildAgentRows(data) {
-            const byAgent = new Map();
-            const remember = (agent, values) => {
-                if (!agent) {
-                    return;
-                }
-                byAgent.set(agent, { ...(byAgent.get(agent) || { agent }), ...values, agent });
-            };
-
-            (data.runtime?.workers || []).forEach((item) => {
-                remember(item.agent, {
-                    provider: item.provider,
-                    model: item.model,
-                    resource_pool: item.resource_pool,
-                    branch: item.branch,
-                    runtime_status: item.status,
-                });
-            });
-            (data.config?.workers || []).forEach((item) => {
-                remember(item.agent, {
-                    task_id: item.task_id,
-                    config_pool: item.resource_pool,
-                    queue: (item.resource_pool_queue || []).join(' -> '),
-                    branch: item.branch,
-                    test_command: item.test_command,
-                });
-            });
-            (data.heartbeats?.agents || []).forEach((item) => {
-                remember(item.agent, {
-                    role: item.role,
-                    heartbeat_state: item.state,
-                    last_seen: item.last_seen,
-                    expected_next_checkin: item.expected_next_checkin,
-                    evidence: item.evidence,
-                    escalation: item.escalation,
-                });
-            });
-            Object.entries(data.processes || {}).forEach(([agent, item]) => {
-                remember(agent, {
-                    process_alive: item.alive,
-                    pid: item.pid,
-                    provider: item.provider,
-                    model: item.model,
-                    resource_pool: item.resource_pool,
-                });
-            });
-
-            return sortAgents(Array.from(byAgent.values())).map((item) => {
-                const state = item.process_alive ? 'active' : (item.heartbeat_state || item.runtime_status || 'not_started');
-                return {
-                    ...item,
-                    display_state: state,
-                    provider: item.provider || 'unassigned',
-                    model: item.model || 'unassigned',
-                    resource_pool: item.resource_pool || item.config_pool || 'unassigned',
-                    branch: item.branch || 'unassigned',
-                    role: item.role || 'worker',
-                };
-            });
-        }
-
-        function buildProgressModel(data, agentRows) {
-            const gates = data.gates?.gates || [];
-            const backlog = data.backlog?.items || [];
-            const passedGates = gates.filter((item) => item.status === 'passed').length;
-            const progress = gates.length ? Math.round((passedGates / gates.length) * 100) : 0;
-            const completedItems = backlog.filter((item) => ['done', 'completed', 'closed'].includes(String(item.status))).length;
-            const blockedItems = backlog.filter((item) => String(item.status) === 'blocked').length;
-            const activeAgents = agentRows.filter((item) => item.display_state === 'active' || item.display_state === 'healthy').length;
-            const attentionAgents = agentRows.filter((item) => item.display_state === 'stale' || String(item.display_state).startsWith('launch_failed')).length;
-            const openGate = gates.find((item) => item.status !== 'passed');
-            return {
-                progress,
-                passedGates,
-                totalGates: gates.length,
-                completedItems,
-                totalItems: backlog.length,
-                blockedItems,
-                activeAgents,
-                attentionAgents,
-                openGate,
-            };
-        }
-
-        function renderSummaryCards(data) {
-            const agentRows = buildAgentRows(data);
-            const progress = buildProgressModel(data, agentRows);
-            const validationCount = (data.validation_errors || []).length;
-            const launchBlockerCount = (data.launch_blockers || []).length;
-            const cards = [
-                { label: 'Agents', value: agentRows.length, hint: `${progress.activeAgents} active or healthy` },
-                { label: 'Overall Progress', value: `${progress.progress}%`, hint: `${progress.passedGates}/${progress.totalGates} gates passed` },
-                { label: 'Attention Needed', value: progress.attentionAgents, hint: `${progress.blockedItems} backlog items blocked` },
-                { label: 'Launch Blockers', value: launchBlockerCount, hint: launchBlockerCount ? `${validationCount} config notes` : 'launch path is ready' },
-            ];
-            return cards.map((item) => `<div class=\"metric\"><strong>${item.value}</strong><div>${item.label}</div><div class=\"small\">${item.hint}</div></div>`).join('');
-        }
-
-        function renderOverviewSnapshot(data, progress) {
-            const entries = [
-                { title: 'Current gate', body: progress.openGate ? `${progress.openGate.id} · ${progress.openGate.name}` : 'All gates passed' },
-                { title: 'Backlog completion', body: `${progress.completedItems}/${progress.totalItems} items complete` },
-                { title: 'Startup state', body: data.mode?.reason || data.mode?.state || 'configured' },
-                { title: 'Last event', body: data.last_event || 'none' },
-            ];
-            return entries.map((item) => `<section class=\"helper-card\"><h3>${item.title}</h3><p class=\"small\">${item.body}</p></section>`).join('');
-        }
-
-        function renderProgressDetails(progress) {
-            const rows = [
-                { label: 'Gates', value: `${progress.passedGates}/${progress.totalGates} passed` },
-                { label: 'Backlog', value: `${progress.completedItems}/${progress.totalItems} completed` },
-                { label: 'Blocked work', value: `${progress.blockedItems} items` },
-                { label: 'Agents needing action', value: `${progress.attentionAgents}` },
-            ];
-            return rows.map((item) => `<div class=\"progress-row\"><span class=\"small\">${item.label}</span><strong>${item.value}</strong></div>`).join('');
-        }
-
-        function mergeDisplayStatus(item) {
-            const raw = String(item.status || 'not_started');
-            if (raw === 'active' || raw === 'healthy') {
-                return { label: 'In progress', className: 'state-active' };
-            }
-            if (raw === 'stale' || raw.startsWith('launch_failed')) {
-                return { label: 'Needs attention', className: 'state-stale' };
-            }
-            if (raw === 'offline' || raw === 'stopped') {
-                return { label: 'Ready for review', className: 'state-offline' };
-            }
-            return { label: 'Queued', className: 'state-not_started' };
-        }
-
-        function renderMergeBoard(items) {
-            const rows = items || [];
-            const reviewReady = rows.filter((item) => ['offline', 'stopped'].includes(String(item.status))).length;
-            const inFlight = rows.filter((item) => ['active', 'healthy'].includes(String(item.status))).length;
-            dashboard.elements.mergeStatusMeta.textContent = `${inFlight} in progress, ${reviewReady} ready for manager review`;
-            if (!rows.length) {
-                return '<div class="small muted">No worker branches registered for manager merge review.</div>';
-            }
-            return rows.map((item) => {
-                const status = mergeDisplayStatus(item);
-                return `
-                    <article class="merge-card">
-                        <div class="merge-card-header">
-                            <div>
-                                <div class="merge-branch">${item.branch}</div>
-                                <div class="merge-track">
-                                    <span>${item.agent}</span>
-                                    <span class="merge-arrow">-></span>
-                                    <span>${item.merge_target}</span>
-                                </div>
-                            </div>
-                            <span class="chip ${status.className}">${status.label}</span>
-                        </div>
-                        <div class="merge-meta">
-                            <div><strong>Submit</strong> ${item.submit_strategy}</div>
-                            <div><strong>Worker identity</strong> ${item.worker_identity}</div>
-                            <div><strong>Manager</strong> ${item.manager_identity}</div>
-                        </div>
-                        <div class="merge-note">${item.manager_action}</div>
-                    </article>
-                `;
-            }).join('');
-        }
-
-        function renderAgentWall(data) {
-            const rows = buildAgentRows(data);
-            const meta = `${rows.filter((item) => item.display_state === 'active' || item.display_state === 'healthy').length} active, ${rows.filter((item) => item.display_state === 'stale' || String(item.display_state).startsWith('launch_failed')).length} need attention`;
-            dashboard.elements.agentStatusMeta.textContent = meta;
-            return rows.map((item) => {
-                const processLine = item.process_alive ? `pid ${item.pid}` : (item.last_seen || 'no heartbeat yet');
-                const poolLine = `${item.resource_pool} / ${item.provider}`;
-                const branchLine = item.branch || 'unassigned';
-                const detailLine = item.process_alive ? 'process alive' : (item.evidence || item.expected_next_checkin || 'waiting for launch');
-                return `
-                    <article class="agent-card">
-                        <header>
-                            <div>
-                                <div class="agent-name">${item.agent}</div>
-                                <div class="agent-role">${item.role}</div>
-                            </div>
-                            <span class="chip ${stateClass(item.display_state)}">${displayState(item.display_state)}</span>
-                        </header>
-                        <div class="agent-meta">
-                            <div><strong>Pool</strong> ${poolLine}</div>
-                            <div><strong>Model</strong> ${item.model}</div>
-                            <div><strong>Branch</strong> ${branchLine}</div>
-                            <div><strong>Heartbeat</strong> ${processLine}</div>
-                            <div class="muted">${detailLine}</div>
-                        </div>
-                    </article>
-                `;
-            }).join('');
-        }
-
-        function setStatus(message, isError = false) {
-            const stamp = new Date().toLocaleTimeString();
-            dashboard.elements.statusLine.textContent = `[${stamp}] ${message}`;
-            dashboard.elements.statusLine.className = isError ? 'status error' : 'status';
-        }
-
-        function setActionState(inFlight) {
-            dashboard.actionInFlight = inFlight;
-            actionButtons().forEach((button) => {
-                button.disabled = inFlight;
-            });
-        }
-
-        function showTab(tabName) {
-            dashboard.currentTab = tabName;
-            ['overview', 'operations', 'settings'].forEach((name) => {
-                requireElement(`tab_${name}`).classList.toggle('active', name === tabName);
-                requireElement(`nav_${name}`).classList.toggle('active', name === tabName);
-            });
-        }
-
-        async function handleControl(control) {
-            if (control === 'launch') {
-                await launchWorkers(false);
-                return;
-            }
-            if (control === 'restart') {
-                await launchWorkers(true);
-                return;
-            }
-            if (control === 'stop') {
-                await stopWorkers();
-                return;
-            }
-            if (control === 'refresh') {
-                await refresh(true);
-                return;
-            }
-            if (control === 'save-config') {
-                await saveConfig();
-                return;
-            }
-            if (control === 'copy-serve') {
-                await copyCommand('serve');
-                return;
-            }
-            if (control === 'copy-up') {
-                await copyCommand('up');
-            }
-        }
-
-        function bindUI() {
-            document.addEventListener('click', (event) => {
-                const target = event.target.closest('[data-tab], [data-control]');
-                if (!target) {
-                    return;
-                }
-                if (target.dataset.tab) {
-                    showTab(target.dataset.tab || 'overview');
-                    return;
-                }
-                if (target.dataset.control) {
-                    void handleControl(target.dataset.control || '');
-                }
-            });
-            dashboard.elements.editor.addEventListener('input', () => {
-                dashboard.editorDirty = true;
-            });
-        }
-
-        async function fetchJson(path, options = {}) {
-            const response = await fetch(path, options);
-            const data = await response.json();
-            if (!response.ok) {
-                throw new Error(data.error || (data.errors || []).join('\\n') || 'request failed');
-            }
-            return data;
-        }
-
-        async function postJson(path, payload) {
-            return fetchJson(path, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload),
-            });
-        }
-
-        async function copyCommand(mode) {
-            const value = dashboard.currentCommands[mode] || '';
-            if (!value) {
-                setStatus(`no ${mode} command available`, true);
-                return;
-            }
-            await navigator.clipboard.writeText(value);
-            setStatus(`${mode} command copied`);
-        }
-
-        async function runAction(label, action) {
-            if (dashboard.actionInFlight) {
-                return;
-            }
-            setActionState(true);
-            setStatus(`${label}...`);
-            try {
-                await action();
-            } catch (error) {
-                setStatus(String(error), true);
-            } finally {
-                setActionState(false);
-            }
-        }
-
-        function renderProject(project) {
-            const dashboard = project.dashboard || {};
-            const rows = [
-                { key: 'repository_name', value: project.repository_name || '' },
-                { key: 'local_repo_root', value: project.local_repo_root || '' },
-                { key: 'paddle_repo_path', value: project.paddle_repo_path || '' },
-                { key: 'integration_branch', value: project.integration_branch || project.base_branch || '' },
-                { key: 'dashboard', value: dashboard.host && dashboard.port ? `${dashboard.host}:${dashboard.port}` : '' },
-            ];
-            return renderTable(rows, ['key', 'value']);
-        }
-
-        function renderValidation(data) {
-            const sections = [];
-            const launchBlockers = data.launch_blockers || [];
-            const notes = data.validation_errors || [];
-            sections.push(launchBlockers.length ? `Launch blockers:\n- ${launchBlockers.join('\\n- ')}` : 'Launch blockers:\\nnone');
-            sections.push(notes.length ? `\\nConfig notes:\n- ${notes.join('\\n- ')}` : '\\nConfig notes:\\nnone');
-            return sections.join('\\n');
-        }
-
-        function renderProcessRows(processes) {
-            return Object.entries(processes).map(([agent, item]) => ({
-                agent,
-                provider: item.provider,
-                model: item.model,
-                alive: item.alive,
-                pid: item.pid,
-                resource_pool: item.resource_pool,
-                returncode: item.returncode,
-            }));
-        }
-
-        function renderRuntime(runtime) {
-            return renderTable(runtime.workers || [], ['agent', 'resource_pool', 'provider', 'model', 'branch', 'status']);
-        }
-
-        function renderHeartbeats(heartbeats) {
-            return renderTable(heartbeats.agents || [], ['agent', 'state', 'last_seen', 'expected_next_checkin']);
-        }
-
-        function renderBacklog(backlog) {
-            return renderTable(backlog.items || [], ['id', 'owner', 'status', 'gate', 'title']);
-        }
-
-        function renderGates(gates) {
-            return renderTable(gates.gates || [], ['id', 'name', 'status', 'owner']);
-        }
-
-        function renderPools(config) {
-            const pools = Object.entries(config.resource_pools || {}).map(([name, item]) => ({
-                name,
-                priority: item.priority ?? 100,
-                provider: item.provider,
-                model: item.model,
-            }));
-            return renderTable(pools, ['name', 'priority', 'provider', 'model']);
-        }
-
-        function renderWorkers(config) {
-            const rows = (config.workers || []).map((item) => ({
-                agent: item.agent,
-                task_id: item.task_id,
-                resource_pool: item.resource_pool,
-                resource_pool_queue: (item.resource_pool_queue || []).join(', '),
-                branch: item.branch,
-                git_identity: item.git_identity ? `${item.git_identity.name || ''} <${item.git_identity.email || ''}>` : 'environment default',
-                submit_strategy: item.submit_strategy,
-                test_command: item.test_command,
-            }));
-            return renderTable(rows, ['agent', 'task_id', 'resource_pool', 'resource_pool_queue', 'branch', 'git_identity', 'submit_strategy', 'test_command']);
-        }
-
-        function renderProviderQueue(items) {
-            return renderTable(items || [], ['resource_pool', 'provider', 'priority', 'binary_found', 'api_key_present', 'connection_quality', 'work_quality', 'score']);
-        }
-
-        function renderMergeQueue(items) {
-            return renderTable(items || [], ['agent', 'branch', 'submit_strategy', 'worker_identity', 'merge_target', 'status', 'manager_action']);
-        }
-
-        function renderMergePolicy(project, mergeQueue) {
-            const manager = project.manager_git_identity
-                ? `${project.manager_git_identity.name || ''} <${project.manager_git_identity.email || ''}>`
-                : 'A0 manager identity';
-            const rows = [
-                { key: 'integration_branch', value: project.integration_branch || project.base_branch || 'main' },
-                { key: 'manager_identity', value: manager },
-                { key: 'merge_owner', value: 'A0' },
-                { key: 'tracked_worker_branches', value: String((mergeQueue || []).length) },
-            ];
-            return renderTable(rows, ['key', 'value']);
-        }
-
-        function renderTopMeta(data) {
-            const mode = data.mode || {};
-            const launchBlockerCount = (data.launch_blockers || []).length;
-            const values = [
-                { label: 'Startup', value: mode.state || 'configured' },
-                { label: 'Launch', value: launchBlockerCount ? `${launchBlockerCount} blocker(s)` : 'ready' },
-                { label: 'Config', value: mode.config_path || 'unknown' },
-                { label: 'Last event', value: data.last_event || 'none' },
-                { label: 'Updated', value: data.updated_at || 'unknown' },
-            ];
-            return values.map((item) => `<div class=\"key-pair\"><span class=\"muted\">${item.label}</span><strong>${item.value}</strong></div>`).join('');
-        }
-
-        async function saveConfig() {
-            await runAction('saving settings', async () => {
-                const data = await postJson('/api/config', { config_text: dashboard.elements.editor.value });
-                dashboard.editorDirty = false;
-                await refresh(true);
-                const blockerCount = (data.launch_blockers || []).length;
-                const noteCount = (data.validation_errors || []).length;
-                setStatus(`settings saved: ${blockerCount} launch blocker(s), ${noteCount} config note(s)`);
-            });
-        }
-
-        async function launchWorkers(restart) {
-            await runAction(restart ? 'restarting workers' : 'launching workers', async () => {
-                const data = await postJson('/api/launch', { restart });
-                setStatus(`launch complete: ${(data.launched || []).length} launched, ${(data.failures || []).length} failures`, !(data.ok ?? false));
-                await refresh(true);
-            });
-        }
-
-        async function stopWorkers() {
-            await runAction('stopping workers', async () => {
-                const data = await postJson('/api/stop', {});
-                setStatus(`stopped workers: ${(data.stopped || []).join(', ') || 'none'}`);
-                await refresh(true);
-            });
-        }
-
-        async function refresh(forceStatus = false) {
-            try {
-                const data = await fetchJson('/api/state');
-                dashboard.latestState = data;
-                dashboard.latestRefreshOk = true;
-                dashboard.currentCommands = data.commands || { serve: '', up: '' };
-                const agentRows = buildAgentRows(data);
-                const progress = buildProgressModel(data, agentRows);
-                if (!dashboard.editorDirty) {
-                    dashboard.elements.editor.value = data.config_text || '';
-                }
-                dashboard.elements.topMeta.innerHTML = renderTopMeta(data);
-                dashboard.elements.summary.innerHTML = renderSummaryCards(data);
-                dashboard.elements.agentWall.innerHTML = renderAgentWall(data);
-                dashboard.elements.progressFill.style.width = `${progress.progress}%`;
-                dashboard.elements.progressMeta.textContent = `${progress.passedGates}/${progress.totalGates} gates passed`;
-                dashboard.elements.progressDetails.innerHTML = renderProgressDetails(progress);
-                dashboard.elements.overviewSnapshot.innerHTML = renderOverviewSnapshot(data, progress);
-                dashboard.elements.overviewMergeBoard.innerHTML = renderMergeBoard(data.merge_queue);
-                dashboard.elements.mergeQueue.innerHTML = renderMergeQueue(data.merge_queue);
-                dashboard.elements.project.innerHTML = renderProject(data.project);
-                dashboard.elements.processes.innerHTML = renderTable(renderProcessRows(data.processes), ['agent', 'provider', 'model', 'alive', 'pid', 'resource_pool', 'returncode']);
-                dashboard.elements.providerQueue.innerHTML = renderProviderQueue(data.provider_queue);
-                dashboard.elements.runtime.innerHTML = renderRuntime(data.runtime);
-                dashboard.elements.heartbeats.innerHTML = renderHeartbeats(data.heartbeats);
-                dashboard.elements.backlog.innerHTML = renderBacklog(data.backlog);
-                dashboard.elements.gates.innerHTML = renderGates(data.gates);
-                dashboard.elements.settingsProject.innerHTML = renderProject(data.project);
-                dashboard.elements.settingsResourcePools.innerHTML = renderPools(data.config);
-                dashboard.elements.settingsWorkers.innerHTML = renderWorkers(data.config);
-                dashboard.elements.settingsMergePolicy.innerHTML = renderMergePolicy(data.project, data.merge_queue);
-                dashboard.elements.managerReport.textContent = data.manager_report;
-                dashboard.elements.commands.textContent = `serve:\n${dashboard.currentCommands.serve}\n\nup:\n${dashboard.currentCommands.up}`;
-                dashboard.elements.validation.textContent = renderValidation(data);
-                if (forceStatus) {
-                    setStatus(`state refreshed, last event: ${data.last_event || 'none'}`);
-                }
-            } catch (error) {
-                if (dashboard.latestRefreshOk || forceStatus) {
-                    setStatus(`refresh failed: ${error}`, true);
-                }
-                dashboard.latestRefreshOk = false;
-            }
-        }
-
-        function initDashboard() {
-            if (dashboard.initialized) {
-                return;
-            }
-            dashboard.elements = cacheElements();
-            bindUI();
-            showTab(dashboard.currentTab);
-            void refresh(true);
-            setInterval(() => {
-                if (!dashboard.actionInFlight && dashboard.elements.autoRefresh.checked) {
-                    void refresh(false);
-                }
-            }, 4000);
-            dashboard.initialized = true;
-        }
-
-        window.addEventListener('error', (event) => {
-            if (dashboard.elements) {
-                setStatus(`dashboard error: ${event.message}`, true);
-            }
-        });
-
-        window.addEventListener('unhandledrejection', (event) => {
-            if (dashboard.elements) {
-                setStatus(`dashboard rejection: ${event.reason}`, true);
-            }
-        });
-
-        if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', initDashboard, { once: true });
-        } else {
-            initDashboard();
-        }
-    </script>
-</body>
-</html>
-"""
 
 
 def parse_args() -> argparse.Namespace:
@@ -2172,7 +1421,7 @@ def apply_runtime_defaults(args: argparse.Namespace, cold_start: bool) -> None:
 
 
 def stop_agents_command(args: argparse.Namespace) -> int:
-    session_state = load_session_state_file()
+    session_state = load_preferred_session_state(args.port or DEFAULT_DASHBOARD_PORT)
     if not session_state:
         print(f"no active session state found at {SESSION_STATE}", file=sys.stderr)
         return 1
@@ -2182,53 +1431,112 @@ def stop_agents_command(args: argparse.Namespace) -> int:
 
 
 def stop_listener_command(args: argparse.Namespace) -> int:
-    session_state = load_session_state_file()
+    session_state = load_preferred_session_state(args.port or DEFAULT_DASHBOARD_PORT)
     if not session_state:
         print(f"no active session state found at {SESSION_STATE}", file=sys.stderr)
         return 1
+    server_pid = int(session_state.get("server", {}).get("pid") or 0)
+    listener_port = int(session_state.get("server", {}).get("port") or DEFAULT_DASHBOARD_PORT)
     try:
         result = post_control_plane(
             control_plane_base_url(args, session_state), "/api/shutdown", {"stop_agents": False}
         )
+        listener_released = wait_for_port_release(listener_port)
+        if not listener_released and server_pid and pid_is_running(server_pid):
+            terminate_process_tree(server_pid, signal.SIGTERM)
+            listener_released = wait_for_port_release(listener_port)
+        result["listener_port"] = listener_port
+        result["listener_released"] = listener_released
         print(json.dumps(result, indent=2))
         return 0
     except RuntimeError:
-        server_pid = int(session_state.get("server", {}).get("pid") or 0)
         if not server_pid or not pid_is_running(server_pid):
             print("listener is not running", file=sys.stderr)
             return 1
-        terminate_pid(server_pid)
-        print(json.dumps({"ok": True, "listener_pid": server_pid, "stop_agents": False}, indent=2))
+        terminate_process_tree(server_pid, signal.SIGTERM)
+        listener_released = wait_for_port_release(listener_port)
+        if not listener_released and pid_is_running(server_pid):
+            terminate_process_tree(server_pid, signal.SIGKILL)
+            listener_released = wait_for_port_release(listener_port)
+        print(
+            json.dumps(
+                {
+                    "ok": listener_released,
+                    "listener_pid": server_pid,
+                    "listener_port": listener_port,
+                    "listener_released": listener_released,
+                    "stop_agents": False,
+                },
+                indent=2,
+            )
+        )
         return 0
 
 
 def stop_all_command(args: argparse.Namespace) -> int:
-    session_state = load_session_state_file()
+    session_state = load_preferred_session_state(args.port or DEFAULT_DASHBOARD_PORT)
     if not session_state:
         print(f"no active session state found at {SESSION_STATE}", file=sys.stderr)
         return 1
+    server_pid = int(session_state.get("server", {}).get("pid") or 0)
+    listener_port = int(session_state.get("server", {}).get("port") or DEFAULT_DASHBOARD_PORT)
+    worker_pids = {
+        agent: int(worker.get("pid") or 0)
+        for agent, worker in session_state.get("workers", {}).items()
+        if int(worker.get("pid") or 0)
+    }
     try:
-        result = post_control_plane(
-            control_plane_base_url(args, session_state), "/api/shutdown", {"stop_agents": True}
-        )
+        result = post_control_plane(control_plane_base_url(args, session_state), "/api/stop-all", {})
+        stopped_worker_names = []
+        for agent, pid in worker_pids.items():
+            if not pid:
+                continue
+            if wait_for_process_exit(pid, timeout=5):
+                stopped_worker_names.append(agent)
+            else:
+                terminate_process_tree(pid, signal.SIGTERM)
+                if wait_for_process_exit(pid, timeout=3):
+                    stopped_worker_names.append(agent)
+                else:
+                    terminate_process_tree(pid, signal.SIGKILL)
+                    if wait_for_process_exit(pid, timeout=2):
+                        stopped_worker_names.append(agent)
+        listener_released = wait_for_port_release(listener_port)
+        if not listener_released and server_pid and pid_is_running(server_pid):
+            terminate_process_tree(server_pid, signal.SIGTERM)
+            listener_released = wait_for_port_release(listener_port)
+        if not listener_released and server_pid and pid_is_running(server_pid):
+            terminate_process_tree(server_pid, signal.SIGKILL)
+            listener_released = wait_for_port_release(listener_port)
+        result["listener_port"] = listener_port
+        result["listener_released"] = listener_released
+        result["stopped_workers"] = sorted(stopped_worker_names)
+        result["warning"] = "listener port is still busy" if not listener_released else ""
         print(json.dumps(result, indent=2))
         return 0
     except RuntimeError:
-        stopped_workers: list[int] = []
-        for worker in session_state.get("workers", {}).values():
-            pid = int(worker.get("pid") or 0)
+        stopped_workers: list[str] = []
+        for agent, pid in worker_pids.items():
             if pid and pid_is_running(pid):
-                terminate_pid(pid)
-                stopped_workers.append(pid)
-        server_pid = int(session_state.get("server", {}).get("pid") or 0)
+                terminate_process_tree(pid, signal.SIGTERM)
+                if not wait_for_process_exit(pid, timeout=3):
+                    terminate_process_tree(pid, signal.SIGKILL)
+                    wait_for_process_exit(pid, timeout=2)
+            if not pid or not pid_is_running(pid):
+                stopped_workers.append(agent)
         if server_pid and pid_is_running(server_pid):
-            terminate_pid(server_pid)
+            terminate_process_tree(server_pid, signal.SIGTERM)
+            if not wait_for_port_release(listener_port):
+                terminate_process_tree(server_pid, signal.SIGKILL)
+        listener_released = wait_for_port_release(listener_port)
         print(
             json.dumps(
                 {
-                    "ok": True,
+                    "ok": listener_released,
                     "listener_pid": server_pid,
-                    "stopped_worker_pids": stopped_workers,
+                    "listener_port": listener_port,
+                    "listener_released": listener_released,
+                    "stopped_workers": sorted(stopped_workers),
                     "stop_agents": True,
                 },
                 indent=2,
