@@ -25,7 +25,6 @@ try:
 except ImportError as exc:  # pragma: no cover - import guard
     raise SystemExit("PyYAML is required. Run `uv sync` or install PyYAML>=6.0.2.") from exc
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 CONTROL_ROOT = REPO_ROOT / "control_plane" / "fp8"
 STATE_DIR = CONTROL_ROOT / "state"
@@ -1089,6 +1088,15 @@ DASHBOARD_HTML = """<!doctype html>
         .progress-fill { height: 100%; background: linear-gradient(90deg, #1f7a6d, #6ad1c3); width: 0%; }
         .progress-list { display: grid; gap: 8px; }
         .progress-row { display: flex; justify-content: space-between; gap: 12px; font-size: 13px; }
+        .merge-board { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+        .merge-card { padding: 14px; border-radius: 14px; background: linear-gradient(180deg, rgba(10, 18, 30, 0.96), rgba(10, 22, 39, 0.84)); border: 1px solid rgba(74, 105, 149, 0.34); display: grid; gap: 10px; }
+        .merge-card-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+        .merge-branch { font-size: 18px; font-weight: 700; line-height: 1.2; }
+        .merge-track { display: flex; align-items: center; gap: 8px; font-size: 12px; color: #b8c8e6; }
+        .merge-arrow { color: #6ad1c3; font-weight: 700; }
+        .merge-meta { display: grid; gap: 6px; font-size: 13px; }
+        .merge-meta strong { color: #9fbbe8; }
+        .merge-note { padding-top: 4px; color: #a7b5d6; font-size: 12px; }
         .agent-wall { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
         .agent-card { padding: 14px; border-radius: 14px; background: linear-gradient(180deg, rgba(11, 18, 31, 0.96), rgba(12, 21, 37, 0.84)); border: 1px solid rgba(74, 105, 149, 0.34); min-height: 148px; display: grid; gap: 10px; }
         .agent-card header { padding: 0; background: none; border: 0; display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
@@ -1176,6 +1184,17 @@ DASHBOARD_HTML = """<!doctype html>
                     </div>
                     <div id=\"overview_snapshot\" class=\"helper-list\"></div>
                 </section>
+            </section>
+
+            <section class=\"card\">
+                <div class=\"panel-title\">
+                    <div>
+                        <h2>Branch Merge Status</h2>
+                        <p class=\"small\">A0-owned merge visibility for every worker branch, without requiring manual worktree management.</p>
+                    </div>
+                    <div class=\"small muted\" id=\"merge_status_meta\"></div>
+                </div>
+                <div id=\"overview_merge_board\" class=\"merge-board\"></div>
             </section>
 
             <section class=\"card\">
@@ -1434,6 +1453,54 @@ DASHBOARD_HTML = """<!doctype html>
             return rows.map((item) => `<div class=\"progress-row\"><span class=\"small\">${item.label}</span><strong>${item.value}</strong></div>`).join('');
         }
 
+        function mergeDisplayStatus(item) {
+            const raw = String(item.status || 'not_started');
+            if (raw === 'active' || raw === 'healthy') {
+                return { label: 'In progress', className: 'state-active' };
+            }
+            if (raw === 'stale' || raw.startsWith('launch_failed')) {
+                return { label: 'Needs attention', className: 'state-stale' };
+            }
+            if (raw === 'offline' || raw === 'stopped') {
+                return { label: 'Ready for review', className: 'state-offline' };
+            }
+            return { label: 'Queued', className: 'state-not_started' };
+        }
+
+        function renderMergeBoard(items) {
+            const rows = items || [];
+            const reviewReady = rows.filter((item) => ['offline', 'stopped'].includes(String(item.status))).length;
+            const inFlight = rows.filter((item) => ['active', 'healthy'].includes(String(item.status))).length;
+            document.getElementById('merge_status_meta').textContent = `${inFlight} in progress, ${reviewReady} ready for manager review`;
+            if (!rows.length) {
+                return '<div class="small muted">No worker branches registered for manager merge review.</div>';
+            }
+            return rows.map((item) => {
+                const status = mergeDisplayStatus(item);
+                return `
+                    <article class="merge-card">
+                        <div class="merge-card-header">
+                            <div>
+                                <div class="merge-branch">${item.branch}</div>
+                                <div class="merge-track">
+                                    <span>${item.agent}</span>
+                                    <span class="merge-arrow">-></span>
+                                    <span>${item.merge_target}</span>
+                                </div>
+                            </div>
+                            <span class="chip ${status.className}">${status.label}</span>
+                        </div>
+                        <div class="merge-meta">
+                            <div><strong>Submit</strong> ${item.submit_strategy}</div>
+                            <div><strong>Worker identity</strong> ${item.worker_identity}</div>
+                            <div><strong>Manager</strong> ${item.manager_identity}</div>
+                        </div>
+                        <div class="merge-note">${item.manager_action}</div>
+                    </article>
+                `;
+            }).join('');
+        }
+
         function renderAgentWall(data) {
             const rows = buildAgentRows(data);
             const meta = `${rows.filter((item) => item.display_state === 'active' || item.display_state === 'healthy').length} active, ${rows.filter((item) => item.display_state === 'stale' || String(item.display_state).startsWith('launch_failed')).length} need attention`;
@@ -1662,6 +1729,7 @@ DASHBOARD_HTML = """<!doctype html>
                 document.getElementById('progress_meta').textContent = `${progress.passedGates}/${progress.totalGates} gates passed`;
                 document.getElementById('progress_details').innerHTML = renderProgressDetails(progress);
                 document.getElementById('overview_snapshot').innerHTML = renderOverviewSnapshot(data, progress);
+                document.getElementById('overview_merge_board').innerHTML = renderMergeBoard(data.merge_queue);
                 document.getElementById('merge_queue').innerHTML = renderMergeQueue(data.merge_queue);
                 document.getElementById('project').innerHTML = renderProject(data.project);
                 document.getElementById('processes').innerHTML = renderTable(renderProcessRows(data.processes), ['agent', 'provider', 'model', 'alive', 'pid', 'resource_pool', 'returncode']);
