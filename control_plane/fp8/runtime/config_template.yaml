@@ -3,6 +3,10 @@ project:
   local_repo_root: /absolute/path/to/local/supersonic-moe
   paddle_repo_path: /absolute/path/to/Paddle
   base_branch: main
+  integration_branch: main
+  manager_git_identity:
+    name: FP8 Control Plane Manager
+    email: fp8-manager@example.com
   dashboard:
     host: 127.0.0.1
     port: 8233
@@ -73,6 +77,9 @@ workers:
     environment_path: /absolute/path/to/supersonic_moe_a1/.venv
     sync_command: uv sync
     test_command: uv run pytest tests/moe_test.py -k protocol
+    git_identity:
+      name: A1 Protocol Worker
+      email: a1-protocol@example.com
     submit_strategy: patch_handoff
   - agent: A6
     task_id: A6-001
@@ -87,4 +94,7 @@ workers:
     environment_path: /absolute/path/to/supersonic_moe_a6/.venv
     sync_command: uv sync
     test_command: uv run pytest tests/moe_test.py -k baseline
+    git_identity:
+      name: A6 Baseline Worker
+      email: a6-baseline@example.com
     submit_strategy: patch_handoff

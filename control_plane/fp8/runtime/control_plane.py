@@ -249,6 +249,12 @@ class ControlPlaneService:
             errors.append("project.dashboard.host is required")
         if not dashboard.get("port"):
             errors.append("project.dashboard.port is required")
+        if project.get("manager_git_identity"):
+            manager_identity = project.get("manager_git_identity", {})
+            if not str(manager_identity.get("name", "")).strip():
+                errors.append("project.manager_git_identity.name is required when manager_git_identity is set")
+            if not str(manager_identity.get("email", "")).strip():
+                errors.append("project.manager_git_identity.email is required when manager_git_identity is set")
 
         seen_agents: set[str] = set()
         seen_branches: set[str] = set()
@@ -310,6 +316,15 @@ class ControlPlaneService:
                 errors.append(f"worker {agent} test_command is required")
             if not worker.get("submit_strategy"):
                 errors.append(f"worker {agent} submit_strategy is required")
+            git_identity = worker.get("git_identity")
+            if git_identity is not None:
+                if not isinstance(git_identity, dict):
+                    errors.append(f"worker {agent} git_identity must be a mapping")
+                else:
+                    if not str(git_identity.get("name", "")).strip():
+                        errors.append(f"worker {agent} git_identity.name is required when git_identity is set")
+                    if not str(git_identity.get("email", "")).strip():
+                        errors.append(f"worker {agent} git_identity.email is required when git_identity is set")
 
         return errors
 
@@ -471,10 +486,95 @@ class ControlPlaneService:
                 return str(item.get("title", task_id))
         return task_id
 
+    def integration_branch(self) -> str:
+        return str(self.project.get("integration_branch") or self.project.get("base_branch") or "main")
+
+    def worker_git_identity(self, worker: dict[str, Any]) -> dict[str, str]:
+        identity = worker.get("git_identity") or {}
+        return {
+            "name": str(identity.get("name", "")).strip(),
+            "email": str(identity.get("email", "")).strip(),
+        }
+
+    def manager_git_identity(self) -> dict[str, str]:
+        identity = self.project.get("manager_git_identity") or {}
+        return {
+            "name": str(identity.get("name", "")).strip(),
+            "email": str(identity.get("email", "")).strip(),
+        }
+
+    def configure_git_identity(self, worker: dict[str, Any]) -> None:
+        identity = self.worker_git_identity(worker)
+        worktree_path = Path(worker["worktree_path"])
+        if identity["name"]:
+            result = subprocess.run(
+                ["git", "config", "user.name", identity["name"]],
+                cwd=worktree_path,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "failed to set git user.name")
+        if identity["email"]:
+            result = subprocess.run(
+                ["git", "config", "user.email", identity["email"]],
+                cwd=worktree_path,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "failed to set git user.email")
+
+    def merge_queue(self) -> list[dict[str, Any]]:
+        runtime_workers = {
+            str(item.get("agent")): item for item in load_yaml(STATE_DIR / "agent_runtime.yaml").get("workers", [])
+        }
+        heartbeats = {
+            str(item.get("agent")): item for item in load_yaml(STATE_DIR / "heartbeats.yaml").get("agents", [])
+        }
+        queue: list[dict[str, Any]] = []
+        manager_identity = self.manager_git_identity()
+        manager_display = (
+            f"{manager_identity['name']} <{manager_identity['email']}>"
+            if manager_identity["name"] and manager_identity["email"]
+            else "A0 manager identity"
+        )
+        for worker in self.workers:
+            agent = str(worker.get("agent", ""))
+            runtime_entry = runtime_workers.get(agent, {})
+            heartbeat = heartbeats.get(agent, {})
+            git_identity = self.worker_git_identity(worker)
+            worker_display = (
+                f"{git_identity['name']} <{git_identity['email']}>"
+                if git_identity["name"] and git_identity["email"]
+                else "environment default"
+            )
+            queue.append(
+                {
+                    "agent": agent,
+                    "branch": worker.get("branch", "unassigned"),
+                    "submit_strategy": worker.get("submit_strategy", "patch_handoff"),
+                    "merge_target": self.integration_branch(),
+                    "worker_identity": worker_display,
+                    "manager_identity": manager_display,
+                    "status": runtime_entry.get("status", heartbeat.get("state", "not_started")),
+                    "manager_action": f"A0 merges {worker.get('branch', 'unassigned')} into {self.integration_branch()}",
+                }
+            )
+        return queue
+
     def render_prompt(self, worker: dict[str, Any], provider_name: str, model: str) -> Path:
         prompt_path = PROMPT_DIR / f"{worker['agent']}.md"
         task_id = worker.get("task_id", "unassigned")
         task_title = self.task_title(task_id)
+        git_identity = self.worker_git_identity(worker)
+        git_identity_text = (
+            f"{git_identity['name']} <{git_identity['email']}>"
+            if git_identity["name"] and git_identity["email"]
+            else "environment default"
+        )
         text = f"""# {worker['agent']} Worker Prompt
 
 Repository name: {self.project.get('repository_name', 'supersonic-moe')}
@@ -486,6 +586,8 @@ Provider: {provider_name}
 Model: {model}
 Worktree: {worker['worktree_path']}
 Branch: {worker['branch']}
+Commit identity: {git_identity_text}
+Manager merge target: {self.integration_branch()}
 
 Mandatory rules:
 
@@ -494,6 +596,7 @@ Mandatory rules:
 3. Update your status file in `control_plane/fp8/status/agents/` and your checkpoint in `control_plane/fp8/checkpoints/agents/`.
 4. Treat `tests/reference_layers/standalone_moe_layer` and `{self.project.get('paddle_repo_path', 'unassigned')}` as reference inputs, not as the final host implementation.
 5. Report blockers before widening scope.
+6. Commit only on your assigned branch; A0 owns final merge or cherry-pick into `{self.integration_branch()}`.
 
 First files to read:
 
@@ -575,11 +678,14 @@ Primary test command:
                 "repository_root": str(REPO_ROOT),
                 "worktree_path": worker["worktree_path"],
                 "branch": worker["branch"],
+                "merge_target": self.integration_branch(),
                 "environment_type": worker.get("environment_type", "uv"),
                 "environment_path": worker.get("environment_path", "unassigned"),
                 "sync_command": worker.get("sync_command", "uv sync"),
                 "test_command": worker.get("test_command", "unassigned"),
                 "submit_strategy": worker.get("submit_strategy", "patch_handoff"),
+                "git_author_name": self.worker_git_identity(worker).get("name", ""),
+                "git_author_email": self.worker_git_identity(worker).get("email", ""),
                 "status": status,
             }
         )
@@ -606,6 +712,7 @@ Primary test command:
         provider, pool, provider_name, model = self.provider_runtime(pool_name, worker)
         prompt_path = self.render_prompt(worker, provider_name, model)
         self.ensure_worktree(worker)
+        self.configure_git_identity(worker)
         self.ensure_environment(worker)
         template = worker.get("command_template") or provider.get("command_template")
         if not template:
@@ -754,6 +861,7 @@ Primary test command:
             "gates": load_yaml(STATE_DIR / "gates.yaml"),
             "processes": self.process_snapshot(),
             "provider_queue": self.provider_queue(),
+            "merge_queue": self.merge_queue(),
             "config": self.config,
             "config_text": config_text,
             "validation_errors": self.validation_errors(),
@@ -938,10 +1046,10 @@ DASHBOARD_HTML = """<!doctype html>
     <style>
         :root { color-scheme: dark; }
         body { font-family: "Avenir Next", "Segoe UI", sans-serif; margin: 0; background: radial-gradient(circle at top, #15345f 0%, #08111f 42%, #060b14 100%); color: #edf2ff; }
-        header { padding: 30px 24px 34px; background: linear-gradient(135deg, rgba(13, 28, 51, 0.96), rgba(13, 93, 89, 0.88)); border-bottom: 1px solid rgba(157, 196, 255, 0.12); }
+        header { padding: 30px 24px 26px; background: linear-gradient(135deg, rgba(13, 28, 51, 0.96), rgba(13, 93, 89, 0.88)); border-bottom: 1px solid rgba(157, 196, 255, 0.12); }
         main { max-width: 1380px; margin: 0 auto; padding: 18px 20px 36px; display: grid; gap: 14px; }
-        .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
         .card { background: rgba(16, 25, 43, 0.84); border: 1px solid rgba(87, 118, 163, 0.32); border-radius: 16px; padding: 16px; box-shadow: 0 16px 40px rgba(0, 0, 0, 0.2); backdrop-filter: blur(12px); }
+        .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
         .summary { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
         .metric { padding: 14px; border-radius: 12px; background: linear-gradient(180deg, rgba(12, 19, 34, 0.95), rgba(10, 17, 28, 0.88)); border: 1px solid rgba(72, 102, 145, 0.34); }
         .metric strong { display: block; font-size: 28px; line-height: 1.1; margin-bottom: 4px; }
@@ -953,26 +1061,34 @@ DASHBOARD_HTML = """<!doctype html>
         th { color: #b6c6ea; font-weight: 600; }
         pre, textarea, code { font-family: ui-monospace, monospace; }
         pre { white-space: pre-wrap; background: #0c1322; padding: 12px; border-radius: 10px; max-height: 320px; overflow: auto; margin: 0; }
-        textarea { width: 100%; min-height: 360px; background: #0c1322; color: #edf2ff; border: 1px solid #243252; border-radius: 10px; padding: 12px; box-sizing: border-box; resize: vertical; }
-        .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+        textarea { width: 100%; min-height: 420px; background: #0c1322; color: #edf2ff; border: 1px solid #243252; border-radius: 10px; padding: 12px; box-sizing: border-box; resize: vertical; }
         button { background: #1f7a6d; color: #fff; border: 0; border-radius: 8px; padding: 10px 14px; cursor: pointer; }
         button.secondary { background: #29405f; }
         button.ghost { background: #18243a; }
         button.danger { background: #8a3d52; }
+        button.nav-button { background: transparent; border: 1px solid transparent; color: #b6c6ea; }
+        button.nav-button.active { background: rgba(27, 115, 101, 0.2); border-color: rgba(87, 211, 183, 0.35); color: #eefbff; }
         button:disabled { opacity: 0.45; cursor: not-allowed; }
         .small { color: #a7b5d6; font-size: 13px; }
+        .muted { color: #93a7cc; }
         .status { padding: 4px 0 0; color: #9ce5c7; min-height: 22px; }
         .error { color: #ffb2c0; }
-        .details { margin: 0; }
-        .details summary { list-style: none; cursor: pointer; font-weight: 600; }
-        .details summary::-webkit-details-marker { display: none; }
-        .details[open] summary { margin-bottom: 10px; }
-        .tagline { max-width: 760px; }
-        .toggle { display: inline-flex; gap: 8px; align-items: center; color: #b6c6ea; font-size: 13px; }
-        .mono { font-family: ui-monospace, monospace; }
         .hero { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 16px; }
         .hero-badge { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; border-radius: 999px; background: rgba(9, 18, 33, 0.46); border: 1px solid rgba(155, 203, 255, 0.18); color: #cfe1ff; font-size: 12px; letter-spacing: 0.04em; text-transform: uppercase; }
+        .tagline { max-width: 760px; }
+        .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; }
+        .toolbar-group { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+        .toggle { display: inline-flex; gap: 8px; align-items: center; color: #b6c6ea; font-size: 13px; }
+        .tab-nav { display: flex; flex-wrap: wrap; gap: 8px; }
+        .tab-panel { display: none; gap: 14px; }
+        .tab-panel.active { display: grid; }
         .panel-title { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+        .overview-hero { display: grid; gap: 14px; grid-template-columns: minmax(0, 1.6fr) minmax(320px, 0.8fr); }
+        .progress-card { display: grid; gap: 12px; }
+        .progress-bar { height: 12px; border-radius: 999px; background: rgba(31, 45, 70, 0.92); overflow: hidden; border: 1px solid rgba(72, 102, 145, 0.34); }
+        .progress-fill { height: 100%; background: linear-gradient(90deg, #1f7a6d, #6ad1c3); width: 0%; }
+        .progress-list { display: grid; gap: 8px; }
+        .progress-row { display: flex; justify-content: space-between; gap: 12px; font-size: 13px; }
         .agent-wall { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
         .agent-card { padding: 14px; border-radius: 14px; background: linear-gradient(180deg, rgba(11, 18, 31, 0.96), rgba(12, 21, 37, 0.84)); border: 1px solid rgba(74, 105, 149, 0.34); min-height: 148px; display: grid; gap: 10px; }
         .agent-card header { padding: 0; background: none; border: 0; display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
@@ -986,7 +1102,16 @@ DASHBOARD_HTML = """<!doctype html>
         .state-offline, .state-stopped { background: rgba(75, 92, 124, 0.22); color: #cad6ef; border: 1px solid rgba(118, 138, 175, 0.3); }
         .state-not_started, .state-not-started, .state-unassigned { background: rgba(50, 61, 88, 0.28); color: #d4def5; border: 1px solid rgba(111, 126, 163, 0.28); }
         .state-error { background: rgba(138, 61, 82, 0.26); color: #ffbfd0; border: 1px solid rgba(212, 101, 133, 0.34); }
-        .muted { color: #93a7cc; }
+        .section-stack { display: grid; gap: 14px; }
+        .page-header { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+        .config-layout { display: grid; gap: 14px; grid-template-columns: minmax(0, 1.3fr) minmax(320px, 0.7fr); }
+        .helper-list { display: grid; gap: 12px; }
+        .helper-card { padding: 12px; border-radius: 12px; background: rgba(12, 19, 34, 0.86); border: 1px solid rgba(72, 102, 145, 0.28); }
+        .pill-row { display: flex; flex-wrap: wrap; gap: 8px; }
+        .key-pair { display: inline-flex; align-items: center; gap: 8px; padding: 7px 10px; border-radius: 999px; background: rgba(12, 19, 34, 0.9); border: 1px solid rgba(72, 102, 145, 0.28); font-size: 12px; }
+        @media (max-width: 980px) {
+            .overview-hero, .config-layout { grid-template-columns: 1fr; }
+        }
     </style>
 </head>
 <body>
@@ -995,93 +1120,174 @@ DASHBOARD_HTML = """<!doctype html>
             <div>
                 <div class=\"hero-badge\">FP8 delivery orchestration</div>
                 <h1>supersonic-moe control plane</h1>
-                <p class=\"small tagline\">Agent status is the first screen. Config, launch, and deeper runtime views stay one click away.</p>
+                <p class=\"small tagline\">Overview stays focused on agent health and program progress. Operations and settings move into dedicated pages.</p>
             </div>
         </div>
     </header>
     <main>
         <section class=\"card\">
             <div class=\"toolbar\">
-                <button data-action onclick=\"saveConfig()\">Save</button>
-                <button data-action onclick=\"launchWorkers(false)\">Launch</button>
-                <button data-action class=\"secondary\" onclick=\"launchWorkers(true)\">Restart</button>
-                <button data-action class=\"danger\" onclick=\"stopWorkers()\">Stop</button>
-                <button data-action class=\"ghost\" onclick=\"refresh(true)\">Refresh</button>
-                <button class=\"ghost\" onclick=\"copyCommand('serve')\">Copy Serve</button>
-                <button class=\"ghost\" onclick=\"copyCommand('up')\">Copy Up</button>
-                <label class=\"toggle\"><input id=\"auto_refresh\" type=\"checkbox\" checked> Auto refresh</label>
+                <div class=\"toolbar-group\">
+                    <button data-action onclick=\"launchWorkers(false)\">Launch</button>
+                    <button data-action class=\"secondary\" onclick=\"launchWorkers(true)\">Restart</button>
+                    <button data-action class=\"danger\" onclick=\"stopWorkers()\">Stop</button>
+                    <button data-action class=\"ghost\" onclick=\"refresh(true)\">Refresh</button>
+                </div>
+                <div class=\"toolbar-group\">
+                    <button class=\"ghost\" onclick=\"copyCommand('serve')\">Copy Serve</button>
+                    <button class=\"ghost\" onclick=\"copyCommand('up')\">Copy Up</button>
+                    <label class=\"toggle\"><input id=\"auto_refresh\" type=\"checkbox\" checked> Auto refresh</label>
+                </div>
             </div>
             <div id=\"status_line\" class=\"status\"></div>
         </section>
 
         <section class=\"card\">
-            <div class=\"panel-title\">
-                <div>
-                    <h2>Agent Status</h2>
-                    <p class=\"small\">All manager and worker agents are visible here by default.</p>
+            <div class=\"toolbar\">
+                <div class=\"tab-nav\" role=\"tablist\" aria-label=\"Dashboard sections\">
+                    <button id=\"nav_overview\" class=\"nav-button active\" type=\"button\" onclick=\"showTab('overview')\">Overview</button>
+                    <button id=\"nav_operations\" class=\"nav-button\" type=\"button\" onclick=\"showTab('operations')\">Operations</button>
+                    <button id=\"nav_settings\" class=\"nav-button\" type=\"button\" onclick=\"showTab('settings')\">Settings</button>
                 </div>
-                <div class=\"small muted\" id=\"agent_status_meta\"></div>
+                <div class=\"pill-row\" id=\"top_meta\"></div>
             </div>
-            <div class=\"agent-wall\" id=\"agent_wall\"></div>
         </section>
 
-        <section class=\"summary\" id=\"summary\"></section>
+        <section id=\"tab_overview\" class=\"tab-panel active\">
+            <section class=\"overview-hero\">
+                <section class=\"card progress-card\">
+                    <div class=\"page-header\">
+                        <div>
+                            <h2>Overall Progress</h2>
+                            <p class=\"small\">A compact view of delivery momentum and the current control-plane state.</p>
+                        </div>
+                        <div class=\"small muted\" id=\"progress_meta\"></div>
+                    </div>
+                    <div class=\"progress-bar\"><div id=\"progress_fill\" class=\"progress-fill\"></div></div>
+                    <div class=\"summary\" id=\"summary\"></div>
+                    <div id=\"progress_details\" class=\"progress-list\"></div>
+                </section>
+                <section class=\"card\">
+                    <div class=\"page-header\">
+                        <div>
+                            <h2>Program Snapshot</h2>
+                            <p class=\"small\">What is blocked, what is runnable, and which event happened last.</p>
+                        </div>
+                    </div>
+                    <div id=\"overview_snapshot\" class=\"helper-list\"></div>
+                </section>
+            </section>
 
-        <div class=\"grid\">
             <section class=\"card\">
-                <h2>Commands</h2>
-                <pre id=\"commands\"></pre>
+                <div class=\"panel-title\">
+                    <div>
+                        <h2>Agent Dashboards</h2>
+                        <p class=\"small\">The home page only shows agent health and essential execution context.</p>
+                    </div>
+                    <div class=\"small muted\" id=\"agent_status_meta\"></div>
+                </div>
+                <div class=\"agent-wall\" id=\"agent_wall\"></div>
+            </section>
+        </section>
+
+        <section id=\"tab_operations\" class=\"tab-panel\">
+            <section class=\"grid\">
+                <section class=\"card\">
+                    <h2>Commands</h2>
+                    <pre id=\"commands\"></pre>
+                </section>
+                <section class=\"card\">
+                    <h2>Validation</h2>
+                    <pre id=\"validation\"></pre>
+                </section>
+            </section>
+            <section class=\"grid\">
+                <section class=\"card\">
+                    <h2>Provider Queue</h2>
+                    <div id=\"provider_queue\"></div>
+                </section>
+                <section class=\"card\">
+                    <h2>Merge Queue</h2>
+                    <div id=\"merge_queue\"></div>
+                </section>
+            </section>
+            <section class=\"grid\">
+                <section class=\"card\">
+                    <h2>Active Processes</h2>
+                    <div id=\"processes\"></div>
+                </section>
+                <section class=\"card\">
+                    <h2>Project</h2>
+                    <div id=\"project\"></div>
+                </section>
+            </section>
+            <section class=\"grid\">
+                <section class=\"card\">
+                    <h2>Runtime Topology</h2>
+                    <div id=\"runtime\"></div>
+                </section>
+                <section class=\"card\">
+                    <h2>Heartbeats</h2>
+                    <div id=\"heartbeats\"></div>
+                </section>
+            </section>
+            <section class=\"grid\">
+                <section class=\"card\">
+                    <h2>Backlog</h2>
+                    <div id=\"backlog\"></div>
+                </section>
+                <section class=\"card\">
+                    <h2>Gates</h2>
+                    <div id=\"gates\"></div>
+                </section>
             </section>
             <section class=\"card\">
-                <h2>Validation</h2>
-                <pre id=\"validation\"></pre>
+                <h2>Manager Report</h2>
+                <pre id=\"manager_report\"></pre>
             </section>
-        </div>
+        </section>
 
-        <details class=\"card details\">
-            <summary>Config Editor</summary>
-            <p class=\"small\">Edit resource pool keys, provider selection, Paddle path, worktrees, branches, and worker commands.</p>
-            <textarea id=\"config_editor\"></textarea>
-        </details>
-
-        <section class=\"card\"><h2>Provider Queue</h2><div id=\"provider_queue\"></div></section>
-
-        <details class=\"card details\">
-            <summary>Worker Config</summary>
-            <div id=\"workers\"></div>
-        </details>
-
-        <details class=\"card details\">
-            <summary>Project and Processes</summary>
-            <div class=\"grid\">
-                <section><h3>Project</h3><div id=\"project\"></div></section>
-                <section><h3>Active Processes</h3><div id=\"processes\"></div></section>
-            </div>
-        </details>
-
-        <details class=\"card details\">
-            <summary>Operational State</summary>
-            <div class=\"grid\">
-                <section><h3>Runtime Topology</h3><div id=\"runtime\"></div></section>
-                <section><h3>Heartbeats</h3><div id=\"heartbeats\"></div></section>
-                <section><h3>Backlog</h3><div id=\"backlog\"></div></section>
-                <section><h3>Gates</h3><div id=\"gates\"></div></section>
-            </div>
-        </details>
-
-        <details class=\"card details\">
-            <summary>Reference Data</summary>
-            <div class=\"grid\">
-                <section><h3>Resource Pools</h3><div id=\"resource_pools\"></div></section>
-                <section><h3>Manager Report</h3><pre id=\"manager_report\"></pre></section>
-            </div>
-        </details>
+        <section id=\"tab_settings\" class=\"tab-panel\">
+            <section class=\"card\">
+                <div class=\"page-header\">
+                    <div>
+                        <h2>Settings</h2>
+                        <p class=\"small\">Edit API keys, provider routing, worktrees, Paddle path, and worker commands here.</p>
+                    </div>
+                    <button data-action onclick=\"saveConfig()\">Save Settings</button>
+                </div>
+                <div class=\"config-layout\">
+                    <div>
+                        <textarea id=\"config_editor\"></textarea>
+                    </div>
+                    <div class=\"helper-list\">
+                        <section class=\"helper-card\">
+                            <h3>Project</h3>
+                            <div id=\"project\"></div>
+                        </section>
+                        <section class=\"helper-card\">
+                            <h3>Resource Pools</h3>
+                            <div id=\"resource_pools\"></div>
+                        </section>
+                        <section class=\"helper-card\">
+                            <h3>Merge Policy</h3>
+                            <div id=\"merge_policy\"></div>
+                        </section>
+                        <section class=\"helper-card\">
+                            <h3>Worker Config</h3>
+                            <div id=\"workers\"></div>
+                        </section>
+                    </div>
+                </div>
+            </section>
+        </section>
     </main>
     <script>
         let editorDirty = false;
         let actionInFlight = false;
         let latestRefreshOk = false;
         let currentCommands = { serve: '', up: '' };
+        let currentTab = 'overview';
 
         const editor = () => document.getElementById('config_editor');
         const actionButtons = () => Array.from(document.querySelectorAll('[data-action]'));
@@ -1173,19 +1379,59 @@ DASHBOARD_HTML = """<!doctype html>
             });
         }
 
+        function buildProgressModel(data, agentRows) {
+            const gates = data.gates?.gates || [];
+            const backlog = data.backlog?.items || [];
+            const passedGates = gates.filter((item) => item.status === 'passed').length;
+            const progress = gates.length ? Math.round((passedGates / gates.length) * 100) : 0;
+            const completedItems = backlog.filter((item) => ['done', 'completed', 'closed'].includes(String(item.status))).length;
+            const blockedItems = backlog.filter((item) => String(item.status) === 'blocked').length;
+            const activeAgents = agentRows.filter((item) => item.display_state === 'active' || item.display_state === 'healthy').length;
+            const attentionAgents = agentRows.filter((item) => item.display_state === 'stale' || String(item.display_state).startsWith('launch_failed')).length;
+            const openGate = gates.find((item) => item.status !== 'passed');
+            return {
+                progress,
+                passedGates,
+                totalGates: gates.length,
+                completedItems,
+                totalItems: backlog.length,
+                blockedItems,
+                activeAgents,
+                attentionAgents,
+                openGate,
+            };
+        }
+
         function renderSummaryCards(data) {
             const agentRows = buildAgentRows(data);
-            const activeWorkers = agentRows.filter((item) => item.display_state === 'active' || item.display_state === 'healthy').length;
-            const staleWorkers = agentRows.filter((item) => item.display_state === 'stale' || String(item.display_state).startsWith('launch_failed')).length;
-            const parkedWorkers = agentRows.filter((item) => item.display_state === 'not_started' || item.display_state === 'offline').length;
+            const progress = buildProgressModel(data, agentRows);
             const validationCount = (data.validation_errors || []).length;
             const cards = [
-                { label: 'Agents Visible', value: agentRows.length, hint: `${activeWorkers} active or healthy` },
-                { label: 'Attention Needed', value: staleWorkers, hint: `${parkedWorkers} parked or offline` },
-                { label: 'Validation Issues', value: validationCount, hint: validationCount ? 'fix config before launch' : 'config is clean' },
-                { label: 'Last Event', value: data.last_event || 'none', hint: data.updated_at || '' },
+                { label: 'Agents', value: agentRows.length, hint: `${progress.activeAgents} active or healthy` },
+                { label: 'Overall Progress', value: `${progress.progress}%`, hint: `${progress.passedGates}/${progress.totalGates} gates passed` },
+                { label: 'Attention Needed', value: progress.attentionAgents, hint: `${progress.blockedItems} backlog items blocked` },
+                { label: 'Validation Issues', value: validationCount, hint: validationCount ? 'settings need cleanup' : 'settings are ready' },
             ];
             return cards.map((item) => `<div class=\"metric\"><strong>${item.value}</strong><div>${item.label}</div><div class=\"small\">${item.hint}</div></div>`).join('');
+        }
+
+        function renderOverviewSnapshot(data, progress) {
+            const entries = [
+                { title: 'Current gate', body: progress.openGate ? `${progress.openGate.id} · ${progress.openGate.name}` : 'All gates passed' },
+                { title: 'Backlog completion', body: `${progress.completedItems}/${progress.totalItems} items complete` },
+                { title: 'Last event', body: data.last_event || 'none' },
+            ];
+            return entries.map((item) => `<section class=\"helper-card\"><h3>${item.title}</h3><p class=\"small\">${item.body}</p></section>`).join('');
+        }
+
+        function renderProgressDetails(progress) {
+            const rows = [
+                { label: 'Gates', value: `${progress.passedGates}/${progress.totalGates} passed` },
+                { label: 'Backlog', value: `${progress.completedItems}/${progress.totalItems} completed` },
+                { label: 'Blocked work', value: `${progress.blockedItems} items` },
+                { label: 'Agents needing action', value: `${progress.attentionAgents}` },
+            ];
+            return rows.map((item) => `<div class=\"progress-row\"><span class=\"small\">${item.label}</span><strong>${item.value}</strong></div>`).join('');
         }
 
         function renderAgentWall(data) {
@@ -1229,6 +1475,14 @@ DASHBOARD_HTML = """<!doctype html>
             actionInFlight = inFlight;
             actionButtons().forEach((button) => {
                 button.disabled = inFlight;
+            });
+        }
+
+        function showTab(tabName) {
+            currentTab = tabName;
+            ['overview', 'operations', 'settings'].forEach((name) => {
+                document.getElementById(`tab_${name}`).classList.toggle('active', name === tabName);
+                document.getElementById(`nav_${name}`).classList.toggle('active', name === tabName);
             });
         }
 
@@ -1279,6 +1533,7 @@ DASHBOARD_HTML = """<!doctype html>
                 { key: 'repository_name', value: project.repository_name || '' },
                 { key: 'local_repo_root', value: project.local_repo_root || '' },
                 { key: 'paddle_repo_path', value: project.paddle_repo_path || '' },
+                { key: 'integration_branch', value: project.integration_branch || project.base_branch || '' },
                 { key: 'dashboard', value: `${project.dashboard.host}:${project.dashboard.port}` },
             ];
             return renderTable(rows, ['key', 'value']);
@@ -1329,21 +1584,48 @@ DASHBOARD_HTML = """<!doctype html>
                 resource_pool: item.resource_pool,
                 resource_pool_queue: (item.resource_pool_queue || []).join(', '),
                 branch: item.branch,
+                git_identity: item.git_identity ? `${item.git_identity.name || ''} <${item.git_identity.email || ''}>` : 'environment default',
+                submit_strategy: item.submit_strategy,
                 test_command: item.test_command,
             }));
-            return renderTable(rows, ['agent', 'task_id', 'resource_pool', 'resource_pool_queue', 'branch', 'test_command']);
+            return renderTable(rows, ['agent', 'task_id', 'resource_pool', 'resource_pool_queue', 'branch', 'git_identity', 'submit_strategy', 'test_command']);
         }
 
         function renderProviderQueue(items) {
             return renderTable(items || [], ['resource_pool', 'provider', 'priority', 'binary_found', 'api_key_present', 'connection_quality', 'work_quality', 'score']);
         }
 
+        function renderMergeQueue(items) {
+            return renderTable(items || [], ['agent', 'branch', 'submit_strategy', 'worker_identity', 'merge_target', 'status', 'manager_action']);
+        }
+
+        function renderMergePolicy(project, mergeQueue) {
+            const manager = project.manager_git_identity
+                ? `${project.manager_git_identity.name || ''} <${project.manager_git_identity.email || ''}>`
+                : 'A0 manager identity';
+            const rows = [
+                { key: 'integration_branch', value: project.integration_branch || project.base_branch || 'main' },
+                { key: 'manager_identity', value: manager },
+                { key: 'merge_owner', value: 'A0' },
+                { key: 'tracked_worker_branches', value: String((mergeQueue || []).length) },
+            ];
+            return renderTable(rows, ['key', 'value']);
+        }
+
+        function renderTopMeta(data) {
+            const values = [
+                { label: 'Last event', value: data.last_event || 'none' },
+                { label: 'Updated', value: data.updated_at || 'unknown' },
+            ];
+            return values.map((item) => `<div class=\"key-pair\"><span class=\"muted\">${item.label}</span><strong>${item.value}</strong></div>`).join('');
+        }
+
         async function saveConfig() {
-            await runAction('saving config', async () => {
+            await runAction('saving settings', async () => {
                 await postJson('/api/config', { config_text: editor().value });
                 editorDirty = false;
                 await refresh(true);
-                setStatus('config saved');
+                setStatus('settings saved');
             });
         }
 
@@ -1368,11 +1650,19 @@ DASHBOARD_HTML = """<!doctype html>
                 const data = await fetchJson('/api/state');
                 latestRefreshOk = true;
                 currentCommands = data.commands || { serve: '', up: '' };
+                const agentRows = buildAgentRows(data);
+                const progress = buildProgressModel(data, agentRows);
                 if (!editorDirty) {
                     editor().value = data.config_text || '';
                 }
-                document.getElementById('agent_wall').innerHTML = renderAgentWall(data);
+                document.getElementById('top_meta').innerHTML = renderTopMeta(data);
                 document.getElementById('summary').innerHTML = renderSummaryCards(data);
+                document.getElementById('agent_wall').innerHTML = renderAgentWall(data);
+                document.getElementById('progress_fill').style.width = `${progress.progress}%`;
+                document.getElementById('progress_meta').textContent = `${progress.passedGates}/${progress.totalGates} gates passed`;
+                document.getElementById('progress_details').innerHTML = renderProgressDetails(progress);
+                document.getElementById('overview_snapshot').innerHTML = renderOverviewSnapshot(data, progress);
+                document.getElementById('merge_queue').innerHTML = renderMergeQueue(data.merge_queue);
                 document.getElementById('project').innerHTML = renderProject(data.project);
                 document.getElementById('processes').innerHTML = renderTable(renderProcessRows(data.processes), ['agent', 'provider', 'model', 'alive', 'pid', 'resource_pool', 'returncode']);
                 document.getElementById('provider_queue').innerHTML = renderProviderQueue(data.provider_queue);
@@ -1382,9 +1672,10 @@ DASHBOARD_HTML = """<!doctype html>
                 document.getElementById('gates').innerHTML = renderGates(data.gates);
                 document.getElementById('resource_pools').innerHTML = renderPools(data.config);
                 document.getElementById('workers').innerHTML = renderWorkers(data.config);
+                document.getElementById('merge_policy').innerHTML = renderMergePolicy(data.project, data.merge_queue);
                 document.getElementById('manager_report').textContent = data.manager_report;
                 document.getElementById('commands').textContent = `serve:\n${currentCommands.serve}\n\nup:\n${currentCommands.up}`;
-                document.getElementById('validation').textContent = data.validation_errors.length ? data.validation_errors.join('\n') : 'config valid';
+                document.getElementById('validation').textContent = data.validation_errors.length ? data.validation_errors.join('\n') : 'settings valid';
                 if (forceStatus) {
                     setStatus(`state refreshed, last event: ${data.last_event || 'none'}`);
                 }
@@ -1400,6 +1691,7 @@ DASHBOARD_HTML = """<!doctype html>
             editorDirty = true;
         });
 
+        showTab(currentTab);
         refresh(true);
         setInterval(() => {
             if (!actionInFlight && autoRefresh()) {

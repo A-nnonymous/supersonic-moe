@@ -102,6 +102,7 @@ cp control_plane/fp8/runtime/config_template.yaml control_plane/fp8/runtime/loca
 - provider and model assignments
 - Paddle absolute path
 - worker worktree paths and branches
+- per-worker git commit identities when different agents should submit under different names
 - real `test_command` values that can run immediately on the local Hopper or Blackwell host
 
 3. Start only the local dashboard backend and frontend from the fully provisioned project environment:
@@ -131,8 +132,10 @@ uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/cont
 ### Control Plane Behavior
 
 - the first screen shows every manager and worker agent as a status card
+- the overview page stays focused on agent dashboards and overall program progress
 - the dashboard can save config, launch workers, restart workers, stop workers, and copy startup commands
 - worker launch decisions use static pool priority plus runtime connection-quality and work-quality scoring
+- each worker can carry its own git identity, and A0 owns final merge into the integration branch
 - every worker may declare a `resource_pool_queue` for fallback ordering
 - provider queue, runtime topology, heartbeats, and validation errors remain available in the dashboard
 

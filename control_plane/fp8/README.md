@@ -55,6 +55,7 @@ If you are validating Blackwell kernels directly on B200 or GB200, set `USE_QUAC
 
 1. Copy `runtime/config_template.yaml` to `runtime/local_config.yaml`.
 2. Fill resource pool api keys, provider/model assignments, worktree paths, `paddle_repo_path`, and real GPU test commands.
+	Also set `project.integration_branch`, optional `project.manager_git_identity`, and any per-worker `git_identity` values you want the runtime to apply inside worker worktrees.
 3. Run `python control_plane/fp8/runtime/control_plane.py serve --config control_plane/fp8/runtime/local_config.yaml --open-browser` to start only the local web control plane.
 4. Run `python control_plane/fp8/runtime/control_plane.py up --config control_plane/fp8/runtime/local_config.yaml --open-browser` to start the web control plane and launch workers in one process.
 5. Override the bind address if needed with `--host` and `--port`, for example `--host 0.0.0.0 --port 9000`.
@@ -85,24 +86,25 @@ If your deployment hostname resolves to IPv6 first, an IPv6-only listener can st
 
 The local webpage now provides:
 
-- a compact top bar for save, launch, restart, stop, refresh, and command copy actions
-- a default first screen that shows every manager and worker agent as a status card
-- summary cards for visible agents, attention-needed agents, validation count, and last event
-- an editable local YAML config in a collapsible editor
-- commands, validation, and provider queue directly below the agent overview
-- low-frequency sections such as worker config, project/processes, operational state, and reference data folded behind details panels
+- a compact top bar for launch, restart, stop, refresh, and command copy actions
+- an `Overview` page that only shows agent dashboards and overall delivery progress
+- an `Operations` page for commands, validation, provider queue, merge queue, runtime state, heartbeats, backlog, and manager report
+- a `Settings` page for API keys, provider routing, Paddle path, worktrees, worker commands, and git submission identities
+- an editable local YAML config with supporting project, resource-pool, and worker summaries
 - provider priority queue with runtime connection-quality and work-quality scoring
+- per-worker git commit identities that are applied inside each worker worktree before launch
+- a manager-owned merge queue that tracks which worker branch should be integrated into the target branch
 
 ## Interaction model
 
 The dashboard is intentionally simple:
 
-1. check the agent wall first to see who is active, parked, stale, or offline
-2. confirm the summary cards and validation block
-3. fix config issues in the collapsible editor if needed
-4. copy the `serve` or `up` command when you need terminal control
+1. start on `Overview` to judge agent health and overall delivery progress
+2. move to `Operations` when you need runtime inspection, launch commands, validation, or provider scheduling detail
+3. move to `Settings` when you need to edit API keys, provider assignments, Paddle paths, worker commands, or per-worker git identities
+4. let A0 own merge timing and final integration into `project.integration_branch`
 5. use `Launch`, `Restart`, or `Stop` from the top bar for normal operations
-6. open the folded sections only when you need deeper runtime inspection
+6. copy the `serve` or `up` command when you need terminal control
 
 ## Execution topology rule
 
@@ -116,6 +118,7 @@ The runtime record must capture at least:
 - model
 - worktree path
 - branch name
+- merge target branch
 - environment path or `uv` environment root
 - test command
 - submit path back to the integration branch
