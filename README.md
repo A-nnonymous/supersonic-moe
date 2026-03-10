@@ -76,7 +76,7 @@ make test
 
 ## Control Plane
 
-This repository includes a local multi-agent control plane under `control_plane/fp8/` for planning, launching, and monitoring FP8 delivery work.
+This repository includes a local multi-agent control plane under `control_plane/fp8/` for upgrading SonicMoE with coordinated FP8 delivery work.
 
 ### Control Plane Deployment
 
@@ -90,13 +90,13 @@ If you are testing Blackwell kernels directly on B200 or GB200, export `USE_QUAC
 
 ### Control Plane Quickstart
 
-1. Copy the runtime template:
+1. Frontend-only debugging with no filled local config:
 
 ```bash
-cp control_plane/fp8/runtime/config_template.yaml control_plane/fp8/runtime/local_config.yaml
+python control_plane/fp8/runtime/control_plane.py serve --dry-run --open-browser
 ```
 
-2. Fill `local_config.yaml` with:
+2. For real multi-agent execution, fill `control_plane/fp8/runtime/local_config.yaml` with:
 
 - resource pool API keys
 - provider and model assignments
@@ -105,28 +105,34 @@ cp control_plane/fp8/runtime/config_template.yaml control_plane/fp8/runtime/loca
 - per-worker git commit identities when different agents should submit under different names
 - real `test_command` values that can run immediately on the local Hopper or Blackwell host
 
-3. Start only the local dashboard backend and frontend from the fully provisioned project environment:
+3. Start only the dashboard and decide when to launch workers from the UI:
 
 ```bash
-python control_plane/fp8/runtime/control_plane.py serve --config control_plane/fp8/runtime/local_config.yaml --open-browser
+python control_plane/fp8/runtime/control_plane.py serve --open-browser
 ```
 
-4. Start the dashboard and launch configured workers in one step:
+4. Start the dashboard and immediately launch configured workers:
 
 ```bash
-python control_plane/fp8/runtime/control_plane.py up --config control_plane/fp8/runtime/local_config.yaml --open-browser
+python control_plane/fp8/runtime/control_plane.py up --open-browser
 ```
 
-5. Override bind address when needed:
+5. Pause running multi-agent work without shutting down the dashboard:
 
 ```bash
-python control_plane/fp8/runtime/control_plane.py serve --config control_plane/fp8/runtime/local_config.yaml --host 0.0.0.0 --port 8233
+curl -X POST http://127.0.0.1:8233/api/stop -H 'Content-Type: application/json' -d '{}'
 ```
 
-6. Optional compatibility path for non-GPU manager machines:
+6. Override bind address when needed:
 
 ```bash
-uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/control_plane.py serve --config control_plane/fp8/runtime/local_config.yaml --open-browser
+python control_plane/fp8/runtime/control_plane.py serve --host 0.0.0.0 --port 8233
+```
+
+7. Optional compatibility path for non-GPU manager machines:
+
+```bash
+uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/control_plane.py serve --open-browser
 ```
 
 ### Control Plane Behavior
@@ -144,6 +150,7 @@ uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/cont
 - on a real Hopper or Blackwell deployment host, the direct `python ...` commands above are the default path
 - keep worker `test_command` and benchmark commands pointed at the same CUDA-capable environment that will run real validation on the target GPU
 - the control plane source of truth remains `control_plane/fp8/README.md`
+- use `control_plane/fp8/README.md` for the full manager workflow, including dry-run, start, pause, and resume guidance
 
 ### Example usage
 - SonicMoE with TC top-K choice routing (SwiGLU activation) on Hopper GPUs
