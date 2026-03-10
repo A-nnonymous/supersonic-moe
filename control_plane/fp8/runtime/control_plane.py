@@ -261,7 +261,9 @@ class ControlPlaneService:
         self.dry_run = self.force_dry_run or using_template
         reasons: list[str] = []
         if using_template:
-            reasons.append(f"using template config {self.config_path}")
+            reasons.append(
+                f"using template config {self.config_path} simulates launch actions until a real config is saved"
+            )
         if self.persist_config_path != self.config_path:
             reasons.append(f"save target is {self.persist_config_path}")
         if self.force_dry_run:
@@ -1312,14 +1314,14 @@ DASHBOARD_HTML = """<!doctype html>
         <section class=\"card\">
             <div class=\"toolbar\">
                 <div class=\"toolbar-group\">
-                    <button data-action onclick=\"launchWorkers(false)\">Launch</button>
-                    <button data-action class=\"secondary\" onclick=\"launchWorkers(true)\">Restart</button>
-                    <button data-action class=\"danger\" onclick=\"stopWorkers()\">Stop</button>
-                    <button data-action class=\"ghost\" onclick=\"refresh(true)\">Refresh</button>
+                    <button data-action data-control=\"launch\">Launch</button>
+                    <button data-action data-control=\"restart\" class=\"secondary\">Restart</button>
+                    <button data-action data-control=\"stop\" class=\"danger\">Stop</button>
+                    <button data-action data-control=\"refresh\" class=\"ghost\">Refresh</button>
                 </div>
                 <div class=\"toolbar-group\">
-                    <button class=\"ghost\" onclick=\"copyCommand('serve')\">Copy Serve</button>
-                    <button class=\"ghost\" onclick=\"copyCommand('up')\">Copy Up</button>
+                    <button class=\"ghost\" data-control=\"copy-serve\">Copy Serve</button>
+                    <button class=\"ghost\" data-control=\"copy-up\">Copy Up</button>
                     <label class=\"toggle\"><input id=\"auto_refresh\" type=\"checkbox\" checked> Auto refresh</label>
                 </div>
             </div>
@@ -1329,9 +1331,9 @@ DASHBOARD_HTML = """<!doctype html>
         <section class=\"card\">
             <div class=\"toolbar\">
                 <div class=\"tab-nav\" role=\"tablist\" aria-label=\"Dashboard sections\">
-                    <button id=\"nav_overview\" class=\"nav-button active\" type=\"button\" onclick=\"showTab('overview')\">Overview</button>
-                    <button id=\"nav_operations\" class=\"nav-button\" type=\"button\" onclick=\"showTab('operations')\">Operations</button>
-                    <button id=\"nav_settings\" class=\"nav-button\" type=\"button\" onclick=\"showTab('settings')\">Settings</button>
+                    <button id=\"nav_overview\" class=\"nav-button active\" type=\"button\" data-tab=\"overview\">Overview</button>
+                    <button id=\"nav_operations\" class=\"nav-button\" type=\"button\" data-tab=\"operations\">Operations</button>
+                    <button id=\"nav_settings\" class=\"nav-button\" type=\"button\" data-tab=\"settings\">Settings</button>
                 </div>
                 <div class=\"pill-row\" id=\"top_meta\"></div>
             </div>
@@ -1449,7 +1451,7 @@ DASHBOARD_HTML = """<!doctype html>
                         <h2>Settings</h2>
                         <p class=\"small\">Edit API keys, provider routing, worktrees, Paddle path, and worker commands here.</p>
                     </div>
-                    <button data-action onclick=\"saveConfig()\">Save Settings</button>
+                    <button data-action data-control=\"save-config\">Save Settings</button>
                 </div>
                 <div class=\"config-layout\">
                     <div>
@@ -1458,19 +1460,19 @@ DASHBOARD_HTML = """<!doctype html>
                     <div class=\"helper-list\">
                         <section class=\"helper-card\">
                             <h3>Project</h3>
-                            <div id=\"project\"></div>
+                            <div id=\"settings_project\"></div>
                         </section>
                         <section class=\"helper-card\">
                             <h3>Resource Pools</h3>
-                            <div id=\"resource_pools\"></div>
+                            <div id=\"settings_resource_pools\"></div>
                         </section>
                         <section class=\"helper-card\">
                             <h3>Merge Policy</h3>
-                            <div id=\"merge_policy\"></div>
+                            <div id=\"settings_merge_policy\"></div>
                         </section>
                         <section class=\"helper-card\">
                             <h3>Worker Config</h3>
-                            <div id=\"workers\"></div>
+                            <div id=\"settings_workers\"></div>
                         </section>
                     </div>
                 </div>
@@ -1488,6 +1490,7 @@ DASHBOARD_HTML = """<!doctype html>
         const editor = () => document.getElementById('config_editor');
         const actionButtons = () => Array.from(document.querySelectorAll('[data-action]'));
         const autoRefresh = () => document.getElementById('auto_refresh').checked;
+        const tabButtons = () => Array.from(document.querySelectorAll('[data-tab]'));
 
         function renderTable(rows, columns) {
             if (!rows || !rows.length) {
@@ -1730,6 +1733,47 @@ DASHBOARD_HTML = """<!doctype html>
             });
         }
 
+        function bindUI() {
+            tabButtons().forEach((button) => {
+                button.addEventListener('click', () => {
+                    showTab(button.dataset.tab || 'overview');
+                });
+            });
+
+            document.querySelectorAll('[data-control]').forEach((button) => {
+                button.addEventListener('click', async () => {
+                    const control = button.dataset.control || '';
+                    if (control === 'launch') {
+                        await launchWorkers(false);
+                        return;
+                    }
+                    if (control === 'restart') {
+                        await launchWorkers(true);
+                        return;
+                    }
+                    if (control === 'stop') {
+                        await stopWorkers();
+                        return;
+                    }
+                    if (control === 'refresh') {
+                        await refresh(true);
+                        return;
+                    }
+                    if (control === 'save-config') {
+                        await saveConfig();
+                        return;
+                    }
+                    if (control === 'copy-serve') {
+                        await copyCommand('serve');
+                        return;
+                    }
+                    if (control === 'copy-up') {
+                        await copyCommand('up');
+                    }
+                });
+            });
+        }
+
         async function fetchJson(path, options = {}) {
             const response = await fetch(path, options);
             const data = await response.json();
@@ -1919,9 +1963,10 @@ DASHBOARD_HTML = """<!doctype html>
                 document.getElementById('heartbeats').innerHTML = renderHeartbeats(data.heartbeats);
                 document.getElementById('backlog').innerHTML = renderBacklog(data.backlog);
                 document.getElementById('gates').innerHTML = renderGates(data.gates);
-                document.getElementById('resource_pools').innerHTML = renderPools(data.config);
-                document.getElementById('workers').innerHTML = renderWorkers(data.config);
-                document.getElementById('merge_policy').innerHTML = renderMergePolicy(data.project, data.merge_queue);
+                document.getElementById('settings_project').innerHTML = renderProject(data.project);
+                document.getElementById('settings_resource_pools').innerHTML = renderPools(data.config);
+                document.getElementById('settings_workers').innerHTML = renderWorkers(data.config);
+                document.getElementById('settings_merge_policy').innerHTML = renderMergePolicy(data.project, data.merge_queue);
                 document.getElementById('manager_report').textContent = data.manager_report;
                 document.getElementById('commands').textContent = `serve:\n${currentCommands.serve}\n\nup:\n${currentCommands.up}`;
                 document.getElementById('validation').textContent = data.validation_errors.length ? data.validation_errors.join('\n') : 'settings valid';
@@ -1940,6 +1985,7 @@ DASHBOARD_HTML = """<!doctype html>
             editorDirty = true;
         });
 
+        bindUI();
         showTab(currentTab);
         refresh(true);
         setInterval(() => {
