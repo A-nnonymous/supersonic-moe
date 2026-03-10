@@ -1,0 +1,63 @@
+project: sonicmoe-fp8
+last_updated: 2026-03-10
+policy:
+  manager_review_cycle: every handoff or resume
+  planning_window: one manager review cycle
+  implementation_window: manager-defined
+agents:
+  - agent: A0
+    role: manager
+    state: healthy
+    last_seen: 2026-03-10
+    evidence: current control-plane maintenance
+    expected_next_checkin: next handoff or resume
+    escalation: none
+  - agent: A1
+    role: protocol
+    state: not-started
+    last_seen: none
+    evidence: no runtime heartbeat yet
+    expected_next_checkin: when protocol drafting starts
+    escalation: launch explicitly before counting A1 as active
+  - agent: A2
+    role: hopper-backend
+    state: not-started
+    last_seen: none
+    evidence: no runtime heartbeat yet
+    expected_next_checkin: after A1 draft exists
+    escalation: do not schedule as active before protocol draft
+  - agent: A3
+    role: blackwell-backend
+    state: not-started
+    last_seen: none
+    evidence: no runtime heartbeat yet
+    expected_next_checkin: after A1 draft exists
+    escalation: do not schedule as active before protocol draft
+  - agent: A4
+    role: torch-functional
+    state: not-started
+    last_seen: none
+    evidence: no runtime heartbeat yet
+    expected_next_checkin: after backend and protocol review
+    escalation: keep parked until G1 path is ready
+  - agent: A5
+    role: tests
+    state: not-started
+    last_seen: none
+    evidence: no runtime heartbeat yet
+    expected_next_checkin: when reference tensors are frozen
+    escalation: do not report as active yet
+  - agent: A6
+    role: baseline-compat
+    state: not-started
+    last_seen: none
+    evidence: no runtime heartbeat yet
+    expected_next_checkin: when tensor contract freeze begins
+    escalation: launch with A1 for G0 work
+  - agent: A7
+    role: perf-delivery
+    state: not-started
+    last_seen: none
+    evidence: no runtime heartbeat yet
+    expected_next_checkin: after protocol interface draft exists
+    escalation: keep queued until benchmark surface is stable
