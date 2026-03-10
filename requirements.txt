@@ -9,3 +9,4 @@ pytest
 parameterized
 ninja
 rich
+PyYAML>=6.0.2

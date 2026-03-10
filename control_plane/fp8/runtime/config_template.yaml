@@ -1,0 +1,90 @@
+project:
+  repository_name: supersonic-moe
+  local_repo_root: /absolute/path/to/local/supersonic-moe
+  paddle_repo_path: /absolute/path/to/Paddle
+  base_branch: main
+  dashboard:
+    host: 127.0.0.1
+    port: 8233
+
+providers:
+  copilot:
+    api_key_env_name: GITHUB_TOKEN
+    command_template:
+      - copilot
+      - --model
+      - "{model}"
+      - --prompt-file
+      - "{prompt_file}"
+      - --worktree
+      - "{worktree_path}"
+  claude_code:
+    api_key_env_name: ANTHROPIC_API_KEY
+    command_template:
+      - claude-code
+      - --model
+      - "{model}"
+      - --prompt-file
+      - "{prompt_file}"
+      - --cwd
+      - "{worktree_path}"
+  opencode:
+    api_key_env_name: OPENCODE_API_KEY
+    command_template:
+      - opencode
+      - --model
+      - "{model}"
+      - --prompt-file
+      - "{prompt_file}"
+      - --cwd
+      - "{worktree_path}"
+
+resource_pools:
+  copilot_pool:
+    priority: 300
+    provider: copilot
+    model: gpt-5.4
+    api_key: replace_me_or_use_api_key_env
+    extra_env: {}
+  claude_pool:
+    priority: 200
+    provider: claude_code
+    model: claude-sonnet-4-5
+    api_key: replace_me_or_use_api_key_env
+    extra_env: {}
+  opencode_pool:
+    priority: 100
+    provider: opencode
+    model: o4-mini
+    api_key: replace_me_or_use_api_key_env
+    extra_env: {}
+
+workers:
+  - agent: A1
+    task_id: A1-001
+    resource_pool: copilot_pool
+    resource_pool_queue:
+      - copilot_pool
+      - claude_pool
+      - opencode_pool
+    worktree_path: /absolute/path/to/supersonic_moe_a1
+    branch: a1_protocol_freeze
+    environment_type: uv
+    environment_path: /absolute/path/to/supersonic_moe_a1/.venv
+    sync_command: uv sync
+    test_command: uv run pytest tests/moe_test.py -k protocol
+    submit_strategy: patch_handoff
+  - agent: A6
+    task_id: A6-001
+    resource_pool: claude_pool
+    resource_pool_queue:
+      - claude_pool
+      - copilot_pool
+      - opencode_pool
+    worktree_path: /absolute/path/to/supersonic_moe_a6
+    branch: a6_baseline_trace
+    environment_type: uv
+    environment_path: /absolute/path/to/supersonic_moe_a6/.venv
+    sync_command: uv sync
+    test_command: uv run pytest tests/moe_test.py -k baseline
+    submit_strategy: patch_handoff

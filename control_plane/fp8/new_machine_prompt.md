@@ -4,8 +4,9 @@ Use this prompt when opening the repository on a new machine or when starting a 
 
 ## Preconditions
 
-- repository is cloned and opened at the SonicMoE workspace root
-- the active project root is `sonic-moe`
+- fork repository name is `supersonic-moe`
+- repository is cloned and opened at the local workspace root
+- the local folder name may differ from the fork name
 - no code changes should be made until the control plane is fully restored and reported
 
 ## Canonical startup prompt
@@ -25,13 +26,14 @@ Paste the following into the next chat session:
 5. 阅读 control_plane/fp8/state/gates.yaml
 6. 阅读 control_plane/fp8/state/heartbeats.yaml
 7. 阅读 control_plane/fp8/state/edit_locks.yaml
-8. 阅读 control_plane/fp8/status/agents/ 下全部 agent 状态文件
-9. 阅读 control_plane/fp8/checkpoints/agents/ 下全部 agent checkpoint
-10. 阅读 control_plane/fp8/experiments/registry.yaml
-11. 阅读 control_plane/fp8/strategy/integration_plan.md
-12. 阅读 control_plane/fp8/strategy/baseline_trace.md
-13. 阅读 control_plane/fp8/governance/operating_model.md
-14. 阅读 control_plane/fp8/governance/decisions.md
+8. 阅读 control_plane/fp8/state/agent_runtime.yaml
+9. 阅读 control_plane/fp8/status/agents/ 下全部 agent 状态文件
+10. 阅读 control_plane/fp8/checkpoints/agents/ 下全部 agent checkpoint
+11. 阅读 control_plane/fp8/experiments/registry.yaml
+12. 阅读 control_plane/fp8/strategy/integration_plan.md
+13. 阅读 control_plane/fp8/strategy/baseline_trace.md
+14. 阅读 control_plane/fp8/governance/operating_model.md
+15. 阅读 control_plane/fp8/governance/decisions.md
 
 恢复后请输出一份简洁但完整的控制面状态报告，必须包含：
 - 当前项目阶段
@@ -39,6 +41,7 @@ Paste the following into the next chat session:
 - 当前 blocker
 - 当前真实存活的 agent 集合
 - 当前 agent 心跳状态
+- 当前 provider / worktree / branch / env 拓扑
 - 当前高冲突文件锁状态
 - 当前是否允许进入真实实验或代码实现
 - 推荐的下一步动作
@@ -57,5 +60,6 @@ sed -n '1,220p' control_plane/fp8/README.md && \
 sed -n '1,220p' control_plane/fp8/checkpoints/manager/latest.md && \
 sed -n '1,220p' control_plane/fp8/reports/manager_report.md && \
 sed -n '1,220p' control_plane/fp8/state/heartbeats.yaml && \
+sed -n '1,220p' control_plane/fp8/state/agent_runtime.yaml && \
 sed -n '1,220p' control_plane/fp8/state/edit_locks.yaml
 ```

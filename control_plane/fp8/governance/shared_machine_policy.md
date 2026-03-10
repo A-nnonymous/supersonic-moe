@@ -20,6 +20,7 @@ An experiment may be inserted only if all checks pass.
 - the device or slot owner is known
 - the expected runtime is recorded
 - the experiment has an owner and an experiment ID
+- the worker's `state/agent_runtime.yaml` entry exists and matches the submitting branch and environment
 
 ### Value checks
 
@@ -47,6 +48,9 @@ Every experiment must be recorded in `experiments/registry.yaml` with:
 - end time
 - result
 - whether retry is allowed
+- worktree path
+- branch name
+- environment path
 
 ## Safe insertion rule
 
@@ -56,3 +60,14 @@ If any of the following is unknown, do not insert the experiment:
 - what gate the experiment supports
 - how to stop the run safely
 - whether enough resources are available
+
+## Worktree rule
+
+Shared machines should use explicit git worktrees for concurrent workers.
+
+- one worktree per worker
+- one branch per worktree
+- one environment per worktree
+- worktree path and branch must match the runtime registry
+
+If two workers need the same branch or the same editable environment, stop and re-plan instead of sharing state.
