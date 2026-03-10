@@ -29,6 +29,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 CONTROL_ROOT = REPO_ROOT / "control_plane" / "fp8"
 STATE_DIR = CONTROL_ROOT / "state"
 RUNTIME_DIR = CONTROL_ROOT / "runtime"
+CONFIG_TEMPLATE_PATH = RUNTIME_DIR / "config_template.yaml"
 PROMPT_DIR = RUNTIME_DIR / "generated_prompts"
 LOG_DIR = RUNTIME_DIR / "logs"
 MANAGER_REPORT = CONTROL_ROOT / "reports" / "manager_report.md"
@@ -169,10 +170,19 @@ def format_endpoint(host: str, port: int) -> str:
 
 
 class ControlPlaneService:
-    def __init__(self, config_path: Path, host_override: str | None = None, port_override: int | None = None):
+    def __init__(
+        self,
+        config_path: Path,
+        host_override: str | None = None,
+        port_override: int | None = None,
+        persist_config_path: Path | None = None,
+        force_dry_run: bool = False,
+    ):
         self.config_path = config_path
+        self.persist_config_path = persist_config_path or config_path
         self.host_override = host_override
         self.port_override = port_override
+        self.force_dry_run = force_dry_run
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
         self.monitor_thread: threading.Thread | None = None
@@ -188,7 +198,21 @@ class ControlPlaneService:
         self.resource_pools: dict[str, Any] = {}
         self.workers: list[dict[str, Any]] = []
         self.provider_stats: dict[str, dict[str, Any]] = {}
+        self.dry_run = False
+        self.dry_run_reason = ""
         self.reload_config()
+
+    def refresh_runtime_mode(self) -> None:
+        using_template = self.config_path.resolve() == CONFIG_TEMPLATE_PATH.resolve()
+        self.dry_run = self.force_dry_run or using_template
+        reasons: list[str] = []
+        if using_template:
+            reasons.append(f"using template config {self.config_path}")
+        if self.persist_config_path != self.config_path:
+            reasons.append(f"save target is {self.persist_config_path}")
+        if self.force_dry_run:
+            reasons.append("--dry-run is enabled")
+        self.dry_run_reason = "; ".join(reasons)
 
     def reload_config(self) -> None:
         with self.lock:
@@ -197,6 +221,7 @@ class ControlPlaneService:
             self.providers = self.config.get("providers", {})
             self.resource_pools = self.config.get("resource_pools", {})
             self.workers = self.config.get("workers", [])
+            self.refresh_runtime_mode()
             self.provider_stats = self.provider_stats or {
                 pool_name: {
                     "launch_successes": 0,
@@ -332,7 +357,10 @@ class ControlPlaneService:
         errors = self.validation_errors(parsed)
         if errors:
             return errors
-        self.config_path.write_text(yaml_text(parsed), encoding="utf-8")
+        target_path = self.persist_config_path
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        target_path.write_text(yaml_text(parsed), encoding="utf-8")
+        self.config_path = target_path
         self.reload_config()
         self.last_event = f"config_saved:{now_iso()}"
         return []
@@ -476,6 +504,9 @@ class ControlPlaneService:
         config = str(self.config_path)
         serve = f"{CONTROL_PLANE_RUNTIME} control_plane/fp8/runtime/control_plane.py serve --config {config} --host {host} --port {port} --open-browser"
         up = f"{CONTROL_PLANE_RUNTIME} control_plane/fp8/runtime/control_plane.py up --config {config} --host {host} --port {port} --open-browser"
+        if self.dry_run:
+            serve += " --dry-run"
+            up += " --dry-run"
         return {"serve": serve, "up": up}
 
     def task_title(self, task_id: str) -> str:
@@ -779,6 +810,9 @@ Primary test command:
 
     def launch_all(self, restart: bool = False) -> dict[str, Any]:
         with self.lock:
+            if self.dry_run:
+                message = self.dry_run_reason or "dry-run mode is active"
+                return {"ok": False, "errors": [f"launch disabled while dry-run mode is active: {message}"]}
             errors = self.validation_errors()
             if errors:
                 return {"ok": False, "errors": errors}
@@ -851,6 +885,12 @@ Primary test command:
         return {
             "updated_at": now_iso(),
             "last_event": self.last_event,
+            "mode": {
+                "dry_run": self.dry_run,
+                "reason": self.dry_run_reason,
+                "config_path": str(self.config_path),
+                "persist_config_path": str(self.persist_config_path),
+            },
             "project": self.project,
             "commands": self.build_cli_commands(),
             "manager_report": MANAGER_REPORT.read_text(encoding="utf-8"),
@@ -1020,7 +1060,10 @@ Primary test command:
     def run_up(self, open_browser: bool = False) -> None:
         self.start_monitoring()
         self.start_dashboard(open_browser=open_browser)
-        self.launch_all()
+        if self.dry_run:
+            self.last_event = f"dry_run:{self.dry_run_reason or 'dashboard only'}"
+        else:
+            self.launch_all()
         self.wait_forever()
 
     def run_serve(self, open_browser: bool = False) -> None:
@@ -1305,6 +1348,7 @@ DASHBOARD_HTML = """<!doctype html>
         let editorDirty = false;
         let actionInFlight = false;
         let latestRefreshOk = false;
+        let latestState = {};
         let currentCommands = { serve: '', up: '' };
         let currentTab = 'overview';
 
@@ -1680,7 +1724,10 @@ DASHBOARD_HTML = """<!doctype html>
         }
 
         function renderTopMeta(data) {
+            const mode = data.mode || {};
             const values = [
+                { label: 'Mode', value: mode.dry_run ? 'dry run' : 'live' },
+                { label: 'Config', value: mode.config_path || 'unknown' },
                 { label: 'Last event', value: data.last_event || 'none' },
                 { label: 'Updated', value: data.updated_at || 'unknown' },
             ];
@@ -1698,6 +1745,9 @@ DASHBOARD_HTML = """<!doctype html>
 
         async function launchWorkers(restart) {
             await runAction(restart ? 'restarting workers' : 'launching workers', async () => {
+                if (latestState.mode && latestState.mode.dry_run) {
+                    throw new Error(latestState.mode.reason || 'launch disabled while dry-run mode is active');
+                }
                 const data = await postJson('/api/launch', { restart });
                 setStatus(`launch complete: ${(data.launched || []).length} launched, ${(data.failures || []).length} failures`, !(data.ok ?? false));
                 await refresh(true);
@@ -1715,6 +1765,7 @@ DASHBOARD_HTML = """<!doctype html>
         async function refresh(forceStatus = false) {
             try {
                 const data = await fetchJson('/api/state');
+                latestState = data;
                 latestRefreshOk = true;
                 currentCommands = data.commands || { serve: '', up: '' };
                 const agentRows = buildAgentRows(data);
@@ -1775,13 +1826,16 @@ DASHBOARD_HTML = """<!doctype html>
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="supersonic-moe control plane runtime")
     parser.add_argument("command", choices=["up", "serve"], help="launch server with workers, or only the server")
-    parser.add_argument(
-        "--config", type=Path, default=RUNTIME_DIR / "local_config.yaml", help="ignored local runtime config"
-    )
+    parser.add_argument("--config", type=Path, default=RUNTIME_DIR / "local_config.yaml", help="runtime config path")
     parser.add_argument("--host", default=None, help="override dashboard host")
     parser.add_argument("--port", type=int, default=None, help="override dashboard port")
     parser.add_argument("--open-browser", action="store_true", help="open the dashboard in a browser")
     parser.add_argument("--detach", action="store_true", help="start the control plane in the background and return")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="render the dashboard without launching workers; if the config file is missing, fall back to config_template.yaml",
+    )
     parser.add_argument(
         "--log-file",
         type=Path,
@@ -1789,6 +1843,32 @@ def parse_args() -> argparse.Namespace:
         help="log file used when --detach is enabled",
     )
     return parser.parse_args()
+
+
+def resolve_runtime_config(args: argparse.Namespace) -> tuple[Path, Path, bool, str]:
+    requested_path = args.config
+    persist_path = requested_path
+    force_dry_run = args.dry_run
+    reasons: list[str] = []
+    default_local_config = (RUNTIME_DIR / "local_config.yaml").resolve()
+
+    if not requested_path.exists():
+        if requested_path.resolve() == default_local_config or args.dry_run:
+            if not CONFIG_TEMPLATE_PATH.exists():
+                raise FileNotFoundError(f"missing template config: {CONFIG_TEMPLATE_PATH}")
+            requested_path = CONFIG_TEMPLATE_PATH
+            force_dry_run = True
+            reasons.append(f"booted from template because {persist_path} does not exist")
+        else:
+            raise FileNotFoundError(f"missing config: {persist_path}")
+
+    if requested_path.resolve() == CONFIG_TEMPLATE_PATH.resolve():
+        force_dry_run = True
+        if persist_path == requested_path:
+            persist_path = RUNTIME_DIR / "local_config.yaml"
+        reasons.append("template-backed session keeps launch actions disabled until a real config is saved")
+
+    return requested_path, persist_path, force_dry_run, "; ".join(dict.fromkeys(reasons))
 
 
 def detach_process(args: argparse.Namespace) -> int:
@@ -1801,6 +1881,8 @@ def detach_process(args: argparse.Namespace) -> int:
         command.extend(["--port", str(args.port)])
     if args.open_browser:
         command.append("--open-browser")
+    if args.dry_run:
+        command.append("--dry-run")
 
     env = os.environ.copy()
     env["CONTROL_PLANE_DETACHED"] = "1"
@@ -1820,15 +1902,31 @@ def detach_process(args: argparse.Namespace) -> int:
 
 def main() -> int:
     args = parse_args()
-    if not args.config.exists():
-        print(f"missing config: {args.config}", file=sys.stderr)
-        print(f"copy {RUNTIME_DIR / 'config_template.yaml'} to {args.config} and fill it first", file=sys.stderr)
+    try:
+        config_path, persist_config_path, force_dry_run, dry_run_reason = resolve_runtime_config(args)
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        print(
+            f"use --dry-run or point --config at {CONFIG_TEMPLATE_PATH} to render the dashboard without a filled local config",
+            file=sys.stderr,
+        )
         return 2
 
     if args.detach and os.environ.get("CONTROL_PLANE_DETACHED") != "1":
+        args.config = config_path
+        args.dry_run = force_dry_run
         return detach_process(args)
 
-    service = ControlPlaneService(args.config, host_override=args.host, port_override=args.port)
+    service = ControlPlaneService(
+        config_path,
+        host_override=args.host,
+        port_override=args.port,
+        persist_config_path=persist_config_path,
+        force_dry_run=force_dry_run,
+    )
+    if service.dry_run and dry_run_reason:
+        service.dry_run_reason = dry_run_reason
+        service.last_event = f"dry_run:{dry_run_reason}"
 
     def handle_signal(signum: int, frame: Any) -> None:  # pragma: no cover - signal path
         del signum, frame
