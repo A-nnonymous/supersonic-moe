@@ -55,12 +55,24 @@ No work is considered active unless it is reflected here.
 
 The local webpage now provides:
 
-- editable local YAML config for resource pool keys, provider/model selection, Paddle path, worktrees, branches, and commands
-- one-click save for config changes
-- one-click launch, restart, and stop for configured workers
-- generated main-agent startup commands for both `serve` and `up` modes
+- a compact top bar for save, launch, restart, stop, refresh, and command copy actions
+- a default first screen that shows every manager and worker agent as a status card
+- summary cards for visible agents, attention-needed agents, validation count, and last event
+- an editable local YAML config in a collapsible editor
+- commands, validation, and provider queue directly below the agent overview
+- low-frequency sections such as worker config, project/processes, operational state, and reference data folded behind details panels
 - provider priority queue with runtime connection-quality and work-quality scoring
-- live views for runtime topology, heartbeats, backlog, gates, worker config, and manager report
+
+## Interaction model
+
+The dashboard is intentionally simple:
+
+1. check the agent wall first to see who is active, parked, stale, or offline
+2. confirm the summary cards and validation block
+3. fix config issues in the collapsible editor if needed
+4. copy the `serve` or `up` command when you need terminal control
+5. use `Launch`, `Restart`, or `Stop` from the top bar for normal operations
+6. open the folded sections only when you need deeper runtime inspection
 
 ## Execution topology rule
 
