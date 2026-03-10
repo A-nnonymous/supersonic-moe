@@ -40,6 +40,8 @@ The orchestrator reads:
 - provider priority queue and per-worker fallback queue
 - Paddle absolute path
 - worktree and branch assignments
+- per-worker git commit identity
+- manager integration branch and optional manager git identity
 - environment and test commands
 
 The dashboard is served on port `8233` by default.
@@ -107,12 +109,18 @@ Required fields to set:
 - `local_workspace_root`
 - `worktree_path`
 - `branch`
+- `merge_target`
 - `environment_type`
 - `environment_path`
 - `sync_command`
 - `test_command`
 - `submit_strategy`
 - `status`
+
+Recommended identity fields to set when workers produce commits:
+
+- `git_identity.name`
+- `git_identity.email`
 
 ### 5. Initialize status and checkpoint
 
@@ -163,6 +171,7 @@ Allowed submit modes:
 Manager rules:
 
 - A0 owns final integration
+- A0 merges worker branches into the configured integration branch
 - A0 decides whether to cherry-pick or merge
 - no worker should integrate directly into the manager branch
 
