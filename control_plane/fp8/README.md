@@ -63,19 +63,33 @@ If you are validating Blackwell kernels directly on B200 or GB200, set `USE_QUAC
 
 Use the control plane in one of these modes:
 
-- `serve --dry-run`: the default remote debug path; now binds to `0.0.0.0` and detaches automatically unless you pass `--foreground`
+- `serve --bootstrap`: the explicit cold-start path; it accepts template-backed editing immediately and detaches automatically on remote-first startup unless you pass `--foreground`
 - `serve`: open the dashboard with your saved config, but do not launch workers until you explicitly press `Launch` or `Restart`
 - `up`: start the dashboard and immediately start all configured workers
 
-If `runtime/local_config.yaml` is missing, the runtime automatically falls back to `runtime/config_template.yaml` and switches into dry-run mode. If you later save a real config from the Settings page, it is written to `runtime/local_config.yaml` automatically.
+If `runtime/local_config.yaml` is missing, the runtime automatically falls back to `runtime/config_template.yaml` and enters cold-start mode. If you later save a real config from the Settings page, it is written to `runtime/local_config.yaml` automatically.
+
+## Frontend architecture
+
+The dashboard frontend is now served as compiled static assets from `runtime/web/static/`.
+
+- source code lives in `runtime/web/src/`
+- the runtime serves `index.html`, `app.js`, and `app.css` directly instead of embedding HTML and JavaScript inside `control_plane.py`
+- UI state is managed in React so tabs, top-bar actions, settings editing, and refresh behavior share one predictable state model
+
+When you change the frontend source, rebuild it with:
+
+`cd control_plane/fp8/runtime/web && npm install && npm run build`
+
+The built assets in `runtime/web/static/` are what the Python runtime serves in production.
 
 ## Quickstart
 
 ### 1. Default remote startup
 
-Use this as the primary bring-up path on a remote machine. It starts the control plane in dry-run mode, listens on all interfaces, and returns the shell immediately:
+Use this as the primary bring-up path on a remote machine. It starts the control plane in cold-start mode, listens on all interfaces, and returns the shell immediately:
 
-`python control_plane/fp8/runtime/control_plane.py serve --dry-run`
+`python control_plane/fp8/runtime/control_plane.py serve --bootstrap`
 
 If you do not want background mode, add `--foreground`.
 
@@ -108,7 +122,7 @@ Use this when your config is ready and the manager wants to begin active multi-a
 
 Use one of these paths:
 
-1. Preferred: click `Stop` in the top bar. This stops all worker processes while keeping the dashboard online.
+1. Preferred: click `Stop Agents` in the top bar. This stops all worker processes while keeping the dashboard online.
 2. Remote or scripted control: `python control_plane/fp8/runtime/control_plane.py stop-agents`
 3. Full shutdown: stop the foreground process with `Ctrl-C`, or stop the detached control-plane process from the shell.
 
@@ -126,9 +140,9 @@ Use the short form by default:
 
 - `serve` opens the control plane only
 - `up` opens the control plane and launches workers
-- `--dry-run` forces dashboard-only mode
+- `--bootstrap` forces template-backed cold-start mode
 - `--open-browser` opens the dashboard automatically
-- `--foreground` disables the new auto-detach behavior for `serve --dry-run`
+- `--foreground` disables the auto-detach behavior for remote cold-start `serve`
 
 Add these only when needed:
 
@@ -140,17 +154,23 @@ Add these only when needed:
 
 ## Stop commands
 
-Use these shell commands when you want to control a running detached session from the same machine:
+Use these shell commands when you want to control a running detached session from the same machine. The runtime now records per-port session state, so `--port 8233` targets the listener you actually care about even if another control-plane instance was started elsewhere.
 
 - stop worker agents only: `python control_plane/fp8/runtime/control_plane.py stop-agents`
 - stop the dashboard listener only: `python control_plane/fp8/runtime/control_plane.py stop-listener`
 - stop both the dashboard listener and all worker agents: `python control_plane/fp8/runtime/control_plane.py stop-all`
 
+`stop-all` is the hard stop path:
+
+- it terminates worker process groups, not just parent PIDs
+- it waits for the target listener port to be released before reporting success
+- when the dashboard is running on `8233`, the command verifies that `8233` is actually clean before it returns
+
 ### Fire-and-forget mode
 
 If you want the control plane to keep running after the shell returns, use detached mode:
 
-`python control_plane/fp8/runtime/control_plane.py serve --dry-run`
+`python control_plane/fp8/runtime/control_plane.py serve --bootstrap`
 
 The detached process writes combined stdout and stderr to `control_plane/fp8/runtime/control_plane.log` by default. You can override that path with `--log-file`.
 
@@ -162,9 +182,9 @@ If you need to run the control plane from a lightweight manager machine that doe
 
 `uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/control_plane.py serve --open-browser`
 
-That same standalone path also supports dry-run startup with no `local_config.yaml` present:
+That same standalone path also supports cold-start startup with no `local_config.yaml` present:
 
-`uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/control_plane.py serve --dry-run --open-browser`
+`uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/control_plane.py serve --bootstrap --open-browser`
 
 ### Remote access note
 
@@ -174,7 +194,7 @@ If your deployment hostname resolves to IPv6 first, an IPv6-only listener can st
 
 The local webpage now provides:
 
-- a compact top bar for launch, restart, stop, refresh, and command copy actions
+- a compact top bar for launch, restart, stop agents, stop all, refresh, and command copy actions
 - an `Overview` page that shows agent dashboards, overall delivery progress, and branch merge status at a glance
 - an `Operations` page for commands, validation, provider queue, merge queue, runtime state, heartbeats, backlog, and manager report
 - a `Settings` page for API keys, provider routing, Paddle path, worktrees, worker commands, and git submission identities
@@ -182,18 +202,20 @@ The local webpage now provides:
 - provider priority queue with runtime connection-quality and work-quality scoring
 - per-worker git commit identities that are applied inside each worker worktree before launch
 - a manager-owned merge queue that tracks which worker branch should be integrated into the target branch
+- React-managed UI state so page navigation and actions stay interactive under refresh and cold-start edits
 
 ## Real usage pattern
 
 For actual SonicMoE FP8 multi-agent delivery, the normal manager loop is:
 
-1. bring the control plane up with `serve --dry-run` or `serve --open-browser`
+1. bring the control plane up with `serve --bootstrap` or `serve --open-browser`
 2. verify Settings and validation output are clean
 3. press `Launch` or run `up --open-browser`
 4. monitor agent health, backlog progress, and branch merge status from `Overview`
 5. inspect provider routing, runtime topology, and heartbeats in `Operations`
-6. press `Stop` or run `stop-agents` when you want to pause the worker fleet without losing dashboard state
-7. let A0 merge finished worker branches into `project.integration_branch`
+6. press `Stop Agents` or run `stop-agents` when you want to pause the worker fleet without losing dashboard state
+7. press `Stop All` or run `stop-all --port 8233` when you need the listener port and every worker process fully released
+8. let A0 merge finished worker branches into `project.integration_branch`
 
 ## Interaction model
 
@@ -203,7 +225,7 @@ The dashboard is intentionally simple:
 2. move to `Operations` when you need runtime inspection, launch commands, validation, or provider scheduling detail
 3. move to `Settings` when you need to edit API keys, provider assignments, Paddle paths, worker commands, or per-worker git identities
 4. let A0 own merge timing and final integration into `project.integration_branch`
-5. use `Launch`, `Restart`, or `Stop` from the top bar for normal operations
+5. use `Launch`, `Restart`, `Stop Agents`, or `Stop All` from the top bar for normal operations
 6. copy the `serve` or `up` command when you need terminal control
 
 ## Execution topology rule

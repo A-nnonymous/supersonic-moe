@@ -93,10 +93,10 @@ If you are testing Blackwell kernels directly on B200 or GB200, export `USE_QUAC
 1. Default remote startup with the fewest parameters:
 
 ```bash
-python control_plane/fp8/runtime/control_plane.py serve --dry-run
+python control_plane/fp8/runtime/control_plane.py serve --bootstrap
 ```
 
-This now defaults to a remote-friendly detached run for dry-run mode. Add `--foreground` if you want to keep it attached to the current shell.
+This now defaults to a remote-friendly detached run for cold-start mode. Add `--foreground` if you want to keep it attached to the current shell.
 
 2. For real multi-agent execution, fill `control_plane/fp8/runtime/local_config.yaml` with:
 
@@ -132,6 +132,8 @@ python control_plane/fp8/runtime/control_plane.py stop-listener
 python control_plane/fp8/runtime/control_plane.py stop-all
 ```
 
+When you use `stop-all`, the runtime terminates worker process groups and waits for the dashboard port to be released before reporting success. For the default listener, `stop-all --port 8233` is the safest explicit form.
+
 6. Override bind address when needed:
 
 ```bash
@@ -148,18 +150,27 @@ uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/cont
 
 - the first screen shows every manager and worker agent as a status card
 - the overview page stays focused on agent dashboards and overall program progress
-- the dashboard can save config, launch workers, restart workers, stop workers, and copy startup commands
+- the dashboard now uses a compiled React frontend served from `control_plane/fp8/runtime/web/static/`
+- the dashboard can save config, launch workers, restart workers, stop agents, stop all, and copy startup commands
 - worker launch decisions use static pool priority plus runtime connection-quality and work-quality scoring
 - each worker can carry its own git identity, and A0 owns final merge into the integration branch
 - every worker may declare a `resource_pool_queue` for fallback ordering
 - provider queue, runtime topology, heartbeats, and validation errors remain available in the dashboard
+
+If you change the frontend source under `control_plane/fp8/runtime/web/src/`, rebuild it with:
+
+```bash
+cd control_plane/fp8/runtime/web
+npm install
+npm run build
+```
 
 ### Control Plane Notes
 
 - on a real Hopper or Blackwell deployment host, the direct `python ...` commands above are the default path
 - keep worker `test_command` and benchmark commands pointed at the same CUDA-capable environment that will run real validation on the target GPU
 - the control plane source of truth remains `control_plane/fp8/README.md`
-- use `control_plane/fp8/README.md` for the full manager workflow, including dry-run, start, pause, and resume guidance
+- use `control_plane/fp8/README.md` for the full manager workflow, including cold-start, start, pause, and resume guidance
 - stop commands are available separately for agents, listener, or both: `stop-agents`, `stop-listener`, and `stop-all`
 
 ### Example usage
