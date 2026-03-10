@@ -226,20 +226,19 @@ class ControlPlaneService:
         host_override: str | None = None,
         port_override: int | None = None,
         persist_config_path: Path | None = None,
-        force_dry_run: bool = False,
+        bootstrap_requested: bool = False,
     ):
         self.config_path = config_path
         self.persist_config_path = persist_config_path or config_path
         self.host_override = host_override
         self.port_override = port_override
-        self.force_dry_run = force_dry_run
+        self.bootstrap_requested = bootstrap_requested
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
         self.monitor_thread: threading.Thread | None = None
         self.server_threads: list[threading.Thread] = []
         self.http_servers: list[ThreadingHTTPServer] = []
         self.processes: dict[str, WorkerProcess] = {}
-        self.simulated_processes: dict[str, dict[str, Any]] = {}
         self.last_event = "initialized"
         PROMPT_DIR.mkdir(parents=True, exist_ok=True)
         LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -249,8 +248,8 @@ class ControlPlaneService:
         self.resource_pools: dict[str, Any] = {}
         self.workers: list[dict[str, Any]] = []
         self.provider_stats: dict[str, dict[str, Any]] = {}
-        self.dry_run = False
-        self.dry_run_reason = ""
+        self.bootstrap_mode = False
+        self.bootstrap_reason = ""
         self.listen_host = ""
         self.listen_port = 0
         self.listen_endpoints: list[str] = []
@@ -258,17 +257,15 @@ class ControlPlaneService:
 
     def refresh_runtime_mode(self) -> None:
         using_template = self.config_path.resolve() == CONFIG_TEMPLATE_PATH.resolve()
-        self.dry_run = self.force_dry_run or using_template
+        self.bootstrap_mode = using_template
         reasons: list[str] = []
         if using_template:
-            reasons.append(
-                f"using template config {self.config_path} simulates launch actions until a real config is saved"
-            )
+            reasons.append(f"cold-start bootstrap loaded from template {self.config_path}")
         if self.persist_config_path != self.config_path:
             reasons.append(f"save target is {self.persist_config_path}")
-        if self.force_dry_run:
-            reasons.append("--dry-run is enabled")
-        self.dry_run_reason = "; ".join(reasons)
+        if self.bootstrap_requested and using_template:
+            reasons.append("bootstrap mode was requested explicitly")
+        self.bootstrap_reason = "; ".join(reasons)
 
     def reload_config(self) -> None:
         with self.lock:
@@ -308,6 +305,8 @@ class ControlPlaneService:
 
     def validation_errors(self, config: dict[str, Any] | None = None) -> list[str]:
         cfg = config or self.config
+        if not isinstance(cfg, dict):
+            return ["top-level config must be a YAML mapping"]
         errors: list[str] = []
         project = cfg.get("project", {})
         providers = cfg.get("providers", {})
@@ -315,26 +314,26 @@ class ControlPlaneService:
         workers = cfg.get("workers", [])
 
         if not project.get("repository_name"):
-            errors.append("project.repository_name is required")
+            errors.append("project.repository_name is recommended")
         if not project.get("local_repo_root"):
-            errors.append("project.local_repo_root is required")
+            errors.append(f"project.local_repo_root is recommended; default runtime root is {REPO_ROOT}")
         elif is_placeholder_path(project.get("local_repo_root")):
-            errors.append("project.local_repo_root must be replaced with a real path")
+            errors.append("project.local_repo_root still points at a placeholder path")
         if not project.get("paddle_repo_path"):
-            errors.append("project.paddle_repo_path is required")
+            errors.append("project.paddle_repo_path is recommended for reference tracing")
         elif is_placeholder_path(project.get("paddle_repo_path")):
-            errors.append("project.paddle_repo_path must be replaced with a real path")
+            errors.append("project.paddle_repo_path still points at a placeholder path")
         dashboard = project.get("dashboard", {})
         if not dashboard.get("host"):
-            errors.append("project.dashboard.host is required")
+            errors.append("project.dashboard.host is recommended")
         if not dashboard.get("port"):
-            errors.append("project.dashboard.port is required")
+            errors.append("project.dashboard.port is recommended")
         if project.get("manager_git_identity"):
             manager_identity = project.get("manager_git_identity", {})
             if not str(manager_identity.get("name", "")).strip():
-                errors.append("project.manager_git_identity.name is required when manager_git_identity is set")
+                errors.append("project.manager_git_identity.name should be set when manager_git_identity is present")
             if not str(manager_identity.get("email", "")).strip():
-                errors.append("project.manager_git_identity.email is required when manager_git_identity is set")
+                errors.append("project.manager_git_identity.email should be set when manager_git_identity is present")
 
         seen_agents: set[str] = set()
         seen_branches: set[str] = set()
@@ -345,7 +344,7 @@ class ControlPlaneService:
             if provider_name not in providers:
                 errors.append(f"resource_pools.{pool_name}.provider references unknown provider {provider_name}")
             if not pool.get("model"):
-                errors.append(f"resource_pools.{pool_name}.model is required")
+                errors.append(f"resource_pools.{pool_name}.model is recommended")
             priority = pool.get("priority", 100)
             if not isinstance(priority, int):
                 errors.append(f"resource_pools.{pool_name}.priority must be an integer")
@@ -364,7 +363,7 @@ class ControlPlaneService:
             if pool_name and pool_name not in resource_pools:
                 errors.append(f"worker {agent} references unknown resource_pool {pool_name}")
             if not pool_name and not pool_queue:
-                errors.append(f"worker {agent} must define resource_pool or resource_pool_queue")
+                errors.append(f"worker {agent} should define resource_pool or resource_pool_queue")
             if pool_queue and not isinstance(pool_queue, list):
                 errors.append(f"worker {agent} resource_pool_queue must be a list")
             for candidate_pool in pool_queue if isinstance(pool_queue, list) else []:
@@ -372,7 +371,7 @@ class ControlPlaneService:
                     errors.append(f"worker {agent} resource_pool_queue references unknown pool {candidate_pool}")
             branch = str(worker.get("branch", "")).strip()
             if not branch:
-                errors.append(f"worker {agent} branch is required")
+                errors.append(f"worker {agent} branch is required for launch")
             elif branch in seen_branches:
                 errors.append(f"duplicate worker branch {branch}")
             else:
@@ -380,9 +379,9 @@ class ControlPlaneService:
 
             worktree = str(worker.get("worktree_path", "")).strip()
             if not worktree:
-                errors.append(f"worker {agent} worktree_path is required")
+                errors.append(f"worker {agent} worktree_path is required for launch")
             elif is_placeholder_path(worktree):
-                errors.append(f"worker {agent} worktree_path must be replaced with a real path")
+                errors.append(f"worker {agent} worktree_path still points at a placeholder path")
             elif worktree in seen_worktrees:
                 errors.append(f"duplicate worker worktree_path {worktree}")
             else:
@@ -390,12 +389,12 @@ class ControlPlaneService:
 
             environment_path = worker.get("environment_path")
             if worker.get("environment_type") not in {"none", None} and is_placeholder_path(environment_path):
-                errors.append(f"worker {agent} environment_path must be replaced with a real path")
+                errors.append(f"worker {agent} environment_path still points at a placeholder path")
 
             if not worker.get("test_command"):
-                errors.append(f"worker {agent} test_command is required")
+                errors.append(f"worker {agent} test_command is recommended")
             if not worker.get("submit_strategy"):
-                errors.append(f"worker {agent} submit_strategy is required")
+                errors.append(f"worker {agent} submit_strategy is recommended")
             git_identity = worker.get("git_identity")
             if git_identity is not None:
                 if not isinstance(git_identity, dict):
@@ -408,18 +407,109 @@ class ControlPlaneService:
 
         return errors
 
+    def launch_blockers(self, config: dict[str, Any] | None = None) -> list[str]:
+        cfg = config or self.config
+        if not isinstance(cfg, dict):
+            return ["top-level config must be a YAML mapping before launch"]
+
+        blockers: list[str] = []
+        providers = cfg.get("providers", {})
+        resource_pools = cfg.get("resource_pools", {})
+        workers = cfg.get("workers", [])
+
+        if not isinstance(providers, dict):
+            blockers.append("providers must be a mapping")
+            providers = {}
+        if not isinstance(resource_pools, dict):
+            blockers.append("resource_pools must be a mapping")
+            resource_pools = {}
+        if not isinstance(workers, list):
+            blockers.append("workers must be a list")
+            workers = []
+
+        if not workers:
+            blockers.append("define at least one worker before launch")
+
+        seen_agents: set[str] = set()
+        seen_branches: set[str] = set()
+        seen_worktrees: set[str] = set()
+
+        for pool_name, pool in resource_pools.items():
+            provider_name = pool.get("provider")
+            if not provider_name:
+                blockers.append(f"resource_pools.{pool_name}.provider is required")
+            elif provider_name not in providers:
+                blockers.append(f"resource_pools.{pool_name}.provider references unknown provider {provider_name}")
+            if not pool.get("model"):
+                blockers.append(f"resource_pools.{pool_name}.model is required")
+            if not isinstance(pool.get("priority", 100), int):
+                blockers.append(f"resource_pools.{pool_name}.priority must be an integer")
+
+        for provider_name, provider in providers.items():
+            template = provider.get("command_template")
+            if not template:
+                blockers.append(f"providers.{provider_name}.command_template is required")
+
+        for worker in workers:
+            agent = str(worker.get("agent", "")).strip()
+            if not agent:
+                blockers.append("worker.agent is required")
+                continue
+            if agent in seen_agents:
+                blockers.append(f"duplicate worker agent {agent}")
+            seen_agents.add(agent)
+
+            branch = str(worker.get("branch", "")).strip()
+            if not branch:
+                blockers.append(f"worker {agent} branch is required")
+            elif branch in seen_branches:
+                blockers.append(f"duplicate worker branch {branch}")
+            else:
+                seen_branches.add(branch)
+
+            worktree = str(worker.get("worktree_path", "")).strip()
+            if not worktree:
+                blockers.append(f"worker {agent} worktree_path is required")
+            elif is_placeholder_path(worktree):
+                blockers.append(f"worker {agent} worktree_path must be replaced with a real path")
+            elif worktree in seen_worktrees:
+                blockers.append(f"duplicate worker worktree_path {worktree}")
+            else:
+                seen_worktrees.add(worktree)
+
+            pool_name = worker.get("resource_pool")
+            pool_queue = worker.get("resource_pool_queue", [])
+            if pool_name and pool_name not in resource_pools:
+                blockers.append(f"worker {agent} references unknown resource_pool {pool_name}")
+            if not pool_name and not pool_queue:
+                blockers.append(f"worker {agent} must define resource_pool or resource_pool_queue")
+            if pool_queue and not isinstance(pool_queue, list):
+                blockers.append(f"worker {agent} resource_pool_queue must be a list")
+            for candidate_pool in pool_queue if isinstance(pool_queue, list) else []:
+                if candidate_pool not in resource_pools:
+                    blockers.append(f"worker {agent} resource_pool_queue references unknown pool {candidate_pool}")
+
+            environment_path = worker.get("environment_path")
+            if worker.get("environment_type") not in {"none", None} and is_placeholder_path(environment_path):
+                blockers.append(f"worker {agent} environment_path must be replaced with a real path")
+            if not worker.get("test_command"):
+                blockers.append(f"worker {agent} test_command is required")
+            if not worker.get("submit_strategy"):
+                blockers.append(f"worker {agent} submit_strategy is required")
+
+        return blockers
+
     def save_config_text(self, raw_text: str) -> list[str]:
         parsed = yaml.safe_load(raw_text) or {}
-        errors = self.validation_errors(parsed)
-        if errors:
-            return errors
+        if not isinstance(parsed, dict):
+            raise ValueError("top-level config must be a YAML mapping")
         target_path = self.persist_config_path
         target_path.parent.mkdir(parents=True, exist_ok=True)
         target_path.write_text(yaml_text(parsed), encoding="utf-8")
         self.config_path = target_path
         self.reload_config()
         self.last_event = f"config_saved:{now_iso()}"
-        return []
+        return self.validation_errors(parsed)
 
     def configured_api_key(self, provider: dict[str, Any], pool: dict[str, Any]) -> str:
         api_env_name = provider.get("api_key_env_name")
@@ -549,7 +639,6 @@ class ControlPlaneService:
             }
             for agent, worker in self.processes.items()
         }
-        worker_payload.update(self.simulated_processes)
         payload = {
             "updated_at": now_iso(),
             "last_event": self.last_event,
@@ -560,7 +649,8 @@ class ControlPlaneService:
                 "endpoints": self.listen_endpoints,
                 "config_path": str(self.config_path),
                 "persist_config_path": str(self.persist_config_path),
-                "dry_run": self.dry_run,
+                "cold_start": self.bootstrap_mode,
+                "bootstrap_reason": self.bootstrap_reason,
                 "alive": not self.stop_event.is_set(),
             },
             "workers": worker_payload,
@@ -570,12 +660,9 @@ class ControlPlaneService:
     def build_cli_commands(self) -> dict[str, str]:
         host = self.host_override or self.project.get("dashboard", {}).get("host", "127.0.0.1")
         port = self.port_override or int(self.project.get("dashboard", {}).get("port", 8233))
-        config = str(self.config_path)
+        config = str(self.persist_config_path)
         serve = f"{CONTROL_PLANE_RUNTIME} control_plane/fp8/runtime/control_plane.py serve --config {config} --host {host} --port {port} --open-browser"
         up = f"{CONTROL_PLANE_RUNTIME} control_plane/fp8/runtime/control_plane.py up --config {config} --host {host} --port {port} --open-browser"
-        if self.dry_run:
-            serve += " --dry-run"
-            up += " --dry-run"
         return {"serve": serve, "up": up}
 
     def task_title(self, task_id: str) -> str:
@@ -879,9 +966,7 @@ Primary test command:
 
     def launch_all(self, restart: bool = False) -> dict[str, Any]:
         with self.lock:
-            if self.dry_run:
-                return self.simulate_launch_all(restart=restart)
-            errors = self.validation_errors()
+            errors = self.launch_blockers()
             if errors:
                 return {"ok": False, "errors": errors}
             if restart:
@@ -928,19 +1013,6 @@ Primary test command:
                     )
                 stopped.append(agent)
                 del self.processes[agent]
-            for agent, worker in list(self.simulated_processes.items()):
-                runtime_entry = next((w for w in self.workers if w.get("agent") == agent), None)
-                if runtime_entry:
-                    self.update_runtime_entry(
-                        runtime_entry,
-                        str(worker.get("resource_pool", "unassigned")),
-                        str(worker.get("provider", "unassigned")),
-                        str(worker.get("model", "unassigned")),
-                        "stopped",
-                    )
-                self.update_heartbeat(agent, "offline", "dry_run_stop", "none")
-                stopped.append(agent)
-                del self.simulated_processes[agent]
             self.last_event = f"stop:{len(stopped)} workers"
             self.write_session_state()
             return {"ok": True, "stopped": stopped}
@@ -959,48 +1031,7 @@ Primary test command:
                 "log_path": str(worker.log_path),
                 "command": worker.command,
             }
-        snapshot.update(self.simulated_processes)
         return snapshot
-
-    def simulate_launch_all(self, restart: bool = False) -> dict[str, Any]:
-        if restart:
-            self.stop_workers()
-        launched: list[dict[str, Any]] = []
-        for worker in self.workers:
-            agent = str(worker.get("agent", "")).strip()
-            if not agent or agent in self.simulated_processes:
-                continue
-            pool_name = str(worker.get("resource_pool") or "unassigned")
-            pool = self.resource_pools.get(pool_name, {})
-            provider_name = str(worker.get("provider") or pool.get("provider") or "unassigned")
-            model = str(worker.get("model") or pool.get("model") or "unassigned")
-            self.simulated_processes[agent] = {
-                "resource_pool": pool_name,
-                "provider": provider_name,
-                "model": model,
-                "pid": "dry-run",
-                "alive": True,
-                "returncode": None,
-                "worktree_path": str(worker.get("worktree_path", "unassigned")),
-                "log_path": "dry-run",
-                "command": ["dry-run", agent],
-                "simulated": True,
-            }
-            self.update_runtime_entry(worker, pool_name, provider_name, model, "active")
-            self.update_heartbeat(agent, "healthy", "dry_run_launch", "none")
-            launched.append(
-                {
-                    "agent": agent,
-                    "resource_pool": pool_name,
-                    "provider": provider_name,
-                    "model": model,
-                    "pid": "dry-run",
-                    "command": ["dry-run", agent],
-                }
-            )
-        self.last_event = f"dry_run_launch:{len(launched)} workers"
-        self.write_session_state()
-        return {"ok": True, "launched": launched, "failures": [], "dry_run": True}
 
     def build_dashboard_state(self) -> dict[str, Any]:
         config_text = self.config_path.read_text(encoding="utf-8") if self.config_path.exists() else ""
@@ -1008,8 +1039,9 @@ Primary test command:
             "updated_at": now_iso(),
             "last_event": self.last_event,
             "mode": {
-                "dry_run": self.dry_run,
-                "reason": self.dry_run_reason,
+                "state": "cold-start" if self.bootstrap_mode else "configured",
+                "cold_start": self.bootstrap_mode,
+                "reason": self.bootstrap_reason,
                 "config_path": str(self.config_path),
                 "persist_config_path": str(self.persist_config_path),
             },
@@ -1026,6 +1058,7 @@ Primary test command:
             "config": self.config,
             "config_text": config_text,
             "validation_errors": self.validation_errors(),
+            "launch_blockers": self.launch_blockers(),
         }
 
     def monitor_loop(self) -> None:
@@ -1102,10 +1135,15 @@ Primary test command:
             except Exception as exc:
                 self.write_json(handler, {"ok": False, "error": str(exc)}, status=400)
                 return True
-            if errors:
-                self.write_json(handler, {"ok": False, "errors": errors}, status=400)
-                return True
-            self.write_json(handler, {"ok": True, "validation_errors": self.validation_errors()})
+            self.write_json(
+                handler,
+                {
+                    "ok": True,
+                    "validation_errors": errors,
+                    "launch_blockers": self.launch_blockers(),
+                    "cold_start": self.bootstrap_mode,
+                },
+            )
             return True
 
         if handler.path == "/api/launch":
@@ -1193,10 +1231,11 @@ Primary test command:
     def run_up(self, open_browser: bool = False) -> None:
         self.start_monitoring()
         self.start_dashboard(open_browser=open_browser)
-        if self.dry_run:
-            self.last_event = f"dry_run:{self.dry_run_reason or 'dashboard only'}"
-        else:
-            self.launch_all()
+        result = self.launch_all()
+        if not result.get("ok"):
+            launch_blockers = result.get("errors") or []
+            if launch_blockers:
+                self.last_event = f"cold_start: launch blocked by {len(launch_blockers)} issue(s)"
         self.wait_forever()
 
     def run_serve(self, open_browser: bool = False) -> None:
@@ -1480,16 +1519,63 @@ DASHBOARD_HTML = """<!doctype html>
         </section>
     </main>
     <script>
-        let editorDirty = false;
-        let actionInFlight = false;
-        let latestRefreshOk = false;
-        let latestState = {};
-        let currentCommands = { serve: '', up: '' };
-        let currentTab = 'overview';
+        const dashboard = {
+            initialized: false,
+            editorDirty: false,
+            actionInFlight: false,
+            latestRefreshOk: false,
+            latestState: {},
+            currentCommands: { serve: '', up: '' },
+            currentTab: 'overview',
+            elements: null,
+        };
 
-        const editor = () => document.getElementById('config_editor');
+        function byId(id) {
+            return document.getElementById(id);
+        }
+
+        function requireElement(id) {
+            const node = byId(id);
+            if (!node) {
+                throw new Error(`missing dashboard element: ${id}`);
+            }
+            return node;
+        }
+
+        function cacheElements() {
+            return {
+                editor: requireElement('config_editor'),
+                statusLine: requireElement('status_line'),
+                autoRefresh: requireElement('auto_refresh'),
+                topMeta: requireElement('top_meta'),
+                summary: requireElement('summary'),
+                agentWall: requireElement('agent_wall'),
+                progressFill: requireElement('progress_fill'),
+                progressMeta: requireElement('progress_meta'),
+                progressDetails: requireElement('progress_details'),
+                overviewSnapshot: requireElement('overview_snapshot'),
+                overviewMergeBoard: requireElement('overview_merge_board'),
+                mergeQueue: requireElement('merge_queue'),
+                project: requireElement('project'),
+                processes: requireElement('processes'),
+                providerQueue: requireElement('provider_queue'),
+                runtime: requireElement('runtime'),
+                heartbeats: requireElement('heartbeats'),
+                backlog: requireElement('backlog'),
+                gates: requireElement('gates'),
+                settingsProject: requireElement('settings_project'),
+                settingsResourcePools: requireElement('settings_resource_pools'),
+                settingsWorkers: requireElement('settings_workers'),
+                settingsMergePolicy: requireElement('settings_merge_policy'),
+                managerReport: requireElement('manager_report'),
+                commands: requireElement('commands'),
+                validation: requireElement('validation'),
+                mergeStatusMeta: requireElement('merge_status_meta'),
+                agentStatusMeta: requireElement('agent_status_meta'),
+            };
+        }
+
         const actionButtons = () => Array.from(document.querySelectorAll('[data-action]'));
-        const autoRefresh = () => document.getElementById('auto_refresh').checked;
         const tabButtons = () => Array.from(document.querySelectorAll('[data-tab]'));
 
         function renderTable(rows, columns) {
@@ -1605,11 +1691,12 @@ DASHBOARD_HTML = """<!doctype html>
             const agentRows = buildAgentRows(data);
             const progress = buildProgressModel(data, agentRows);
             const validationCount = (data.validation_errors || []).length;
+            const launchBlockerCount = (data.launch_blockers || []).length;
             const cards = [
                 { label: 'Agents', value: agentRows.length, hint: `${progress.activeAgents} active or healthy` },
                 { label: 'Overall Progress', value: `${progress.progress}%`, hint: `${progress.passedGates}/${progress.totalGates} gates passed` },
                 { label: 'Attention Needed', value: progress.attentionAgents, hint: `${progress.blockedItems} backlog items blocked` },
-                { label: 'Validation Issues', value: validationCount, hint: validationCount ? 'settings need cleanup' : 'settings are ready' },
+                { label: 'Launch Blockers', value: launchBlockerCount, hint: launchBlockerCount ? `${validationCount} config notes` : 'launch path is ready' },
             ];
             return cards.map((item) => `<div class=\"metric\"><strong>${item.value}</strong><div>${item.label}</div><div class=\"small\">${item.hint}</div></div>`).join('');
         }
@@ -1618,6 +1705,7 @@ DASHBOARD_HTML = """<!doctype html>
             const entries = [
                 { title: 'Current gate', body: progress.openGate ? `${progress.openGate.id} · ${progress.openGate.name}` : 'All gates passed' },
                 { title: 'Backlog completion', body: `${progress.completedItems}/${progress.totalItems} items complete` },
+                { title: 'Startup state', body: data.mode?.reason || data.mode?.state || 'configured' },
                 { title: 'Last event', body: data.last_event || 'none' },
             ];
             return entries.map((item) => `<section class=\"helper-card\"><h3>${item.title}</h3><p class=\"small\">${item.body}</p></section>`).join('');
@@ -1651,7 +1739,7 @@ DASHBOARD_HTML = """<!doctype html>
             const rows = items || [];
             const reviewReady = rows.filter((item) => ['offline', 'stopped'].includes(String(item.status))).length;
             const inFlight = rows.filter((item) => ['active', 'healthy'].includes(String(item.status))).length;
-            document.getElementById('merge_status_meta').textContent = `${inFlight} in progress, ${reviewReady} ready for manager review`;
+            dashboard.elements.mergeStatusMeta.textContent = `${inFlight} in progress, ${reviewReady} ready for manager review`;
             if (!rows.length) {
                 return '<div class="small muted">No worker branches registered for manager merge review.</div>';
             }
@@ -1684,7 +1772,7 @@ DASHBOARD_HTML = """<!doctype html>
         function renderAgentWall(data) {
             const rows = buildAgentRows(data);
             const meta = `${rows.filter((item) => item.display_state === 'active' || item.display_state === 'healthy').length} active, ${rows.filter((item) => item.display_state === 'stale' || String(item.display_state).startsWith('launch_failed')).length} need attention`;
-            document.getElementById('agent_status_meta').textContent = meta;
+            dashboard.elements.agentStatusMeta.textContent = meta;
             return rows.map((item) => {
                 const processLine = item.process_alive ? `pid ${item.pid}` : (item.last_seen || 'no heartbeat yet');
                 const poolLine = `${item.resource_pool} / ${item.provider}`;
@@ -1712,65 +1800,72 @@ DASHBOARD_HTML = """<!doctype html>
         }
 
         function setStatus(message, isError = false) {
-            const node = document.getElementById('status_line');
             const stamp = new Date().toLocaleTimeString();
-            node.textContent = `[${stamp}] ${message}`;
-            node.className = isError ? 'status error' : 'status';
+            dashboard.elements.statusLine.textContent = `[${stamp}] ${message}`;
+            dashboard.elements.statusLine.className = isError ? 'status error' : 'status';
         }
 
         function setActionState(inFlight) {
-            actionInFlight = inFlight;
+            dashboard.actionInFlight = inFlight;
             actionButtons().forEach((button) => {
                 button.disabled = inFlight;
             });
         }
 
         function showTab(tabName) {
-            currentTab = tabName;
+            dashboard.currentTab = tabName;
             ['overview', 'operations', 'settings'].forEach((name) => {
-                document.getElementById(`tab_${name}`).classList.toggle('active', name === tabName);
-                document.getElementById(`nav_${name}`).classList.toggle('active', name === tabName);
+                requireElement(`tab_${name}`).classList.toggle('active', name === tabName);
+                requireElement(`nav_${name}`).classList.toggle('active', name === tabName);
             });
         }
 
-        function bindUI() {
-            tabButtons().forEach((button) => {
-                button.addEventListener('click', () => {
-                    showTab(button.dataset.tab || 'overview');
-                });
-            });
+        async function handleControl(control) {
+            if (control === 'launch') {
+                await launchWorkers(false);
+                return;
+            }
+            if (control === 'restart') {
+                await launchWorkers(true);
+                return;
+            }
+            if (control === 'stop') {
+                await stopWorkers();
+                return;
+            }
+            if (control === 'refresh') {
+                await refresh(true);
+                return;
+            }
+            if (control === 'save-config') {
+                await saveConfig();
+                return;
+            }
+            if (control === 'copy-serve') {
+                await copyCommand('serve');
+                return;
+            }
+            if (control === 'copy-up') {
+                await copyCommand('up');
+            }
+        }
 
-            document.querySelectorAll('[data-control]').forEach((button) => {
-                button.addEventListener('click', async () => {
-                    const control = button.dataset.control || '';
-                    if (control === 'launch') {
-                        await launchWorkers(false);
-                        return;
-                    }
-                    if (control === 'restart') {
-                        await launchWorkers(true);
-                        return;
-                    }
-                    if (control === 'stop') {
-                        await stopWorkers();
-                        return;
-                    }
-                    if (control === 'refresh') {
-                        await refresh(true);
-                        return;
-                    }
-                    if (control === 'save-config') {
-                        await saveConfig();
-                        return;
-                    }
-                    if (control === 'copy-serve') {
-                        await copyCommand('serve');
-                        return;
-                    }
-                    if (control === 'copy-up') {
-                        await copyCommand('up');
-                    }
-                });
+        function bindUI() {
+            document.addEventListener('click', (event) => {
+                const target = event.target.closest('[data-tab], [data-control]');
+                if (!target) {
+                    return;
+                }
+                if (target.dataset.tab) {
+                    showTab(target.dataset.tab || 'overview');
+                    return;
+                }
+                if (target.dataset.control) {
+                    void handleControl(target.dataset.control || '');
+                }
+            });
+            dashboard.elements.editor.addEventListener('input', () => {
+                dashboard.editorDirty = true;
             });
         }
 
@@ -1778,7 +1873,7 @@ DASHBOARD_HTML = """<!doctype html>
             const response = await fetch(path, options);
             const data = await response.json();
             if (!response.ok) {
-                throw new Error(data.error || (data.errors || []).join('\n') || 'request failed');
+                throw new Error(data.error || (data.errors || []).join('\\n') || 'request failed');
             }
             return data;
         }
@@ -1792,7 +1887,7 @@ DASHBOARD_HTML = """<!doctype html>
         }
 
         async function copyCommand(mode) {
-            const value = currentCommands[mode] || '';
+            const value = dashboard.currentCommands[mode] || '';
             if (!value) {
                 setStatus(`no ${mode} command available`, true);
                 return;
@@ -1802,7 +1897,7 @@ DASHBOARD_HTML = """<!doctype html>
         }
 
         async function runAction(label, action) {
-            if (actionInFlight) {
+            if (dashboard.actionInFlight) {
                 return;
             }
             setActionState(true);
@@ -1817,14 +1912,24 @@ DASHBOARD_HTML = """<!doctype html>
         }
 
         function renderProject(project) {
+            const dashboard = project.dashboard || {};
             const rows = [
                 { key: 'repository_name', value: project.repository_name || '' },
                 { key: 'local_repo_root', value: project.local_repo_root || '' },
                 { key: 'paddle_repo_path', value: project.paddle_repo_path || '' },
                 { key: 'integration_branch', value: project.integration_branch || project.base_branch || '' },
-                { key: 'dashboard', value: `${project.dashboard.host}:${project.dashboard.port}` },
+                { key: 'dashboard', value: dashboard.host && dashboard.port ? `${dashboard.host}:${dashboard.port}` : '' },
             ];
             return renderTable(rows, ['key', 'value']);
+        }
+
+        function renderValidation(data) {
+            const sections = [];
+            const launchBlockers = data.launch_blockers || [];
+            const notes = data.validation_errors || [];
+            sections.push(launchBlockers.length ? `Launch blockers:\n- ${launchBlockers.join('\\n- ')}` : 'Launch blockers:\\nnone');
+            sections.push(notes.length ? `\\nConfig notes:\n- ${notes.join('\\n- ')}` : '\\nConfig notes:\\nnone');
+            return sections.join('\\n');
         }
 
         function renderProcessRows(processes) {
@@ -1902,8 +2007,10 @@ DASHBOARD_HTML = """<!doctype html>
 
         function renderTopMeta(data) {
             const mode = data.mode || {};
+            const launchBlockerCount = (data.launch_blockers || []).length;
             const values = [
-                { label: 'Mode', value: mode.dry_run ? 'dry run' : 'live' },
+                { label: 'Startup', value: mode.state || 'configured' },
+                { label: 'Launch', value: launchBlockerCount ? `${launchBlockerCount} blocker(s)` : 'ready' },
                 { label: 'Config', value: mode.config_path || 'unknown' },
                 { label: 'Last event', value: data.last_event || 'none' },
                 { label: 'Updated', value: data.updated_at || 'unknown' },
@@ -1913,10 +2020,12 @@ DASHBOARD_HTML = """<!doctype html>
 
         async function saveConfig() {
             await runAction('saving settings', async () => {
-                await postJson('/api/config', { config_text: editor().value });
-                editorDirty = false;
+                const data = await postJson('/api/config', { config_text: dashboard.elements.editor.value });
+                dashboard.editorDirty = false;
                 await refresh(true);
-                setStatus('settings saved');
+                const blockerCount = (data.launch_blockers || []).length;
+                const noteCount = (data.validation_errors || []).length;
+                setStatus(`settings saved: ${blockerCount} launch blocker(s), ${noteCount} config note(s)`);
             });
         }
 
@@ -1939,60 +2048,81 @@ DASHBOARD_HTML = """<!doctype html>
         async function refresh(forceStatus = false) {
             try {
                 const data = await fetchJson('/api/state');
-                latestState = data;
-                latestRefreshOk = true;
-                currentCommands = data.commands || { serve: '', up: '' };
+                dashboard.latestState = data;
+                dashboard.latestRefreshOk = true;
+                dashboard.currentCommands = data.commands || { serve: '', up: '' };
                 const agentRows = buildAgentRows(data);
                 const progress = buildProgressModel(data, agentRows);
-                if (!editorDirty) {
-                    editor().value = data.config_text || '';
+                if (!dashboard.editorDirty) {
+                    dashboard.elements.editor.value = data.config_text || '';
                 }
-                document.getElementById('top_meta').innerHTML = renderTopMeta(data);
-                document.getElementById('summary').innerHTML = renderSummaryCards(data);
-                document.getElementById('agent_wall').innerHTML = renderAgentWall(data);
-                document.getElementById('progress_fill').style.width = `${progress.progress}%`;
-                document.getElementById('progress_meta').textContent = `${progress.passedGates}/${progress.totalGates} gates passed`;
-                document.getElementById('progress_details').innerHTML = renderProgressDetails(progress);
-                document.getElementById('overview_snapshot').innerHTML = renderOverviewSnapshot(data, progress);
-                document.getElementById('overview_merge_board').innerHTML = renderMergeBoard(data.merge_queue);
-                document.getElementById('merge_queue').innerHTML = renderMergeQueue(data.merge_queue);
-                document.getElementById('project').innerHTML = renderProject(data.project);
-                document.getElementById('processes').innerHTML = renderTable(renderProcessRows(data.processes), ['agent', 'provider', 'model', 'alive', 'pid', 'resource_pool', 'returncode']);
-                document.getElementById('provider_queue').innerHTML = renderProviderQueue(data.provider_queue);
-                document.getElementById('runtime').innerHTML = renderRuntime(data.runtime);
-                document.getElementById('heartbeats').innerHTML = renderHeartbeats(data.heartbeats);
-                document.getElementById('backlog').innerHTML = renderBacklog(data.backlog);
-                document.getElementById('gates').innerHTML = renderGates(data.gates);
-                document.getElementById('settings_project').innerHTML = renderProject(data.project);
-                document.getElementById('settings_resource_pools').innerHTML = renderPools(data.config);
-                document.getElementById('settings_workers').innerHTML = renderWorkers(data.config);
-                document.getElementById('settings_merge_policy').innerHTML = renderMergePolicy(data.project, data.merge_queue);
-                document.getElementById('manager_report').textContent = data.manager_report;
-                document.getElementById('commands').textContent = `serve:\n${currentCommands.serve}\n\nup:\n${currentCommands.up}`;
-                document.getElementById('validation').textContent = data.validation_errors.length ? data.validation_errors.join('\n') : 'settings valid';
+                dashboard.elements.topMeta.innerHTML = renderTopMeta(data);
+                dashboard.elements.summary.innerHTML = renderSummaryCards(data);
+                dashboard.elements.agentWall.innerHTML = renderAgentWall(data);
+                dashboard.elements.progressFill.style.width = `${progress.progress}%`;
+                dashboard.elements.progressMeta.textContent = `${progress.passedGates}/${progress.totalGates} gates passed`;
+                dashboard.elements.progressDetails.innerHTML = renderProgressDetails(progress);
+                dashboard.elements.overviewSnapshot.innerHTML = renderOverviewSnapshot(data, progress);
+                dashboard.elements.overviewMergeBoard.innerHTML = renderMergeBoard(data.merge_queue);
+                dashboard.elements.mergeQueue.innerHTML = renderMergeQueue(data.merge_queue);
+                dashboard.elements.project.innerHTML = renderProject(data.project);
+                dashboard.elements.processes.innerHTML = renderTable(renderProcessRows(data.processes), ['agent', 'provider', 'model', 'alive', 'pid', 'resource_pool', 'returncode']);
+                dashboard.elements.providerQueue.innerHTML = renderProviderQueue(data.provider_queue);
+                dashboard.elements.runtime.innerHTML = renderRuntime(data.runtime);
+                dashboard.elements.heartbeats.innerHTML = renderHeartbeats(data.heartbeats);
+                dashboard.elements.backlog.innerHTML = renderBacklog(data.backlog);
+                dashboard.elements.gates.innerHTML = renderGates(data.gates);
+                dashboard.elements.settingsProject.innerHTML = renderProject(data.project);
+                dashboard.elements.settingsResourcePools.innerHTML = renderPools(data.config);
+                dashboard.elements.settingsWorkers.innerHTML = renderWorkers(data.config);
+                dashboard.elements.settingsMergePolicy.innerHTML = renderMergePolicy(data.project, data.merge_queue);
+                dashboard.elements.managerReport.textContent = data.manager_report;
+                dashboard.elements.commands.textContent = `serve:\n${dashboard.currentCommands.serve}\n\nup:\n${dashboard.currentCommands.up}`;
+                dashboard.elements.validation.textContent = renderValidation(data);
                 if (forceStatus) {
                     setStatus(`state refreshed, last event: ${data.last_event || 'none'}`);
                 }
             } catch (error) {
-                if (latestRefreshOk || forceStatus) {
+                if (dashboard.latestRefreshOk || forceStatus) {
                     setStatus(`refresh failed: ${error}`, true);
                 }
-                latestRefreshOk = false;
+                dashboard.latestRefreshOk = false;
             }
         }
 
-        editor().addEventListener('input', () => {
-            editorDirty = true;
+        function initDashboard() {
+            if (dashboard.initialized) {
+                return;
+            }
+            dashboard.elements = cacheElements();
+            bindUI();
+            showTab(dashboard.currentTab);
+            void refresh(true);
+            setInterval(() => {
+                if (!dashboard.actionInFlight && dashboard.elements.autoRefresh.checked) {
+                    void refresh(false);
+                }
+            }, 4000);
+            dashboard.initialized = true;
+        }
+
+        window.addEventListener('error', (event) => {
+            if (dashboard.elements) {
+                setStatus(`dashboard error: ${event.message}`, true);
+            }
         });
 
-        bindUI();
-        showTab(currentTab);
-        refresh(true);
-        setInterval(() => {
-            if (!actionInFlight && autoRefresh()) {
-                refresh(false);
+        window.addEventListener('unhandledrejection', (event) => {
+            if (dashboard.elements) {
+                setStatus(`dashboard rejection: ${event.reason}`, true);
             }
-        }, 4000);
+        });
+
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', initDashboard, { once: true });
+        } else {
+            initDashboard();
+        }
     </script>
 </body>
 </html>
@@ -2015,9 +2145,14 @@ def parse_args() -> argparse.Namespace:
         "--foreground", action="store_true", help="keep the control plane attached to the current shell"
     )
     parser.add_argument(
+        "--bootstrap",
+        action="store_true",
+        help="force template-backed cold-start bootstrap even before local_config.yaml exists",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="render the dashboard without launching workers; if the config file is missing, fall back to config_template.yaml",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--log-file",
@@ -2028,8 +2163,8 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def apply_runtime_defaults(args: argparse.Namespace, dry_run: bool) -> None:
-    if args.command == "serve" and dry_run:
+def apply_runtime_defaults(args: argparse.Namespace, cold_start: bool) -> None:
+    if args.command == "serve" and cold_start:
         if args.host is None:
             args.host = DEFAULT_DASHBOARD_HOST
         if not args.foreground:
@@ -2105,27 +2240,32 @@ def stop_all_command(args: argparse.Namespace) -> int:
 def resolve_runtime_config(args: argparse.Namespace) -> tuple[Path, Path, bool, str]:
     requested_path = args.config
     persist_path = requested_path
-    force_dry_run = args.dry_run
+    bootstrap_requested = bool(args.bootstrap or args.dry_run)
     reasons: list[str] = []
     default_local_config = (RUNTIME_DIR / "local_config.yaml").resolve()
 
     if not requested_path.exists():
-        if requested_path.resolve() == default_local_config or args.dry_run:
+        if requested_path.resolve() == default_local_config or bootstrap_requested:
             if not CONFIG_TEMPLATE_PATH.exists():
                 raise FileNotFoundError(f"missing template config: {CONFIG_TEMPLATE_PATH}")
             requested_path = CONFIG_TEMPLATE_PATH
-            force_dry_run = True
-            reasons.append(f"booted from template because {persist_path} does not exist")
+            reasons.append(f"cold-start bootstrapped from template because {persist_path} does not exist")
         else:
             raise FileNotFoundError(f"missing config: {persist_path}")
 
     if requested_path.resolve() == CONFIG_TEMPLATE_PATH.resolve():
-        force_dry_run = True
         if persist_path == requested_path:
             persist_path = RUNTIME_DIR / "local_config.yaml"
-        reasons.append("template-backed session keeps launch actions disabled until a real config is saved")
+        reasons.append(
+            "template-backed control plane will accept settings edits immediately and launch when blockers are cleared"
+        )
 
-    return requested_path, persist_path, force_dry_run, "; ".join(dict.fromkeys(reasons))
+    return (
+        requested_path,
+        persist_path,
+        requested_path.resolve() == CONFIG_TEMPLATE_PATH.resolve(),
+        "; ".join(dict.fromkeys(reasons)),
+    )
 
 
 def detach_process(args: argparse.Namespace) -> int:
@@ -2143,8 +2283,8 @@ def detach_process(args: argparse.Namespace) -> int:
         command.extend(["--port", str(args.port)])
     if args.open_browser:
         command.append("--open-browser")
-    if args.dry_run:
-        command.append("--dry-run")
+    if args.bootstrap:
+        command.append("--bootstrap")
 
     env = os.environ.copy()
     env["CONTROL_PLANE_DETACHED"] = "1"
@@ -2172,20 +2312,20 @@ def main() -> int:
         return stop_all_command(args)
 
     try:
-        config_path, persist_config_path, force_dry_run, dry_run_reason = resolve_runtime_config(args)
+        config_path, persist_config_path, cold_start, bootstrap_reason = resolve_runtime_config(args)
     except FileNotFoundError as exc:
         print(str(exc), file=sys.stderr)
         print(
-            f"use --dry-run or point --config at {CONFIG_TEMPLATE_PATH} to render the dashboard without a filled local config",
+            f"create {RUNTIME_DIR / 'local_config.yaml'} or point --config at {CONFIG_TEMPLATE_PATH} to bootstrap from the template",
             file=sys.stderr,
         )
         return 2
 
-    apply_runtime_defaults(args, force_dry_run)
+    apply_runtime_defaults(args, cold_start)
 
     if args.detach and os.environ.get("CONTROL_PLANE_DETACHED") != "1":
         args.config = config_path
-        args.dry_run = force_dry_run
+        args.bootstrap = cold_start
         return detach_process(args)
 
     service = ControlPlaneService(
@@ -2193,11 +2333,11 @@ def main() -> int:
         host_override=args.host,
         port_override=args.port,
         persist_config_path=persist_config_path,
-        force_dry_run=force_dry_run,
+        bootstrap_requested=args.bootstrap,
     )
-    if service.dry_run and dry_run_reason:
-        service.dry_run_reason = dry_run_reason
-        service.last_event = f"dry_run:{dry_run_reason}"
+    if service.bootstrap_mode and bootstrap_reason:
+        service.bootstrap_reason = bootstrap_reason
+        service.last_event = f"cold_start:{bootstrap_reason}"
 
     def handle_signal(signum: int, frame: Any) -> None:  # pragma: no cover - signal path
         del signum, frame
