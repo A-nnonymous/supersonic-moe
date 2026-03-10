@@ -1,0 +1,107 @@
+project: sonicmoe-fp8
+last_updated: 2026-03-10
+manager: A0
+phase: protocol-freeze
+items:
+  - id: A1-001
+    title: Freeze FP8 protocol
+    owner: A1
+    status: pending
+    gate: G0
+    priority: P0
+    dependencies: []
+    outputs:
+      - sonicmoe/enums.py protocol sketch
+      - scale encoding contract
+      - backend selection contract
+    done_when:
+      - dtype/backend/scale names are fixed
+      - Hopper and Blackwell adapter contract is fixed
+      - reference path inputs and outputs are fixed
+
+  - id: A6-001
+    title: Freeze baseline trace
+    owner: A6
+    status: pending
+    gate: G0
+    priority: P0
+    dependencies: []
+    outputs:
+      - control_plane/fp8/strategy/baseline_trace.md
+      - reference tensor map
+      - compatibility minimal surface
+    done_when:
+      - baseline source of truth is explicit
+      - Paddle semantic references are mapped
+      - compatibility scope is bounded
+
+  - id: A4-001
+    title: Build reference path
+    owner: A4
+    status: blocked
+    gate: G1
+    priority: P0
+    dependencies: [A1-001, A6-001]
+    outputs:
+      - torch FP8 reference path entrypoint
+      - autograd skeleton
+    done_when:
+      - forward runs
+      - backward runs
+      - reference path uses frozen protocol
+
+  - id: A2-001
+    title: Audit Hopper float8 path
+    owner: A2
+    status: pending
+    gate: G2
+    priority: P0
+    dependencies: [A1-001]
+    outputs:
+      - grouped_gemm constraints report
+      - Hopper adapter plan
+    done_when:
+      - float8 constraints are documented
+      - missing pieces are enumerated
+
+  - id: A3-001
+    title: Audit Blackwell QuACK path
+    owner: A3
+    status: pending
+    gate: G3
+    priority: P0
+    dependencies: [A1-001]
+    outputs:
+      - QuACK scale mapping report
+      - backward support report
+    done_when:
+      - Blackwell path semantics are explicit
+      - unsupported cases fail fast
+
+  - id: A5-001
+    title: Build baseline-aligned tests
+    owner: A5
+    status: blocked
+    gate: G4
+    priority: P0
+    dependencies: [A4-001, A6-001]
+    outputs:
+      - FP8 test skeleton
+      - baseline compare helpers
+    done_when:
+      - forward and backward baseline tests exist
+      - tolerances are documented
+
+  - id: A7-001
+    title: Build benchmark skeleton
+    owner: A7
+    status: pending
+    gate: G6
+    priority: P1
+    dependencies: [A1-001]
+    outputs:
+      - benchmark entrypoint
+      - perf metric schema
+    done_when:
+      - benchmark arguments are fixed
+      - perf collection fields are fixed

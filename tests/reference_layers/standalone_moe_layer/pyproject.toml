@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moe-standalone"
+version = "0.1.0"
+description = "Standalone DeepEPMOELayer extracted from ernie-core for FP8 upgrade and Sonic-MoE integration"
+requires-python = ">=3.8"
+license = {text = "Apache-2.0"}
+
+dependencies = [
+    # paddlepaddle-gpu is the core dependency (must be pre-installed)
+    # paddlefleet provides deep_ep, TDU etc. (optional, for full functionality)
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+]
+
+[tool.setuptools.packages.find]
+include = ["moe_standalone*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
