@@ -63,7 +63,7 @@ If you are validating Blackwell kernels directly on B200 or GB200, set `USE_QUAC
 
 Use the control plane in one of these modes:
 
-- `serve --dry-run`: render the frontend, inspect state files, and debug the dashboard without a real worker config
+- `serve --dry-run`: the default remote debug path; now binds to `0.0.0.0` and detaches automatically unless you pass `--foreground`
 - `serve`: open the dashboard with your saved config, but do not launch workers until you explicitly press `Launch` or `Restart`
 - `up`: start the dashboard and immediately start all configured workers
 
@@ -71,11 +71,13 @@ If `runtime/local_config.yaml` is missing, the runtime automatically falls back 
 
 ## Quickstart
 
-### 1. Frontend-only debugging
+### 1. Default remote startup
 
-Use this when you want to verify the dashboard can open and render even before filling real paths, API keys, or worker commands:
+Use this as the primary bring-up path on a remote machine. It starts the control plane in dry-run mode, listens on all interfaces, and returns the shell immediately:
 
-`python control_plane/fp8/runtime/control_plane.py serve --dry-run --open-browser`
+`python control_plane/fp8/runtime/control_plane.py serve --dry-run`
+
+If you do not want background mode, add `--foreground`.
 
 ### 2. Prepare real multi-agent execution
 
@@ -107,7 +109,7 @@ Use this when your config is ready and the manager wants to begin active multi-a
 Use one of these paths:
 
 1. Preferred: click `Stop` in the top bar. This stops all worker processes while keeping the dashboard online.
-2. Remote or scripted control: `curl -X POST http://127.0.0.1:8233/api/stop -H 'Content-Type: application/json' -d '{}'`
+2. Remote or scripted control: `python control_plane/fp8/runtime/control_plane.py stop-agents`
 3. Full shutdown: stop the foreground process with `Ctrl-C`, or stop the detached control-plane process from the shell.
 
 ### 6. Resume paused work
@@ -126,20 +128,29 @@ Use the short form by default:
 - `up` opens the control plane and launches workers
 - `--dry-run` forces dashboard-only mode
 - `--open-browser` opens the dashboard automatically
+- `--foreground` disables the new auto-detach behavior for `serve --dry-run`
 
 Add these only when needed:
 
-- `--host 0.0.0.0` to listen on all interfaces
+- `--host 0.0.0.0` to override the listener explicitly
 - `--port 9000` to change the dashboard port
 - `--detach` to keep the control plane running after the shell returns
 - `--log-file <path>` to change the detached log path
 - `--config <path>` only if you do not want the default `runtime/local_config.yaml`
 
+## Stop commands
+
+Use these shell commands when you want to control a running detached session from the same machine:
+
+- stop worker agents only: `python control_plane/fp8/runtime/control_plane.py stop-agents`
+- stop the dashboard listener only: `python control_plane/fp8/runtime/control_plane.py stop-listener`
+- stop both the dashboard listener and all worker agents: `python control_plane/fp8/runtime/control_plane.py stop-all`
+
 ### Fire-and-forget mode
 
 If you want the control plane to keep running after the shell returns, use detached mode:
 
-`python control_plane/fp8/runtime/control_plane.py serve --host 0.0.0.0 --port 8233 --detach`
+`python control_plane/fp8/runtime/control_plane.py serve --dry-run`
 
 The detached process writes combined stdout and stderr to `control_plane/fp8/runtime/control_plane.log` by default. You can override that path with `--log-file`.
 
@@ -176,12 +187,12 @@ The local webpage now provides:
 
 For actual SonicMoE FP8 multi-agent delivery, the normal manager loop is:
 
-1. open the dashboard with `serve --open-browser`
+1. bring the control plane up with `serve --dry-run` or `serve --open-browser`
 2. verify Settings and validation output are clean
 3. press `Launch` or run `up --open-browser`
 4. monitor agent health, backlog progress, and branch merge status from `Overview`
 5. inspect provider routing, runtime topology, and heartbeats in `Operations`
-6. press `Stop` when you want to pause the worker fleet without losing dashboard state
+6. press `Stop` or run `stop-agents` when you want to pause the worker fleet without losing dashboard state
 7. let A0 merge finished worker branches into `project.integration_branch`
 
 ## Interaction model

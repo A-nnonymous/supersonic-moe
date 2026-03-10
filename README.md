@@ -90,11 +90,13 @@ If you are testing Blackwell kernels directly on B200 or GB200, export `USE_QUAC
 
 ### Control Plane Quickstart
 
-1. Frontend-only debugging with no filled local config:
+1. Default remote startup with the fewest parameters:
 
 ```bash
-python control_plane/fp8/runtime/control_plane.py serve --dry-run --open-browser
+python control_plane/fp8/runtime/control_plane.py serve --dry-run
 ```
+
+This now defaults to a remote-friendly detached run for dry-run mode. Add `--foreground` if you want to keep it attached to the current shell.
 
 2. For real multi-agent execution, fill `control_plane/fp8/runtime/local_config.yaml` with:
 
@@ -120,7 +122,14 @@ python control_plane/fp8/runtime/control_plane.py up --open-browser
 5. Pause running multi-agent work without shutting down the dashboard:
 
 ```bash
-curl -X POST http://127.0.0.1:8233/api/stop -H 'Content-Type: application/json' -d '{}'
+python control_plane/fp8/runtime/control_plane.py stop-agents
+```
+
+You can also stop the listener only or stop both listener and agents:
+
+```bash
+python control_plane/fp8/runtime/control_plane.py stop-listener
+python control_plane/fp8/runtime/control_plane.py stop-all
 ```
 
 6. Override bind address when needed:
@@ -151,6 +160,7 @@ uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/cont
 - keep worker `test_command` and benchmark commands pointed at the same CUDA-capable environment that will run real validation on the target GPU
 - the control plane source of truth remains `control_plane/fp8/README.md`
 - use `control_plane/fp8/README.md` for the full manager workflow, including dry-run, start, pause, and resume guidance
+- stop commands are available separately for agents, listener, or both: `stop-agents`, `stop-listener`, and `stop-all`
 
 ### Example usage
 - SonicMoE with TC top-K choice routing (SwiGLU activation) on Hopper GPUs
