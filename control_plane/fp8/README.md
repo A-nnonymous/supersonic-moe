@@ -87,7 +87,7 @@ If your deployment hostname resolves to IPv6 first, an IPv6-only listener can st
 The local webpage now provides:
 
 - a compact top bar for launch, restart, stop, refresh, and command copy actions
-- an `Overview` page that only shows agent dashboards and overall delivery progress
+- an `Overview` page that shows agent dashboards, overall delivery progress, and branch merge status at a glance
 - an `Operations` page for commands, validation, provider queue, merge queue, runtime state, heartbeats, backlog, and manager report
 - a `Settings` page for API keys, provider routing, Paddle path, worktrees, worker commands, and git submission identities
 - an editable local YAML config with supporting project, resource-pool, and worker summaries
@@ -99,7 +99,7 @@ The local webpage now provides:
 
 The dashboard is intentionally simple:
 
-1. start on `Overview` to judge agent health and overall delivery progress
+1. start on `Overview` to judge agent health, overall delivery progress, and which worker branches are waiting for manager merge review
 2. move to `Operations` when you need runtime inspection, launch commands, validation, or provider scheduling detail
 3. move to `Settings` when you need to edit API keys, provider assignments, Paddle paths, worker commands, or per-worker git identities
 4. let A0 own merge timing and final integration into `project.integration_branch`
