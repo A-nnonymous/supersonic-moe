@@ -837,94 +837,286 @@ DASHBOARD_HTML = """<!doctype html>
     <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
     <title>supersonic-moe control plane</title>
     <style>
-        body { font-family: ui-sans-serif, sans-serif; margin: 0; background: #08111f; color: #edf2ff; }
-        header { padding: 24px; background: linear-gradient(135deg, #0f2140, #126556); }
-        main { padding: 20px 24px 32px; display: grid; gap: 16px; }
-        .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
-        .card { background: #10192b; border: 1px solid #26334d; border-radius: 14px; padding: 16px; box-shadow: 0 10px 24px rgba(0, 0, 0, 0.18); }
+        :root { color-scheme: dark; }
+        body { font-family: "Avenir Next", "Segoe UI", sans-serif; margin: 0; background: radial-gradient(circle at top, #15345f 0%, #08111f 42%, #060b14 100%); color: #edf2ff; }
+        header { padding: 30px 24px 34px; background: linear-gradient(135deg, rgba(13, 28, 51, 0.96), rgba(13, 93, 89, 0.88)); border-bottom: 1px solid rgba(157, 196, 255, 0.12); }
+        main { max-width: 1380px; margin: 0 auto; padding: 18px 20px 36px; display: grid; gap: 14px; }
+        .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+        .card { background: rgba(16, 25, 43, 0.84); border: 1px solid rgba(87, 118, 163, 0.32); border-radius: 16px; padding: 16px; box-shadow: 0 16px 40px rgba(0, 0, 0, 0.2); backdrop-filter: blur(12px); }
+        .summary { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+        .metric { padding: 14px; border-radius: 12px; background: linear-gradient(180deg, rgba(12, 19, 34, 0.95), rgba(10, 17, 28, 0.88)); border: 1px solid rgba(72, 102, 145, 0.34); }
+        .metric strong { display: block; font-size: 28px; line-height: 1.1; margin-bottom: 4px; }
         h1, h2, h3, p { margin: 0 0 10px; }
-        table { width: 100%; border-collapse: collapse; font-size: 14px; }
-        th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #23314a; vertical-align: top; }
+        h2 { font-size: 18px; }
+        h3 { font-size: 14px; color: #c7d5f8; }
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+        th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid #1e2b42; vertical-align: top; }
+        th { color: #b6c6ea; font-weight: 600; }
         pre, textarea, code { font-family: ui-monospace, monospace; }
-        pre { white-space: pre-wrap; background: #0c1322; padding: 12px; border-radius: 8px; max-height: 320px; overflow: auto; }
-        textarea { width: 100%; min-height: 420px; background: #0c1322; color: #edf2ff; border: 1px solid #243252; border-radius: 8px; padding: 12px; box-sizing: border-box; }
-        .controls { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+        pre { white-space: pre-wrap; background: #0c1322; padding: 12px; border-radius: 10px; max-height: 320px; overflow: auto; margin: 0; }
+        textarea { width: 100%; min-height: 360px; background: #0c1322; color: #edf2ff; border: 1px solid #243252; border-radius: 10px; padding: 12px; box-sizing: border-box; resize: vertical; }
+        .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
         button { background: #1f7a6d; color: #fff; border: 0; border-radius: 8px; padding: 10px 14px; cursor: pointer; }
         button.secondary { background: #29405f; }
+        button.ghost { background: #18243a; }
         button.danger { background: #8a3d52; }
         button:disabled { opacity: 0.45; cursor: not-allowed; }
         .small { color: #a7b5d6; font-size: 13px; }
-        .status { padding: 8px 0; color: #9ce5c7; min-height: 22px; }
+        .status { padding: 4px 0 0; color: #9ce5c7; min-height: 22px; }
         .error { color: #ffb2c0; }
-        .pill { display: inline-block; padding: 4px 8px; border-radius: 999px; background: #16233a; color: #c7d5f8; font-size: 12px; margin-right: 6px; }
+        .details { margin: 0; }
+        .details summary { list-style: none; cursor: pointer; font-weight: 600; }
+        .details summary::-webkit-details-marker { display: none; }
+        .details[open] summary { margin-bottom: 10px; }
+        .tagline { max-width: 760px; }
+        .toggle { display: inline-flex; gap: 8px; align-items: center; color: #b6c6ea; font-size: 13px; }
+        .mono { font-family: ui-monospace, monospace; }
+        .hero { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 16px; }
+        .hero-badge { display: inline-flex; align-items: center; gap: 8px; padding: 8px 12px; border-radius: 999px; background: rgba(9, 18, 33, 0.46); border: 1px solid rgba(155, 203, 255, 0.18); color: #cfe1ff; font-size: 12px; letter-spacing: 0.04em; text-transform: uppercase; }
+        .panel-title { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+        .agent-wall { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
+        .agent-card { padding: 14px; border-radius: 14px; background: linear-gradient(180deg, rgba(11, 18, 31, 0.96), rgba(12, 21, 37, 0.84)); border: 1px solid rgba(74, 105, 149, 0.34); min-height: 148px; display: grid; gap: 10px; }
+        .agent-card header { padding: 0; background: none; border: 0; display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+        .agent-name { font-size: 20px; font-weight: 700; line-height: 1; }
+        .agent-role { color: #9fb2d5; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+        .agent-meta { display: grid; gap: 6px; font-size: 13px; color: #d9e5ff; }
+        .agent-meta strong { color: #9fbbe8; font-weight: 600; }
+        .chip { display: inline-flex; align-items: center; padding: 5px 10px; border-radius: 999px; font-size: 12px; font-weight: 700; letter-spacing: 0.02em; }
+        .state-healthy, .state-active { background: rgba(31, 122, 109, 0.22); color: #9ff0d8; border: 1px solid rgba(63, 197, 170, 0.32); }
+        .state-stale, .state-launch_failed { background: rgba(160, 92, 36, 0.22); color: #ffd4a6; border: 1px solid rgba(223, 142, 76, 0.34); }
+        .state-offline, .state-stopped { background: rgba(75, 92, 124, 0.22); color: #cad6ef; border: 1px solid rgba(118, 138, 175, 0.3); }
+        .state-not_started, .state-not-started, .state-unassigned { background: rgba(50, 61, 88, 0.28); color: #d4def5; border: 1px solid rgba(111, 126, 163, 0.28); }
+        .state-error { background: rgba(138, 61, 82, 0.26); color: #ffbfd0; border: 1px solid rgba(212, 101, 133, 0.34); }
+        .muted { color: #93a7cc; }
     </style>
 </head>
 <body>
     <header>
-        <h1>supersonic-moe control plane</h1>
-        <p class=\"small\">Multi-provider orchestration, runtime topology, and local progress dashboard.</p>
+        <div class=\"hero\">
+            <div>
+                <div class=\"hero-badge\">FP8 delivery orchestration</div>
+                <h1>supersonic-moe control plane</h1>
+                <p class=\"small tagline\">Agent status is the first screen. Config, launch, and deeper runtime views stay one click away.</p>
+            </div>
+        </div>
     </header>
     <main>
         <section class=\"card\">
-            <h2>Controls</h2>
-            <p class=\"small\">Save config, refresh state, and launch or stop workers from the same page.</p>
-            <div class=\"controls\" id=\"action_buttons\">
-                <button data-action onclick=\"saveConfig()\">Save Config</button>
-                <button data-action onclick=\"launchWorkers(false)\">Launch Workers</button>
-                <button data-action class=\"secondary\" onclick=\"launchWorkers(true)\">Restart Workers</button>
-                <button data-action class=\"danger\" onclick=\"stopWorkers()\">Stop Workers</button>
-                <button data-action class=\"secondary\" onclick=\"refresh(true)\">Refresh</button>
+            <div class=\"toolbar\">
+                <button data-action onclick=\"saveConfig()\">Save</button>
+                <button data-action onclick=\"launchWorkers(false)\">Launch</button>
+                <button data-action class=\"secondary\" onclick=\"launchWorkers(true)\">Restart</button>
+                <button data-action class=\"danger\" onclick=\"stopWorkers()\">Stop</button>
+                <button data-action class=\"ghost\" onclick=\"refresh(true)\">Refresh</button>
+                <button class=\"ghost\" onclick=\"copyCommand('serve')\">Copy Serve</button>
+                <button class=\"ghost\" onclick=\"copyCommand('up')\">Copy Up</button>
+                <label class=\"toggle\"><input id=\"auto_refresh\" type=\"checkbox\" checked> Auto refresh</label>
             </div>
             <div id=\"status_line\" class=\"status\"></div>
-            <div class=\"grid\">
-                <section>
-                    <h3>Main Agent Commands</h3>
-                    <pre id=\"commands\"></pre>
-                </section>
-                <section>
-                    <h3>Validation</h3>
-                    <pre id=\"validation\"></pre>
-                </section>
-            </div>
         </section>
+
         <section class=\"card\">
-            <h2>Local Config</h2>
-            <p class=\"small\">Edit resource pool keys, provider/model mapping, Paddle path, worker worktrees, branches, and environment commands here.</p>
-            <textarea id=\"config_editor\"></textarea>
+            <div class=\"panel-title\">
+                <div>
+                    <h2>Agent Status</h2>
+                    <p class=\"small\">All manager and worker agents are visible here by default.</p>
+                </div>
+                <div class=\"small muted\" id=\"agent_status_meta\"></div>
+            </div>
+            <div class=\"agent-wall\" id=\"agent_wall\"></div>
         </section>
+
+        <section class=\"summary\" id=\"summary\"></section>
+
         <div class=\"grid\">
-            <section class=\"card\"><h2>Project</h2><div id=\"project\"></div></section>
-            <section class=\"card\"><h2>Processes</h2><div id=\"processes\"></div></section>
+            <section class=\"card\">
+                <h2>Commands</h2>
+                <pre id=\"commands\"></pre>
+            </section>
+            <section class=\"card\">
+                <h2>Validation</h2>
+                <pre id=\"validation\"></pre>
+            </section>
         </div>
-        <div class=\"grid\">
-            <section class=\"card\"><h2>Provider Queue</h2><div id=\"provider_queue\"></div></section>
-            <section class=\"card\"><h2>Resource Pools</h2><div id=\"resource_pools\"></div></section>
-        </div>
-        <div class=\"grid\">
-            <section class=\"card\"><h2>Worker Config</h2><div id=\"workers\"></div></section>
-            <section class=\"card\"><h2>Runtime Topology</h2><div id=\"runtime\"></div></section>
-        </div>
-        <div class=\"grid\">
-            <section class=\"card\"><h2>Heartbeats</h2><div id=\"heartbeats\"></div></section>
-            <section class=\"card\"><h2>Backlog</h2><div id=\"backlog\"></div></section>
-        </div>
-        <div class=\"grid\">
-            <section class=\"card\"><h2>Gates</h2><div id=\"gates\"></div></section>
-            <section class=\"card\"><h2>Manager Report</h2><pre id=\"manager_report\"></pre></section>
-        </div>
+
+        <details class=\"card details\">
+            <summary>Config Editor</summary>
+            <p class=\"small\">Edit resource pool keys, provider selection, Paddle path, worktrees, branches, and worker commands.</p>
+            <textarea id=\"config_editor\"></textarea>
+        </details>
+
+        <section class=\"card\"><h2>Provider Queue</h2><div id=\"provider_queue\"></div></section>
+
+        <details class=\"card details\">
+            <summary>Worker Config</summary>
+            <div id=\"workers\"></div>
+        </details>
+
+        <details class=\"card details\">
+            <summary>Project and Processes</summary>
+            <div class=\"grid\">
+                <section><h3>Project</h3><div id=\"project\"></div></section>
+                <section><h3>Active Processes</h3><div id=\"processes\"></div></section>
+            </div>
+        </details>
+
+        <details class=\"card details\">
+            <summary>Operational State</summary>
+            <div class=\"grid\">
+                <section><h3>Runtime Topology</h3><div id=\"runtime\"></div></section>
+                <section><h3>Heartbeats</h3><div id=\"heartbeats\"></div></section>
+                <section><h3>Backlog</h3><div id=\"backlog\"></div></section>
+                <section><h3>Gates</h3><div id=\"gates\"></div></section>
+            </div>
+        </details>
+
+        <details class=\"card details\">
+            <summary>Reference Data</summary>
+            <div class=\"grid\">
+                <section><h3>Resource Pools</h3><div id=\"resource_pools\"></div></section>
+                <section><h3>Manager Report</h3><pre id=\"manager_report\"></pre></section>
+            </div>
+        </details>
     </main>
     <script>
         let editorDirty = false;
         let actionInFlight = false;
         let latestRefreshOk = false;
+        let currentCommands = { serve: '', up: '' };
 
         const editor = () => document.getElementById('config_editor');
         const actionButtons = () => Array.from(document.querySelectorAll('[data-action]'));
+        const autoRefresh = () => document.getElementById('auto_refresh').checked;
 
         function renderTable(rows, columns) {
+            if (!rows || !rows.length) {
+                return '<div class="small muted">No data</div>';
+            }
             const head = columns.map((col) => `<th>${col}</th>`).join('');
             const body = rows.map((row) => `<tr>${columns.map((col) => `<td>${row[col] ?? ''}</td>`).join('')}</tr>`).join('');
             return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+        }
+
+        function sortAgents(values) {
+            return values.sort((left, right) => {
+                const leftNum = Number(String(left.agent || '').replace(/[^0-9]/g, ''));
+                const rightNum = Number(String(right.agent || '').replace(/[^0-9]/g, ''));
+                return leftNum - rightNum;
+            });
+        }
+
+        function displayState(value) {
+            return String(value || 'unknown').replaceAll('_', ' ');
+        }
+
+        function stateClass(value) {
+            return `state-${String(value || 'unknown').replace(/[^a-zA-Z0-9]+/g, '_')}`;
+        }
+
+        function buildAgentRows(data) {
+            const byAgent = new Map();
+            const remember = (agent, values) => {
+                if (!agent) {
+                    return;
+                }
+                byAgent.set(agent, { ...(byAgent.get(agent) || { agent }), ...values, agent });
+            };
+
+            (data.runtime?.workers || []).forEach((item) => {
+                remember(item.agent, {
+                    provider: item.provider,
+                    model: item.model,
+                    resource_pool: item.resource_pool,
+                    branch: item.branch,
+                    runtime_status: item.status,
+                });
+            });
+            (data.config?.workers || []).forEach((item) => {
+                remember(item.agent, {
+                    task_id: item.task_id,
+                    config_pool: item.resource_pool,
+                    queue: (item.resource_pool_queue || []).join(' -> '),
+                    branch: item.branch,
+                    test_command: item.test_command,
+                });
+            });
+            (data.heartbeats?.agents || []).forEach((item) => {
+                remember(item.agent, {
+                    role: item.role,
+                    heartbeat_state: item.state,
+                    last_seen: item.last_seen,
+                    expected_next_checkin: item.expected_next_checkin,
+                    evidence: item.evidence,
+                    escalation: item.escalation,
+                });
+            });
+            Object.entries(data.processes || {}).forEach(([agent, item]) => {
+                remember(agent, {
+                    process_alive: item.alive,
+                    pid: item.pid,
+                    provider: item.provider,
+                    model: item.model,
+                    resource_pool: item.resource_pool,
+                });
+            });
+
+            return sortAgents(Array.from(byAgent.values())).map((item) => {
+                const state = item.process_alive ? 'active' : (item.heartbeat_state || item.runtime_status || 'not_started');
+                return {
+                    ...item,
+                    display_state: state,
+                    provider: item.provider || 'unassigned',
+                    model: item.model || 'unassigned',
+                    resource_pool: item.resource_pool || item.config_pool || 'unassigned',
+                    branch: item.branch || 'unassigned',
+                    role: item.role || 'worker',
+                };
+            });
+        }
+
+        function renderSummaryCards(data) {
+            const agentRows = buildAgentRows(data);
+            const activeWorkers = agentRows.filter((item) => item.display_state === 'active' || item.display_state === 'healthy').length;
+            const staleWorkers = agentRows.filter((item) => item.display_state === 'stale' || String(item.display_state).startsWith('launch_failed')).length;
+            const parkedWorkers = agentRows.filter((item) => item.display_state === 'not_started' || item.display_state === 'offline').length;
+            const validationCount = (data.validation_errors || []).length;
+            const cards = [
+                { label: 'Agents Visible', value: agentRows.length, hint: `${activeWorkers} active or healthy` },
+                { label: 'Attention Needed', value: staleWorkers, hint: `${parkedWorkers} parked or offline` },
+                { label: 'Validation Issues', value: validationCount, hint: validationCount ? 'fix config before launch' : 'config is clean' },
+                { label: 'Last Event', value: data.last_event || 'none', hint: data.updated_at || '' },
+            ];
+            return cards.map((item) => `<div class=\"metric\"><strong>${item.value}</strong><div>${item.label}</div><div class=\"small\">${item.hint}</div></div>`).join('');
+        }
+
+        function renderAgentWall(data) {
+            const rows = buildAgentRows(data);
+            const meta = `${rows.filter((item) => item.display_state === 'active' || item.display_state === 'healthy').length} active, ${rows.filter((item) => item.display_state === 'stale' || String(item.display_state).startsWith('launch_failed')).length} need attention`;
+            document.getElementById('agent_status_meta').textContent = meta;
+            return rows.map((item) => {
+                const processLine = item.process_alive ? `pid ${item.pid}` : (item.last_seen || 'no heartbeat yet');
+                const poolLine = `${item.resource_pool} / ${item.provider}`;
+                const branchLine = item.branch || 'unassigned';
+                const detailLine = item.process_alive ? 'process alive' : (item.evidence || item.expected_next_checkin || 'waiting for launch');
+                return `
+                    <article class="agent-card">
+                        <header>
+                            <div>
+                                <div class="agent-name">${item.agent}</div>
+                                <div class="agent-role">${item.role}</div>
+                            </div>
+                            <span class="chip ${stateClass(item.display_state)}">${displayState(item.display_state)}</span>
+                        </header>
+                        <div class="agent-meta">
+                            <div><strong>Pool</strong> ${poolLine}</div>
+                            <div><strong>Model</strong> ${item.model}</div>
+                            <div><strong>Branch</strong> ${branchLine}</div>
+                            <div><strong>Heartbeat</strong> ${processLine}</div>
+                            <div class="muted">${detailLine}</div>
+                        </div>
+                    </article>
+                `;
+            }).join('');
         }
 
         function setStatus(message, isError = false) {
@@ -936,20 +1128,36 @@ DASHBOARD_HTML = """<!doctype html>
 
         function setActionState(inFlight) {
             actionInFlight = inFlight;
-            actionButtons().forEach((button) => { button.disabled = inFlight; });
+            actionButtons().forEach((button) => {
+                button.disabled = inFlight;
+            });
         }
 
-        async function postJson(path, payload) {
-            const response = await fetch(path, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(payload),
-            });
+        async function fetchJson(path, options = {}) {
+            const response = await fetch(path, options);
             const data = await response.json();
             if (!response.ok) {
                 throw new Error(data.error || (data.errors || []).join('\n') || 'request failed');
             }
             return data;
+        }
+
+        async function postJson(path, payload) {
+            return fetchJson(path, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+        }
+
+        async function copyCommand(mode) {
+            const value = currentCommands[mode] || '';
+            if (!value) {
+                setStatus(`no ${mode} command available`, true);
+                return;
+            }
+            await navigator.clipboard.writeText(value);
+            setStatus(`${mode} command copied`);
         }
 
         async function runAction(label, action) {
@@ -980,26 +1188,25 @@ DASHBOARD_HTML = """<!doctype html>
         function renderProcessRows(processes) {
             return Object.entries(processes).map(([agent, item]) => ({
                 agent,
-                resource_pool: item.resource_pool,
                 provider: item.provider,
                 model: item.model,
-                pid: item.pid,
                 alive: item.alive,
+                pid: item.pid,
+                resource_pool: item.resource_pool,
                 returncode: item.returncode,
-                worktree_path: item.worktree_path,
             }));
         }
 
         function renderRuntime(runtime) {
-            return renderTable(runtime.workers || [], ['agent', 'resource_pool', 'provider', 'model', 'branch', 'worktree_path', 'environment_path', 'submit_strategy', 'status']);
+            return renderTable(runtime.workers || [], ['agent', 'resource_pool', 'provider', 'model', 'branch', 'status']);
         }
 
         function renderHeartbeats(heartbeats) {
-            return renderTable(heartbeats.agents || [], ['agent', 'state', 'last_seen', 'evidence', 'expected_next_checkin']);
+            return renderTable(heartbeats.agents || [], ['agent', 'state', 'last_seen', 'expected_next_checkin']);
         }
 
         function renderBacklog(backlog) {
-            return renderTable(backlog.items || [], ['id', 'owner', 'status', 'gate', 'priority', 'title']);
+            return renderTable(backlog.items || [], ['id', 'owner', 'status', 'gate', 'title']);
         }
 
         function renderGates(gates) {
@@ -1012,38 +1219,39 @@ DASHBOARD_HTML = """<!doctype html>
                 priority: item.priority ?? 100,
                 provider: item.provider,
                 model: item.model,
-                api_key: item.api_key || '',
             }));
-            return renderTable(pools, ['name', 'priority', 'provider', 'model', 'api_key']);
+            return renderTable(pools, ['name', 'priority', 'provider', 'model']);
         }
 
         function renderWorkers(config) {
             const rows = (config.workers || []).map((item) => ({
-                ...item,
+                agent: item.agent,
+                task_id: item.task_id,
+                resource_pool: item.resource_pool,
                 resource_pool_queue: (item.resource_pool_queue || []).join(', '),
+                branch: item.branch,
+                test_command: item.test_command,
             }));
-            return renderTable(rows, ['agent', 'task_id', 'resource_pool', 'resource_pool_queue', 'branch', 'worktree_path', 'environment_path', 'test_command', 'submit_strategy']);
+            return renderTable(rows, ['agent', 'task_id', 'resource_pool', 'resource_pool_queue', 'branch', 'test_command']);
         }
 
         function renderProviderQueue(items) {
-            return renderTable(items || [], ['resource_pool', 'provider', 'model', 'priority', 'binary_found', 'api_key_present', 'connection_quality', 'work_quality', 'score', 'active_workers', 'last_failure']);
+            return renderTable(items || [], ['resource_pool', 'provider', 'priority', 'binary_found', 'api_key_present', 'connection_quality', 'work_quality', 'score']);
         }
 
         async function saveConfig() {
             await runAction('saving config', async () => {
                 await postJson('/api/config', { config_text: editor().value });
                 editorDirty = false;
-                setStatus('config saved');
                 await refresh(true);
+                setStatus('config saved');
             });
         }
 
         async function launchWorkers(restart) {
             await runAction(restart ? 'restarting workers' : 'launching workers', async () => {
                 const data = await postJson('/api/launch', { restart });
-                const count = (data.launched || []).length;
-                const failures = (data.failures || []).length;
-                setStatus(`launch complete: ${count} launched, ${failures} failures`, failures > 0);
+                setStatus(`launch complete: ${(data.launched || []).length} launched, ${(data.failures || []).length} failures`, !(data.ok ?? false));
                 await refresh(true);
             });
         }
@@ -1058,14 +1266,16 @@ DASHBOARD_HTML = """<!doctype html>
 
         async function refresh(forceStatus = false) {
             try {
-                const response = await fetch('/api/state');
-                const data = await response.json();
+                const data = await fetchJson('/api/state');
                 latestRefreshOk = true;
+                currentCommands = data.commands || { serve: '', up: '' };
                 if (!editorDirty) {
                     editor().value = data.config_text || '';
                 }
+                document.getElementById('agent_wall').innerHTML = renderAgentWall(data);
+                document.getElementById('summary').innerHTML = renderSummaryCards(data);
                 document.getElementById('project').innerHTML = renderProject(data.project);
-                document.getElementById('processes').innerHTML = renderTable(renderProcessRows(data.processes), ['agent', 'resource_pool', 'provider', 'model', 'pid', 'alive', 'returncode', 'worktree_path']);
+                document.getElementById('processes').innerHTML = renderTable(renderProcessRows(data.processes), ['agent', 'provider', 'model', 'alive', 'pid', 'resource_pool', 'returncode']);
                 document.getElementById('provider_queue').innerHTML = renderProviderQueue(data.provider_queue);
                 document.getElementById('runtime').innerHTML = renderRuntime(data.runtime);
                 document.getElementById('heartbeats').innerHTML = renderHeartbeats(data.heartbeats);
@@ -1074,7 +1284,7 @@ DASHBOARD_HTML = """<!doctype html>
                 document.getElementById('resource_pools').innerHTML = renderPools(data.config);
                 document.getElementById('workers').innerHTML = renderWorkers(data.config);
                 document.getElementById('manager_report').textContent = data.manager_report;
-                document.getElementById('commands').textContent = `serve:\n${data.commands.serve}\n\nup:\n${data.commands.up}`;
+                document.getElementById('commands').textContent = `serve:\n${currentCommands.serve}\n\nup:\n${currentCommands.up}`;
                 document.getElementById('validation').textContent = data.validation_errors.length ? data.validation_errors.join('\n') : 'config valid';
                 if (forceStatus) {
                     setStatus(`state refreshed, last event: ${data.last_event || 'none'}`);
@@ -1093,10 +1303,10 @@ DASHBOARD_HTML = """<!doctype html>
 
         refresh(true);
         setInterval(() => {
-            if (!actionInFlight) {
+            if (!actionInFlight && autoRefresh()) {
                 refresh(false);
             }
-        }, 3000);
+        }, 4000);
     </script>
 </body>
 </html>
