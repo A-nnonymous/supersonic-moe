@@ -53,14 +53,16 @@ If you are validating Blackwell kernels directly on B200 or GB200, set `USE_QUAC
 
 ## Quickstart
 
-1. Copy `runtime/config_template.yaml` to `runtime/local_config.yaml`.
-2. Fill resource pool api keys, provider/model assignments, worktree paths, `paddle_repo_path`, and real GPU test commands.
+1. For UI-only debugging, run `python control_plane/fp8/runtime/control_plane.py serve --dry-run --open-browser`.
+2. If `runtime/local_config.yaml` is missing, the runtime now boots from `runtime/config_template.yaml` automatically and keeps launch actions disabled.
+3. If you open the Settings page during that template-backed session and save a fully filled config, it is written to `runtime/local_config.yaml` for you.
+4. For real execution, fill resource pool api keys, provider/model assignments, worktree paths, `paddle_repo_path`, and real GPU test commands.
 	Also set `project.integration_branch`, optional `project.manager_git_identity`, and any per-worker `git_identity` values you want the runtime to apply inside worker worktrees.
-3. Run `python control_plane/fp8/runtime/control_plane.py serve --config control_plane/fp8/runtime/local_config.yaml --open-browser` to start only the local web control plane.
-4. Run `python control_plane/fp8/runtime/control_plane.py up --config control_plane/fp8/runtime/local_config.yaml --open-browser` to start the web control plane and launch workers in one process.
-5. Override the bind address if needed with `--host` and `--port`, for example `--host 0.0.0.0 --port 9000`.
-6. If you bind to `0.0.0.0`, open `http://<server-hostname-or-ip>:8233` from another machine instead of `127.0.0.1`.
-7. On startup, the runtime now prints the effective listen address and a remote access URL hint to stderr.
+5. Run `python control_plane/fp8/runtime/control_plane.py serve --config control_plane/fp8/runtime/local_config.yaml --open-browser` to start only the local web control plane.
+6. Run `python control_plane/fp8/runtime/control_plane.py up --config control_plane/fp8/runtime/local_config.yaml --open-browser` to start the web control plane and launch workers in one process.
+7. Override the bind address if needed with `--host` and `--port`, for example `--host 0.0.0.0 --port 9000`.
+8. If you bind to `0.0.0.0`, open `http://<server-hostname-or-ip>:8233` from another machine instead of `127.0.0.1`.
+9. On startup, the runtime now prints the effective listen address and a remote access URL hint to stderr.
 
 ### Fire-and-forget mode
 
@@ -77,6 +79,10 @@ If your working foreground command uses `uv run ... python`, keep that same laun
 If you need to run the control plane from a lightweight manager machine that does not carry the full CUDA stack, use the standalone path below instead of the default GPU-host deployment path above:
 
 `uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/control_plane.py serve --config control_plane/fp8/runtime/local_config.yaml --open-browser`
+
+That same standalone path also supports dry-run startup with no `local_config.yaml` present:
+
+`uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/control_plane.py serve --dry-run --open-browser`
 
 ### Remote access note
 
