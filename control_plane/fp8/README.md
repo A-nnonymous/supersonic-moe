@@ -1,6 +1,14 @@
 # SonicMoE FP8 Control Plane
 
-This directory is the operational control plane for SonicMoE FP8 agentic delivery.
+This directory is the multi-agent control plane for upgrading SonicMoE with FP8 support.
+
+Its job is to keep the FP8 program executable as coordinated manager and worker work, not as ad hoc local notes. The control plane owns:
+
+- agent planning and backlog state
+- worker launch and stop orchestration
+- provider and resource-pool routing
+- branch and merge visibility for manager-owned integration
+- resumable checkpoints, heartbeats, and runtime status
 
 Fork repository name: `supersonic-moe`
 
@@ -51,24 +59,87 @@ The default target is a Linux machine with Hopper or Blackwell GPUs and a fully 
 
 If you are validating Blackwell kernels directly on B200 or GB200, set `USE_QUACK_GEMM=1` in the worker environment before launching those jobs.
 
+## Operating modes
+
+Use the control plane in one of these modes:
+
+- `serve --dry-run`: render the frontend, inspect state files, and debug the dashboard without a real worker config
+- `serve`: open the dashboard with your saved config, but do not launch workers until you explicitly press `Launch` or `Restart`
+- `up`: start the dashboard and immediately start all configured workers
+
+If `runtime/local_config.yaml` is missing, the runtime automatically falls back to `runtime/config_template.yaml` and switches into dry-run mode. If you later save a real config from the Settings page, it is written to `runtime/local_config.yaml` automatically.
+
 ## Quickstart
 
-1. For UI-only debugging, run `python control_plane/fp8/runtime/control_plane.py serve --dry-run --open-browser`.
-2. If `runtime/local_config.yaml` is missing, the runtime now boots from `runtime/config_template.yaml` automatically and keeps launch actions disabled.
-3. If you open the Settings page during that template-backed session and save a fully filled config, it is written to `runtime/local_config.yaml` for you.
-4. For real execution, fill resource pool api keys, provider/model assignments, worktree paths, `paddle_repo_path`, and real GPU test commands.
-	Also set `project.integration_branch`, optional `project.manager_git_identity`, and any per-worker `git_identity` values you want the runtime to apply inside worker worktrees.
-5. Run `python control_plane/fp8/runtime/control_plane.py serve --config control_plane/fp8/runtime/local_config.yaml --open-browser` to start only the local web control plane.
-6. Run `python control_plane/fp8/runtime/control_plane.py up --config control_plane/fp8/runtime/local_config.yaml --open-browser` to start the web control plane and launch workers in one process.
-7. Override the bind address if needed with `--host` and `--port`, for example `--host 0.0.0.0 --port 9000`.
-8. If you bind to `0.0.0.0`, open `http://<server-hostname-or-ip>:8233` from another machine instead of `127.0.0.1`.
-9. On startup, the runtime now prints the effective listen address and a remote access URL hint to stderr.
+### 1. Frontend-only debugging
+
+Use this when you want to verify the dashboard can open and render even before filling real paths, API keys, or worker commands:
+
+`python control_plane/fp8/runtime/control_plane.py serve --dry-run --open-browser`
+
+### 2. Prepare real multi-agent execution
+
+Fill `runtime/local_config.yaml` from the Settings page or by editing YAML directly. At minimum, replace placeholder values for:
+
+- `project.local_repo_root`
+- `project.paddle_repo_path`
+- worker `worktree_path`
+- worker `environment_path`
+- resource pool credentials or credential env vars
+- real worker `test_command` values
+
+Also set `project.integration_branch`, optional `project.manager_git_identity`, and any per-worker `git_identity` values you want the runtime to apply inside worker worktrees.
+
+### 3. Start the dashboard only
+
+Use this when you want the manager to inspect config, queues, and branch state first, then launch agents from the UI:
+
+`python control_plane/fp8/runtime/control_plane.py serve --open-browser`
+
+### 4. Start the dashboard and launch all configured agents
+
+Use this when your config is ready and the manager wants to begin active multi-agent execution immediately:
+
+`python control_plane/fp8/runtime/control_plane.py up --open-browser`
+
+### 5. Pause running multi-agent work
+
+Use one of these paths:
+
+1. Preferred: click `Stop` in the top bar. This stops all worker processes while keeping the dashboard online.
+2. Remote or scripted control: `curl -X POST http://127.0.0.1:8233/api/stop -H 'Content-Type: application/json' -d '{}'`
+3. Full shutdown: stop the foreground process with `Ctrl-C`, or stop the detached control-plane process from the shell.
+
+### 6. Resume paused work
+
+After a pause, use one of these paths:
+
+1. Click `Launch` to start workers again with the current config.
+2. Click `Restart` if you want a full stop-and-relaunch cycle.
+3. Re-run `python control_plane/fp8/runtime/control_plane.py up --open-browser` if the control plane itself is not running.
+
+## Launch parameters
+
+Use the short form by default:
+
+- `serve` opens the control plane only
+- `up` opens the control plane and launches workers
+- `--dry-run` forces dashboard-only mode
+- `--open-browser` opens the dashboard automatically
+
+Add these only when needed:
+
+- `--host 0.0.0.0` to listen on all interfaces
+- `--port 9000` to change the dashboard port
+- `--detach` to keep the control plane running after the shell returns
+- `--log-file <path>` to change the detached log path
+- `--config <path>` only if you do not want the default `runtime/local_config.yaml`
 
 ### Fire-and-forget mode
 
 If you want the control plane to keep running after the shell returns, use detached mode:
 
-`python control_plane/fp8/runtime/control_plane.py serve --config control_plane/fp8/runtime/local_config.yaml --host 0.0.0.0 --port 8233 --detach`
+`python control_plane/fp8/runtime/control_plane.py serve --host 0.0.0.0 --port 8233 --detach`
 
 The detached process writes combined stdout and stderr to `control_plane/fp8/runtime/control_plane.log` by default. You can override that path with `--log-file`.
 
@@ -78,7 +149,7 @@ If your working foreground command uses `uv run ... python`, keep that same laun
 
 If you need to run the control plane from a lightweight manager machine that does not carry the full CUDA stack, use the standalone path below instead of the default GPU-host deployment path above:
 
-`uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/control_plane.py serve --config control_plane/fp8/runtime/local_config.yaml --open-browser`
+`uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/control_plane.py serve --open-browser`
 
 That same standalone path also supports dry-run startup with no `local_config.yaml` present:
 
@@ -100,6 +171,18 @@ The local webpage now provides:
 - provider priority queue with runtime connection-quality and work-quality scoring
 - per-worker git commit identities that are applied inside each worker worktree before launch
 - a manager-owned merge queue that tracks which worker branch should be integrated into the target branch
+
+## Real usage pattern
+
+For actual SonicMoE FP8 multi-agent delivery, the normal manager loop is:
+
+1. open the dashboard with `serve --open-browser`
+2. verify Settings and validation output are clean
+3. press `Launch` or run `up --open-browser`
+4. monitor agent health, backlog progress, and branch merge status from `Overview`
+5. inspect provider routing, runtime topology, and heartbeats in `Operations`
+6. press `Stop` when you want to pause the worker fleet without losing dashboard state
+7. let A0 merge finished worker branches into `project.integration_branch`
 
 ## Interaction model
 
