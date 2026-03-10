@@ -100,37 +100,58 @@ class DualStackThreadingHTTPServer(ThreadingHTTPServer):
         super().server_bind()
 
 
-def bind_targets(host: str) -> list[str]:
-    if host == "0.0.0.0":
-        return ["::", host]
-    return [host]
+class IPv6OnlyThreadingHTTPServer(ThreadingHTTPServer):
+    address_family = socket.AF_INET6
 
-
-def create_http_server(host: str, port: int, handler: type[BaseHTTPRequestHandler]) -> ThreadingHTTPServer:
-    attempts: list[str] = []
-    for bind_host in bind_targets(host):
-        try:
-            infos = socket.getaddrinfo(bind_host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE)
-        except socket.gaierror as exc:
-            attempts.append(f"{bind_host}:{port} ({exc})")
-            continue
-
-        for family, _, _, _, sockaddr in infos:
-            server_cls: type[ThreadingHTTPServer]
-            if family == socket.AF_INET6:
-                server_cls = DualStackThreadingHTTPServer
-            elif family == socket.AF_INET:
-                server_cls = ThreadingHTTPServer
-            else:
-                continue
-
+    def server_bind(self) -> None:
+        if hasattr(socket, "IPPROTO_IPV6") and hasattr(socket, "IPV6_V6ONLY"):
             try:
-                server = server_cls(sockaddr, handler, bind_and_activate=False)
-                server.server_bind()
-                server.server_activate()
-                return server
-            except OSError as exc:
-                attempts.append(f"{sockaddr} ({exc})")
+                self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            except OSError:
+                pass
+        super().server_bind()
+
+
+def bind_server(
+    server_cls: type[ThreadingHTTPServer], address: Any, handler: type[BaseHTTPRequestHandler]
+) -> ThreadingHTTPServer:
+    server = server_cls(address, handler, bind_and_activate=False)
+    server.server_bind()
+    server.server_activate()
+    return server
+
+
+def create_http_servers(host: str, port: int, handler: type[BaseHTTPRequestHandler]) -> list[ThreadingHTTPServer]:
+    attempts: list[str] = []
+    servers: list[ThreadingHTTPServer] = []
+
+    if host == "0.0.0.0":
+        try:
+            servers.append(bind_server(ThreadingHTTPServer, (host, port), handler))
+        except OSError as exc:
+            attempts.append(f"{host}:{port} ({exc})")
+        try:
+            servers.append(bind_server(IPv6OnlyThreadingHTTPServer, ("::", port, 0, 0), handler))
+        except OSError as exc:
+            attempts.append(f"[::]:{port} ({exc})")
+        if servers:
+            return servers
+        detail = "; ".join(attempts) if attempts else "no compatible address families"
+        raise OSError(f"failed to bind control plane on {host}:{port}: {detail}")
+
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE)
+    except socket.gaierror as exc:
+        raise OSError(f"failed to resolve control plane host {host}:{port}: {exc}") from exc
+
+    for family, _, _, _, sockaddr in infos:
+        try:
+            if family == socket.AF_INET6:
+                return [bind_server(IPv6OnlyThreadingHTTPServer, sockaddr, handler)]
+            if family == socket.AF_INET:
+                return [bind_server(ThreadingHTTPServer, sockaddr, handler)]
+        except OSError as exc:
+            attempts.append(f"{sockaddr} ({exc})")
 
     detail = "; ".join(attempts) if attempts else "no compatible address families"
     raise OSError(f"failed to bind control plane on {host}:{port}: {detail}")
@@ -156,8 +177,8 @@ class ControlPlaneService:
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
         self.monitor_thread: threading.Thread | None = None
-        self.server_thread: threading.Thread | None = None
-        self.httpd: ThreadingHTTPServer | None = None
+        self.server_threads: list[threading.Thread] = []
+        self.http_servers: list[ThreadingHTTPServer] = []
         self.processes: dict[str, WorkerProcess] = {}
         self.last_event = "initialized"
         PROMPT_DIR.mkdir(parents=True, exist_ok=True)
@@ -858,11 +879,19 @@ Primary test command:
             def log_message(self, format: str, *args: object) -> None:  # noqa: A003
                 return
 
-        self.httpd = create_http_server(host, port, Handler)
-        self.server_thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
-        self.server_thread.start()
-        listen_host, listen_port = self.httpd.server_address[:2]
-        print(f"control plane listening on {format_endpoint(listen_host, listen_port)}", file=sys.stderr, flush=True)
+        self.http_servers = create_http_servers(host, port, Handler)
+        self.server_threads = []
+        for server in self.http_servers:
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            self.server_threads.append(thread)
+
+        listen_endpoints = []
+        for server in self.http_servers:
+            listen_host, listen_port = server.server_address[:2]
+            endpoint = format_endpoint(listen_host, listen_port)
+            listen_endpoints.append(endpoint)
+            print(f"control plane listening on {endpoint}", file=sys.stderr, flush=True)
         if host in {"0.0.0.0", "::"}:
             print(
                 f"remote access URL: http://<server-hostname-or-ip>:{listen_port}",
@@ -871,7 +900,7 @@ Primary test command:
             )
         if open_browser:
             webbrowser.open(f"http://{browser_open_host(host)}:{listen_port}")
-        self.last_event = f"dashboard:{format_endpoint(listen_host, listen_port)}"
+        self.last_event = f"dashboard:{', '.join(listen_endpoints)}"
 
     def wait_forever(self) -> None:
         while not self.stop_event.is_set():
@@ -895,8 +924,9 @@ Primary test command:
     def shutdown(self) -> None:
         self.stop_event.set()
         self.stop_workers()
-        if self.httpd:
-            self.httpd.shutdown()
+        for server in self.http_servers:
+            server.shutdown()
+            server.server_close()
 
 
 DASHBOARD_HTML = """<!doctype html>
@@ -1391,7 +1421,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default=None, help="override dashboard host")
     parser.add_argument("--port", type=int, default=None, help="override dashboard port")
     parser.add_argument("--open-browser", action="store_true", help="open the dashboard in a browser")
+    parser.add_argument("--detach", action="store_true", help="start the control plane in the background and return")
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=RUNTIME_DIR / "control_plane.log",
+        help="log file used when --detach is enabled",
+    )
     return parser.parse_args()
+
+
+def detach_process(args: argparse.Namespace) -> int:
+    log_path = args.log_file
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    command = [sys.executable, str(Path(__file__).resolve()), args.command, "--config", str(args.config)]
+    if args.host is not None:
+        command.extend(["--host", args.host])
+    if args.port is not None:
+        command.extend(["--port", str(args.port)])
+    if args.open_browser:
+        command.append("--open-browser")
+
+    env = os.environ.copy()
+    env["CONTROL_PLANE_DETACHED"] = "1"
+    with log_path.open("a", encoding="utf-8") as handle:
+        process = subprocess.Popen(
+            command,
+            cwd=REPO_ROOT,
+            stdin=subprocess.DEVNULL,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            env=env,
+        )
+    print(f"control plane started in background: pid={process.pid} log={log_path}")
+    return 0
 
 
 def main() -> int:
@@ -1400,6 +1464,9 @@ def main() -> int:
         print(f"missing config: {args.config}", file=sys.stderr)
         print(f"copy {RUNTIME_DIR / 'config_template.yaml'} to {args.config} and fill it first", file=sys.stderr)
         return 2
+
+    if args.detach and os.environ.get("CONTROL_PLANE_DETACHED") != "1":
+        return detach_process(args)
 
     service = ControlPlaneService(args.config, host_override=args.host, port_override=args.port)
 

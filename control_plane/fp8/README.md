@@ -61,6 +61,16 @@ If you are validating Blackwell kernels directly on B200 or GB200, set `USE_QUAC
 6. If you bind to `0.0.0.0`, open `http://<server-hostname-or-ip>:8233` from another machine instead of `127.0.0.1`.
 7. On startup, the runtime now prints the effective listen address and a remote access URL hint to stderr.
 
+### Fire-and-forget mode
+
+If you want the control plane to keep running after the shell returns, use detached mode:
+
+`python control_plane/fp8/runtime/control_plane.py serve --config control_plane/fp8/runtime/local_config.yaml --host 0.0.0.0 --port 8233 --detach`
+
+The detached process writes combined stdout and stderr to `control_plane/fp8/runtime/control_plane.log` by default. You can override that path with `--log-file`.
+
+If your working foreground command uses `uv run ... python`, keep that same launcher and append `--detach` at the end instead of switching interpreters.
+
 ### Compatibility fallback
 
 If you need to run the control plane from a lightweight manager machine that does not carry the full CUDA stack, use the standalone path below instead of the default GPU-host deployment path above:
@@ -69,7 +79,7 @@ If you need to run the control plane from a lightweight manager machine that doe
 
 ### Remote access note
 
-If your deployment hostname resolves to IPv6 first, older IPv4-only listeners can look like `ERR_CONNECTION_REFUSED` from the browser even when the port is open on IPv4. The runtime now prefers a dual-stack bind when you pass `--host 0.0.0.0`, then falls back to IPv4 if dual-stack is unavailable.
+If your deployment hostname resolves to IPv6 first, an IPv6-only listener can still look like `ERR_CONNECTION_REFUSED` from the browser when your clients reach the node over IPv4. The runtime now always brings up an IPv4 listener first when you pass `--host 0.0.0.0`, then adds IPv6 as a secondary listener when possible.
 
 ## Dashboard capabilities
 
