@@ -5,9 +5,22 @@ export type CommandMap = {
   up: string;
 };
 
+export type LaunchStrategy = 'initial_copilot' | 'selected_model' | 'elastic';
+
+export type LaunchPolicyState = {
+  default_strategy: LaunchStrategy;
+  default_provider?: string | null;
+  default_model?: string | null;
+  available_strategies: LaunchStrategy[];
+  available_providers: string[];
+  initial_provider: string;
+  has_launch_history: boolean;
+};
+
 export type DashboardMode = {
   state: string;
   cold_start: boolean;
+  listener_active: boolean;
   reason: string;
   config_path: string;
   persist_config_path: string;
@@ -107,7 +120,11 @@ export type ConfigWorker = {
   task_id?: string;
   resource_pool?: string;
   resource_pool_queue?: string[];
+  worktree_path?: string;
   branch?: string;
+  environment_type?: string;
+  environment_path?: string;
+  sync_command?: string;
   git_identity?: {
     name?: string;
     email?: string;
@@ -116,14 +133,29 @@ export type ConfigWorker = {
   test_command?: string;
 };
 
+export type ConfigProvider = {
+  api_key_env_name?: string;
+  command_template?: string[];
+};
+
+export type ConfigResourcePool = {
+  priority?: number;
+  provider?: string;
+  model?: string;
+  api_key?: string;
+  extra_env?: Record<string, string>;
+};
+
 export type ConfigShape = {
   project?: ConfigProject;
-  resource_pools?: Record<string, {
-    priority?: number;
-    provider?: string;
-    model?: string;
-  }>;
+  providers?: Record<string, ConfigProvider>;
+  resource_pools?: Record<string, ConfigResourcePool>;
   workers?: ConfigWorker[];
+};
+
+export type ValidationIssue = {
+  field: string;
+  message: string;
 };
 
 export type DashboardState = {
@@ -132,6 +164,7 @@ export type DashboardState = {
   mode: DashboardMode;
   project: ConfigProject;
   commands: CommandMap;
+  launch_policy: LaunchPolicyState;
   manager_report: string;
   runtime: { workers?: RuntimeWorker[] };
   heartbeats: { agents?: HeartbeatAgent[] };
@@ -148,13 +181,26 @@ export type DashboardState = {
 
 export type ConfigSaveResponse = {
   ok: boolean;
+  validation_issues: ValidationIssue[];
   validation_errors: string[];
   launch_blockers: string[];
   cold_start: boolean;
 };
 
+export type ConfigValidationResponse = {
+  ok: boolean;
+  validation_issues: ValidationIssue[];
+  validation_errors: string[];
+  launch_blockers: string[];
+};
+
 export type LaunchResponse = {
   ok: boolean;
+  launch_policy?: {
+    strategy: LaunchStrategy;
+    provider?: string | null;
+    model?: string | null;
+  };
   launched?: Array<Record<string, unknown>>;
   failures?: Array<{ agent: string; error: string }>;
   errors?: string[];
@@ -172,4 +218,11 @@ export type StopAllResponse = {
   listener_released?: boolean;
   stopped_workers?: string[];
   warning?: string;
+};
+
+export type SilentModeResponse = {
+  ok: boolean;
+  listener_port?: number;
+  listener_active: boolean;
+  stop_agents: boolean;
 };

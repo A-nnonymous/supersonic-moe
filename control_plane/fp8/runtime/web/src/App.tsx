@@ -1,41 +1,21 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { fetchState, launchWorkers, saveConfig, stopAll, stopWorkers } from './api';
+import { enableSilentMode, fetchState, launchWorkers, saveConfig, stopAll, stopWorkers, validateConfig } from './api';
 import type {
+  ConfigResourcePool,
   ConfigShape,
   ConfigWorker,
   DashboardState,
   GateItem,
   HeartbeatAgent,
+  LaunchStrategy,
   MergeQueueItem,
   ProcessSnapshot,
-  ProviderQueueItem,
   RuntimeWorker,
   TabKey,
+  ValidationIssue,
 } from './types';
 
 const AUTO_REFRESH_MS = 4000;
-
-function classNames(...values: Array<string | false | null | undefined>): string {
-  return values.filter(Boolean).join(' ');
-}
-
-function stateClass(value: string | undefined): string {
-  return `state-${String(value || 'unknown').replace(/[^a-zA-Z0-9]+/g, '_')}`;
-}
-
-function displayState(value: string | undefined): string {
-  return String(value || 'unknown').replaceAll('_', ' ');
-}
-
-function renderCell(value: unknown): string {
-  if (value === null || value === undefined || value === '') {
-    return ' ';
-  }
-  if (typeof value === 'boolean') {
-    return value ? 'yes' : 'no';
-  }
-  return String(value);
-}
 
 type AgentRow = {
   agent: string;
@@ -53,6 +33,88 @@ type AgentRow = {
   last_seen?: string;
   display_state: string;
 };
+
+type ProgressModel = {
+  progress: number;
+  passedGates: number;
+  totalGates: number;
+  completedItems: number;
+  totalItems: number;
+  blockedItems: number;
+  activeAgents: number;
+  attentionAgents: number;
+  openGate?: GateItem;
+};
+
+type IssueMap = Record<string, string[]>;
+
+function classNames(...values: Array<string | false | null | undefined>): string {
+  return values.filter(Boolean).join(' ');
+}
+
+function displayState(value: string | undefined): string {
+  return String(value || 'unknown').replaceAll('_', ' ');
+}
+
+function stateClass(value: string | undefined): string {
+  return `state-${String(value || 'unknown').replace(/[^a-zA-Z0-9]+/g, '_')}`;
+}
+
+function renderCell(value: unknown): string {
+  if (value === null || value === undefined || value === '') {
+    return ' ';
+  }
+  if (typeof value === 'boolean') {
+    return value ? 'yes' : 'no';
+  }
+  return String(value);
+}
+
+function cloneConfig(config: ConfigShape | undefined): ConfigShape {
+  if (!config) {
+    return { project: {}, providers: {}, resource_pools: {}, workers: [] };
+  }
+  return JSON.parse(JSON.stringify(config)) as ConfigShape;
+}
+
+function normalizeConfig(config: ConfigShape): ConfigShape {
+  return {
+    project: config.project || {},
+    providers: config.providers || {},
+    resource_pools: config.resource_pools || {},
+    workers: config.workers || [],
+  };
+}
+
+function buildIssueMap(...issueSets: ValidationIssue[][]): IssueMap {
+  return issueSets.reduce<IssueMap>((acc, issues) => {
+    issues.forEach((issue) => {
+      acc[issue.field] = [...(acc[issue.field] || []), issue.message];
+    });
+    return acc;
+  }, {});
+}
+
+function parseQueue(value: string): string[] {
+  return value
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function stringifyQueue(values: string[] | undefined): string {
+  return (values || []).join(', ');
+}
+
+function launchStrategyLabel(strategy: LaunchStrategy): string {
+  if (strategy === 'initial_copilot') {
+    return 'Initial Copilot';
+  }
+  if (strategy === 'selected_model') {
+    return 'Selected Model';
+  }
+  return 'Elastic';
+}
 
 function sortAgents(rows: AgentRow[]): AgentRow[] {
   return [...rows].sort((left, right) => {
@@ -85,9 +147,7 @@ function buildAgentRows(data: DashboardState | null): AgentRow[] {
   });
 
   (data.config?.workers || []).forEach((item: ConfigWorker) => {
-    remember(item.agent, {
-      branch: item.branch,
-    });
+    remember(item.agent, { branch: item.branch });
   });
 
   (data.heartbeats?.agents || []).forEach((item: HeartbeatAgent) => {
@@ -133,18 +193,6 @@ function buildAgentRows(data: DashboardState | null): AgentRow[] {
   );
 }
 
-type ProgressModel = {
-  progress: number;
-  passedGates: number;
-  totalGates: number;
-  completedItems: number;
-  totalItems: number;
-  blockedItems: number;
-  activeAgents: number;
-  attentionAgents: number;
-  openGate?: GateItem;
-};
-
 function buildProgressModel(data: DashboardState | null, agentRows: AgentRow[]): ProgressModel {
   const gates = data?.gates?.gates || [];
   const backlog = data?.backlog?.items || [];
@@ -158,23 +206,183 @@ function buildProgressModel(data: DashboardState | null, agentRows: AgentRow[]):
   return { progress, passedGates, totalGates: gates.length, completedItems, totalItems: backlog.length, blockedItems, activeAgents, attentionAgents, openGate };
 }
 
+function getLocalValidationIssues(config: ConfigShape): ValidationIssue[] {
+  const draft = normalizeConfig(config);
+  const issues: ValidationIssue[] = [];
+  const add = (field: string, message: string) => issues.push({ field, message });
+  const project = draft.project || {};
+  const dashboard = project.dashboard || {};
+  const pools = draft.resource_pools || {};
+  const workers = draft.workers || [];
+
+  if (!String(project.repository_name || '').trim()) {
+    add('project.repository_name', 'repository name is required');
+  }
+  if (!String(project.local_repo_root || '').trim()) {
+    add('project.local_repo_root', 'local repo root is required');
+  }
+  if (!String(project.paddle_repo_path || '').trim()) {
+    add('project.paddle_repo_path', 'Paddle path is required');
+  }
+  if (!String(dashboard.host || '').trim()) {
+    add('project.dashboard.host', 'dashboard host is required');
+  }
+  if (!Number.isInteger(Number(dashboard.port)) || Number(dashboard.port) < 1 || Number(dashboard.port) > 65535) {
+    add('project.dashboard.port', 'dashboard port must be between 1 and 65535');
+  }
+  if (!String(project.integration_branch || project.base_branch || '').trim()) {
+    add('project.integration_branch', 'integration branch is required');
+  }
+
+  const seenAgents = new Set<string>();
+  const seenBranches = new Set<string>();
+  const seenWorktrees = new Set<string>();
+
+  Object.entries(pools).forEach(([poolName, pool]) => {
+    if (!String(pool.provider || '').trim()) {
+      add(`resource_pools.${poolName}.provider`, 'provider is required');
+    }
+    if (!String(pool.model || '').trim()) {
+      add(`resource_pools.${poolName}.model`, 'model is required');
+    }
+    if (!Number.isInteger(Number(pool.priority ?? 100))) {
+      add(`resource_pools.${poolName}.priority`, 'priority must be an integer');
+    }
+  });
+
+  workers.forEach((worker, index) => {
+    const root = `workers[${index}]`;
+    const agent = String(worker.agent || '').trim();
+    const branch = String(worker.branch || '').trim();
+    const worktreePath = String(worker.worktree_path || '').trim();
+    if (!agent) {
+      add(`${root}.agent`, 'agent is required');
+    } else if (seenAgents.has(agent)) {
+      add(`${root}.agent`, 'agent must be unique');
+    } else {
+      seenAgents.add(agent);
+    }
+    if (!branch) {
+      add(`${root}.branch`, 'branch is required');
+    } else if (seenBranches.has(branch)) {
+      add(`${root}.branch`, 'branch must be unique');
+    } else {
+      seenBranches.add(branch);
+    }
+    if (!worktreePath) {
+      add(`${root}.worktree_path`, 'worktree path is required');
+    } else if (seenWorktrees.has(worktreePath)) {
+      add(`${root}.worktree_path`, 'worktree path must be unique');
+    } else {
+      seenWorktrees.add(worktreePath);
+    }
+    const poolName = String(worker.resource_pool || '').trim();
+    const queue = worker.resource_pool_queue || [];
+    if (!poolName && !queue.length) {
+      add(`${root}.resource_pool`, 'resource pool or queue is required');
+    }
+    if (!String(worker.test_command || '').trim()) {
+      add(`${root}.test_command`, 'test command is required');
+    }
+    if (!String(worker.submit_strategy || '').trim()) {
+      add(`${root}.submit_strategy`, 'submit strategy is required');
+    }
+    if (String(worker.environment_type || 'uv') !== 'none' && !String(worker.environment_path || '').trim()) {
+      add(`${root}.environment_path`, 'environment path is required unless environment type is none');
+    }
+  });
+
+  return issues;
+}
+
 function DataTable({ columns, rows }: { columns: string[]; rows: Array<Record<string, unknown>> }) {
   if (!rows.length) {
     return <div className="small muted">No data</div>;
   }
   return (
-    <table>
-      <thead>
-        <tr>{columns.map((column) => <th key={column}>{column}</th>)}</tr>
-      </thead>
-      <tbody>
-        {rows.map((row, rowIndex) => (
-          <tr key={rowIndex}>
-            {columns.map((column) => <td key={column}>{renderCell(row[column])}</td>)}
-          </tr>
-        ))}
-      </tbody>
-    </table>
+    <div className="table-shell">
+      <table>
+        <thead>
+          <tr>{columns.map((column) => <th key={column}>{column}</th>)}</tr>
+        </thead>
+        <tbody>
+          {rows.map((row, rowIndex) => (
+            <tr key={rowIndex}>
+              {columns.map((column) => <td key={column}>{renderCell(row[column])}</td>)}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function Field({
+  label,
+  value,
+  onChange,
+  issues,
+  placeholder,
+  type = 'text',
+}: {
+  label: string;
+  value: string | number;
+  onChange: (value: string) => void;
+  issues?: string[];
+  placeholder?: string;
+  type?: 'text' | 'number';
+}) {
+  return (
+    <label className="field">
+      <span className="field-label">{label}</span>
+      <input
+        className={classNames('field-input', issues && issues.length > 0 && 'field-input-error')}
+        type={type}
+        value={value ?? ''}
+        placeholder={placeholder}
+        onChange={(event) => onChange(event.target.value)}
+      />
+      {issues && issues.length > 0 ? <span className="field-error">{issues[0]}</span> : null}
+    </label>
+  );
+}
+
+function SelectField({
+  label,
+  value,
+  onChange,
+  issues,
+  options,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  issues?: string[];
+  options: string[];
+}) {
+  return (
+    <label className="field">
+      <span className="field-label">{label}</span>
+      <select className={classNames('field-input', issues && issues.length > 0 && 'field-input-error')} value={value} onChange={(event) => onChange(event.target.value)}>
+        <option value="">Select…</option>
+        {options.map((option) => <option key={option} value={option}>{option}</option>)}
+      </select>
+      {issues && issues.length > 0 ? <span className="field-error">{issues[0]}</span> : null}
+    </label>
+  );
+}
+
+function SectionIssueList({ issues }: { issues: ValidationIssue[] }) {
+  if (!issues.length) {
+    return null;
+  }
+  return (
+    <div className="settings-issues">
+      <h3>Validation Warnings</h3>
+      <ul>
+        {issues.map((issue, index) => <li key={`${issue.field}-${index}`}>{issue.field}: {issue.message}</li>)}
+      </ul>
+    </div>
   );
 }
 
@@ -259,6 +467,7 @@ function OperationsTab({ data }: { data: DashboardState }) {
     { key: 'paddle_repo_path', value: data.project.paddle_repo_path || '' },
     { key: 'integration_branch', value: data.project.integration_branch || data.project.base_branch || '' },
     { key: 'dashboard', value: data.project.dashboard?.host && data.project.dashboard?.port ? `${data.project.dashboard.host}:${data.project.dashboard.port}` : '' },
+    { key: 'listener_active', value: data.mode.listener_active },
   ];
   const processRows = Object.entries(data.processes || {}).map(([agent, item]) => ({ agent, provider: item.provider, model: item.model, alive: item.alive, pid: item.pid, resource_pool: item.resource_pool, returncode: item.returncode }));
   const mergeRows = data.merge_queue.map((item) => ({ agent: item.agent, branch: item.branch, submit_strategy: item.submit_strategy, worker_identity: item.worker_identity, merge_target: item.merge_target, status: item.status, manager_action: item.manager_action }));
@@ -290,43 +499,115 @@ function OperationsTab({ data }: { data: DashboardState }) {
   );
 }
 
-function SettingsTab({ data, configText, onChange, onSave }: { data: DashboardState; configText: string; onChange: (value: string) => void; onSave: () => void }) {
-  const pools = Object.entries(data.config.resource_pools || {}).map(([name, item]) => ({ name, priority: item.priority ?? 100, provider: item.provider, model: item.model }));
-  const workers = (data.config.workers || []).map((item) => ({ agent: item.agent, task_id: item.task_id, resource_pool: item.resource_pool, resource_pool_queue: (item.resource_pool_queue || []).join(', '), branch: item.branch, git_identity: item.git_identity ? `${item.git_identity.name || ''} <${item.git_identity.email || ''}>` : 'environment default', submit_strategy: item.submit_strategy, test_command: item.test_command }));
-  const manager = data.project.manager_git_identity ? `${data.project.manager_git_identity.name || ''} <${data.project.manager_git_identity.email || ''}>` : 'A0 manager identity';
-  const mergePolicy = [
-    { key: 'integration_branch', value: data.project.integration_branch || data.project.base_branch || 'main' },
-    { key: 'manager_identity', value: manager },
-    { key: 'merge_owner', value: 'A0' },
-    { key: 'tracked_worker_branches', value: String(data.merge_queue.length) },
-  ];
-  const projectRows = [
-    { key: 'repository_name', value: data.project.repository_name || '' },
-    { key: 'local_repo_root', value: data.project.local_repo_root || '' },
-    { key: 'paddle_repo_path', value: data.project.paddle_repo_path || '' },
-    { key: 'integration_branch', value: data.project.integration_branch || data.project.base_branch || '' },
-    { key: 'dashboard', value: data.project.dashboard?.host && data.project.dashboard?.port ? `${data.project.dashboard.host}:${data.project.dashboard.port}` : '' },
-  ];
+function SettingsTab({
+  draftConfig,
+  providerOptions,
+  issues,
+  backendIssues,
+  onProjectChange,
+  onMergeChange,
+  onPoolChange,
+  onAddPool,
+  onWorkerChange,
+  onAddWorker,
+  onSave,
+}: {
+  draftConfig: ConfigShape;
+  providerOptions: string[];
+  issues: IssueMap;
+  backendIssues: ValidationIssue[];
+  onProjectChange: (field: string, value: string) => void;
+  onMergeChange: (field: string, value: string) => void;
+  onPoolChange: (poolName: string, field: keyof ConfigResourcePool, value: string) => void;
+  onAddPool: () => void;
+  onWorkerChange: (index: number, field: string, value: string) => void;
+  onAddWorker: () => void;
+  onSave: () => void;
+}) {
+  const project = draftConfig.project || {};
+  const dashboard = project.dashboard || {};
+  const pools = draftConfig.resource_pools || {};
+  const workers = draftConfig.workers || [];
   return (
     <div className="tab-body">
       <section className="card">
         <div className="page-header">
           <div>
             <h2>Settings</h2>
-            <p className="small">Edit API keys, provider routing, worktrees, Paddle path, and worker commands here.</p>
+            <p className="small">The four cards below are editable. Invalid values are warned and are not saved.</p>
           </div>
-          <button onClick={onSave}>Save Settings</button>
+          <button onClick={onSave}>Validate And Save</button>
         </div>
-        <div className="config-layout">
-          <div>
-            <textarea value={configText} onChange={(event) => onChange(event.target.value)} />
-          </div>
-          <div className="helper-list">
-            <section className="helper-card"><h3>Project</h3><DataTable columns={['key', 'value']} rows={projectRows} /></section>
-            <section className="helper-card"><h3>Resource Pools</h3><DataTable columns={['name', 'priority', 'provider', 'model']} rows={pools} /></section>
-            <section className="helper-card"><h3>Merge Policy</h3><DataTable columns={['key', 'value']} rows={mergePolicy} /></section>
-            <section className="helper-card"><h3>Worker Config</h3><DataTable columns={['agent', 'task_id', 'resource_pool', 'resource_pool_queue', 'branch', 'git_identity', 'submit_strategy', 'test_command']} rows={workers} /></section>
-          </div>
+        <SectionIssueList issues={backendIssues} />
+        <div className="settings-grid">
+          <section className="helper-card settings-card">
+            <div className="section-head"><h3>Project</h3></div>
+            <div className="field-grid">
+              <Field label="Repository" value={project.repository_name || ''} onChange={(value) => onProjectChange('repository_name', value)} issues={issues['project.repository_name']} />
+              <Field label="Local Repo Root" value={project.local_repo_root || ''} onChange={(value) => onProjectChange('local_repo_root', value)} issues={issues['project.local_repo_root']} />
+              <Field label="Paddle Repo Path" value={project.paddle_repo_path || ''} onChange={(value) => onProjectChange('paddle_repo_path', value)} issues={issues['project.paddle_repo_path']} />
+              <Field label="Dashboard Host" value={dashboard.host || ''} onChange={(value) => onProjectChange('dashboard.host', value)} issues={issues['project.dashboard.host']} />
+              <Field label="Dashboard Port" type="number" value={dashboard.port || 8233} onChange={(value) => onProjectChange('dashboard.port', value)} issues={issues['project.dashboard.port']} />
+            </div>
+          </section>
+
+          <section className="helper-card settings-card">
+            <div className="section-head">
+              <h3>Resource Pools</h3>
+              <button className="ghost" type="button" onClick={onAddPool}>Add Pool</button>
+            </div>
+            <div className="stack-list">
+              {Object.entries(pools).map(([poolName, pool]) => (
+                <div key={poolName} className="subcard">
+                  <div className="subcard-title">{poolName}</div>
+                  <div className="field-grid">
+                    <SelectField label="Provider" value={String(pool.provider || '')} onChange={(value) => onPoolChange(poolName, 'provider', value)} issues={issues[`resource_pools.${poolName}.provider`]} options={providerOptions} />
+                    <Field label="Model" value={String(pool.model || '')} onChange={(value) => onPoolChange(poolName, 'model', value)} issues={issues[`resource_pools.${poolName}.model`]} />
+                    <Field label="Priority" type="number" value={Number(pool.priority ?? 100)} onChange={(value) => onPoolChange(poolName, 'priority', value)} issues={issues[`resource_pools.${poolName}.priority`]} />
+                    <Field label="API Key" value={String(pool.api_key || '')} onChange={(value) => onPoolChange(poolName, 'api_key', value)} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+
+          <section className="helper-card settings-card">
+            <div className="section-head"><h3>Merge Policy</h3></div>
+            <div className="field-grid">
+              <Field label="Integration Branch" value={project.integration_branch || project.base_branch || ''} onChange={(value) => onMergeChange('integration_branch', value)} issues={issues['project.integration_branch']} />
+              <Field label="Manager Name" value={project.manager_git_identity?.name || ''} onChange={(value) => onMergeChange('manager_git_identity.name', value)} />
+              <Field label="Manager Email" value={project.manager_git_identity?.email || ''} onChange={(value) => onMergeChange('manager_git_identity.email', value)} />
+            </div>
+          </section>
+
+          <section className="helper-card settings-card settings-card-wide">
+            <div className="section-head">
+              <h3>Worker Config</h3>
+              <button className="ghost" type="button" onClick={onAddWorker}>Add Worker</button>
+            </div>
+            <div className="stack-list">
+              {workers.map((worker, index) => (
+                <div key={`${worker.agent || 'worker'}-${index}`} className="subcard">
+                  <div className="subcard-title">{worker.agent || `Worker ${index + 1}`}</div>
+                  <div className="field-grid">
+                    <Field label="Agent" value={worker.agent || ''} onChange={(value) => onWorkerChange(index, 'agent', value)} issues={issues[`workers[${index}].agent`]} />
+                    <Field label="Task ID" value={worker.task_id || ''} onChange={(value) => onWorkerChange(index, 'task_id', value)} />
+                    <Field label="Resource Pool" value={worker.resource_pool || ''} onChange={(value) => onWorkerChange(index, 'resource_pool', value)} issues={issues[`workers[${index}].resource_pool`]} />
+                    <Field label="Pool Queue" value={stringifyQueue(worker.resource_pool_queue)} onChange={(value) => onWorkerChange(index, 'resource_pool_queue', value)} issues={issues[`workers[${index}].resource_pool_queue`]} placeholder="pool_a, pool_b" />
+                    <Field label="Branch" value={worker.branch || ''} onChange={(value) => onWorkerChange(index, 'branch', value)} issues={issues[`workers[${index}].branch`]} />
+                    <Field label="Worktree Path" value={worker.worktree_path || ''} onChange={(value) => onWorkerChange(index, 'worktree_path', value)} issues={issues[`workers[${index}].worktree_path`]} />
+                    <SelectField label="Environment Type" value={worker.environment_type || 'uv'} onChange={(value) => onWorkerChange(index, 'environment_type', value)} options={['uv', 'venv', 'none']} />
+                    <Field label="Environment Path" value={worker.environment_path || ''} onChange={(value) => onWorkerChange(index, 'environment_path', value)} issues={issues[`workers[${index}].environment_path`]} />
+                    <Field label="Sync Command" value={worker.sync_command || ''} onChange={(value) => onWorkerChange(index, 'sync_command', value)} />
+                    <Field label="Test Command" value={worker.test_command || ''} onChange={(value) => onWorkerChange(index, 'test_command', value)} issues={issues[`workers[${index}].test_command`]} />
+                    <Field label="Submit Strategy" value={worker.submit_strategy || ''} onChange={(value) => onWorkerChange(index, 'submit_strategy', value)} issues={issues[`workers[${index}].submit_strategy`]} />
+                    <Field label="Git Name" value={worker.git_identity?.name || ''} onChange={(value) => onWorkerChange(index, 'git_identity.name', value)} />
+                    <Field label="Git Email" value={worker.git_identity?.email || ''} onChange={(value) => onWorkerChange(index, 'git_identity.email', value)} />
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
         </div>
       </section>
     </div>
@@ -417,15 +698,23 @@ async function writeClipboard(text: string): Promise<void> {
 export function App() {
   const [tab, setTab] = useState<TabKey>('overview');
   const [data, setData] = useState<DashboardState | null>(null);
-  const [configText, setConfigText] = useState('');
-  const [editorDirty, setEditorDirty] = useState(false);
+  const [draftConfig, setDraftConfig] = useState<ConfigShape>({ project: {}, providers: {}, resource_pools: {}, workers: [] });
+  const [configDirty, setConfigDirty] = useState(false);
+  const [launchStrategy, setLaunchStrategy] = useState<LaunchStrategy>('initial_copilot');
+  const [launchProvider, setLaunchProvider] = useState('copilot');
+  const [launchModel, setLaunchModel] = useState('');
+  const [launchDirty, setLaunchDirty] = useState(false);
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [actionInFlight, setActionInFlight] = useState(false);
   const [status, setStatus] = useState<{ message: string; error: boolean }>({ message: '', error: false });
+  const [backendIssues, setBackendIssues] = useState<ValidationIssue[]>([]);
   const abortRef = useRef<AbortController | null>(null);
 
   const agentRows = useMemo(() => buildAgentRows(data), [data]);
   const progress = useMemo(() => buildProgressModel(data, agentRows), [data, agentRows]);
+  const localIssues = useMemo(() => getLocalValidationIssues(draftConfig), [draftConfig]);
+  const issueMap = useMemo(() => buildIssueMap(localIssues, backendIssues), [localIssues, backendIssues]);
+  const providerOptions = useMemo(() => Object.keys(draftConfig.providers || {}), [draftConfig.providers]);
 
   const setStampedStatus = (message: string, error = false) => {
     const stamp = new Date().toLocaleTimeString();
@@ -439,8 +728,14 @@ export function App() {
     try {
       const nextData = await fetchState(controller.signal);
       setData(nextData);
-      if (!editorDirty) {
-        setConfigText(nextData.config_text || '');
+      if (!configDirty) {
+        setDraftConfig(cloneConfig(nextData.config));
+        setBackendIssues([]);
+      }
+      if (!launchDirty) {
+        setLaunchStrategy(nextData.launch_policy.default_strategy);
+        setLaunchProvider(nextData.launch_policy.default_provider || nextData.launch_policy.initial_provider || 'copilot');
+        setLaunchModel(nextData.launch_policy.default_model || '');
       }
       if (forceStatus) {
         setStampedStatus(`state refreshed, last event: ${nextData.last_event || 'none'}`);
@@ -465,7 +760,7 @@ export function App() {
       void refresh(false);
     }, AUTO_REFRESH_MS);
     return () => window.clearInterval(timer);
-  }, [autoRefresh, actionInFlight, editorDirty]);
+  }, [autoRefresh, actionInFlight, configDirty, launchDirty]);
 
   const runAction = async (label: string, action: () => Promise<void>) => {
     if (actionInFlight) {
@@ -482,16 +777,155 @@ export function App() {
     }
   };
 
-  const onSave = () => void runAction('saving settings', async () => {
-    const response = await saveConfig(configText);
-    setEditorDirty(false);
+  const updateConfig = (updater: (current: ConfigShape) => ConfigShape) => {
+    setConfigDirty(true);
+    setBackendIssues([]);
+    setDraftConfig((current) => normalizeConfig(updater(normalizeConfig(cloneConfig(current)))));
+  };
+
+  const onProjectChange = (field: string, value: string) => {
+    updateConfig((current) => {
+      const next = normalizeConfig(current);
+      next.project = next.project || {};
+      if (field.startsWith('dashboard.')) {
+        const key = field.replace('dashboard.', '');
+        next.project.dashboard = next.project.dashboard || {};
+        if (key === 'port') {
+          next.project.dashboard.port = Number(value);
+        } else {
+          next.project.dashboard.host = value;
+        }
+      } else if (field === 'repository_name') {
+        next.project.repository_name = value;
+      } else if (field === 'local_repo_root') {
+        next.project.local_repo_root = value;
+      } else if (field === 'paddle_repo_path') {
+        next.project.paddle_repo_path = value;
+      }
+      return next;
+    });
+  };
+
+  const onMergeChange = (field: string, value: string) => {
+    updateConfig((current) => {
+      const next = normalizeConfig(current);
+      next.project = next.project || {};
+      if (field === 'integration_branch') {
+        next.project.integration_branch = value;
+      } else {
+        next.project.manager_git_identity = next.project.manager_git_identity || {};
+        if (field.endsWith('.name')) {
+          next.project.manager_git_identity.name = value;
+        } else {
+          next.project.manager_git_identity.email = value;
+        }
+      }
+      return next;
+    });
+  };
+
+  const onPoolChange = (poolName: string, field: keyof ConfigResourcePool, value: string) => {
+    updateConfig((current) => {
+      const next = normalizeConfig(current);
+      next.resource_pools = next.resource_pools || {};
+      const existing = next.resource_pools[poolName] || {};
+      next.resource_pools[poolName] = {
+        ...existing,
+        [field]: field === 'priority' ? Number(value) : value,
+      };
+      return next;
+    });
+  };
+
+  const onAddPool = () => {
+    updateConfig((current) => {
+      const next = normalizeConfig(current);
+      next.resource_pools = next.resource_pools || {};
+      let index = Object.keys(next.resource_pools).length + 1;
+      let name = `pool_${index}`;
+      while (next.resource_pools[name]) {
+        index += 1;
+        name = `pool_${index}`;
+      }
+      next.resource_pools[name] = { priority: 100, provider: providerOptions[0] || '', model: '', api_key: '' };
+      return next;
+    });
+  };
+
+  const onWorkerChange = (index: number, field: string, value: string) => {
+    updateConfig((current) => {
+      const next = normalizeConfig(current);
+      const workers = [...(next.workers || [])];
+      const worker = { ...(workers[index] || { agent: `A${index + 1}` }) };
+      if (field === 'resource_pool_queue') {
+        worker.resource_pool_queue = parseQueue(value);
+      } else if (field === 'git_identity.name' || field === 'git_identity.email') {
+        worker.git_identity = worker.git_identity || {};
+        if (field.endsWith('.name')) {
+          worker.git_identity.name = value;
+        } else {
+          worker.git_identity.email = value;
+        }
+      } else {
+        (worker as Record<string, unknown>)[field] = value;
+      }
+      workers[index] = worker;
+      next.workers = workers;
+      return next;
+    });
+  };
+
+  const onAddWorker = () => {
+    updateConfig((current) => {
+      const next = normalizeConfig(current);
+      const workers = [...(next.workers || [])];
+      workers.push({
+        agent: `A${workers.length + 1}`,
+        task_id: '',
+        resource_pool: Object.keys(next.resource_pools || {})[0] || '',
+        resource_pool_queue: [],
+        worktree_path: '',
+        branch: '',
+        environment_type: 'uv',
+        environment_path: '',
+        sync_command: 'uv sync',
+        test_command: '',
+        submit_strategy: 'patch_handoff',
+        git_identity: { name: '', email: '' },
+      });
+      next.workers = workers;
+      return next;
+    });
+  };
+
+  const onSave = () => void runAction('validating settings', async () => {
+    if (localIssues.length > 0) {
+      setStampedStatus(`settings contain ${localIssues.length} local validation issue(s)`, true);
+      return;
+    }
+    const validation = await validateConfig(draftConfig);
+    setBackendIssues(validation.validation_issues);
+    if (!validation.ok) {
+      setStampedStatus(`settings rejected: ${validation.validation_issues.length} validation issue(s)`, true);
+      return;
+    }
+    const response = await saveConfig(draftConfig);
+    setConfigDirty(false);
+    setBackendIssues([]);
     await refresh(true);
     setStampedStatus(`settings saved: ${response.launch_blockers.length} launch blocker(s), ${response.validation_errors.length} config note(s)`);
   });
 
   const onLaunch = (restart: boolean) => void runAction(restart ? 'restarting workers' : 'launching workers', async () => {
-    const response = await launchWorkers(restart);
-    setStampedStatus(`launch complete: ${(response.launched || []).length} launched, ${(response.failures || []).length} failures`, !response.ok);
+    const response = await launchWorkers(restart, {
+      strategy: launchStrategy,
+      provider: launchStrategy === 'elastic' ? undefined : launchProvider,
+      model: launchStrategy === 'selected_model' ? launchModel : undefined,
+    });
+    setStampedStatus(
+      `launch complete (${launchStrategyLabel(response.launch_policy?.strategy || launchStrategy)}): ${(response.launched || []).length} launched, ${(response.failures || []).length} failures`,
+      !response.ok,
+    );
     await refresh(true);
   });
 
@@ -507,7 +941,13 @@ export function App() {
       response.listener_released
         ? `stop all requested: ${response.stopped_workers?.length || 0} worker(s) stopped, port ${response.listener_port} released`
         : `stop all requested${response.warning ? `: ${response.warning}` : ''}`,
+      !response.listener_released,
     );
+  });
+
+  const onSilentMode = () => void runAction('entering silent mode', async () => {
+    const response = await enableSilentMode();
+    setStampedStatus(`silent mode enabled: listener on port ${response.listener_port} closed`);
   });
 
   const onCopy = (mode: 'serve' | 'up') => void runAction(`copying ${mode} command`, async () => {
@@ -520,9 +960,10 @@ export function App() {
 
   const topMeta = data ? [
     { label: 'Startup', value: data.mode.state || 'configured' },
+    { label: 'Listener', value: data.mode.listener_active ? 'active' : 'silent' },
     { label: 'Launch', value: data.launch_blockers.length ? `${data.launch_blockers.length} blocker(s)` : 'ready' },
+    { label: 'Launch Mode', value: launchStrategyLabel(launchStrategy) },
     { label: 'Config', value: data.mode.config_path || 'unknown' },
-    { label: 'Last event', value: data.last_event || 'none' },
     { label: 'Updated', value: data.updated_at || 'unknown' },
   ] : [];
 
@@ -533,7 +974,7 @@ export function App() {
           <div>
             <div className="hero-badge">FP8 delivery orchestration</div>
             <h1>supersonic-moe control plane</h1>
-            <p className="small tagline">React-structured cold-start control for agent launch, inspection, settings, and deterministic stop behavior.</p>
+            <p className="small tagline">Cold-start by default, fire-and-forget serving, editable settings forms, strict validation, and an explicit silent listener mode.</p>
           </div>
         </div>
       </header>
@@ -544,10 +985,65 @@ export function App() {
               <button disabled={actionInFlight} onClick={() => onLaunch(false)}>Launch</button>
               <button className="secondary" disabled={actionInFlight} onClick={() => onLaunch(true)}>Restart</button>
               <button className="danger" disabled={actionInFlight} onClick={onStopWorkers}>Stop Agents</button>
+              <button className="ghost danger-outline" disabled={actionInFlight} onClick={onSilentMode}>Silent Mode</button>
               <button className="danger ghost-danger" disabled={actionInFlight} onClick={onStopAll}>Stop All</button>
               <button className="ghost" disabled={actionInFlight} onClick={() => void refresh(true)}>Refresh</button>
             </div>
             <div className="toolbar-group">
+              {data ? (
+                <>
+                  <label className="field field-compact">
+                    <span className="field-label">Launch Mode</span>
+                    <select
+                      className="field-input compact-input"
+                      value={launchStrategy}
+                      onChange={(event) => {
+                        setLaunchDirty(true);
+                        setLaunchStrategy(event.target.value as LaunchStrategy);
+                        if (event.target.value === 'initial_copilot') {
+                          setLaunchProvider(data.launch_policy.initial_provider || 'copilot');
+                        }
+                      }}
+                    >
+                      {data.launch_policy.available_strategies.map((strategy) => (
+                        <option key={strategy} value={strategy}>{launchStrategyLabel(strategy)}</option>
+                      ))}
+                    </select>
+                  </label>
+                  {launchStrategy !== 'elastic' ? (
+                    <label className="field field-compact">
+                      <span className="field-label">Provider</span>
+                      <select
+                        className="field-input compact-input"
+                        value={launchProvider}
+                        disabled={launchStrategy === 'initial_copilot'}
+                        onChange={(event) => {
+                          setLaunchDirty(true);
+                          setLaunchProvider(event.target.value);
+                        }}
+                      >
+                        {data.launch_policy.available_providers.map((provider) => (
+                          <option key={provider} value={provider}>{provider}</option>
+                        ))}
+                      </select>
+                    </label>
+                  ) : null}
+                  {launchStrategy === 'selected_model' ? (
+                    <label className="field field-compact field-compact-wide">
+                      <span className="field-label">Model</span>
+                      <input
+                        className="field-input compact-input"
+                        value={launchModel}
+                        placeholder="gpt-5.4"
+                        onChange={(event) => {
+                          setLaunchDirty(true);
+                          setLaunchModel(event.target.value);
+                        }}
+                      />
+                    </label>
+                  ) : null}
+                </>
+              ) : null}
               <button className="ghost" disabled={actionInFlight} onClick={() => onCopy('serve')}>Copy Serve</button>
               <button className="ghost" disabled={actionInFlight} onClick={() => onCopy('up')}>Copy Up</button>
               <label className="toggle"><input type="checkbox" checked={autoRefresh} onChange={(event) => setAutoRefresh(event.target.checked)} /> Auto refresh</label>
@@ -570,7 +1066,23 @@ export function App() {
         </section>
 
         {data ? (
-          tab === 'overview' ? <OverviewTab data={data} agentRows={agentRows} progress={progress} /> : tab === 'operations' ? <OperationsTab data={data} /> : <SettingsTab data={data} configText={configText} onChange={(value) => { setEditorDirty(true); setConfigText(value); }} onSave={onSave} />
+          tab === 'overview'
+            ? <OverviewTab data={data} agentRows={agentRows} progress={progress} />
+            : tab === 'operations'
+              ? <OperationsTab data={data} />
+              : <SettingsTab
+                  draftConfig={draftConfig}
+                  providerOptions={providerOptions}
+                  issues={issueMap}
+                  backendIssues={backendIssues}
+                  onProjectChange={onProjectChange}
+                  onMergeChange={onMergeChange}
+                  onPoolChange={onPoolChange}
+                  onAddPool={onAddPool}
+                  onWorkerChange={onWorkerChange}
+                  onAddWorker={onAddWorker}
+                  onSave={onSave}
+                />
         ) : (
           <section className="card"><div className="small muted">Loading dashboard state...</div></section>
         )}

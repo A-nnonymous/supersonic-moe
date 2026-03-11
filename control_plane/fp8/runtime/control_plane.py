@@ -43,6 +43,8 @@ SESSION_STATE = RUNTIME_DIR / "session_state.json"
 CONTROL_PLANE_RUNTIME = "uv run --no-project --with 'PyYAML>=6.0.2' python"
 WEB_STATIC_DIR = RUNTIME_DIR / "web" / "static"
 WEB_INDEX_FILE = WEB_STATIC_DIR / "index.html"
+DEFAULT_INITIAL_PROVIDER = "copilot"
+LAUNCH_STRATEGIES = {"initial_copilot", "selected_model", "elastic"}
 
 
 def now_iso() -> str:
@@ -67,6 +69,10 @@ def run_shell(command: str, cwd: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, cwd=cwd, shell=True, text=True, capture_output=True)
 
 
+def run_command(args: list[str], timeout: float = 3.0) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, text=True, capture_output=True, check=False, timeout=timeout)
+
+
 def format_command(template: Any, values: dict[str, str]) -> list[str]:
     if isinstance(template, str):
         return shlex.split(template.format(**values))
@@ -82,6 +88,32 @@ def is_placeholder_path(value: Any) -> bool:
     return normalized.startswith("/absolute/path/") or normalized in {"unassigned", "none"}
 
 
+def is_local_host(host: str) -> bool:
+    return host in {"127.0.0.1", "localhost", "0.0.0.0", "::1", "::"}
+
+
+def path_exists_via_ls(path_value: str) -> bool:
+    try:
+        result = run_command(["ls", "-d", path_value])
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return Path(path_value).exists()
+    return result.returncode == 0
+
+
+def host_reachable_via_ping(host: str) -> bool:
+    if is_local_host(host):
+        return True
+    try:
+        result = run_command(["ping", "-c", "1", host], timeout=2.5)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        try:
+            socket.getaddrinfo(host, None)
+        except socket.gaierror:
+            return False
+        return True
+    return result.returncode == 0
+
+
 @dataclass
 class WorkerProcess:
     agent: str
@@ -94,6 +126,13 @@ class WorkerProcess:
     log_handle: TextIO
     process: subprocess.Popen[str]
     started_at: float
+
+
+@dataclass(frozen=True)
+class LaunchPolicy:
+    strategy: str
+    provider: str | None = None
+    model: str | None = None
 
 
 class DualStackThreadingHTTPServer(ThreadingHTTPServer):
@@ -322,7 +361,161 @@ class ControlPlaneService:
         self.listen_host = ""
         self.listen_port = 0
         self.listen_endpoints: list[str] = []
+        self.listener_active = False
         self.reload_config()
+
+    def config_validation_issues(self, config: dict[str, Any] | None = None) -> list[dict[str, str]]:
+        cfg = config or self.config
+        issues: list[dict[str, str]] = []
+
+        def add_issue(field: str, message: str) -> None:
+            issues.append({"field": field, "message": message})
+
+        if not isinstance(cfg, dict):
+            add_issue("config", "top-level config must be a YAML mapping")
+            return issues
+
+        project = cfg.get("project", {})
+        providers = cfg.get("providers", {})
+        resource_pools = cfg.get("resource_pools", {})
+        workers = cfg.get("workers", [])
+
+        if not isinstance(project, dict):
+            add_issue("project", "project must be a mapping")
+            project = {}
+        if not isinstance(providers, dict):
+            add_issue("providers", "providers must be a mapping")
+            providers = {}
+        if not isinstance(resource_pools, dict):
+            add_issue("resource_pools", "resource_pools must be a mapping")
+            resource_pools = {}
+        if not isinstance(workers, list):
+            add_issue("workers", "workers must be a list")
+            workers = []
+
+        repository_name = str(project.get("repository_name", "")).strip()
+        if not repository_name:
+            add_issue("project.repository_name", "repository name is required")
+
+        for field_name in ("local_repo_root", "paddle_repo_path"):
+            raw_value = str(project.get(field_name, "")).strip()
+            field_path = f"project.{field_name}"
+            if not raw_value:
+                add_issue(field_path, f"{field_name} is required")
+            elif is_placeholder_path(raw_value):
+                add_issue(field_path, f"{field_name} must be replaced with a real path")
+            elif not path_exists_via_ls(raw_value):
+                add_issue(field_path, f"{field_name} does not exist: {raw_value}")
+
+        dashboard = project.get("dashboard", {})
+        if not isinstance(dashboard, dict):
+            add_issue("project.dashboard", "dashboard must be a mapping")
+            dashboard = {}
+        host = str(dashboard.get("host", "")).strip()
+        if not host:
+            add_issue("project.dashboard.host", "dashboard host is required")
+        elif not host_reachable_via_ping(host):
+            add_issue("project.dashboard.host", f"dashboard host is not reachable via ping: {host}")
+        port = dashboard.get("port")
+        if not isinstance(port, int) or not (1 <= int(port) <= 65535):
+            add_issue("project.dashboard.port", "dashboard port must be an integer between 1 and 65535")
+
+        seen_agents: set[str] = set()
+        seen_branches: set[str] = set()
+        seen_worktrees: set[str] = set()
+
+        for pool_name, pool in resource_pools.items():
+            if not isinstance(pool, dict):
+                add_issue(f"resource_pools.{pool_name}", "resource pool must be a mapping")
+                continue
+            provider_name = str(pool.get("provider", "")).strip()
+            if not provider_name:
+                add_issue(f"resource_pools.{pool_name}.provider", "provider is required")
+            elif provider_name not in providers:
+                add_issue(f"resource_pools.{pool_name}.provider", f"unknown provider: {provider_name}")
+            if not str(pool.get("model", "")).strip():
+                add_issue(f"resource_pools.{pool_name}.model", "model is required")
+            priority = pool.get("priority", 100)
+            if not isinstance(priority, int):
+                add_issue(f"resource_pools.{pool_name}.priority", "priority must be an integer")
+
+        for worker_index, worker in enumerate(workers):
+            field_root = f"workers[{worker_index}]"
+            if not isinstance(worker, dict):
+                add_issue(field_root, "worker must be a mapping")
+                continue
+            agent = str(worker.get("agent", "")).strip()
+            if not agent:
+                add_issue(f"{field_root}.agent", "agent is required")
+            elif agent in seen_agents:
+                add_issue(f"{field_root}.agent", f"duplicate agent: {agent}")
+            else:
+                seen_agents.add(agent)
+
+            branch = str(worker.get("branch", "")).strip()
+            if not branch:
+                add_issue(f"{field_root}.branch", "branch is required")
+            elif branch in seen_branches:
+                add_issue(f"{field_root}.branch", f"duplicate branch: {branch}")
+            else:
+                seen_branches.add(branch)
+
+            worktree_path = str(worker.get("worktree_path", "")).strip()
+            if not worktree_path:
+                add_issue(f"{field_root}.worktree_path", "worktree path is required")
+            elif is_placeholder_path(worktree_path):
+                add_issue(f"{field_root}.worktree_path", "worktree path must be replaced with a real path")
+            elif not path_exists_via_ls(worktree_path):
+                add_issue(f"{field_root}.worktree_path", f"worktree path does not exist: {worktree_path}")
+            elif worktree_path in seen_worktrees:
+                add_issue(f"{field_root}.worktree_path", f"duplicate worktree path: {worktree_path}")
+            else:
+                seen_worktrees.add(worktree_path)
+
+            pool_name = str(worker.get("resource_pool", "")).strip()
+            pool_queue = worker.get("resource_pool_queue", [])
+            if not pool_name and not pool_queue:
+                add_issue(f"{field_root}.resource_pool", "resource_pool or resource_pool_queue is required")
+            if pool_name and pool_name not in resource_pools:
+                add_issue(f"{field_root}.resource_pool", f"unknown resource pool: {pool_name}")
+            if pool_queue and not isinstance(pool_queue, list):
+                add_issue(f"{field_root}.resource_pool_queue", "resource_pool_queue must be a list")
+            if isinstance(pool_queue, list):
+                for queue_index, candidate_pool in enumerate(pool_queue):
+                    if str(candidate_pool) not in resource_pools:
+                        add_issue(
+                            f"{field_root}.resource_pool_queue[{queue_index}]",
+                            f"unknown resource pool: {candidate_pool}",
+                        )
+
+            environment_type = str(worker.get("environment_type", "uv")).strip() or "uv"
+            environment_path = str(worker.get("environment_path", "")).strip()
+            if environment_type != "none":
+                if not environment_path:
+                    add_issue(
+                        f"{field_root}.environment_path",
+                        "environment path is required when environment_type is not none",
+                    )
+                elif is_placeholder_path(environment_path):
+                    add_issue(f"{field_root}.environment_path", "environment path must be replaced with a real path")
+                elif not path_exists_via_ls(environment_path):
+                    add_issue(f"{field_root}.environment_path", f"environment path does not exist: {environment_path}")
+
+            if not str(worker.get("test_command", "")).strip():
+                add_issue(f"{field_root}.test_command", "test_command is required")
+            if not str(worker.get("submit_strategy", "")).strip():
+                add_issue(f"{field_root}.submit_strategy", "submit_strategy is required")
+
+        return issues
+
+    def validate_config_payload(self, config: dict[str, Any]) -> dict[str, Any]:
+        issues = self.config_validation_issues(config)
+        return {
+            "ok": len(issues) == 0,
+            "validation_issues": issues,
+            "validation_errors": self.validation_errors(config),
+            "launch_blockers": self.launch_blockers(config),
+        }
 
     def refresh_runtime_mode(self) -> None:
         using_template = self.config_path.resolve() == CONFIG_TEMPLATE_PATH.resolve()
@@ -568,10 +761,7 @@ class ControlPlaneService:
 
         return blockers
 
-    def save_config_text(self, raw_text: str) -> list[str]:
-        parsed = yaml.safe_load(raw_text) or {}
-        if not isinstance(parsed, dict):
-            raise ValueError("top-level config must be a YAML mapping")
+    def save_config_data(self, parsed: dict[str, Any]) -> list[str]:
         target_path = self.persist_config_path
         target_path.parent.mkdir(parents=True, exist_ok=True)
         target_path.write_text(yaml_text(parsed), encoding="utf-8")
@@ -579,6 +769,12 @@ class ControlPlaneService:
         self.reload_config()
         self.last_event = f"config_saved:{now_iso()}"
         return self.validation_errors(parsed)
+
+    def save_config_text(self, raw_text: str) -> list[str]:
+        parsed = yaml.safe_load(raw_text) or {}
+        if not isinstance(parsed, dict):
+            raise ValueError("top-level config must be a YAML mapping")
+        return self.save_config_data(parsed)
 
     def configured_api_key(self, provider: dict[str, Any], pool: dict[str, Any]) -> str:
         api_env_name = provider.get("api_key_env_name")
@@ -669,6 +865,73 @@ class ControlPlaneService:
         evaluations = [self.evaluate_resource_pool(pool_name) for pool_name in self.resource_pools]
         return sorted(evaluations, key=lambda item: (-item["score"], -item["priority"], item["resource_pool"]))
 
+    def has_launch_history(self) -> bool:
+        if self.processes:
+            return True
+        worker_agents = {str(worker.get("agent", "")).strip() for worker in self.workers if worker.get("agent")}
+        if not worker_agents:
+            return False
+        runtime_workers = load_yaml(STATE_DIR / "agent_runtime.yaml").get("workers", [])
+        for entry in runtime_workers:
+            agent = str(entry.get("agent", "")).strip()
+            if agent not in worker_agents:
+                continue
+            status = str(entry.get("status", "")).strip()
+            if status and status not in {"not_started", "not-started", "unassigned"}:
+                return True
+        heartbeat_workers = load_yaml(STATE_DIR / "heartbeats.yaml").get("agents", [])
+        for entry in heartbeat_workers:
+            agent = str(entry.get("agent", "")).strip()
+            if agent not in worker_agents:
+                continue
+            state = str(entry.get("state", "")).strip()
+            last_seen = str(entry.get("last_seen", "")).strip()
+            if state and state not in {"not_started", "not-started"}:
+                return True
+            if last_seen and last_seen.lower() != "none":
+                return True
+        return False
+
+    def default_launch_policy(self) -> LaunchPolicy:
+        if not self.has_launch_history():
+            return LaunchPolicy(strategy="initial_copilot", provider=DEFAULT_INITIAL_PROVIDER)
+        return LaunchPolicy(strategy="elastic")
+
+    def parse_launch_policy(self, payload: dict[str, Any]) -> LaunchPolicy:
+        default_policy = self.default_launch_policy()
+        raw_strategy = str(payload.get("strategy") or default_policy.strategy).strip() or default_policy.strategy
+        if raw_strategy not in LAUNCH_STRATEGIES:
+            raise ValueError(f"unknown launch strategy: {raw_strategy}")
+
+        provider = str(payload.get("provider") or "").strip() or None
+        model = str(payload.get("model") or "").strip() or None
+
+        if raw_strategy == "initial_copilot":
+            provider = DEFAULT_INITIAL_PROVIDER
+        elif raw_strategy == "selected_model":
+            if not provider:
+                raise ValueError("provider is required when strategy is selected_model")
+            if provider not in self.providers:
+                raise ValueError(f"unknown provider for selected_model: {provider}")
+            if not model:
+                raise ValueError("model is required when strategy is selected_model")
+
+        if provider and provider not in self.providers:
+            raise ValueError(f"unknown provider: {provider}")
+        return LaunchPolicy(strategy=raw_strategy, provider=provider, model=model)
+
+    def launch_policy_state(self) -> dict[str, Any]:
+        default_policy = self.default_launch_policy()
+        return {
+            "default_strategy": default_policy.strategy,
+            "default_provider": default_policy.provider,
+            "default_model": default_policy.model,
+            "available_strategies": sorted(LAUNCH_STRATEGIES),
+            "available_providers": sorted(self.providers.keys()),
+            "initial_provider": DEFAULT_INITIAL_PROVIDER,
+            "has_launch_history": self.has_launch_history(),
+        }
+
     def candidate_pools_for_worker(self, worker: dict[str, Any]) -> list[str]:
         configured_queue = worker.get("resource_pool_queue")
         if isinstance(configured_queue, list) and configured_queue:
@@ -676,6 +939,15 @@ class ControlPlaneService:
         if worker.get("resource_pool"):
             return [str(worker["resource_pool"])]
         return [item["resource_pool"] for item in self.provider_queue()]
+
+    def best_pool_for_provider(self, provider_name: str) -> tuple[str, dict[str, Any]]:
+        ordered_candidates = [item for item in self.provider_queue() if item["provider"] == provider_name]
+        if not ordered_candidates:
+            raise RuntimeError(f"no eligible resource pool candidates exist for provider {provider_name}")
+        for item in ordered_candidates:
+            if item["binary_found"] and item["api_key_present"]:
+                return item["resource_pool"], item
+        return ordered_candidates[0]["resource_pool"], ordered_candidates[0]
 
     def best_pool_for_worker(self, worker: dict[str, Any]) -> tuple[str, dict[str, Any]]:
         queue = self.provider_queue()
@@ -691,6 +963,12 @@ class ControlPlaneService:
         if ordered_candidates:
             return ordered_candidates[0]["resource_pool"], ordered_candidates[0]
         raise RuntimeError(f"worker {worker['agent']} has no eligible resource pool candidates")
+
+    def resolve_pool_for_launch(self, worker: dict[str, Any], policy: LaunchPolicy) -> tuple[str, dict[str, Any]]:
+        if policy.strategy == "elastic":
+            return self.best_pool_for_worker(worker)
+        provider_name = policy.provider or DEFAULT_INITIAL_PROVIDER
+        return self.best_pool_for_provider(provider_name)
 
     def write_session_state(self) -> None:
         worker_payload = {
@@ -720,6 +998,7 @@ class ControlPlaneService:
                 "persist_config_path": str(self.persist_config_path),
                 "cold_start": self.bootstrap_mode,
                 "bootstrap_reason": self.bootstrap_reason,
+                "listener_active": self.listener_active,
                 "alive": not self.stop_event.is_set(),
             },
             "workers": worker_payload,
@@ -747,11 +1026,32 @@ class ControlPlaneService:
         return asset_path.read_bytes(), content_type or "application/octet-stream"
 
     def build_cli_commands(self) -> dict[str, str]:
-        host = self.host_override or self.project.get("dashboard", {}).get("host", "127.0.0.1")
-        port = self.port_override or int(self.project.get("dashboard", {}).get("port", 8233))
+        host = self.host_override or self.project.get("dashboard", {}).get("host", DEFAULT_DASHBOARD_HOST)
+        port = self.port_override or int(self.project.get("dashboard", {}).get("port", DEFAULT_DASHBOARD_PORT))
         config = str(self.persist_config_path)
-        serve = f"{CONTROL_PLANE_RUNTIME} control_plane/fp8/runtime/control_plane.py serve --config {config} --host {host} --port {port} --open-browser"
-        up = f"{CONTROL_PLANE_RUNTIME} control_plane/fp8/runtime/control_plane.py up --config {config} --host {host} --port {port} --open-browser"
+        serve_parts = [
+            CONTROL_PLANE_RUNTIME,
+            "control_plane/fp8/runtime/control_plane.py",
+            "serve",
+            "--config",
+            config,
+        ]
+        up_parts = [
+            CONTROL_PLANE_RUNTIME,
+            "control_plane/fp8/runtime/control_plane.py",
+            "up",
+            "--config",
+            config,
+        ]
+        if host != DEFAULT_DASHBOARD_HOST:
+            serve_parts.extend(["--host", str(host)])
+            up_parts.extend(["--host", str(host)])
+        if port != DEFAULT_DASHBOARD_PORT:
+            serve_parts.extend(["--port", str(port)])
+            up_parts.extend(["--port", str(port)])
+        up_parts.append("--open-browser")
+        serve = " ".join(serve_parts)
+        up = " ".join(up_parts)
         return {"serve": serve, "up": up}
 
     def task_title(self, task_id: str) -> str:
@@ -890,12 +1190,16 @@ Primary test command:
         return prompt_path
 
     def provider_runtime(
-        self, pool_name: str, worker: dict[str, Any]
+        self,
+        pool_name: str,
+        worker: dict[str, Any],
+        provider_override: str | None = None,
+        model_override: str | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any], str, str]:
         pool = self.resource_pools[pool_name]
-        provider_name = worker.get("provider") or pool["provider"]
+        provider_name = provider_override or worker.get("provider") or pool["provider"]
         provider = self.providers[provider_name]
-        model = worker.get("model") or pool["model"]
+        model = model_override or worker.get("model") or pool["model"]
         return provider, pool, provider_name, model
 
     def branch_exists(self, branch: str) -> bool:
@@ -982,9 +1286,15 @@ Primary test command:
         heartbeats["last_updated"] = now_iso()
         dump_yaml(heartbeats_path, heartbeats)
 
-    def launch_worker(self, worker: dict[str, Any]) -> dict[str, Any]:
-        pool_name, evaluation = self.best_pool_for_worker(worker)
-        provider, pool, provider_name, model = self.provider_runtime(pool_name, worker)
+    def launch_worker(self, worker: dict[str, Any], policy: LaunchPolicy | None = None) -> dict[str, Any]:
+        resolved_policy = policy or self.default_launch_policy()
+        pool_name, evaluation = self.resolve_pool_for_launch(worker, resolved_policy)
+        provider, pool, provider_name, model = self.provider_runtime(
+            pool_name,
+            worker,
+            provider_override=resolved_policy.provider,
+            model_override=resolved_policy.model,
+        )
         prompt_path = self.render_prompt(worker, provider_name, model)
         self.ensure_worktree(worker)
         self.configure_git_identity(worker)
@@ -1043,8 +1353,8 @@ Primary test command:
             process=process,
             started_at=time.time(),
         )
-        self.update_runtime_entry(worker, pool_name, provider_name, model, "active")
-        self.update_heartbeat(worker["agent"], "healthy", "orchestrator_launch", "none")
+        self.update_runtime_entry(worker, pool_name, provider_name, model, "launching")
+        self.update_heartbeat(worker["agent"], "launching", "process_spawned", "waiting for first monitor check")
         return {
             "agent": worker["agent"],
             "resource_pool": pool_name,
@@ -1052,13 +1362,15 @@ Primary test command:
             "model": model,
             "pid": process.pid,
             "command": command,
+            "launch_strategy": resolved_policy.strategy,
         }
 
-    def launch_all(self, restart: bool = False) -> dict[str, Any]:
+    def launch_all(self, restart: bool = False, policy: LaunchPolicy | None = None) -> dict[str, Any]:
         with self.lock:
             errors = self.launch_blockers()
             if errors:
                 return {"ok": False, "errors": errors}
+            resolved_policy = policy or self.default_launch_policy()
             if restart:
                 self.stop_workers()
             launched: list[dict[str, Any]] = []
@@ -1067,21 +1379,33 @@ Primary test command:
                 if worker["agent"] in self.processes and self.processes[worker["agent"]].process.poll() is None:
                     continue
                 try:
-                    launched.append(self.launch_worker(worker))
+                    launched.append(self.launch_worker(worker, policy=resolved_policy))
                 except Exception as exc:
-                    candidate_pools = self.candidate_pools_for_worker(worker)
+                    try:
+                        candidate_pools = [self.resolve_pool_for_launch(worker, resolved_policy)[0]]
+                    except Exception:
+                        candidate_pools = self.candidate_pools_for_worker(worker)
                     pool_name = candidate_pools[0] if candidate_pools else "unassigned"
                     if pool_name in self.provider_stats:
                         self.provider_stats[pool_name]["launch_failures"] += 1
                         self.provider_stats[pool_name]["last_failure"] = str(exc)
-                    provider_name = worker.get("provider", "unassigned") or "unassigned"
-                    model = worker.get("model", "unassigned") or "unassigned"
+                    provider_name = resolved_policy.provider or worker.get("provider", "unassigned") or "unassigned"
+                    model = resolved_policy.model or worker.get("model", "unassigned") or "unassigned"
                     self.update_runtime_entry(worker, pool_name, provider_name, model, f"launch_failed: {exc}")
                     self.update_heartbeat(worker["agent"], "stale", "launch_failed", str(exc))
                     failures.append({"agent": worker["agent"], "error": str(exc)})
-            self.last_event = f"launch:{len(launched)} workers"
+            self.last_event = f"launch:{resolved_policy.strategy}:{len(launched)} workers"
             self.write_session_state()
-            return {"ok": len(failures) == 0, "launched": launched, "failures": failures}
+            return {
+                "ok": len(failures) == 0,
+                "launched": launched,
+                "failures": failures,
+                "launch_policy": {
+                    "strategy": resolved_policy.strategy,
+                    "provider": resolved_policy.provider,
+                    "model": resolved_policy.model,
+                },
+            }
 
     def stop_workers(self) -> dict[str, Any]:
         with self.lock:
@@ -1131,12 +1455,14 @@ Primary test command:
             "mode": {
                 "state": "cold-start" if self.bootstrap_mode else "configured",
                 "cold_start": self.bootstrap_mode,
+                "listener_active": self.listener_active,
                 "reason": self.bootstrap_reason,
                 "config_path": str(self.config_path),
                 "persist_config_path": str(self.persist_config_path),
             },
             "project": self.project,
             "commands": self.build_cli_commands(),
+            "launch_policy": self.launch_policy_state(),
             "manager_report": MANAGER_REPORT.read_text(encoding="utf-8"),
             "runtime": load_yaml(STATE_DIR / "agent_runtime.yaml"),
             "heartbeats": load_yaml(STATE_DIR / "heartbeats.yaml"),
@@ -1158,6 +1484,15 @@ Primary test command:
                     returncode = worker.process.poll()
                     if returncode is None:
                         self.update_heartbeat(agent, "healthy", "process_running", "none")
+                        runtime_entry = next((w for w in self.workers if w.get("agent") == agent), None)
+                        if runtime_entry:
+                            self.update_runtime_entry(
+                                runtime_entry,
+                                worker.resource_pool,
+                                worker.provider,
+                                worker.model,
+                                "healthy",
+                            )
                     else:
                         if returncode == 0:
                             self.provider_stats[worker.resource_pool]["clean_exits"] += 1
@@ -1169,6 +1504,15 @@ Primary test command:
                         state = "offline" if returncode == 0 else "stale"
                         escalation = "worker exited cleanly" if returncode == 0 else f"worker exited with {returncode}"
                         self.update_heartbeat(agent, state, "process_exit", escalation)
+                        runtime_entry = next((w for w in self.workers if w.get("agent") == agent), None)
+                        if runtime_entry:
+                            self.update_runtime_entry(
+                                runtime_entry,
+                                worker.resource_pool,
+                                worker.provider,
+                                worker.model,
+                                state,
+                            )
                 self.write_session_state()
             time.sleep(5)
 
@@ -1225,12 +1569,32 @@ Primary test command:
             return True
 
         if handler.path == "/api/config":
-            raw_text = payload.get("config_text")
-            if not isinstance(raw_text, str):
-                self.write_json(handler, {"ok": False, "error": "config_text is required"}, status=400)
-                return True
+            raw_config = payload.get("config")
             try:
-                errors = self.save_config_text(raw_text)
+                if isinstance(raw_config, dict):
+                    validation = self.validate_config_payload(raw_config)
+                    if validation["validation_issues"]:
+                        self.write_json(handler, validation, status=400)
+                        return True
+                    errors = self.save_config_data(raw_config)
+                else:
+                    raw_text = payload.get("config_text")
+                    if not isinstance(raw_text, str):
+                        self.write_json(
+                            handler, {"ok": False, "error": "config or config_text is required"}, status=400
+                        )
+                        return True
+                    parsed = yaml.safe_load(raw_text) or {}
+                    if not isinstance(parsed, dict):
+                        self.write_json(
+                            handler, {"ok": False, "error": "top-level config must be a YAML mapping"}, status=400
+                        )
+                        return True
+                    validation = self.validate_config_payload(parsed)
+                    if validation["validation_issues"]:
+                        self.write_json(handler, validation, status=400)
+                        return True
+                    errors = self.save_config_data(parsed)
             except Exception as exc:
                 self.write_json(handler, {"ok": False, "error": str(exc)}, status=400)
                 return True
@@ -1238,6 +1602,7 @@ Primary test command:
                 handler,
                 {
                     "ok": True,
+                    "validation_issues": [],
                     "validation_errors": errors,
                     "launch_blockers": self.launch_blockers(),
                     "cold_start": self.bootstrap_mode,
@@ -1245,9 +1610,22 @@ Primary test command:
             )
             return True
 
+        if handler.path == "/api/config/validate":
+            raw_config = payload.get("config")
+            if not isinstance(raw_config, dict):
+                self.write_json(handler, {"ok": False, "error": "config is required"}, status=400)
+                return True
+            self.write_json(handler, self.validate_config_payload(raw_config))
+            return True
+
         if handler.path == "/api/launch":
             restart = bool(payload.get("restart", False))
-            result = self.launch_all(restart=restart)
+            try:
+                launch_policy = self.parse_launch_policy(payload)
+            except ValueError as exc:
+                self.write_json(handler, {"ok": False, "error": str(exc)}, status=400)
+                return True
+            result = self.launch_all(restart=restart, policy=launch_policy)
             self.write_json(handler, result, status=200 if result.get("ok") else 400)
             return True
 
@@ -1270,6 +1648,19 @@ Primary test command:
                 },
             )
             threading.Thread(target=self.shutdown, kwargs={"stop_agents": True}, daemon=True).start()
+            return True
+
+        if handler.path == "/api/silent":
+            self.write_json(
+                handler,
+                {
+                    "ok": True,
+                    "listener_port": self.listen_port,
+                    "listener_active": False,
+                    "stop_agents": False,
+                },
+            )
+            threading.Thread(target=self.enter_silent_mode, daemon=True).start()
             return True
 
         if handler.path == "/api/shutdown":
@@ -1328,6 +1719,7 @@ Primary test command:
         self.listen_host = host
         self.listen_port = listen_port
         self.listen_endpoints = listen_endpoints
+        self.listener_active = True
         self.last_event = f"dashboard:{', '.join(listen_endpoints)}"
         self.write_session_state()
         if host in {"0.0.0.0", "::"}:
@@ -1362,14 +1754,32 @@ Primary test command:
         self.start_dashboard(open_browser=open_browser)
         self.wait_forever()
 
+    def close_http_servers(self) -> bool:
+        released = True
+        for server in self.http_servers:
+            server.shutdown()
+            server.server_close()
+        if self.listen_port:
+            released = wait_for_port_release(self.listen_port)
+        self.http_servers = []
+        self.server_threads = []
+        self.listen_endpoints = []
+        self.listener_active = False
+        return released
+
+    def enter_silent_mode(self) -> None:
+        with self.lock:
+            if not self.listener_active:
+                return
+            released = self.close_http_servers()
+            self.last_event = f"silent_mode:listener released={released}"
+            self.write_session_state()
+
     def shutdown(self, stop_agents: bool = True) -> None:
         self.stop_event.set()
         if stop_agents:
             self.stop_workers()
-        for server in self.http_servers:
-            server.shutdown()
-            server.server_close()
-        listener_released = wait_for_port_release(self.listen_port) if self.listen_port else True
+        listener_released = self.close_http_servers()
         self.last_event = (
             f"shutdown:all released={listener_released}"
             if stop_agents
@@ -1382,7 +1792,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="supersonic-moe control plane runtime")
     parser.add_argument(
         "command",
-        choices=["up", "serve", "stop-agents", "stop-listener", "stop-all"],
+        choices=["up", "serve", "silent", "stop-agents", "stop-listener", "stop-all"],
         help="launch the control plane, or stop agents/listener from a running session",
     )
     parser.add_argument("--config", type=Path, default=RUNTIME_DIR / "local_config.yaml", help="runtime config path")
@@ -1399,11 +1809,6 @@ def parse_args() -> argparse.Namespace:
         help="force template-backed cold-start bootstrap even before local_config.yaml exists",
     )
     parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument(
         "--log-file",
         type=Path,
         default=RUNTIME_DIR / "control_plane.log",
@@ -1413,9 +1818,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def apply_runtime_defaults(args: argparse.Namespace, cold_start: bool) -> None:
-    if args.command == "serve" and cold_start:
+    if args.command in {"serve", "up"}:
         if args.host is None:
             args.host = DEFAULT_DASHBOARD_HOST
+        if args.port is None:
+            args.port = DEFAULT_DASHBOARD_PORT
+    if args.command == "serve" and not args.foreground:
+        args.detach = True
+    elif args.command == "serve" and cold_start:
         if not args.foreground:
             args.detach = True
 
@@ -1425,9 +1835,27 @@ def stop_agents_command(args: argparse.Namespace) -> int:
     if not session_state:
         print(f"no active session state found at {SESSION_STATE}", file=sys.stderr)
         return 1
-    result = post_control_plane(control_plane_base_url(args, session_state), "/api/stop", {})
-    print(json.dumps(result, indent=2))
-    return 0
+    worker_pids = {
+        agent: int(worker.get("pid") or 0)
+        for agent, worker in session_state.get("workers", {}).items()
+        if int(worker.get("pid") or 0)
+    }
+    try:
+        result = post_control_plane(control_plane_base_url(args, session_state), "/api/stop", {})
+        print(json.dumps(result, indent=2))
+        return 0
+    except RuntimeError:
+        stopped_workers: list[str] = []
+        for agent, pid in worker_pids.items():
+            if pid and pid_is_running(pid):
+                terminate_process_tree(pid, signal.SIGTERM)
+                if not wait_for_process_exit(pid, timeout=3):
+                    terminate_process_tree(pid, signal.SIGKILL)
+                    wait_for_process_exit(pid, timeout=2)
+            if not pid or not pid_is_running(pid):
+                stopped_workers.append(agent)
+        print(json.dumps({"ok": True, "stopped": sorted(stopped_workers)}, indent=2))
+        return 0
 
 
 def stop_listener_command(args: argparse.Namespace) -> int:
@@ -1437,40 +1865,29 @@ def stop_listener_command(args: argparse.Namespace) -> int:
         return 1
     server_pid = int(session_state.get("server", {}).get("pid") or 0)
     listener_port = int(session_state.get("server", {}).get("port") or DEFAULT_DASHBOARD_PORT)
-    try:
-        result = post_control_plane(
-            control_plane_base_url(args, session_state), "/api/shutdown", {"stop_agents": False}
-        )
-        listener_released = wait_for_port_release(listener_port)
-        if not listener_released and server_pid and pid_is_running(server_pid):
-            terminate_process_tree(server_pid, signal.SIGTERM)
-            listener_released = wait_for_port_release(listener_port)
-        result["listener_port"] = listener_port
-        result["listener_released"] = listener_released
-        print(json.dumps(result, indent=2))
-        return 0
-    except RuntimeError:
-        if not server_pid or not pid_is_running(server_pid):
-            print("listener is not running", file=sys.stderr)
-            return 1
-        terminate_process_tree(server_pid, signal.SIGTERM)
-        listener_released = wait_for_port_release(listener_port)
-        if not listener_released and pid_is_running(server_pid):
-            terminate_process_tree(server_pid, signal.SIGKILL)
-            listener_released = wait_for_port_release(listener_port)
+    if not session_state.get("server", {}).get("listener_active", True):
         print(
             json.dumps(
                 {
-                    "ok": listener_released,
-                    "listener_pid": server_pid,
+                    "ok": True,
                     "listener_port": listener_port,
-                    "listener_released": listener_released,
+                    "listener_released": True,
                     "stop_agents": False,
                 },
                 indent=2,
             )
         )
         return 0
+    try:
+        result = post_control_plane(control_plane_base_url(args, session_state), "/api/silent", {})
+        listener_released = wait_for_port_release(listener_port)
+        result["listener_port"] = listener_port
+        result["listener_released"] = listener_released
+        print(json.dumps(result, indent=2))
+        return 0
+    except RuntimeError:
+        print("listener control plane is unreachable; cannot enter silent mode safely", file=sys.stderr)
+        return 1
 
 
 def stop_all_command(args: argparse.Namespace) -> int:
@@ -1548,7 +1965,7 @@ def stop_all_command(args: argparse.Namespace) -> int:
 def resolve_runtime_config(args: argparse.Namespace) -> tuple[Path, Path, bool, str]:
     requested_path = args.config
     persist_path = requested_path
-    bootstrap_requested = bool(args.bootstrap or args.dry_run)
+    bootstrap_requested = bool(args.bootstrap)
     reasons: list[str] = []
     default_local_config = (RUNTIME_DIR / "local_config.yaml").resolve()
 
@@ -1612,6 +2029,8 @@ def detach_process(args: argparse.Namespace) -> int:
 
 def main() -> int:
     args = parse_args()
+    if args.command == "silent":
+        return stop_listener_command(args)
     if args.command == "stop-agents":
         return stop_agents_command(args)
     if args.command == "stop-listener":
