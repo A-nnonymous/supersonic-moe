@@ -328,6 +328,15 @@ def wait_for_port_release(port: int, timeout: float = 5.0) -> bool:
     return not tcp_port_in_use(port)
 
 
+def wait_for_port_listen(port: int, timeout: float = 5.0) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if tcp_port_in_use(port):
+            return True
+        time.sleep(0.1)
+    return tcp_port_in_use(port)
+
+
 def safe_relative_web_path(request_path: str) -> Path | None:
     parsed = urlparse(request_path)
     raw_path = unquote(parsed.path)
@@ -410,6 +419,91 @@ class ControlPlaneService:
             return {}
         defaults = cfg.get("worker_defaults", {})
         return defaults if isinstance(defaults, dict) else {}
+
+    def repair_config_resource_pool_references(self, config: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+        if not isinstance(config, dict):
+            return config, []
+
+        repaired = copy.deepcopy(config)
+        repairs: list[str] = []
+        providers = repaired.get("providers", {})
+        available_providers = set(providers.keys()) if isinstance(providers, dict) else set()
+        resource_pools = repaired.get("resource_pools", {})
+        available_pools = set(resource_pools.keys()) if isinstance(resource_pools, dict) else set()
+
+        project = repaired.get("project")
+        if isinstance(project, dict):
+            initial_provider = str(project.get("initial_provider", "")).strip()
+            if initial_provider and initial_provider not in available_providers:
+                project.pop("initial_provider", None)
+                repairs.append(f"project.initial_provider cleared unknown provider {initial_provider}")
+
+        task_policies = repaired.get("task_policies")
+        if isinstance(task_policies, dict):
+            defaults = task_policies.get("defaults")
+            if isinstance(defaults, dict):
+                preferred = defaults.get("preferred_providers")
+                if isinstance(preferred, list):
+                    filtered = [str(item) for item in preferred if str(item) in available_providers]
+                    if filtered != [str(item) for item in preferred]:
+                        repairs.append("task_policies.defaults.preferred_providers removed unknown providers")
+                    if filtered:
+                        defaults["preferred_providers"] = filtered
+                    else:
+                        defaults.pop("preferred_providers", None)
+            types = task_policies.get("types")
+            if isinstance(types, dict):
+                for task_type, entry in types.items():
+                    if not isinstance(entry, dict):
+                        continue
+                    preferred = entry.get("preferred_providers")
+                    if isinstance(preferred, list):
+                        filtered = [str(item) for item in preferred if str(item) in available_providers]
+                        if filtered != [str(item) for item in preferred]:
+                            repairs.append(
+                                f"task_policies.types.{task_type}.preferred_providers removed unknown providers"
+                            )
+                        if filtered:
+                            entry["preferred_providers"] = filtered
+                        else:
+                            entry.pop("preferred_providers", None)
+
+        worker_defaults = repaired.get("worker_defaults")
+        if isinstance(worker_defaults, dict):
+            default_pool = str(worker_defaults.get("resource_pool", "")).strip()
+            if default_pool and default_pool not in available_pools:
+                worker_defaults.pop("resource_pool", None)
+                repairs.append(f"worker_defaults.resource_pool cleared unknown pool {default_pool}")
+            default_queue = worker_defaults.get("resource_pool_queue")
+            if isinstance(default_queue, list):
+                filtered_queue = [str(item) for item in default_queue if str(item) in available_pools]
+                if filtered_queue != [str(item) for item in default_queue]:
+                    repairs.append("worker_defaults.resource_pool_queue removed unknown pools")
+                if filtered_queue:
+                    worker_defaults["resource_pool_queue"] = filtered_queue
+                else:
+                    worker_defaults.pop("resource_pool_queue", None)
+
+        workers = repaired.get("workers")
+        if isinstance(workers, list):
+            for index, worker in enumerate(workers):
+                if not isinstance(worker, dict):
+                    continue
+                pool_name = str(worker.get("resource_pool", "")).strip()
+                if pool_name and pool_name not in available_pools:
+                    worker.pop("resource_pool", None)
+                    repairs.append(f"workers[{index}].resource_pool cleared unknown pool {pool_name}")
+                pool_queue = worker.get("resource_pool_queue")
+                if isinstance(pool_queue, list):
+                    filtered_queue = [str(item) for item in pool_queue if str(item) in available_pools]
+                    if filtered_queue != [str(item) for item in pool_queue]:
+                        repairs.append(f"workers[{index}].resource_pool_queue removed unknown pools")
+                    if filtered_queue:
+                        worker["resource_pool_queue"] = filtered_queue
+                    else:
+                        worker.pop("resource_pool_queue", None)
+
+        return repaired, repairs
 
     def default_provider_stat_entry(self) -> dict[str, Any]:
         return {
@@ -1143,12 +1237,13 @@ class ControlPlaneService:
         return issues
 
     def validate_config_payload(self, config: dict[str, Any]) -> dict[str, Any]:
-        issues = self.config_validation_issues(config)
+        repaired_config, _ = self.repair_config_resource_pool_references(config)
+        issues = self.config_validation_issues(repaired_config)
         return {
             "ok": len(issues) == 0,
             "validation_issues": issues,
-            "validation_errors": self.validation_errors(config),
-            "launch_blockers": self.launch_blockers(config),
+            "validation_errors": self.validation_errors(repaired_config),
+            "launch_blockers": self.launch_blockers(repaired_config),
         }
 
     def validate_config_section(self, section: str, value: Any) -> dict[str, Any]:
@@ -1176,7 +1271,8 @@ class ControlPlaneService:
 
     def reload_config(self) -> None:
         with self.lock:
-            self.config = load_yaml(self.config_path)
+            loaded_config = load_yaml(self.config_path)
+            self.config, repairs = self.repair_config_resource_pool_references(loaded_config)
             self.project = self.config.get("project", {})
             self.providers = self.config.get("providers", {})
             self.resource_pools = self.config.get("resource_pools", {})
@@ -1197,6 +1293,8 @@ class ControlPlaneService:
                     self.default_provider_stat_entry(),
                 )
             self.persist_provider_stats()
+            if repairs:
+                self.last_event = f"config_repaired:{len(repairs)} stale reference update(s)"
 
     def validation_errors(self, config: dict[str, Any] | None = None) -> list[str]:
         cfg = config or self.config
@@ -1432,6 +1530,7 @@ class ControlPlaneService:
         return blockers
 
     def save_config_data(self, parsed: dict[str, Any]) -> list[str]:
+        parsed, _ = self.repair_config_resource_pool_references(parsed)
         target_path = self.persist_config_path
         target_path.parent.mkdir(parents=True, exist_ok=True)
         target_path.write_text(yaml_text(parsed), encoding="utf-8")
@@ -2980,6 +3079,23 @@ def resolve_runtime_config(args: argparse.Namespace) -> tuple[Path, Path, bool, 
 def detach_process(args: argparse.Namespace) -> int:
     log_path = args.log_file
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    requested_port = int(args.port or DEFAULT_DASHBOARD_PORT)
+    if tcp_port_in_use(requested_port):
+        session_state = load_preferred_session_state(requested_port)
+        server = session_state.get("server", {}) if isinstance(session_state, dict) else {}
+        config_hint = str(server.get("config_path") or "").strip()
+        pid_hint = int(server.get("pid") or 0)
+        detail = f"port {requested_port} is already in use"
+        if pid_hint:
+            detail += f" by pid {pid_hint}"
+        if config_hint:
+            detail += f" using config {config_hint}"
+        print(detail, file=sys.stderr)
+        print(
+            "stop the existing listener or choose a different --port before starting a new detached session",
+            file=sys.stderr,
+        )
+        return 1
     script_path = str(Path(__file__).resolve())
     if shutil.which("uv"):
         command = ["uv", "run", "--no-project", "--with", "PyYAML>=6.0.2", "python", script_path, args.command]
@@ -3007,8 +3123,25 @@ def detach_process(args: argparse.Namespace) -> int:
             start_new_session=True,
             env=env,
         )
-    print(f"control plane started in background: pid={process.pid} log={log_path}")
-    return 0
+    if wait_for_port_listen(requested_port, timeout=5):
+        print(f"control plane started in background: pid={process.pid} log={log_path}")
+        return 0
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3)
+    tail = ""
+    try:
+        tail = "\n".join(log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-10:])
+    except OSError:
+        tail = ""
+    print(f"control plane failed to start on port {requested_port}; see log {log_path}", file=sys.stderr)
+    if tail:
+        print(tail, file=sys.stderr)
+    return 1
 
 
 def main() -> int:

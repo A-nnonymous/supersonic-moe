@@ -522,6 +522,35 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
         wait_for(lambda: not port_is_listening(self.port), timeout=15, interval=0.5)
         wait_for(lambda: not pid_is_running(detached_pid), timeout=15, interval=0.5)
 
+    def test_detached_serve_fails_clearly_when_port_is_busy(self) -> None:
+        result = subprocess.run(
+            [
+                "uv",
+                "run",
+                "--with",
+                "PyYAML>=6.0.2",
+                "python",
+                str(self.runtime_script),
+                "serve",
+                "--config",
+                str(self.config_path),
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(self.port),
+            ],
+            cwd=self.root,
+            env=self.env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"port {self.port} is already in use", result.stderr)
+        self.assertIn("stop the existing listener", result.stderr)
+
     def test_launch_failure_surfaces_missing_provider_credentials(self) -> None:
         current_state = self.fetch_state()
         broken_config = deepcopy(current_state["config"])
@@ -550,6 +579,41 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
         self.assertEqual(heartbeats["A2"]["state"], "stale")
         self.assertIn("launch_failed", runtime_workers["A1"]["status"])
         self.assertIn("launch_failed", runtime_workers["A2"]["status"])
+
+    def test_invalid_pool_references_are_repaired_before_launch(self) -> None:
+        current_state = self.fetch_state()
+        repaired_config = deepcopy(current_state["config"])
+        repaired_config["providers"] = {"ducc": repaired_config["providers"]["ducc"]}
+        repaired_config["resource_pools"] = {"ducc_pool": repaired_config["resource_pools"]["ducc_pool"]}
+        repaired_config["project"]["initial_provider"] = "copilot"
+        repaired_config["task_policies"]["defaults"]["preferred_providers"] = ["copilot", "ducc", "opencode"]
+        for task_entry in repaired_config["task_policies"]["types"].values():
+            if isinstance(task_entry, dict):
+                task_entry["preferred_providers"] = ["claude_code", "ducc", "opencode"]
+        repaired_config["worker_defaults"]["resource_pool_queue"] = ["claude_pool", "ducc_pool", "opencode_pool"]
+        repaired_config["workers"][0]["resource_pool"] = "claude_pool"
+        repaired_config["workers"][0]["resource_pool_queue"] = ["claude_pool", "ducc_pool", "opencode_pool"]
+        repaired_config["workers"][1]["resource_pool"] = "claude_pool"
+
+        save_result = read_json(f"{self.base_url}/api/config", {"config": repaired_config})
+        self.assertTrue(save_result["ok"])
+
+        state = self.fetch_state()
+        saved_defaults = state["config"]["worker_defaults"]
+        self.assertNotIn("initial_provider", state["config"]["project"])
+        self.assertEqual(state["config"]["task_policies"]["defaults"]["preferred_providers"], ["ducc"])
+        for task_entry in state["config"]["task_policies"]["types"].values():
+            if isinstance(task_entry, dict) and "preferred_providers" in task_entry:
+                self.assertEqual(task_entry["preferred_providers"], ["ducc"])
+        self.assertEqual(saved_defaults["resource_pool_queue"], ["ducc_pool"])
+        self.assertNotIn("resource_pool", state["config"]["workers"][0])
+        self.assertEqual(state["config"]["workers"][0]["resource_pool_queue"], ["ducc_pool"])
+        self.assertNotIn("resource_pool", state["config"]["workers"][1])
+
+        launch_result = read_json(f"{self.base_url}/api/launch", {"restart": False})
+        self.assertTrue(launch_result["ok"])
+        self.wait_for_agent_state(expected_provider="ducc", expected_model="claude-sonnet-4-5")
+        self.stop_workers()
 
     def test_session_backed_provider_launches_without_api_key(self) -> None:
         current_state = self.fetch_state()
