@@ -61,11 +61,13 @@ If you are validating Blackwell kernels directly on B200 or GB200, set `USE_QUAC
 
 ## Operating modes
 
-Use the control plane in one of these modes:
+Keep the high-frequency path simple:
 
-- `serve --bootstrap`: the explicit cold-start path; it accepts template-backed editing immediately and detaches automatically on remote-first startup unless you pass `--foreground`
-- `serve`: open the dashboard with your saved config, but do not launch workers until you explicitly press `Launch` or `Restart`
-- `up`: start the dashboard and immediately start all configured workers
+- `serve`: start the dashboard only
+- `up`: start the dashboard and launch all configured workers immediately
+- `stop-agents`: stop workers and keep the dashboard running
+- `silent`: close only the dashboard listener and keep workers running
+- `stop-all`: stop both the listener and the worker fleet
 
 If `runtime/local_config.yaml` is missing, the runtime automatically falls back to `runtime/config_template.yaml` and enters cold-start mode. If you later save a real config from the Settings page, it is written to `runtime/local_config.yaml` automatically.
 
@@ -85,13 +87,28 @@ The built assets in `runtime/web/static/` are what the Python runtime serves in 
 
 ## Quickstart
 
-### 1. Default remote startup
+### 1. Primary shell commands
 
-Use this as the primary bring-up path on a remote machine. It starts the control plane in cold-start mode, listens on all interfaces, and returns the shell immediately:
+Use these first. They match the runtime defaults and cover the normal manager loop:
 
-`python control_plane/fp8/runtime/control_plane.py serve --bootstrap`
+`python control_plane/fp8/runtime/control_plane.py serve`
 
-If you do not want background mode, add `--foreground`.
+`python control_plane/fp8/runtime/control_plane.py up`
+
+`python control_plane/fp8/runtime/control_plane.py stop-agents`
+
+`python control_plane/fp8/runtime/control_plane.py silent`
+
+`python control_plane/fp8/runtime/control_plane.py stop-all`
+
+What these do by default:
+
+- `serve` starts the dashboard only and detaches automatically
+- `up` starts the dashboard and launches all configured workers
+- `stop-agents` pauses the worker fleet without removing the dashboard
+- `silent` removes only the listener and leaves workers alone
+- `stop-all` performs the full shutdown path
+- the default listener is `0.0.0.0:8233` unless you override it
 
 ### 2. Prepare real multi-agent execution
 
@@ -106,33 +123,34 @@ Fill `runtime/local_config.yaml` from the Settings page or by editing YAML direc
 
 Also set `project.integration_branch`, optional `project.manager_git_identity`, and any per-worker `git_identity` values you want the runtime to apply inside worker worktrees.
 
-### 3. Start the dashboard only
+### 3. Optional launch flags
 
-Use this when you want the manager to inspect config, queues, and branch state first, then launch agents from the UI:
+Add parameters only when the default path is not enough:
+
+- `--open-browser`: open the dashboard automatically after startup
+- `--foreground`: keep `serve` attached to the current shell instead of detaching
+- `--bootstrap`: force template-backed cold-start mode
+- `--host 127.0.0.1`: bind to a specific address instead of the default `0.0.0.0`
+- `--port 9000`: move the listener to a different port
+- `--config <path>`: load a non-default runtime config file
+- `--log-file <path>`: change the detached log path
+- `--detach`: force detach on a non-`serve` command
+
+Examples:
 
 `python control_plane/fp8/runtime/control_plane.py serve --open-browser`
 
-### 4. Start the dashboard and launch all configured agents
-
-Use this when your config is ready and the manager wants to begin active multi-agent execution immediately:
-
 `python control_plane/fp8/runtime/control_plane.py up --open-browser`
 
-### 5. Pause running multi-agent work
+`python control_plane/fp8/runtime/control_plane.py serve --bootstrap --foreground`
 
-Use one of these paths:
+### 4. Resume paused work
 
-1. Preferred: click `Stop Agents` in the top bar. This stops all worker processes while keeping the dashboard online.
-2. Remote or scripted control: `python control_plane/fp8/runtime/control_plane.py stop-agents`
-3. Full shutdown: stop the foreground process with `Ctrl-C`, or stop the detached control-plane process from the shell.
-
-### 6. Resume paused work
-
-After a pause, use one of these paths:
+After `stop-agents`, use one of these paths:
 
 1. Click `Launch` to start workers again with the current config.
 2. Click `Restart` if you want a full stop-and-relaunch cycle.
-3. Re-run `python control_plane/fp8/runtime/control_plane.py up --open-browser` if the control plane itself is not running.
+3. Re-run `python control_plane/fp8/runtime/control_plane.py up` if the control plane itself is not running.
 
 ## Launch parameters
 
@@ -140,12 +158,12 @@ Use the short form by default:
 
 - `serve` opens the control plane only
 - `up` opens the control plane and launches workers
-- `--bootstrap` forces template-backed cold-start mode
-- `--open-browser` opens the dashboard automatically
-- `--foreground` disables the default fire-and-forget behavior of `serve`
 
 Add these only when needed:
 
+- `--open-browser` opens the dashboard automatically
+- `--foreground` disables the default fire-and-forget behavior of `serve`
+- `--bootstrap` forces template-backed cold-start mode
 - `--port 9000` to change the dashboard port
 - `--host 127.0.0.1` or another address if you do not want the default `0.0.0.0`
 - `--detach` only if you want to force detach on a non-serve command
@@ -175,11 +193,7 @@ Use these shell commands when you want to control a running detached session fro
 
 ### Fire-and-forget mode
 
-If you want the control plane to keep running after the shell returns, use detached mode:
-
-`python control_plane/fp8/runtime/control_plane.py serve`
-
-That default path now binds `0.0.0.0:8233` and detaches automatically. Use `--foreground` only when you want logs in the current shell.
+`python control_plane/fp8/runtime/control_plane.py serve` is already the default detached path. It binds `0.0.0.0:8233` unless you override host or port. Use `--foreground` only when you want logs in the current shell.
 
 The detached process writes combined stdout and stderr to `control_plane/fp8/runtime/control_plane.log` by default. You can override that path with `--log-file`.
 
@@ -187,11 +201,11 @@ If your working foreground command uses `uv run ... python`, keep that same laun
 
 ### Compatibility fallback
 
-If you need to run the control plane from a lightweight manager machine that does not carry the full CUDA stack, use the standalone path below instead of the default GPU-host deployment path above:
+If you need to run the control plane from a lightweight manager machine that does not carry the full CUDA stack, keep the same command shape and only swap the launcher:
 
-`uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/control_plane.py serve --open-browser`
+`uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/control_plane.py serve`
 
-That same standalone path also supports cold-start startup with no `local_config.yaml` present:
+That same standalone path supports the same optional flags, for example:
 
 `uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/control_plane.py serve --bootstrap --open-browser`
 
@@ -219,7 +233,7 @@ The local webpage now provides:
 
 For actual SonicMoE FP8 multi-agent delivery, the normal manager loop is:
 
-1. bring the control plane up with `serve --bootstrap` or `serve --open-browser`
+1. bring the control plane up with `serve`
 2. verify Settings and validation output are clean
 3. use `Initial Copilot` for the first fleet launch, then switch to `Selected Model` or `Elastic` as needed before pressing `Launch`
 4. monitor agent health, backlog progress, and branch merge status from `Overview`

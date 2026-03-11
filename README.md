@@ -90,15 +90,29 @@ If you are testing Blackwell kernels directly on B200 or GB200, export `USE_QUAC
 
 ### Control Plane Quickstart
 
-1. Default remote startup with the fewest parameters:
+Use the simplest commands first. They cover the normal manager workflow and match the runtime defaults:
 
 ```bash
-python control_plane/fp8/runtime/control_plane.py serve --bootstrap
+python control_plane/fp8/runtime/control_plane.py serve
+python control_plane/fp8/runtime/control_plane.py up
+python control_plane/fp8/runtime/control_plane.py stop-agents
+python control_plane/fp8/runtime/control_plane.py silent
+python control_plane/fp8/runtime/control_plane.py stop-all
 ```
 
-This now defaults to a remote-friendly detached run for cold-start mode. Add `--foreground` if you want to keep it attached to the current shell.
+- `serve` starts the dashboard only
+- `up` starts the dashboard and launches all configured workers immediately
+- `stop-agents` stops workers but keeps the dashboard available
+- `silent` closes only the dashboard listener and leaves workers running
+- `stop-all` stops both the listener and the worker fleet
 
-2. For real multi-agent execution, fill `control_plane/fp8/runtime/local_config.yaml` with:
+For the default deployment, these commands already do the reliable thing:
+
+- they use `runtime/local_config.yaml` when it exists
+- they bind the dashboard to `0.0.0.0:8233` unless you override host or port
+- `serve` detaches by default so the control plane keeps running after the shell returns
+
+Before using `up`, fill `control_plane/fp8/runtime/local_config.yaml` with:
 
 - resource pool API keys
 - provider and model assignments
@@ -107,45 +121,33 @@ This now defaults to a remote-friendly detached run for cold-start mode. Add `--
 - per-worker git commit identities when different agents should submit under different names
 - real `test_command` values that can run immediately on the local Hopper or Blackwell host
 
-3. Start only the dashboard and decide when to launch workers from the UI:
+If you want browser auto-open during local debugging, add `--open-browser` to either launch command:
 
 ```bash
 python control_plane/fp8/runtime/control_plane.py serve --open-browser
-```
-
-4. Start the dashboard and immediately launch configured workers:
-
-```bash
 python control_plane/fp8/runtime/control_plane.py up --open-browser
 ```
 
-5. Pause running multi-agent work without shutting down the dashboard:
+Use additional parameters only when you actually need them:
+
+- `--foreground`: keep `serve` attached to the current shell instead of detaching
+- `--bootstrap`: force template-backed cold-start mode when you want to edit from the default template
+- `--host 127.0.0.1`: do not expose the dashboard on all interfaces
+- `--port 9000`: move the listener to a different port
+- `--config <path>`: load a non-default runtime config file
+- `--log-file <path>`: change the detached log path
+- `--detach`: force detach on a non-`serve` command
+
+For lightweight manager machines that do not carry the full CUDA stack, keep the same command shape and only swap the launcher:
 
 ```bash
-python control_plane/fp8/runtime/control_plane.py stop-agents
+uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/control_plane.py serve
 ```
 
-You can also stop the listener only or stop both listener and agents:
+That fallback launcher also supports the same optional parameters, for example:
 
 ```bash
-python control_plane/fp8/runtime/control_plane.py silent
-python control_plane/fp8/runtime/control_plane.py stop-all
-```
-
-`silent` closes only the dashboard listener and leaves workers running. `stop-listener` remains as a compatibility alias. When you use `stop-all`, the runtime terminates worker process groups and waits for the dashboard port to be released before reporting success. For the default listener, `stop-all --port 8233` is the safest explicit form.
-
-6. Default detached serve path:
-
-```bash
-python control_plane/fp8/runtime/control_plane.py serve
-```
-
-That default path now binds `0.0.0.0:8233` and detaches automatically. Add `--foreground` when you want to keep it attached to the current shell, or `--host/--port` only when deviating from the default.
-
-7. Optional compatibility path for non-GPU manager machines:
-
-```bash
-uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/control_plane.py serve --open-browser
+uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/control_plane.py serve --bootstrap --open-browser
 ```
 
 ### Control Plane Behavior
