@@ -1,7 +1,12 @@
 project:
   repository_name: supersonic-moe
   local_repo_root: /absolute/path/to/local/supersonic-moe
-  paddle_repo_path: /absolute/path/to/Paddle
+  reference_workspace_root: /absolute/path/to/reference/workspace
+  reference_inputs:
+    - tests/reference_layers/standalone_moe_layer
+  prompt_context_files:
+    - control_plane/fp8/strategy/integration_plan.md
+    - control_plane/fp8/strategy/baseline_trace.md
   base_branch: main
   integration_branch: main
   manager_git_identity:
@@ -17,37 +22,15 @@ providers:
     command_template:
       - copilot
       - --model
-  - agent: A2
-    task_id: A2-001
-    worktree_path: /absolute/path/to/supersonic_moe_a2
-    branch: a2_audit_hopper_float8_path
-  - agent: A3
-    task_id: A3-001
-    resource_pool: claude_pool
-    worktree_path: /absolute/path/to/supersonic_moe_a3
-    branch: a3_audit_blackwell_quack_path
-  - agent: A4
-    task_id: A4-001
-    worktree_path: /absolute/path/to/supersonic_moe_a4
-    branch: a4_build_reference_path
-  - agent: A5
-    task_id: A5-001
-    resource_pool: opencode_pool
-    worktree_path: /absolute/path/to/supersonic_moe_a5
-    branch: a5_build_baseline_aligned_tests
       - "{model}"
       - --prompt-file
       - "{prompt_file}"
       - --worktree
-    branch: a6_freeze_baseline_trace
+      - "{worktree_path}"
   claude_code:
     api_key_env_name: ANTHROPIC_API_KEY
     command_template:
       - claude-code
-  - agent: A7
-    task_id: A7-001
-    worktree_path: /absolute/path/to/supersonic_moe_a7
-    branch: a7_build_benchmark_skeleton
       - --model
       - "{model}"
       - --prompt-file
@@ -85,13 +68,87 @@ resource_pools:
     api_key: replace_me_or_use_api_key_env
     extra_env: {}
 
+task_policies:
+  defaults:
+    task_type: default
+    preferred_providers:
+      - copilot
+      - claude_code
+      - opencode
+    suggested_test_command: uv run pytest tests/moe_test.py -k test_moe
+  types:
+    protocol:
+      preferred_providers:
+        - copilot
+        - claude_code
+        - opencode
+      suggested_test_command: uv run pytest tests/reference_layers/standalone_moe_layer/tests/test_imports_and_interfaces.py
+    baseline:
+      preferred_providers:
+        - claude_code
+        - copilot
+        - opencode
+      suggested_test_command: uv run pytest tests/reference_layers/standalone_moe_layer/tests/test_imports_and_interfaces.py
+    audit_hopper:
+      preferred_providers:
+        - copilot
+        - claude_code
+        - opencode
+      suggested_test_command: uv run pytest tests/moe_test.py -k test_moe
+    audit_blackwell:
+      preferred_providers:
+        - claude_code
+        - opencode
+        - copilot
+      suggested_test_command: USE_QUACK_GEMM=1 uv run pytest tests/moe_test.py -k test_moe
+    reference:
+      preferred_providers:
+        - opencode
+        - copilot
+        - claude_code
+      suggested_test_command: uv run pytest tests/moe_test.py -k test_moe
+    tests:
+      preferred_providers:
+        - opencode
+        - copilot
+        - claude_code
+      suggested_test_command: uv run pytest tests/moe_test.py -k test_moe
+    benchmark:
+      preferred_providers:
+        - opencode
+        - copilot
+        - claude_code
+      suggested_test_command: python -m py_compile benchmarks/bench_triton_moe.py
+  rules:
+    - name: freeze-protocol
+      task_type: protocol
+      task_ids: [A1-001]
+    - name: freeze-baseline-trace
+      task_type: baseline
+      task_ids: [A6-001]
+    - name: audit-hopper-path
+      task_type: audit_hopper
+      task_ids: [A2-001]
+    - name: audit-blackwell-path
+      task_type: audit_blackwell
+      task_ids: [A3-001]
+    - name: build-reference-path
+      task_type: reference
+      task_ids: [A4-001]
+    - name: build-baseline-tests
+      task_type: tests
+      task_ids: [A5-001]
+    - name: build-benchmark-skeleton
+      task_type: benchmark
+      task_ids: [A7-001]
+
 worker_defaults:
   resource_pool_queue:
     - copilot_pool
     - claude_pool
     - opencode_pool
   environment_type: uv
-  environment_path: /absolute/path/to/shared/.venv
+  environment_path: /absolute/path/to/local/supersonic-moe/.venv
   sync_command: uv sync
   test_command: uv run pytest tests/moe_test.py
   submit_strategy: patch_handoff
@@ -103,14 +160,36 @@ workers:
   - agent: A1
     task_id: A1-001
     worktree_path: /absolute/path/to/supersonic_moe_a1
-    branch: a1_protocol_freeze
+    branch: a1_freeze_fp8_protocol
     test_command: uv run pytest tests/moe_test.py -k protocol
+  - agent: A2
+    task_id: A2-001
+    worktree_path: /absolute/path/to/supersonic_moe_a2
+    branch: a2_audit_hopper_float8_path
+  - agent: A3
+    task_id: A3-001
+    resource_pool: claude_pool
+    worktree_path: /absolute/path/to/supersonic_moe_a3
+    branch: a3_audit_blackwell_quack_path
+  - agent: A4
+    task_id: A4-001
+    worktree_path: /absolute/path/to/supersonic_moe_a4
+    branch: a4_build_reference_path
+  - agent: A5
+    task_id: A5-001
+    resource_pool: opencode_pool
+    worktree_path: /absolute/path/to/supersonic_moe_a5
+    branch: a5_build_baseline_aligned_tests
   - agent: A6
     task_id: A6-001
     resource_pool: claude_pool
     worktree_path: /absolute/path/to/supersonic_moe_a6
-    branch: a6_baseline_trace
+    branch: a6_freeze_baseline_trace
     test_command: uv run pytest tests/moe_test.py -k baseline
     git_identity:
       name: A6 Baseline Worker
       email: a6-baseline@example.com
+  - agent: A7
+    task_id: A7-001
+    worktree_path: /absolute/path/to/supersonic_moe_a7
+    branch: a7_build_benchmark_skeleton

@@ -5,6 +5,7 @@ phase: protocol-freeze
 items:
   - id: A1-001
     title: Freeze FP8 protocol
+    task_type: protocol
     owner: A1
     status: pending
     gate: G0
@@ -21,6 +22,7 @@ items:
 
   - id: A6-001
     title: Freeze baseline trace
+    task_type: baseline
     owner: A6
     status: pending
     gate: G0
@@ -37,6 +39,7 @@ items:
 
   - id: A4-001
     title: Build reference path
+    task_type: reference
     owner: A4
     status: blocked
     gate: G1
@@ -52,6 +55,7 @@ items:
 
   - id: A2-001
     title: Audit Hopper float8 path
+    task_type: audit_hopper
     owner: A2
     status: pending
     gate: G2
@@ -66,6 +70,7 @@ items:
 
   - id: A3-001
     title: Audit Blackwell QuACK path
+    task_type: audit_blackwell
     owner: A3
     status: pending
     gate: G3
@@ -80,6 +85,7 @@ items:
 
   - id: A5-001
     title: Build baseline-aligned tests
+    task_type: tests
     owner: A5
     status: blocked
     gate: G4
@@ -94,6 +100,7 @@ items:
 
   - id: A7-001
     title: Build benchmark skeleton
+    task_type: benchmark
     owner: A7
     status: pending
     gate: G6

@@ -21,6 +21,7 @@ Use this as the cold-start context for any new agent working in `control_plane/`
 - Settings should support section-scoped validate/save so one block can change without revalidating everything.
 - Worktree paths should be auto-derived when safe, then overridable.
 - Worker roster logic should reflect real plan/runtime state, not stale sample entries.
+- A0 is the scheduler, not just a launcher. The control plane should infer task-aware worker defaults, route workers dynamically, and ask the user only for hard blockers it cannot safely resolve.
 - Stop behavior depends on per-port session files like `session_state_<port>.json`; do not regress that targeting model.
 
 ## User Preferences
@@ -29,6 +30,7 @@ Use this as the cold-start context for any new agent working in `control_plane/`
 - Optimize for repeated operator use, not abstract flexibility.
 - Prefer workflow improvements over cosmetic-only changes.
 - Prefer automatic defaults over repetitive manual entry.
+- Push human input down to API keys, local paths, and true policy decisions; A0 should absorb routine worker initialization and routing decisions.
 - Keep override power, but hide infrequent knobs behind advanced sections.
 - Avoid large blank areas; use horizontal space well without making laptop layouts fragile.
 - Keep UI labels, comments, README guidance, and runtime behavior aligned.
@@ -37,7 +39,10 @@ Use this as the cold-start context for any new agent working in `control_plane/`
 ## Architecture Facts
 
 - Config supports top-level `worker_defaults`, merged into each worker for validation and launch.
+- Runtime now derives task-aware branch names, test commands, and resource-pool recommendations/locks from explicit backlog `task_type` metadata plus config-driven `task_policies`, not backend keyword matching.
 - Backlog/runtime files are part of the planning model. Use `control_plane/fp8/state/backlog.yaml` and `control_plane/fp8/state/agent_runtime.yaml` when deriving or syncing worker roster.
+- Provider-quality history is part of live scheduling. Preserve and use persisted quality signals instead of treating every restart like a blank slate.
+- Project-level shared references should flow through `project.reference_workspace_root`, `project.reference_inputs`, and `project.prompt_context_files` instead of task-specific field names in the runtime.
 - Missing-but-plausible worktree paths are acceptable if runtime can create the worktree at launch time.
 - Default deployment assumption is a Hopper/Blackwell Linux machine with a provisioned SonicMoE environment; the `uv --no-project` path is fallback only.
 - SonicMoE public path is still BF16-first; FP8 work is integration-heavy, and QuACK / Blackwell paths already exist behind `USE_QUACK_GEMM`.
@@ -46,7 +51,9 @@ Use this as the cold-start context for any new agent working in `control_plane/`
 
 - First decide whether a new setting belongs in `project`, `worker_defaults`, or a per-worker override.
 - If a value can be inferred safely, auto-fill it and leave override room instead of forcing manual entry.
+- Prefer A0-managed defaults for task ID, branch, worktree path, test command, and default resource-pool routing.
 - Keep worker cards focused on identity, routing, and common controls; treat env/test/sync/submit/git overrides as advanced.
+- When a task type strongly matches a provider, encode that in `task_policies` or backlog `task_type` data and let A0 lock that pool by default if availability and quality signals support it.
 - Preserve the merge model between defaults and workers in both validation and launch.
 - If docs mention commands, lead with the high-frequency path and move optional flags later.
 
