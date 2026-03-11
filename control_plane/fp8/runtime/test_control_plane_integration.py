@@ -102,6 +102,7 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
         self.write_fake_provider_binary("copilot")
         self.write_fake_provider_binary("opencode")
         self.write_fake_provider_binary("claude-code")
+        self.write_fake_provider_binary("ducc")
 
         self.port = find_free_port()
         self.config_path = self.root / "integration_config.yaml"
@@ -158,10 +159,27 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
 
     def write_fake_provider_binary(self, binary_name: str) -> None:
         binary_path = self.bin_dir / binary_name
-        binary_path.write_text(
-            "#!/bin/sh\n" "while [ $# -gt 0 ]; do\n" "  shift\n" "done\n" "sleep 30\n",
-            encoding="utf-8",
-        )
+        if binary_name == "ducc":
+            binary_path.write_text(
+                "#!/bin/sh\n"
+                'if [ "$1" = "session-ok" ]; then\n'
+                "  exit 0\n"
+                "fi\n"
+                'if [ "$1" = "session-fail" ]; then\n'
+                '  echo "ducc session unavailable" >&2\n'
+                "  exit 17\n"
+                "fi\n"
+                "while [ $# -gt 0 ]; do\n"
+                "  shift\n"
+                "done\n"
+                "sleep 30\n",
+                encoding="utf-8",
+            )
+        else:
+            binary_path.write_text(
+                "#!/bin/sh\n" "while [ $# -gt 0 ]; do\n" "  shift\n" "done\n" "sleep 30\n",
+                encoding="utf-8",
+            )
         binary_path.chmod(0o755)
 
     def render_config(self) -> str:
@@ -218,20 +236,33 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
                         "{worktree_path}",
                     ],
                 },
+                "ducc": {
+                    "auth_mode": "session",
+                    "session_probe_command": ["ducc", "session-ok"],
+                    "command_template": [
+                        "ducc",
+                        "--model",
+                        "{model}",
+                        "--prompt-file",
+                        "{prompt_file}",
+                        "--cwd",
+                        "{worktree_path}",
+                    ],
+                },
             },
             "task_policies": {
                 "defaults": {
                     "task_type": "default",
-                    "preferred_providers": ["copilot", "claude_code", "opencode"],
+                    "preferred_providers": ["copilot", "claude_code", "ducc", "opencode"],
                     "suggested_test_command": "uv run pytest tests/moe_test.py -k test_moe",
                 },
                 "types": {
                     "protocol": {
-                        "preferred_providers": ["copilot", "claude_code", "opencode"],
+                        "preferred_providers": ["copilot", "claude_code", "ducc", "opencode"],
                         "suggested_test_command": "uv run pytest tests/reference_layers/standalone_moe_layer/tests/test_imports_and_interfaces.py",
                     },
                     "audit_hopper": {
-                        "preferred_providers": ["copilot", "claude_code", "opencode"],
+                        "preferred_providers": ["copilot", "claude_code", "ducc", "opencode"],
                         "suggested_test_command": "uv run pytest tests/moe_test.py -k test_moe",
                     },
                 },
@@ -262,9 +293,15 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
                     "api_key": "replace_me_or_use_api_key_env",
                     "extra_env": {},
                 },
+                "ducc_pool": {
+                    "priority": 350,
+                    "provider": "ducc",
+                    "model": "claude-sonnet-4-5",
+                    "extra_env": {},
+                },
             },
             "worker_defaults": {
-                "resource_pool_queue": ["copilot_pool", "opencode_pool", "claude_pool"],
+                "resource_pool_queue": ["copilot_pool", "ducc_pool", "opencode_pool", "claude_pool"],
                 "environment_type": "none",
                 "sync_command": "none",
                 "submit_strategy": "patch_handoff",
@@ -513,6 +550,58 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
         self.assertEqual(heartbeats["A2"]["state"], "stale")
         self.assertIn("launch_failed", runtime_workers["A1"]["status"])
         self.assertIn("launch_failed", runtime_workers["A2"]["status"])
+
+    def test_session_backed_provider_launches_without_api_key(self) -> None:
+        current_state = self.fetch_state()
+        session_config = deepcopy(current_state["config"])
+        session_config["worker_defaults"]["resource_pool_queue"] = ["ducc_pool"]
+
+        save_result = read_json(f"{self.base_url}/api/config", {"config": session_config})
+        self.assertTrue(save_result["ok"])
+
+        launch_result = read_json(
+            f"{self.base_url}/api/launch",
+            {"restart": False, "strategy": "selected_model", "provider": "ducc", "model": "ducc-sonnet-it"},
+        )
+        self.assertTrue(launch_result["ok"])
+
+        state = self.wait_for_agent_state(expected_provider="ducc", expected_model="ducc-sonnet-it")
+        provider_queue = {item["resource_pool"]: item for item in state["provider_queue"]}
+        self.assertEqual(provider_queue["ducc_pool"]["auth_mode"], "session")
+        self.assertTrue(provider_queue["ducc_pool"]["auth_ready"])
+        self.assertTrue(provider_queue["ducc_pool"]["launch_ready"])
+        self.assertFalse(provider_queue["ducc_pool"]["api_key_present"])
+
+        runtime_workers = {item["agent"]: item for item in state["runtime"]["workers"]}
+        self.assertEqual(runtime_workers["A1"]["provider"], "ducc")
+        self.assertEqual(runtime_workers["A2"]["provider"], "ducc")
+
+        self.stop_workers()
+
+    def test_session_probe_failure_surfaces_actionable_error(self) -> None:
+        current_state = self.fetch_state()
+        broken_config = deepcopy(current_state["config"])
+        broken_config["providers"]["ducc"]["session_probe_command"] = ["ducc", "session-fail"]
+        broken_config["worker_defaults"]["resource_pool_queue"] = ["ducc_pool"]
+
+        save_result = read_json(f"{self.base_url}/api/config", {"config": broken_config})
+        self.assertTrue(save_result["ok"])
+
+        status_code, failed_launch = request_json_allow_error(
+            f"{self.base_url}/api/launch",
+            {"restart": False, "strategy": "selected_model", "provider": "ducc", "model": "ducc-sonnet-it"},
+        )
+        self.assertEqual(status_code, 400)
+        self.assertFalse(failed_launch["ok"])
+        self.assertIn("ducc session unavailable", failed_launch["error"])
+        self.assertTrue(all("ducc session unavailable" in item["error"] for item in failed_launch["failures"]))
+
+        state = self.fetch_state()
+        provider_queue = {item["resource_pool"]: item for item in state["provider_queue"]}
+        self.assertEqual(provider_queue["ducc_pool"]["auth_mode"], "session")
+        self.assertFalse(provider_queue["ducc_pool"]["auth_ready"])
+        self.assertFalse(provider_queue["ducc_pool"]["launch_ready"])
+        self.assertIn("ducc session unavailable", provider_queue["ducc_pool"]["auth_detail"])
 
     def test_silent_and_stop_all_cli_preserve_then_release_workers(self) -> None:
         launch_result = read_json(f"{self.base_url}/api/launch", {"restart": False})
