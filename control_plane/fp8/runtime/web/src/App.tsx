@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { enableSilentMode, fetchState, launchWorkers, saveConfig, stopAll, stopWorkers, validateConfig } from './api';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { enableSilentMode, fetchState, launchWorkers, saveConfigSection, stopAll, stopWorkers, validateConfigSection } from './api';
 import type {
+  ConfigSection,
   ConfigResourcePool,
   ConfigShape,
   ConfigWorker,
@@ -48,6 +49,40 @@ type ProgressModel = {
 };
 
 type IssueMap = Record<string, string[]>;
+type SectionStatusMap = Partial<Record<ConfigSection, { message: string; error: boolean }>>;
+type PlannedWorker = {
+  agent: string;
+  task_id: string;
+  title: string;
+  branch: string;
+  worktree_path: string;
+};
+
+function buildSectionValue(config: ConfigShape, section: ConfigSection): unknown {
+  if (section === 'project') {
+    const project = config.project || {};
+    return {
+      repository_name: project.repository_name || '',
+      local_repo_root: project.local_repo_root || '',
+      paddle_repo_path: project.paddle_repo_path || '',
+      dashboard: project.dashboard || {},
+    };
+  }
+  if (section === 'merge_policy') {
+    const project = config.project || {};
+    return {
+      integration_branch: project.integration_branch || project.base_branch || '',
+      manager_git_identity: project.manager_git_identity || {},
+    };
+  }
+  if (section === 'resource_pools') {
+    return config.resource_pools || {};
+  }
+  if (section === 'worker_defaults') {
+    return config.worker_defaults || {};
+  }
+  return config.workers || [];
+}
 
 function classNames(...values: Array<string | false | null | undefined>): string {
   return values.filter(Boolean).join(' ');
@@ -73,7 +108,7 @@ function renderCell(value: unknown): string {
 
 function cloneConfig(config: ConfigShape | undefined): ConfigShape {
   if (!config) {
-    return { project: {}, providers: {}, resource_pools: {}, workers: [] };
+    return { project: {}, providers: {}, resource_pools: {}, worker_defaults: {}, workers: [] };
   }
   return JSON.parse(JSON.stringify(config)) as ConfigShape;
 }
@@ -153,6 +188,90 @@ function launchStrategyLabel(strategy: LaunchStrategy): string {
     return 'Selected Model';
   }
   return 'Elastic';
+}
+
+function slugify(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .replace(/_{2,}/g, '_');
+}
+
+function deriveWorktreePath(config: ConfigShape, agent: string): string {
+  const project = config.project || {};
+  const localRepoRoot = String(project.local_repo_root || '').trim();
+  if (!localRepoRoot) {
+    return '';
+  }
+  const normalizedRoot = localRepoRoot.replace(/\/$/, '');
+  const parent = normalizedRoot.includes('/') ? normalizedRoot.slice(0, normalizedRoot.lastIndexOf('/')) : normalizedRoot;
+  const baseName = String(project.repository_name || normalizedRoot.split('/').pop() || 'supersonic-moe');
+  return `${parent}/${slugify(baseName)}_${agent.toLowerCase()}`;
+}
+
+function deriveBranchName(agent: string, title: string, taskId: string): string {
+  const branchSuffix = slugify(title || taskId || agent) || agent.toLowerCase();
+  return `${agent.toLowerCase()}_${branchSuffix}`;
+}
+
+function sectionMatchesField(section: ConfigSection, field: string): boolean {
+  if (section === 'project') {
+    return field.startsWith('project.') && !field.startsWith('project.integration_branch') && !field.startsWith('project.manager_git_identity');
+  }
+  if (section === 'merge_policy') {
+    return field.startsWith('project.integration_branch') || field.startsWith('project.manager_git_identity');
+  }
+  if (section === 'resource_pools') {
+    return field.startsWith('resource_pools.');
+  }
+  if (section === 'worker_defaults') {
+    return field.startsWith('worker_defaults.');
+  }
+  return field.startsWith('workers[');
+}
+
+function collectSectionIssues(section: ConfigSection, issues: ValidationIssue[]): ValidationIssue[] {
+  return issues.filter((issue) => sectionMatchesField(section, issue.field));
+}
+
+function buildPlannedWorkers(data: DashboardState | null, config: ConfigShape): PlannedWorker[] {
+  if (!data) {
+    return [];
+  }
+
+  const byAgent = new Map<string, PlannedWorker>();
+  (data.backlog.items || []).forEach((item) => {
+    const agent = String(item.owner || '').trim();
+    if (!agent || agent === 'A0') {
+      return;
+    }
+    if (!byAgent.has(agent)) {
+      byAgent.set(agent, {
+        agent,
+        task_id: item.id,
+        title: item.title,
+        branch: deriveBranchName(agent, item.title, item.id),
+        worktree_path: deriveWorktreePath(config, agent),
+      });
+    }
+  });
+
+  (data.runtime.workers || []).forEach((item) => {
+    const agent = String(item.agent || '').trim();
+    if (!agent || agent === 'A0' || byAgent.has(agent)) {
+      return;
+    }
+    byAgent.set(agent, {
+      agent,
+      task_id: `${agent}-001`,
+      title: item.branch || agent,
+      branch: item.branch || deriveBranchName(agent, item.branch || agent, `${agent}-001`),
+      worktree_path: deriveWorktreePath(config, agent),
+    });
+  });
+
+  return Array.from(byAgent.values()).sort((left, right) => left.agent.localeCompare(right.agent, undefined, { numeric: true }));
 }
 
 function sortAgents(rows: AgentRow[]): AgentRow[] {
@@ -443,6 +562,34 @@ function SectionIssueList({ issues }: { issues: ValidationIssue[] }) {
   );
 }
 
+function SectionHeader({
+  title,
+  section,
+  status,
+  onValidate,
+  onSave,
+  action,
+}: {
+  title: string;
+  section: ConfigSection;
+  status?: { message: string; error: boolean };
+  onValidate: (section: ConfigSection) => void;
+  onSave: (section: ConfigSection) => void;
+  action?: ReactNode;
+}) {
+  return (
+    <div className="section-head section-head-actions">
+      <h3>{title}</h3>
+      <div className="section-actions">
+        {status?.message ? <span className={classNames('section-status', status.error && 'error')}>{status.message}</span> : null}
+        <button className="ghost" type="button" onClick={() => onValidate(section)}>Validate</button>
+        <button type="button" onClick={() => onSave(section)}>Save</button>
+        {action}
+      </div>
+    </div>
+  );
+}
+
 function OverviewTab({ data, agentRows, progress }: { data: DashboardState; agentRows: AgentRow[]; progress: ProgressModel }) {
   const mergeQueue = data.merge_queue || [];
   const mergeReady = mergeQueue.filter((item) => ['offline', 'stopped'].includes(String(item.status))).length;
@@ -557,49 +704,58 @@ function OperationsTab({ data }: { data: DashboardState }) {
 }
 
 function SettingsTab({
+  data,
   draftConfig,
   providerOptions,
-  issues,
-  backendIssues,
+  allIssues,
+  sectionStatuses,
   onProjectChange,
   onMergeChange,
   onPoolChange,
   onAddPool,
   onWorkerChange,
   onAddWorker,
-  onSave,
+  onValidateSection,
+  onSaveSection,
+  onSyncWorkers,
+  onAutoFillWorktreePaths,
 }: {
+  data: DashboardState;
   draftConfig: ConfigShape;
   providerOptions: string[];
-  issues: IssueMap;
-  backendIssues: ValidationIssue[];
+  allIssues: ValidationIssue[];
+  sectionStatuses: SectionStatusMap;
   onProjectChange: (field: string, value: string) => void;
   onMergeChange: (field: string, value: string) => void;
   onPoolChange: (poolName: string, field: keyof ConfigResourcePool, value: string) => void;
   onAddPool: () => void;
   onWorkerChange: (index: number, field: string, value: string) => void;
   onAddWorker: () => void;
-  onSave: () => void;
+  onValidateSection: (section: ConfigSection) => void;
+  onSaveSection: (section: ConfigSection) => void;
+  onSyncWorkers: () => void;
+  onAutoFillWorktreePaths: () => void;
 }) {
   const project = draftConfig.project || {};
   const dashboard = project.dashboard || {};
   const pools = draftConfig.resource_pools || {};
   const workerDefaults = draftConfig.worker_defaults || {};
   const workers = draftConfig.workers || [];
+  const plannedWorkers = buildPlannedWorkers(data, draftConfig);
+  const issues = buildIssueMap(allIssues);
   return (
     <div className="tab-body">
       <section className="card">
         <div className="page-header">
           <div>
             <h2>Settings</h2>
-            <p className="small">The four cards below are editable. Invalid values are warned and are not saved.</p>
+            <p className="small">Each block can be validated and saved independently. Worker paths and plan coverage can be generated automatically.</p>
           </div>
-          <button onClick={onSave}>Validate And Save</button>
         </div>
-        <SectionIssueList issues={backendIssues} />
         <div className="settings-grid">
           <section className="helper-card settings-card">
-            <div className="section-head"><h3>Project</h3></div>
+            <SectionHeader title="Project" section="project" status={sectionStatuses.project} onValidate={onValidateSection} onSave={onSaveSection} />
+            <SectionIssueList issues={collectSectionIssues('project', allIssues)} />
             <div className="field-grid">
               <Field label="Repository" value={project.repository_name || ''} onChange={(value) => onProjectChange('repository_name', value)} issues={issues['project.repository_name']} />
               <Field label="Local Repo Root" value={project.local_repo_root || ''} onChange={(value) => onProjectChange('local_repo_root', value)} issues={issues['project.local_repo_root']} />
@@ -610,10 +766,8 @@ function SettingsTab({
           </section>
 
           <section className="helper-card settings-card settings-card-wide">
-            <div className="section-head">
-              <h3>Resource Pools</h3>
-              <button className="ghost" type="button" onClick={onAddPool}>Add Pool</button>
-            </div>
+            <SectionHeader title="Resource Pools" section="resource_pools" status={sectionStatuses.resource_pools} onValidate={onValidateSection} onSave={onSaveSection} action={<button className="ghost" type="button" onClick={onAddPool}>Add Pool</button>} />
+            <SectionIssueList issues={collectSectionIssues('resource_pools', allIssues)} />
             <div className="pool-strip">
               {Object.entries(pools).map(([poolName, pool]) => (
                 <div key={poolName} className="subcard pool-card">
@@ -630,7 +784,8 @@ function SettingsTab({
           </section>
 
           <section className="helper-card settings-card">
-            <div className="section-head"><h3>Merge Policy</h3></div>
+            <SectionHeader title="Merge Policy" section="merge_policy" status={sectionStatuses.merge_policy} onValidate={onValidateSection} onSave={onSaveSection} />
+            <SectionIssueList issues={collectSectionIssues('merge_policy', allIssues)} />
             <div className="field-grid">
               <Field label="Integration Branch" value={project.integration_branch || project.base_branch || ''} onChange={(value) => onMergeChange('integration_branch', value)} issues={issues['project.integration_branch']} />
               <Field label="Manager Name" value={project.manager_git_identity?.name || ''} onChange={(value) => onMergeChange('manager_git_identity.name', value)} />
@@ -639,7 +794,8 @@ function SettingsTab({
           </section>
 
           <section className="helper-card settings-card settings-card-wide">
-            <div className="section-head"><h3>Worker Defaults</h3></div>
+            <SectionHeader title="Worker Defaults" section="worker_defaults" status={sectionStatuses.worker_defaults} onValidate={onValidateSection} onSave={onSaveSection} />
+            <SectionIssueList issues={collectSectionIssues('worker_defaults', allIssues)} />
             <p className="small muted">These values apply to every worker unless a row below overrides them.</p>
             <div className="field-grid">
               <Field label="Default Pool" value={workerDefaults.resource_pool || ''} onChange={(value) => onWorkerChange(-1, 'worker_defaults.resource_pool', value)} issues={issues['worker_defaults.resource_pool']} helpText="Leave blank to rely on pool queue or per-worker overrides." />
@@ -655,12 +811,23 @@ function SettingsTab({
           </section>
 
           <section className="helper-card settings-card settings-card-wide">
-            <div className="section-head">
-              <h3>Worker Config</h3>
-              <button className="ghost" type="button" onClick={onAddWorker}>Add Worker</button>
-            </div>
-            <p className="small muted">Keep each row focused on identity and routing. Leave override fields blank to inherit Worker Defaults.</p>
-            <div className="stack-list">
+            <SectionHeader
+              title="Worker Config"
+              section="workers"
+              status={sectionStatuses.workers}
+              onValidate={onValidateSection}
+              onSave={onSaveSection}
+              action={
+                <>
+                  <button className="ghost" type="button" onClick={onSyncWorkers}>Sync From Plan</button>
+                  <button className="ghost" type="button" onClick={onAutoFillWorktreePaths}>Auto Paths</button>
+                  <button className="ghost" type="button" onClick={onAddWorker}>Add Worker</button>
+                </>
+              }
+            />
+            <SectionIssueList issues={collectSectionIssues('workers', allIssues)} />
+            <p className="small muted">Detected workers from backlog/runtime: {plannedWorkers.map((item) => item.agent).join(', ') || 'none'}. Leave overrides blank to inherit defaults.</p>
+            <div className="worker-grid">
               {workers.map((worker, index) => (
                 <div key={`${worker.agent || 'worker'}-${index}`} className="subcard">
                   <div className="subcard-title">{worker.agent || `Worker ${index + 1}`}</div>
@@ -788,12 +955,13 @@ export function App() {
   const [actionInFlight, setActionInFlight] = useState(false);
   const [status, setStatus] = useState<{ message: string; error: boolean }>({ message: '', error: false });
   const [backendIssues, setBackendIssues] = useState<ValidationIssue[]>([]);
+  const [sectionStatuses, setSectionStatuses] = useState<SectionStatusMap>({});
   const abortRef = useRef<AbortController | null>(null);
 
   const agentRows = useMemo(() => buildAgentRows(data), [data]);
   const progress = useMemo(() => buildProgressModel(data, agentRows), [data, agentRows]);
   const localIssues = useMemo(() => getLocalValidationIssues(draftConfig), [draftConfig]);
-  const issueMap = useMemo(() => buildIssueMap(localIssues, backendIssues), [localIssues, backendIssues]);
+  const allIssues = useMemo(() => [...localIssues, ...backendIssues], [localIssues, backendIssues]);
   const providerOptions = useMemo(() => Object.keys(draftConfig.providers || {}), [draftConfig.providers]);
 
   const setStampedStatus = (message: string, error = false) => {
@@ -811,6 +979,7 @@ export function App() {
       if (!configDirty) {
         setDraftConfig(cloneConfig(nextData.config));
         setBackendIssues([]);
+        setSectionStatuses({});
       }
       if (!launchDirty) {
         setLaunchStrategy(nextData.launch_policy.default_strategy);
@@ -863,6 +1032,12 @@ export function App() {
     setDraftConfig((current) => normalizeConfig(updater(normalizeConfig(cloneConfig(current)))));
   };
 
+  const refreshStateOnly = async () => {
+    const controller = new AbortController();
+    const nextData = await fetchState(controller.signal);
+    setData(nextData);
+  };
+
   const onProjectChange = (field: string, value: string) => {
     updateConfig((current) => {
       const next = normalizeConfig(current);
@@ -882,6 +1057,10 @@ export function App() {
       } else if (field === 'paddle_repo_path') {
         next.project.paddle_repo_path = value;
       }
+      next.workers = (next.workers || []).map((worker) => ({
+        ...worker,
+        worktree_path: worker.worktree_path || deriveWorktreePath(next, worker.agent),
+      }));
       return next;
     });
   };
@@ -966,6 +1145,9 @@ export function App() {
       } else {
         (worker as Record<string, unknown>)[field] = value;
       }
+      if (field === 'agent' && !worker.worktree_path) {
+        worker.worktree_path = deriveWorktreePath(next, String(value));
+      }
       workers[index] = worker;
       next.workers = workers;
       return next;
@@ -989,22 +1171,97 @@ export function App() {
     });
   };
 
-  const onSave = () => void runAction('validating settings', async () => {
-    if (localIssues.length > 0) {
-      setStampedStatus(`settings contain ${localIssues.length} local validation issue(s)`, true);
+  const onSyncWorkers = () => {
+    updateConfig((current) => {
+      const next = normalizeConfig(current);
+      const plannedWorkers = buildPlannedWorkers(data, next);
+      const existingByAgent = new Map((next.workers || []).map((worker) => [worker.agent, worker]));
+      const syncedWorkers = plannedWorkers.map((plannedWorker) => {
+        const existing = existingByAgent.get(plannedWorker.agent);
+        return {
+          agent: plannedWorker.agent,
+          task_id: existing?.task_id || plannedWorker.task_id,
+          branch: existing?.branch || plannedWorker.branch,
+          worktree_path: existing?.worktree_path || plannedWorker.worktree_path,
+          resource_pool: existing?.resource_pool || '',
+          resource_pool_queue: existing?.resource_pool_queue || [],
+          environment_type: existing?.environment_type,
+          environment_path: existing?.environment_path,
+          sync_command: existing?.sync_command,
+          test_command: existing?.test_command,
+          submit_strategy: existing?.submit_strategy,
+          git_identity: existing?.git_identity,
+        };
+      });
+      const extraWorkers = (next.workers || []).filter((worker) => !plannedWorkers.some((plannedWorker) => plannedWorker.agent === worker.agent));
+      next.workers = [...syncedWorkers, ...extraWorkers];
+      return next;
+    });
+    setStampedStatus('worker list synced from backlog and runtime plan');
+  };
+
+  const onAutoFillWorktreePaths = () => {
+    updateConfig((current) => {
+      const next = normalizeConfig(current);
+      next.workers = (next.workers || []).map((worker) => ({
+        ...worker,
+        worktree_path: worker.worktree_path || deriveWorktreePath(next, worker.agent),
+      }));
+      return next;
+    });
+    setStampedStatus('missing worktree paths filled from local repo root');
+  };
+
+  const onValidateSection = (section: ConfigSection) => void runAction(`validating ${section}`, async () => {
+    const sectionValue = buildSectionValue(draftConfig, section);
+    const validation = await validateConfigSection(section, sectionValue);
+    const nextIssues = validation.validation_issues;
+    setBackendIssues((current) => [
+      ...current.filter((issue) => !sectionMatchesField(section, issue.field)),
+      ...nextIssues,
+    ]);
+    setSectionStatuses((current) => ({
+      ...current,
+      [section]: {
+        message: validation.ok ? 'validated' : `${nextIssues.length} issue(s)`,
+        error: !validation.ok,
+      },
+    }));
+    setStampedStatus(validation.ok ? `${section} validated` : `${section} has validation issues`, !validation.ok);
+  });
+
+  const onSaveSection = (section: ConfigSection) => void runAction(`saving ${section}`, async () => {
+    const sectionLocalIssues = collectSectionIssues(section, localIssues);
+    if (sectionLocalIssues.length > 0) {
+      setSectionStatuses((current) => ({
+        ...current,
+        [section]: { message: `${sectionLocalIssues.length} local issue(s)`, error: true },
+      }));
+      setStampedStatus(`${section} contains local validation issues`, true);
       return;
     }
-    const validation = await validateConfig(draftConfig);
-    setBackendIssues(validation.validation_issues);
+    const sectionValue = buildSectionValue(draftConfig, section);
+    const validation = await validateConfigSection(section, sectionValue);
     if (!validation.ok) {
-      setStampedStatus(`settings rejected: ${validation.validation_issues.length} validation issue(s)`, true);
+      setBackendIssues((current) => [
+        ...current.filter((issue) => !sectionMatchesField(section, issue.field)),
+        ...validation.validation_issues,
+      ]);
+      setSectionStatuses((current) => ({
+        ...current,
+        [section]: { message: `${validation.validation_issues.length} issue(s)`, error: true },
+      }));
+      setStampedStatus(`${section} rejected by validation`, true);
       return;
     }
-    const response = await saveConfig(draftConfig);
-    setConfigDirty(false);
-    setBackendIssues([]);
-    await refresh(true);
-    setStampedStatus(`settings saved: ${response.launch_blockers.length} launch blocker(s), ${response.validation_errors.length} config note(s)`);
+    const response = await saveConfigSection(section, sectionValue);
+    setBackendIssues((current) => current.filter((issue) => !sectionMatchesField(section, issue.field)));
+    setSectionStatuses((current) => ({
+      ...current,
+      [section]: { message: 'saved', error: false },
+    }));
+    await refreshStateOnly();
+    setStampedStatus(`${section} saved: ${response.validation_errors.length} note(s), ${response.launch_blockers.length} blocker(s)`);
   });
 
   const onLaunch = (restart: boolean) => void runAction(restart ? 'restarting workers' : 'launching workers', async () => {
@@ -1162,17 +1419,21 @@ export function App() {
             : tab === 'operations'
               ? <OperationsTab data={data} />
               : <SettingsTab
+                  data={data}
                   draftConfig={draftConfig}
                   providerOptions={providerOptions}
-                  issues={issueMap}
-                  backendIssues={backendIssues}
+                  allIssues={allIssues}
+                  sectionStatuses={sectionStatuses}
                   onProjectChange={onProjectChange}
                   onMergeChange={onMergeChange}
                   onPoolChange={onPoolChange}
                   onAddPool={onAddPool}
                   onWorkerChange={onWorkerChange}
                   onAddWorker={onAddWorker}
-                  onSave={onSave}
+                  onValidateSection={onValidateSection}
+                  onSaveSection={onSaveSection}
+                  onSyncWorkers={onSyncWorkers}
+                  onAutoFillWorktreePaths={onAutoFillWorktreePaths}
                 />
         ) : (
           <section className="card"><div className="small muted">Loading dashboard state...</div></section>

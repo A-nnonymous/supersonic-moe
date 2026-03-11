@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import mimetypes
 import os
@@ -45,6 +46,7 @@ WEB_STATIC_DIR = RUNTIME_DIR / "web" / "static"
 WEB_INDEX_FILE = WEB_STATIC_DIR / "index.html"
 DEFAULT_INITIAL_PROVIDER = "copilot"
 LAUNCH_STRATEGIES = {"initial_copilot", "selected_model", "elastic"}
+CONFIG_SECTIONS = {"project", "merge_policy", "resource_pools", "worker_defaults", "workers"}
 
 
 def now_iso() -> str:
@@ -371,6 +373,24 @@ class ControlPlaneService:
         defaults = cfg.get("worker_defaults", {})
         return defaults if isinstance(defaults, dict) else {}
 
+    def suggested_worktree_path(self, worker: dict[str, Any], config: dict[str, Any] | None = None) -> str:
+        cfg = config or self.config
+        if not isinstance(cfg, dict) or not isinstance(worker, dict):
+            return ""
+        project = cfg.get("project", {})
+        if not isinstance(project, dict):
+            return ""
+        agent = str(worker.get("agent", "")).strip()
+        local_repo_root = str(project.get("local_repo_root", "")).strip()
+        repository_name = str(project.get("repository_name", "")).strip()
+        if not agent or not local_repo_root or is_placeholder_path(local_repo_root):
+            return ""
+        root_path = Path(local_repo_root).expanduser()
+        parent = root_path.parent if root_path.parent != root_path else root_path
+        base_name = repository_name or root_path.name or "supersonic-moe"
+        safe_base_name = "_".join(part for part in base_name.replace("-", "_").split("_") if part) or "supersonic_moe"
+        return str((parent / f"{safe_base_name}_{agent.lower()}").resolve())
+
     def merge_worker_config(self, worker: dict[str, Any], defaults: dict[str, Any] | None = None) -> dict[str, Any]:
         if not isinstance(worker, dict):
             return {}
@@ -396,6 +416,12 @@ class ControlPlaneService:
         if (not isinstance(raw_queue, list) or not raw_queue) and isinstance(default_queue, list) and default_queue:
             merged["resource_pool_queue"] = list(default_queue)
 
+        raw_worktree_path = str(merged.get("worktree_path", "")).strip()
+        if not raw_worktree_path:
+            suggested_path = self.suggested_worktree_path(merged)
+            if suggested_path:
+                merged["worktree_path"] = suggested_path
+
         default_identity = worker_defaults.get("git_identity")
         raw_identity = merged.get("git_identity")
         if isinstance(default_identity, dict) or isinstance(raw_identity, dict):
@@ -413,6 +439,95 @@ class ControlPlaneService:
                 merged["git_identity"] = merged_identity
 
         return merged
+
+    def field_matches_section(self, field: str, section: str) -> bool:
+        if section == "project":
+            return (
+                field.startswith("project.")
+                and not field.startswith("project.integration_branch")
+                and not field.startswith("project.manager_git_identity")
+            )
+        if section == "merge_policy":
+            return field.startswith("project.integration_branch") or field.startswith("project.manager_git_identity")
+        if section == "resource_pools":
+            return field.startswith("resource_pools.")
+        if section == "worker_defaults":
+            return field.startswith("worker_defaults.")
+        if section == "workers":
+            return field.startswith("workers[")
+        return False
+
+    def filter_section_issue_text(self, values: list[str], section: str) -> list[str]:
+        if section == "project":
+            keywords = (
+                "project.repository_name",
+                "project.local_repo_root",
+                "project.paddle_repo_path",
+                "project.dashboard",
+            )
+        elif section == "merge_policy":
+            keywords = ("project.integration_branch", "project.manager_git_identity", "merge")
+        elif section == "resource_pools":
+            keywords = ("resource_pools.", "provider", "pool")
+        elif section == "worker_defaults":
+            keywords = ("worker_defaults",)
+        elif section == "workers":
+            keywords = (
+                "worker ",
+                "workers[",
+                "worktree_path",
+                "resource_pool_queue",
+                "branch",
+                "submit_strategy",
+                "test_command",
+            )
+        else:
+            return values
+        return [value for value in values if any(keyword in value for keyword in keywords)]
+
+    def config_for_section(
+        self, section: str, value: Any, base_config: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        if section not in CONFIG_SECTIONS:
+            raise ValueError(f"unknown config section: {section}")
+        current = copy.deepcopy(base_config or self.config or {})
+        if not isinstance(current, dict):
+            current = {}
+
+        if section == "project":
+            project = current.get("project", {})
+            if not isinstance(project, dict):
+                project = {}
+            payload = value if isinstance(value, dict) else {}
+            project.update(
+                {
+                    "repository_name": payload.get("repository_name", project.get("repository_name")),
+                    "local_repo_root": payload.get("local_repo_root", project.get("local_repo_root")),
+                    "paddle_repo_path": payload.get("paddle_repo_path", project.get("paddle_repo_path")),
+                    "dashboard": payload.get("dashboard", project.get("dashboard", {})),
+                }
+            )
+            current["project"] = project
+            return current
+
+        if section == "merge_policy":
+            project = current.get("project", {})
+            if not isinstance(project, dict):
+                project = {}
+            payload = value if isinstance(value, dict) else {}
+            project.update(
+                {
+                    "integration_branch": payload.get("integration_branch", project.get("integration_branch")),
+                    "manager_git_identity": payload.get(
+                        "manager_git_identity", project.get("manager_git_identity", {})
+                    ),
+                }
+            )
+            current["project"] = project
+            return current
+
+        current[section] = copy.deepcopy(value)
+        return current
 
     def config_validation_issues(self, config: dict[str, Any] | None = None) -> list[dict[str, str]]:
         cfg = config or self.config
@@ -550,13 +665,11 @@ class ControlPlaneService:
             else:
                 seen_branches.add(branch)
 
-            worktree_path = str(worker.get("worktree_path", "")).strip()
+            worktree_path = str(effective_worker.get("worktree_path", "")).strip()
             if not worktree_path:
                 add_issue(f"{field_root}.worktree_path", "worktree path is required")
             elif is_placeholder_path(worktree_path):
                 add_issue(f"{field_root}.worktree_path", "worktree path must be replaced with a real path")
-            elif not path_exists_via_ls(worktree_path):
-                add_issue(f"{field_root}.worktree_path", f"worktree path does not exist: {worktree_path}")
             elif worktree_path in seen_worktrees:
                 add_issue(f"{field_root}.worktree_path", f"duplicate worktree path: {worktree_path}")
             else:
@@ -606,6 +719,17 @@ class ControlPlaneService:
             "validation_errors": self.validation_errors(config),
             "launch_blockers": self.launch_blockers(config),
         }
+
+    def validate_config_section(self, section: str, value: Any) -> dict[str, Any]:
+        next_config = self.config_for_section(section, value)
+        validation = self.validate_config_payload(next_config)
+        validation["validation_issues"] = [
+            issue for issue in validation["validation_issues"] if self.field_matches_section(issue["field"], section)
+        ]
+        validation["validation_errors"] = self.filter_section_issue_text(validation["validation_errors"], section)
+        validation["launch_blockers"] = self.filter_section_issue_text(validation["launch_blockers"], section)
+        validation["ok"] = len(validation["validation_issues"]) == 0
+        return validation
 
     def refresh_runtime_mode(self) -> None:
         using_template = self.config_path.resolve() == CONFIG_TEMPLATE_PATH.resolve()
@@ -739,7 +863,7 @@ class ControlPlaneService:
             else:
                 seen_branches.add(branch)
 
-            worktree = str(worker.get("worktree_path", "")).strip()
+            worktree = str(effective_worker.get("worktree_path", "")).strip()
             if not worktree:
                 errors.append(f"worker {agent} worktree_path is required for launch")
             elif is_placeholder_path(worktree):
@@ -836,7 +960,7 @@ class ControlPlaneService:
             else:
                 seen_branches.add(branch)
 
-            worktree = str(worker.get("worktree_path", "")).strip()
+            worktree = str(effective_worker.get("worktree_path", "")).strip()
             if not worktree:
                 blockers.append(f"worker {agent} worktree_path is required")
             elif is_placeholder_path(worktree):
@@ -878,6 +1002,13 @@ class ControlPlaneService:
         self.reload_config()
         self.last_event = f"config_saved:{now_iso()}"
         return self.validation_errors(parsed)
+
+    def save_config_section(self, section: str, value: Any) -> list[str]:
+        next_config = self.config_for_section(section, value)
+        validation = self.validate_config_section(section, value)
+        if validation["validation_issues"]:
+            raise ValueError(f"section {section} has validation issues")
+        return self.save_config_data(next_config)
 
     def save_config_text(self, raw_text: str) -> list[str]:
         parsed = yaml.safe_load(raw_text) or {}
@@ -1725,6 +1856,42 @@ Primary test command:
                 self.write_json(handler, {"ok": False, "error": "config is required"}, status=400)
                 return True
             self.write_json(handler, self.validate_config_payload(raw_config))
+            return True
+
+        if handler.path == "/api/config/validate-section":
+            section = str(payload.get("section", "")).strip()
+            value = payload.get("value")
+            if section not in CONFIG_SECTIONS:
+                self.write_json(handler, {"ok": False, "error": "valid section is required"}, status=400)
+                return True
+            self.write_json(handler, self.validate_config_section(section, value))
+            return True
+
+        if handler.path == "/api/config/section":
+            section = str(payload.get("section", "")).strip()
+            value = payload.get("value")
+            if section not in CONFIG_SECTIONS:
+                self.write_json(handler, {"ok": False, "error": "valid section is required"}, status=400)
+                return True
+            try:
+                validation = self.validate_config_section(section, value)
+                if validation["validation_issues"]:
+                    self.write_json(handler, validation, status=400)
+                    return True
+                errors = self.save_config_section(section, value)
+            except Exception as exc:
+                self.write_json(handler, {"ok": False, "error": str(exc)}, status=400)
+                return True
+            self.write_json(
+                handler,
+                {
+                    "ok": True,
+                    "validation_issues": [],
+                    "validation_errors": self.filter_section_issue_text(errors, section),
+                    "launch_blockers": self.filter_section_issue_text(self.launch_blockers(), section),
+                    "cold_start": self.bootstrap_mode,
+                },
+            )
             return True
 
         if handler.path == "/api/launch":

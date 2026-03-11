@@ -24513,11 +24513,11 @@ async function fetchState(signal) {
   const response = await fetch("/api/state", { signal });
   return parseJson(response);
 }
-function validateConfig(config) {
-  return postJson("/api/config/validate", { config });
+function validateConfigSection(section, value) {
+  return postJson("/api/config/validate-section", { section, value });
 }
-function saveConfig(config) {
-  return postJson("/api/config", { config });
+function saveConfigSection(section, value) {
+  return postJson("/api/config/section", { section, value });
 }
 function launchWorkers(restart, launchPolicy) {
   return postJson("/api/launch", { restart, ...launchPolicy });
@@ -24535,6 +24535,31 @@ function enableSilentMode() {
 // src/App.tsx
 var import_jsx_runtime = __toESM(require_jsx_runtime(), 1);
 var AUTO_REFRESH_MS = 4e3;
+function buildSectionValue(config, section) {
+  if (section === "project") {
+    const project = config.project || {};
+    return {
+      repository_name: project.repository_name || "",
+      local_repo_root: project.local_repo_root || "",
+      paddle_repo_path: project.paddle_repo_path || "",
+      dashboard: project.dashboard || {}
+    };
+  }
+  if (section === "merge_policy") {
+    const project = config.project || {};
+    return {
+      integration_branch: project.integration_branch || project.base_branch || "",
+      manager_git_identity: project.manager_git_identity || {}
+    };
+  }
+  if (section === "resource_pools") {
+    return config.resource_pools || {};
+  }
+  if (section === "worker_defaults") {
+    return config.worker_defaults || {};
+  }
+  return config.workers || [];
+}
 function classNames(...values) {
   return values.filter(Boolean).join(" ");
 }
@@ -24555,7 +24580,7 @@ function renderCell(value) {
 }
 function cloneConfig(config) {
   if (!config) {
-    return { project: {}, providers: {}, resource_pools: {}, workers: [] };
+    return { project: {}, providers: {}, resource_pools: {}, worker_defaults: {}, workers: [] };
   }
   return JSON.parse(JSON.stringify(config));
 }
@@ -24622,6 +24647,77 @@ function launchStrategyLabel(strategy) {
     return "Selected Model";
   }
   return "Elastic";
+}
+function slugify(value) {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").replace(/_{2,}/g, "_");
+}
+function deriveWorktreePath(config, agent) {
+  const project = config.project || {};
+  const localRepoRoot = String(project.local_repo_root || "").trim();
+  if (!localRepoRoot) {
+    return "";
+  }
+  const normalizedRoot = localRepoRoot.replace(/\/$/, "");
+  const parent = normalizedRoot.includes("/") ? normalizedRoot.slice(0, normalizedRoot.lastIndexOf("/")) : normalizedRoot;
+  const baseName = String(project.repository_name || normalizedRoot.split("/").pop() || "supersonic-moe");
+  return `${parent}/${slugify(baseName)}_${agent.toLowerCase()}`;
+}
+function deriveBranchName(agent, title, taskId) {
+  const branchSuffix = slugify(title || taskId || agent) || agent.toLowerCase();
+  return `${agent.toLowerCase()}_${branchSuffix}`;
+}
+function sectionMatchesField(section, field) {
+  if (section === "project") {
+    return field.startsWith("project.") && !field.startsWith("project.integration_branch") && !field.startsWith("project.manager_git_identity");
+  }
+  if (section === "merge_policy") {
+    return field.startsWith("project.integration_branch") || field.startsWith("project.manager_git_identity");
+  }
+  if (section === "resource_pools") {
+    return field.startsWith("resource_pools.");
+  }
+  if (section === "worker_defaults") {
+    return field.startsWith("worker_defaults.");
+  }
+  return field.startsWith("workers[");
+}
+function collectSectionIssues(section, issues) {
+  return issues.filter((issue) => sectionMatchesField(section, issue.field));
+}
+function buildPlannedWorkers(data, config) {
+  if (!data) {
+    return [];
+  }
+  const byAgent = /* @__PURE__ */ new Map();
+  (data.backlog.items || []).forEach((item) => {
+    const agent = String(item.owner || "").trim();
+    if (!agent || agent === "A0") {
+      return;
+    }
+    if (!byAgent.has(agent)) {
+      byAgent.set(agent, {
+        agent,
+        task_id: item.id,
+        title: item.title,
+        branch: deriveBranchName(agent, item.title, item.id),
+        worktree_path: deriveWorktreePath(config, agent)
+      });
+    }
+  });
+  (data.runtime.workers || []).forEach((item) => {
+    const agent = String(item.agent || "").trim();
+    if (!agent || agent === "A0" || byAgent.has(agent)) {
+      return;
+    }
+    byAgent.set(agent, {
+      agent,
+      task_id: `${agent}-001`,
+      title: item.branch || agent,
+      branch: item.branch || deriveBranchName(agent, item.branch || agent, `${agent}-001`),
+      worktree_path: deriveWorktreePath(config, agent)
+    });
+  });
+  return Array.from(byAgent.values()).sort((left, right) => left.agent.localeCompare(right.agent, void 0, { numeric: true }));
 }
 function sortAgents(rows) {
   return [...rows].sort((left, right) => {
@@ -24865,6 +24961,24 @@ function SectionIssueList({ issues }) {
     ] }, `${issue.field}-${index}`)) })
   ] });
 }
+function SectionHeader({
+  title,
+  section,
+  status,
+  onValidate,
+  onSave,
+  action
+}) {
+  return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "section-head section-head-actions", children: [
+    /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", { children: title }),
+    /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "section-actions", children: [
+      status?.message ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { className: classNames("section-status", status.error && "error"), children: status.message }) : null,
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { className: "ghost", type: "button", onClick: () => onValidate(section), children: "Validate" }),
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { type: "button", onClick: () => onSave(section), children: "Save" }),
+      action
+    ] })
+  ] });
+}
 function OverviewTab({ data, agentRows, progress }) {
   const mergeQueue = data.merge_queue || [];
   const mergeReady = mergeQueue.filter((item) => ["offline", "stopped"].includes(String(item.status))).length;
@@ -25017,35 +25131,38 @@ ${data.commands.up}` })
   ] });
 }
 function SettingsTab({
+  data,
   draftConfig,
   providerOptions,
-  issues,
-  backendIssues,
+  allIssues,
+  sectionStatuses,
   onProjectChange,
   onMergeChange,
   onPoolChange,
   onAddPool,
   onWorkerChange,
   onAddWorker,
-  onSave
+  onValidateSection,
+  onSaveSection,
+  onSyncWorkers,
+  onAutoFillWorktreePaths
 }) {
   const project = draftConfig.project || {};
   const dashboard = project.dashboard || {};
   const pools = draftConfig.resource_pools || {};
   const workerDefaults = draftConfig.worker_defaults || {};
   const workers = draftConfig.workers || [];
+  const plannedWorkers = buildPlannedWorkers(data, draftConfig);
+  const issues = buildIssueMap(allIssues);
   return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "tab-body", children: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "card", children: [
-    /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "page-header", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
-        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", { children: "Settings" }),
-        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { className: "small", children: "The four cards below are editable. Invalid values are warned and are not saved." })
-      ] }),
-      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { onClick: onSave, children: "Validate And Save" })
-    ] }),
-    /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SectionIssueList, { issues: backendIssues }),
+    /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "page-header", children: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", { children: "Settings" }),
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { className: "small", children: "Each block can be validated and saved independently. Worker paths and plan coverage can be generated automatically." })
+    ] }) }),
     /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "settings-grid", children: [
       /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "helper-card settings-card", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "section-head", children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", { children: "Project" }) }),
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SectionHeader, { title: "Project", section: "project", status: sectionStatuses.project, onValidate: onValidateSection, onSave: onSaveSection }),
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SectionIssueList, { issues: collectSectionIssues("project", allIssues) }),
         /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "field-grid", children: [
           /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Repository", value: project.repository_name || "", onChange: (value) => onProjectChange("repository_name", value), issues: issues["project.repository_name"] }),
           /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Local Repo Root", value: project.local_repo_root || "", onChange: (value) => onProjectChange("local_repo_root", value), issues: issues["project.local_repo_root"] }),
@@ -25055,10 +25172,8 @@ function SettingsTab({
         ] })
       ] }),
       /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "helper-card settings-card settings-card-wide", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "section-head", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", { children: "Resource Pools" }),
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { className: "ghost", type: "button", onClick: onAddPool, children: "Add Pool" })
-        ] }),
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SectionHeader, { title: "Resource Pools", section: "resource_pools", status: sectionStatuses.resource_pools, onValidate: onValidateSection, onSave: onSaveSection, action: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { className: "ghost", type: "button", onClick: onAddPool, children: "Add Pool" }) }),
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SectionIssueList, { issues: collectSectionIssues("resource_pools", allIssues) }),
         /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "pool-strip", children: Object.entries(pools).map(([poolName, pool]) => /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "subcard pool-card", children: [
           /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "subcard-title", children: poolName }),
           /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "field-grid", children: [
@@ -25070,7 +25185,8 @@ function SettingsTab({
         ] }, poolName)) })
       ] }),
       /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "helper-card settings-card", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "section-head", children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", { children: "Merge Policy" }) }),
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SectionHeader, { title: "Merge Policy", section: "merge_policy", status: sectionStatuses.merge_policy, onValidate: onValidateSection, onSave: onSaveSection }),
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SectionIssueList, { issues: collectSectionIssues("merge_policy", allIssues) }),
         /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "field-grid", children: [
           /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Integration Branch", value: project.integration_branch || project.base_branch || "", onChange: (value) => onMergeChange("integration_branch", value), issues: issues["project.integration_branch"] }),
           /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Manager Name", value: project.manager_git_identity?.name || "", onChange: (value) => onMergeChange("manager_git_identity.name", value) }),
@@ -25078,7 +25194,8 @@ function SettingsTab({
         ] })
       ] }),
       /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "helper-card settings-card settings-card-wide", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "section-head", children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", { children: "Worker Defaults" }) }),
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SectionHeader, { title: "Worker Defaults", section: "worker_defaults", status: sectionStatuses.worker_defaults, onValidate: onValidateSection, onSave: onSaveSection }),
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SectionIssueList, { issues: collectSectionIssues("worker_defaults", allIssues) }),
         /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { className: "small muted", children: "These values apply to every worker unless a row below overrides them." }),
         /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "field-grid", children: [
           /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Default Pool", value: workerDefaults.resource_pool || "", onChange: (value) => onWorkerChange(-1, "worker_defaults.resource_pool", value), issues: issues["worker_defaults.resource_pool"], helpText: "Leave blank to rely on pool queue or per-worker overrides." }),
@@ -25093,12 +25210,28 @@ function SettingsTab({
         ] })
       ] }),
       /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "helper-card settings-card settings-card-wide", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "section-head", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", { children: "Worker Config" }),
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { className: "ghost", type: "button", onClick: onAddWorker, children: "Add Worker" })
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)(
+          SectionHeader,
+          {
+            title: "Worker Config",
+            section: "workers",
+            status: sectionStatuses.workers,
+            onValidate: onValidateSection,
+            onSave: onSaveSection,
+            action: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [
+              /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { className: "ghost", type: "button", onClick: onSyncWorkers, children: "Sync From Plan" }),
+              /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { className: "ghost", type: "button", onClick: onAutoFillWorktreePaths, children: "Auto Paths" }),
+              /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { className: "ghost", type: "button", onClick: onAddWorker, children: "Add Worker" })
+            ] })
+          }
+        ),
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SectionIssueList, { issues: collectSectionIssues("workers", allIssues) }),
+        /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", { className: "small muted", children: [
+          "Detected workers from backlog/runtime: ",
+          plannedWorkers.map((item) => item.agent).join(", ") || "none",
+          ". Leave overrides blank to inherit defaults."
         ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { className: "small muted", children: "Keep each row focused on identity and routing. Leave override fields blank to inherit Worker Defaults." }),
-        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "stack-list", children: workers.map((worker, index) => /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "subcard", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "worker-grid", children: workers.map((worker, index) => /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "subcard", children: [
           /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "subcard-title", children: worker.agent || `Worker ${index + 1}` }),
           /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "field-grid", children: [
             /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Agent", value: worker.agent || "", onChange: (value) => onWorkerChange(index, "agent", value), issues: issues[`workers[${index}].agent`] }),
@@ -25245,11 +25378,12 @@ function App() {
   const [actionInFlight, setActionInFlight] = (0, import_react.useState)(false);
   const [status, setStatus] = (0, import_react.useState)({ message: "", error: false });
   const [backendIssues, setBackendIssues] = (0, import_react.useState)([]);
+  const [sectionStatuses, setSectionStatuses] = (0, import_react.useState)({});
   const abortRef = (0, import_react.useRef)(null);
   const agentRows = (0, import_react.useMemo)(() => buildAgentRows(data), [data]);
   const progress = (0, import_react.useMemo)(() => buildProgressModel(data, agentRows), [data, agentRows]);
   const localIssues = (0, import_react.useMemo)(() => getLocalValidationIssues(draftConfig), [draftConfig]);
-  const issueMap = (0, import_react.useMemo)(() => buildIssueMap(localIssues, backendIssues), [localIssues, backendIssues]);
+  const allIssues = (0, import_react.useMemo)(() => [...localIssues, ...backendIssues], [localIssues, backendIssues]);
   const providerOptions = (0, import_react.useMemo)(() => Object.keys(draftConfig.providers || {}), [draftConfig.providers]);
   const setStampedStatus = (message, error = false) => {
     const stamp = (/* @__PURE__ */ new Date()).toLocaleTimeString();
@@ -25265,6 +25399,7 @@ function App() {
       if (!configDirty) {
         setDraftConfig(cloneConfig(nextData.config));
         setBackendIssues([]);
+        setSectionStatuses({});
       }
       if (!launchDirty) {
         setLaunchStrategy(nextData.launch_policy.default_strategy);
@@ -25312,6 +25447,11 @@ function App() {
     setBackendIssues([]);
     setDraftConfig((current) => normalizeConfig(updater(normalizeConfig(cloneConfig(current)))));
   };
+  const refreshStateOnly = async () => {
+    const controller = new AbortController();
+    const nextData = await fetchState(controller.signal);
+    setData(nextData);
+  };
   const onProjectChange = (field, value) => {
     updateConfig((current) => {
       const next = normalizeConfig(current);
@@ -25331,6 +25471,10 @@ function App() {
       } else if (field === "paddle_repo_path") {
         next.project.paddle_repo_path = value;
       }
+      next.workers = (next.workers || []).map((worker) => ({
+        ...worker,
+        worktree_path: worker.worktree_path || deriveWorktreePath(next, worker.agent)
+      }));
       return next;
     });
   };
@@ -25411,6 +25555,9 @@ function App() {
       } else {
         worker[field] = value;
       }
+      if (field === "agent" && !worker.worktree_path) {
+        worker.worktree_path = deriveWorktreePath(next, String(value));
+      }
       workers[index] = worker;
       next.workers = workers;
       return next;
@@ -25432,22 +25579,94 @@ function App() {
       return next;
     });
   };
-  const onSave = () => void runAction("validating settings", async () => {
-    if (localIssues.length > 0) {
-      setStampedStatus(`settings contain ${localIssues.length} local validation issue(s)`, true);
+  const onSyncWorkers = () => {
+    updateConfig((current) => {
+      const next = normalizeConfig(current);
+      const plannedWorkers = buildPlannedWorkers(data, next);
+      const existingByAgent = new Map((next.workers || []).map((worker) => [worker.agent, worker]));
+      const syncedWorkers = plannedWorkers.map((plannedWorker) => {
+        const existing = existingByAgent.get(plannedWorker.agent);
+        return {
+          agent: plannedWorker.agent,
+          task_id: existing?.task_id || plannedWorker.task_id,
+          branch: existing?.branch || plannedWorker.branch,
+          worktree_path: existing?.worktree_path || plannedWorker.worktree_path,
+          resource_pool: existing?.resource_pool || "",
+          resource_pool_queue: existing?.resource_pool_queue || [],
+          environment_type: existing?.environment_type,
+          environment_path: existing?.environment_path,
+          sync_command: existing?.sync_command,
+          test_command: existing?.test_command,
+          submit_strategy: existing?.submit_strategy,
+          git_identity: existing?.git_identity
+        };
+      });
+      const extraWorkers = (next.workers || []).filter((worker) => !plannedWorkers.some((plannedWorker) => plannedWorker.agent === worker.agent));
+      next.workers = [...syncedWorkers, ...extraWorkers];
+      return next;
+    });
+    setStampedStatus("worker list synced from backlog and runtime plan");
+  };
+  const onAutoFillWorktreePaths = () => {
+    updateConfig((current) => {
+      const next = normalizeConfig(current);
+      next.workers = (next.workers || []).map((worker) => ({
+        ...worker,
+        worktree_path: worker.worktree_path || deriveWorktreePath(next, worker.agent)
+      }));
+      return next;
+    });
+    setStampedStatus("missing worktree paths filled from local repo root");
+  };
+  const onValidateSection = (section) => void runAction(`validating ${section}`, async () => {
+    const sectionValue = buildSectionValue(draftConfig, section);
+    const validation = await validateConfigSection(section, sectionValue);
+    const nextIssues = validation.validation_issues;
+    setBackendIssues((current) => [
+      ...current.filter((issue) => !sectionMatchesField(section, issue.field)),
+      ...nextIssues
+    ]);
+    setSectionStatuses((current) => ({
+      ...current,
+      [section]: {
+        message: validation.ok ? "validated" : `${nextIssues.length} issue(s)`,
+        error: !validation.ok
+      }
+    }));
+    setStampedStatus(validation.ok ? `${section} validated` : `${section} has validation issues`, !validation.ok);
+  });
+  const onSaveSection = (section) => void runAction(`saving ${section}`, async () => {
+    const sectionLocalIssues = collectSectionIssues(section, localIssues);
+    if (sectionLocalIssues.length > 0) {
+      setSectionStatuses((current) => ({
+        ...current,
+        [section]: { message: `${sectionLocalIssues.length} local issue(s)`, error: true }
+      }));
+      setStampedStatus(`${section} contains local validation issues`, true);
       return;
     }
-    const validation = await validateConfig(draftConfig);
-    setBackendIssues(validation.validation_issues);
+    const sectionValue = buildSectionValue(draftConfig, section);
+    const validation = await validateConfigSection(section, sectionValue);
     if (!validation.ok) {
-      setStampedStatus(`settings rejected: ${validation.validation_issues.length} validation issue(s)`, true);
+      setBackendIssues((current) => [
+        ...current.filter((issue) => !sectionMatchesField(section, issue.field)),
+        ...validation.validation_issues
+      ]);
+      setSectionStatuses((current) => ({
+        ...current,
+        [section]: { message: `${validation.validation_issues.length} issue(s)`, error: true }
+      }));
+      setStampedStatus(`${section} rejected by validation`, true);
       return;
     }
-    const response = await saveConfig(draftConfig);
-    setConfigDirty(false);
-    setBackendIssues([]);
-    await refresh(true);
-    setStampedStatus(`settings saved: ${response.launch_blockers.length} launch blocker(s), ${response.validation_errors.length} config note(s)`);
+    const response = await saveConfigSection(section, sectionValue);
+    setBackendIssues((current) => current.filter((issue) => !sectionMatchesField(section, issue.field)));
+    setSectionStatuses((current) => ({
+      ...current,
+      [section]: { message: "saved", error: false }
+    }));
+    await refreshStateOnly();
+    setStampedStatus(`${section} saved: ${response.validation_errors.length} note(s), ${response.launch_blockers.length} blocker(s)`);
   });
   const onLaunch = (restart) => void runAction(restart ? "restarting workers" : "launching workers", async () => {
     const response = await launchWorkers(restart, {
@@ -25581,17 +25800,21 @@ function App() {
       data ? tab === "overview" ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)(OverviewTab, { data, agentRows, progress }) : tab === "operations" ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)(OperationsTab, { data }) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)(
         SettingsTab,
         {
+          data,
           draftConfig,
           providerOptions,
-          issues: issueMap,
-          backendIssues,
+          allIssues,
+          sectionStatuses,
           onProjectChange,
           onMergeChange,
           onPoolChange,
           onAddPool,
           onWorkerChange,
           onAddWorker,
-          onSave
+          onValidateSection,
+          onSaveSection,
+          onSyncWorkers,
+          onAutoFillWorktreePaths
         }
       ) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)("section", { className: "card", children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "small muted", children: "Loading dashboard state..." }) })
     ] })

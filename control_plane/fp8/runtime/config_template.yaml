@@ -17,15 +17,37 @@ providers:
     command_template:
       - copilot
       - --model
+  - agent: A2
+    task_id: A2-001
+    worktree_path: /absolute/path/to/supersonic_moe_a2
+    branch: a2_audit_hopper_float8_path
+  - agent: A3
+    task_id: A3-001
+    resource_pool: claude_pool
+    worktree_path: /absolute/path/to/supersonic_moe_a3
+    branch: a3_audit_blackwell_quack_path
+  - agent: A4
+    task_id: A4-001
+    worktree_path: /absolute/path/to/supersonic_moe_a4
+    branch: a4_build_reference_path
+  - agent: A5
+    task_id: A5-001
+    resource_pool: opencode_pool
+    worktree_path: /absolute/path/to/supersonic_moe_a5
+    branch: a5_build_baseline_aligned_tests
       - "{model}"
       - --prompt-file
       - "{prompt_file}"
       - --worktree
-      - "{worktree_path}"
+    branch: a6_freeze_baseline_trace
   claude_code:
     api_key_env_name: ANTHROPIC_API_KEY
     command_template:
       - claude-code
+  - agent: A7
+    task_id: A7-001
+    worktree_path: /absolute/path/to/supersonic_moe_a7
+    branch: a7_build_benchmark_skeleton
       - --model
       - "{model}"
       - --prompt-file
