@@ -484,6 +484,23 @@ class ControlPlaneService:
         fallback = [DEFAULT_INITIAL_PROVIDER, *sorted(str(key) for key in configured_providers.keys())]
         return dedupe_strings([*ordered, *fallback])
 
+    def initial_provider_name(self, config: dict[str, Any] | None = None) -> str:
+        cfg = config or self.config
+        project = cfg.get("project", {}) if isinstance(cfg, dict) else {}
+        providers = cfg.get("providers", {}) if isinstance(cfg, dict) else {}
+        configured_initial = ""
+        if isinstance(project, dict):
+            configured_initial = str(project.get("initial_provider") or "").strip()
+        if configured_initial and configured_initial in providers:
+            return configured_initial
+        if DEFAULT_INITIAL_PROVIDER in providers:
+            return DEFAULT_INITIAL_PROVIDER
+        preferences = self.provider_preference_default(cfg)
+        for provider_name in preferences:
+            if provider_name in providers:
+                return provider_name
+        return configured_initial or DEFAULT_INITIAL_PROVIDER
+
     def task_policy_defaults(self, config: dict[str, Any] | None = None) -> dict[str, Any]:
         policy_config = self.task_policy_config(config)
         defaults = policy_config.get("defaults", {})
@@ -1203,6 +1220,9 @@ class ControlPlaneService:
                 errors.append("project.manager_git_identity.name should be set when manager_git_identity is present")
             if not str(manager_identity.get("email", "")).strip():
                 errors.append("project.manager_git_identity.email should be set when manager_git_identity is present")
+        configured_initial_provider = str(project.get("initial_provider") or "").strip()
+        if configured_initial_provider and configured_initial_provider not in providers:
+            errors.append(f"project.initial_provider references unknown provider {configured_initial_provider}")
 
         seen_agents: set[str] = set()
         seen_branches: set[str] = set()
@@ -1636,7 +1656,7 @@ class ControlPlaneService:
 
     def default_launch_policy(self) -> LaunchPolicy:
         if not self.has_launch_history():
-            return LaunchPolicy(strategy="initial_copilot", provider=DEFAULT_INITIAL_PROVIDER)
+            return LaunchPolicy(strategy="initial_copilot", provider=self.initial_provider_name())
         return LaunchPolicy(strategy="elastic")
 
     def parse_launch_policy(self, payload: dict[str, Any]) -> LaunchPolicy:
@@ -1649,7 +1669,7 @@ class ControlPlaneService:
         model = str(payload.get("model") or "").strip() or None
 
         if raw_strategy == "initial_copilot":
-            provider = DEFAULT_INITIAL_PROVIDER
+            provider = self.initial_provider_name()
         elif raw_strategy == "selected_model":
             if not provider:
                 raise ValueError("provider is required when strategy is selected_model")
@@ -1670,7 +1690,7 @@ class ControlPlaneService:
             "default_model": default_policy.model,
             "available_strategies": sorted(LAUNCH_STRATEGIES),
             "available_providers": sorted(self.providers.keys()),
-            "initial_provider": DEFAULT_INITIAL_PROVIDER,
+            "initial_provider": self.initial_provider_name(),
             "has_launch_history": self.has_launch_history(),
         }
 
@@ -1709,7 +1729,7 @@ class ControlPlaneService:
     def resolve_pool_for_launch(self, worker: dict[str, Any], policy: LaunchPolicy) -> tuple[str, dict[str, Any]]:
         if policy.strategy == "elastic":
             return self.best_pool_for_worker(worker)
-        provider_name = policy.provider or DEFAULT_INITIAL_PROVIDER
+        provider_name = policy.provider or self.initial_provider_name()
         return self.best_pool_for_provider(provider_name)
 
     def write_session_state(self) -> None:

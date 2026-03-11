@@ -603,6 +603,30 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
         self.assertFalse(provider_queue["ducc_pool"]["launch_ready"])
         self.assertIn("ducc session unavailable", provider_queue["ducc_pool"]["auth_detail"])
 
+    def test_initial_launch_provider_falls_back_to_configured_ducc(self) -> None:
+        current_state = self.fetch_state()
+        ducc_only_config = deepcopy(current_state["config"])
+        ducc_only_config["providers"] = {"ducc": ducc_only_config["providers"]["ducc"]}
+        ducc_only_config["resource_pools"] = {"ducc_pool": ducc_only_config["resource_pools"]["ducc_pool"]}
+        ducc_only_config["worker_defaults"]["resource_pool_queue"] = ["ducc_pool"]
+        ducc_only_config["task_policies"]["defaults"]["preferred_providers"] = ["ducc"]
+        for entry in ducc_only_config["task_policies"]["types"].values():
+            entry["preferred_providers"] = ["ducc"]
+
+        save_result = read_json(f"{self.base_url}/api/config", {"config": ducc_only_config})
+        self.assertTrue(save_result["ok"])
+
+        state = self.fetch_state()
+        self.assertEqual(state["launch_policy"]["initial_provider"], "ducc")
+        self.assertEqual(state["launch_policy"]["default_provider"], "ducc")
+
+        launch_result = read_json(f"{self.base_url}/api/launch", {"restart": False})
+        self.assertTrue(launch_result["ok"])
+        self.assertEqual(launch_result["launch_policy"]["provider"], "ducc")
+
+        self.wait_for_agent_state(expected_provider="ducc", expected_model="claude-sonnet-4-5")
+        self.stop_workers()
+
     def test_silent_and_stop_all_cli_preserve_then_release_workers(self) -> None:
         launch_result = read_json(f"{self.base_url}/api/launch", {"restart": False})
         self.assertTrue(launch_result["ok"])
