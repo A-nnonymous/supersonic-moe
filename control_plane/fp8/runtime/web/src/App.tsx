@@ -91,6 +91,11 @@ function isAutoManagedCommandBlank(value: unknown): boolean {
   return !normalized || normalized === 'unassigned' || normalized === 'none';
 }
 
+function isPlaceholderPath(value: unknown): boolean {
+  const normalized = normalizedText(value);
+  return Boolean(normalized) && (normalized.startsWith('/absolute/path/') || normalized === 'unassigned' || normalized === 'none');
+}
+
 function firstMeaningfulValue(...values: unknown[]): string {
   for (const value of values) {
     if (!isAutoManagedBlank(value)) {
@@ -103,6 +108,15 @@ function firstMeaningfulValue(...values: unknown[]): string {
 function firstMeaningfulCommand(...values: unknown[]): string {
   for (const value of values) {
     if (!isAutoManagedCommandBlank(value)) {
+      return normalizedText(value);
+    }
+  }
+  return '';
+}
+
+function firstMeaningfulPath(...values: unknown[]): string {
+  for (const value of values) {
+    if (!isAutoManagedBlank(value) && !isPlaceholderPath(value)) {
       return normalizedText(value);
     }
   }
@@ -172,6 +186,12 @@ function buildSectionValue(config: ConfigShape, section: ConfigSection): unknown
     return config.worker_defaults || {};
   }
   return config.workers || [];
+}
+
+function configForProjectSave(baseConfig: ConfigShape | undefined, draftConfig: ConfigShape): ConfigShape {
+  const base = normalizeConfig(cloneConfig(baseConfig));
+  const draft = normalizeConfig(cloneConfig(draftConfig));
+  return normalizeDerivedPaths(mergeSavedSection(base, draft, 'project'));
 }
 
 function classNames(...values: Array<string | false | null | undefined>): string {
@@ -343,6 +363,51 @@ function deriveDefaultEnvironmentPath(config: ConfigShape): string {
   return `${localRepoRoot.replace(/\/$/, '')}/.venv`;
 }
 
+function normalizeDerivedPaths(config: ConfigShape): ConfigShape {
+  const next = normalizeConfig(cloneConfig(config));
+  const nextAutoEnvPath = deriveDefaultEnvironmentPath(next);
+  next.worker_defaults = next.worker_defaults || {};
+  if (next.worker_defaults.environment_type !== 'none') {
+    const currentEnvironmentPath = normalizedText(next.worker_defaults.environment_path);
+    if (!currentEnvironmentPath || isPlaceholderPath(currentEnvironmentPath)) {
+      next.worker_defaults.environment_path = nextAutoEnvPath;
+    }
+  }
+  next.workers = (next.workers || []).map((worker) => {
+    const worktreePath = normalizedText(worker.worktree_path);
+    const environmentPath = normalizedText(worker.environment_path);
+    return {
+      ...worker,
+      worktree_path: !worktreePath || isPlaceholderPath(worktreePath) ? deriveWorktreePath(next, worker.agent) : worker.worktree_path,
+      environment_path: !environmentPath || isPlaceholderPath(environmentPath) ? undefined : worker.environment_path,
+    };
+  });
+  return next;
+}
+
+function formatLaunchErrorMessage(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const lines = message.split('\n').map((line) => line.trim()).filter(Boolean);
+  const pathBlockers = new Map<string, string[]>();
+  for (const line of lines) {
+    const match = line.match(/^worker\s+(A\d+)\s+(worktree_path|environment_path)\s+must be replaced with a real path$/);
+    if (!match) {
+      continue;
+    }
+    const [, agent, field] = match;
+    const entry = pathBlockers.get(agent) || [];
+    entry.push(field === 'worktree_path' ? 'worktree' : 'environment');
+    pathBlockers.set(agent, entry);
+  }
+  if (!pathBlockers.size) {
+    return message;
+  }
+  const workerSummary = Array.from(pathBlockers.entries())
+    .map(([agent, fields]) => `${agent}: ${fields.join(' + ')} path`)
+    .join('; ');
+  return `Launch blocked: saved worker paths still contain template placeholders. ${workerSummary}. Save Project again to persist derived paths, or use Reset to A0 in Worker Config if a worker was manually pinned to a placeholder.`;
+}
+
 function deriveDefaultPoolQueue(config: ConfigShape, data: DashboardState | null): string[] {
   if (data?.provider_queue?.length) {
     return data.provider_queue.map((item) => item.resource_pool);
@@ -471,13 +536,13 @@ function hydrateConfigForA0(data: DashboardState | null, config: ConfigShape): C
       agent: plannedWorker.agent,
       task_id: firstMeaningfulValue(existing?.task_id, resolvedWorker?.task_id, plannedWorker.task_id),
       branch: firstMeaningfulValue(existing?.branch, resolvedWorker?.branch, runtimeWorker?.branch, plannedWorker.branch),
-      worktree_path: firstMeaningfulValue(existing?.worktree_path, resolvedWorker?.worktree_path, runtimeWorker?.worktree_path, plannedWorker.worktree_path),
+      worktree_path: firstMeaningfulPath(existing?.worktree_path, resolvedWorker?.worktree_path, runtimeWorker?.worktree_path, plannedWorker.worktree_path),
       resource_pool: firstMeaningfulValue(existing?.resource_pool, resolvedWorker?.resource_pool, resolvedWorker?.locked_pool, runtimeWorker?.resource_pool),
       resource_pool_queue: Array.isArray(existing?.resource_pool_queue) && existing.resource_pool_queue.length > 0
         ? existing.resource_pool_queue
         : (resolvedWorker?.resource_pool_queue || []),
       environment_type: firstMeaningfulValue(existing?.environment_type, runtimeWorker?.environment_type),
-      environment_path: firstMeaningfulValue(existing?.environment_path, runtimeWorker?.environment_path),
+      environment_path: firstMeaningfulPath(existing?.environment_path, runtimeWorker?.environment_path),
       sync_command: firstMeaningfulCommand(existing?.sync_command, runtimeWorker?.sync_command),
       test_command: firstMeaningfulCommand(existing?.test_command, resolvedWorker?.test_command, runtimeWorker?.test_command),
       submit_strategy: firstMeaningfulCommand(existing?.submit_strategy, runtimeWorker?.submit_strategy),
@@ -490,11 +555,11 @@ function hydrateConfigForA0(data: DashboardState | null, config: ConfigShape): C
     .map((worker) => ({
       ...worker,
       branch: worker.branch || (worker.agent ? deriveBranchName(worker.agent, worker.task_id || worker.agent, worker.task_id || worker.agent) : ''),
-      worktree_path: worker.worktree_path || deriveWorktreePath(next, worker.agent),
+      worktree_path: !normalizedText(worker.worktree_path) || isPlaceholderPath(worker.worktree_path) ? deriveWorktreePath(next, worker.agent) : worker.worktree_path,
     }));
 
   next.workers = [...hydratedPlannedWorkers, ...extraWorkers];
-  return next;
+  return normalizeDerivedPaths(next);
 }
 
 function sectionMatchesField(section: ConfigSection, field: string): boolean {
@@ -1452,7 +1517,7 @@ export function App() {
       next.worker_defaults = next.worker_defaults || {};
       if (next.worker_defaults.environment_type !== 'none') {
         const currentEnvironmentPath = normalizedText(next.worker_defaults.environment_path);
-        if (!currentEnvironmentPath || currentEnvironmentPath === previousAutoEnvPath) {
+        if (!currentEnvironmentPath || isPlaceholderPath(currentEnvironmentPath) || currentEnvironmentPath === previousAutoEnvPath) {
           next.worker_defaults.environment_path = nextAutoEnvPath;
         }
       }
@@ -1462,10 +1527,10 @@ export function App() {
           const previousDerived = deriveWorktreePath(current, worker.agent);
           const nextDerived = deriveWorktreePath(next, worker.agent);
           const currentPath = normalizedText(worker.worktree_path);
-          return !currentPath || currentPath === previousDerived ? nextDerived : worker.worktree_path;
+          return !currentPath || isPlaceholderPath(currentPath) || currentPath === previousDerived ? nextDerived : worker.worktree_path;
         })(),
       }));
-      return next;
+      return normalizeDerivedPaths(next);
     });
   };
 
@@ -1578,7 +1643,7 @@ export function App() {
       }
       workers[index] = worker;
       next.workers = workers;
-      return next;
+      return normalizeDerivedPaths(next);
     });
   };
 
@@ -1609,7 +1674,7 @@ export function App() {
         });
       }
       next.workers = workers;
-      return next;
+      return normalizeDerivedPaths(next);
     });
   };
 
@@ -1637,7 +1702,7 @@ export function App() {
       });
       const extraWorkers = (next.workers || []).filter((worker) => !plannedWorkers.some((plannedWorker) => plannedWorker.agent === worker.agent));
       next.workers = [...syncedWorkers, ...extraWorkers];
-      return next;
+      return normalizeDerivedPaths(next);
     });
     setStampedStatus('worker list synced from backlog and runtime plan');
   };
@@ -1647,9 +1712,9 @@ export function App() {
       const next = normalizeConfig(current);
       next.workers = (next.workers || []).map((worker) => ({
         ...worker,
-        worktree_path: worker.worktree_path || deriveWorktreePath(next, worker.agent),
+        worktree_path: !normalizedText(worker.worktree_path) || isPlaceholderPath(worker.worktree_path) ? deriveWorktreePath(next, worker.agent) : worker.worktree_path,
       }));
-      return next;
+      return normalizeDerivedPaths(next);
     });
     setStampedStatus('missing worktree paths filled from local repo root');
   };
@@ -1682,16 +1747,19 @@ export function App() {
   };
 
   const onValidateSection = (section: ConfigSection) => void runAction(`validating ${section}`, async () => {
-    const sectionValue = buildSectionValue(draftConfig, section);
+    const effectiveDraft = section === 'project'
+      ? configForProjectSave(data?.config, draftConfig)
+      : normalizeDerivedPaths(draftConfig);
+    const sectionValue = buildSectionValue(effectiveDraft, section);
     let validation;
-    let usedFullConfigFallback = false;
+    let usedFullConfigFallback = section === 'project';
     try {
-      validation = await validateConfigSection(section, sectionValue);
+      validation = usedFullConfigFallback ? await validateConfig(effectiveDraft) : await validateConfigSection(section, sectionValue);
     } catch (error) {
       if (!sectionRouteUnavailable(error, '/api/config/validate-section')) {
         throw error;
       }
-      validation = await validateConfig(draftConfig);
+      validation = await validateConfig(effectiveDraft);
       usedFullConfigFallback = true;
     }
     const nextIssues = usedFullConfigFallback
@@ -1733,16 +1801,19 @@ export function App() {
       setStampedStatus(`${section} contains local validation issues`, true);
       return;
     }
-    const sectionValue = buildSectionValue(draftConfig, section);
+    const effectiveDraft = section === 'project'
+      ? configForProjectSave(data?.config, draftConfig)
+      : normalizeDerivedPaths(draftConfig);
+    const sectionValue = buildSectionValue(effectiveDraft, section);
     let validation;
-    let usedFullConfigFallback = false;
+    let usedFullConfigFallback = section === 'project';
     try {
-      validation = await validateConfigSection(section, sectionValue);
+      validation = usedFullConfigFallback ? await validateConfig(effectiveDraft) : await validateConfigSection(section, sectionValue);
     } catch (error) {
       if (!sectionRouteUnavailable(error, '/api/config/validate-section')) {
         throw error;
       }
-      validation = await validateConfig(draftConfig);
+      validation = await validateConfig(effectiveDraft);
       usedFullConfigFallback = true;
     }
     const validationIssues = usedFullConfigFallback
@@ -1770,7 +1841,7 @@ export function App() {
       return;
     }
     const response = usedFullConfigFallback
-      ? await saveConfig(draftConfig)
+      ? await saveConfig(effectiveDraft)
       : await saveConfigSection(section, sectionValue);
     setBackendIssues((current) => current.filter((issue) => usedFullConfigFallback || !sectionMatchesField(section, issue.field)));
     setSectionStatuses((current) => ({
@@ -1789,16 +1860,21 @@ export function App() {
   });
 
   const onLaunch = (restart: boolean) => void runAction(restart ? 'restarting workers' : 'launching workers', async () => {
-    const response = await launchWorkers(restart, {
-      strategy: launchStrategy,
-      provider: launchStrategy === 'elastic' ? undefined : launchProvider,
-      model: launchStrategy === 'selected_model' ? launchModel : undefined,
-    });
-    setStampedStatus(
-      `launch complete (${launchStrategyLabel(response.launch_policy?.strategy || launchStrategy)}): ${(response.launched || []).length} launched, ${(response.failures || []).length} failures`,
-      !response.ok,
-    );
-    await refresh(true);
+    try {
+      const response = await launchWorkers(restart, {
+        strategy: launchStrategy,
+        provider: launchStrategy === 'elastic' ? undefined : launchProvider,
+        model: launchStrategy === 'selected_model' ? launchModel : undefined,
+      });
+      setStampedStatus(
+        `launch complete (${launchStrategyLabel(response.launch_policy?.strategy || launchStrategy)}): ${(response.launched || []).length} launched, ${(response.failures || []).length} failures`,
+        !response.ok,
+      );
+    } catch (error) {
+      throw new Error(formatLaunchErrorMessage(error));
+    } finally {
+      await refresh(true);
+    }
   });
 
   const onStopWorkers = () => void runAction('stopping workers', async () => {
