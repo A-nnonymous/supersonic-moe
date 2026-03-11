@@ -148,6 +148,7 @@ Fill `runtime/local_config.yaml` from the Settings page or by editing YAML direc
 - `project.local_repo_root`
 - `project.reference_workspace_root` if your workflow depends on a shared reference repo or baseline workspace
 - resource pool credentials or credential env vars
+- session-backed providers such as `ducc` only need `providers.<name>.auth_mode: session` plus a working binary on `PATH`; no api key is required
 - `worker_defaults.environment_path`
 - every worker `worktree_path`
 

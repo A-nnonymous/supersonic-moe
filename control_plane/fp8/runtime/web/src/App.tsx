@@ -1081,7 +1081,7 @@ function OperationsTab({ data }: { data: DashboardState }) {
   ];
   const processRows = Object.entries(data.processes || {}).map(([agent, item]) => ({ agent, provider: item.provider, model: item.model, alive: item.alive, pid: item.pid, resource_pool: item.resource_pool, returncode: item.returncode }));
   const mergeRows = data.merge_queue.map((item) => ({ agent: item.agent, branch: item.branch, submit_strategy: item.submit_strategy, worker_identity: item.worker_identity, merge_target: item.merge_target, status: item.status, manager_action: item.manager_action }));
-  const providerRows = data.provider_queue.map((item) => ({ resource_pool: item.resource_pool, provider: item.provider, priority: item.priority, binary_found: item.binary_found, api_key_present: item.api_key_present, connection_quality: item.connection_quality, work_quality: item.work_quality, score: item.score }));
+  const providerRows = data.provider_queue.map((item) => ({ resource_pool: item.resource_pool, provider: item.provider, priority: item.priority, binary_found: item.binary_found, auth_mode: item.auth_mode, auth_ready: item.auth_ready, launch_ready: item.launch_ready, auth_detail: item.auth_detail, connection_quality: item.connection_quality, work_quality: item.work_quality, score: item.score }));
   return (
     <div className="tab-body">
       <section className="grid">
@@ -1089,7 +1089,7 @@ function OperationsTab({ data }: { data: DashboardState }) {
         <section className="card"><h2>Validation</h2><pre>{renderValidation(data)}</pre></section>
       </section>
       <section className="grid">
-        <section className="card"><h2>Provider Queue</h2><DataTable columns={['resource_pool', 'provider', 'priority', 'binary_found', 'api_key_present', 'connection_quality', 'work_quality', 'score']} rows={providerRows} /></section>
+        <section className="card"><h2>Provider Queue</h2><DataTable columns={['resource_pool', 'provider', 'priority', 'binary_found', 'auth_mode', 'auth_ready', 'launch_ready', 'auth_detail', 'connection_quality', 'work_quality', 'score']} rows={providerRows} /></section>
         <section className="card"><h2>Merge Queue</h2><DataTable columns={['agent', 'branch', 'submit_strategy', 'worker_identity', 'merge_target', 'status', 'manager_action']} rows={mergeRows} /></section>
       </section>
       <section className="grid">

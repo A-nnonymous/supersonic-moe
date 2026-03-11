@@ -48,6 +48,7 @@ WEB_INDEX_FILE = WEB_STATIC_DIR / "index.html"
 DEFAULT_INITIAL_PROVIDER = "copilot"
 LAUNCH_STRATEGIES = {"initial_copilot", "selected_model", "elastic"}
 CONFIG_SECTIONS = {"project", "merge_policy", "resource_pools", "worker_defaults", "workers"}
+PROVIDER_AUTH_MODES = {"api_key", "session"}
 
 
 def now_iso() -> str:
@@ -680,8 +681,7 @@ class ControlPlaneService:
                     pool_name
                     for pool_name in ordered_candidates
                     if str(evaluations.get(pool_name, {}).get("provider", "")) == preferred_provider
-                    and bool(evaluations.get(pool_name, {}).get("binary_found"))
-                    and bool(evaluations.get(pool_name, {}).get("api_key_present"))
+                    and bool(evaluations.get(pool_name, {}).get("launch_ready"))
                 ]
                 if provider_candidates:
                     preferred_usable_candidates = provider_candidates
@@ -1208,6 +1208,17 @@ class ControlPlaneService:
         seen_branches: set[str] = set()
         seen_worktrees: set[str] = set()
 
+        for provider_name, provider in providers.items():
+            if not isinstance(provider, dict):
+                errors.append(f"providers.{provider_name} must be a mapping")
+                continue
+            auth_mode = self.provider_auth_mode(provider)
+            if auth_mode not in PROVIDER_AUTH_MODES:
+                errors.append(f"providers.{provider_name}.auth_mode must be one of {sorted(PROVIDER_AUTH_MODES)}")
+            session_probe_command = provider.get("session_probe_command")
+            if session_probe_command is not None and not isinstance(session_probe_command, (str, list)):
+                errors.append(f"providers.{provider_name}.session_probe_command must be a string or list")
+
         for pool_name, pool in resource_pools.items():
             provider_name = pool.get("provider")
             if provider_name not in providers:
@@ -1217,6 +1228,9 @@ class ControlPlaneService:
             priority = pool.get("priority", 100)
             if not isinstance(priority, int):
                 errors.append(f"resource_pools.{pool_name}.priority must be an integer")
+            session_probe_command = pool.get("session_probe_command")
+            if session_probe_command is not None and not isinstance(session_probe_command, (str, list)):
+                errors.append(f"resource_pools.{pool_name}.session_probe_command must be a string or list")
 
         for task_type, entry in self.task_policy_types(cfg).items():
             for provider_name in entry.get("preferred_providers", []):
@@ -1419,6 +1433,83 @@ class ControlPlaneService:
             return str(os.environ.get(api_env_name, ""))
         return ""
 
+    def provider_auth_mode(self, provider: dict[str, Any]) -> str:
+        raw_mode = str(provider.get("auth_mode") or "").strip().lower()
+        if raw_mode:
+            return raw_mode
+        if bool(provider.get("session_auth")):
+            return "session"
+        return "api_key"
+
+    def provider_probe_timeout(self, provider: dict[str, Any], pool: dict[str, Any]) -> float:
+        raw_timeout = pool.get("session_probe_timeout_sec", provider.get("session_probe_timeout_sec", 3.0))
+        try:
+            timeout = float(raw_timeout)
+        except (TypeError, ValueError):
+            return 3.0
+        return min(max(timeout, 0.2), 30.0)
+
+    def provider_probe_values(
+        self,
+        pool_name: str,
+        provider_name: str,
+        pool: dict[str, Any],
+        binary: str,
+        binary_path: str,
+    ) -> dict[str, str]:
+        return {
+            "binary": binary,
+            "binary_path": binary_path,
+            "model": str(pool.get("model", "")),
+            "provider": provider_name,
+            "resource_pool": pool_name,
+        }
+
+    def provider_auth_status(
+        self,
+        pool_name: str,
+        provider_name: str,
+        provider: dict[str, Any],
+        pool: dict[str, Any],
+        binary: str,
+        binary_path: str,
+    ) -> tuple[str, bool, str, bool]:
+        auth_mode = self.provider_auth_mode(provider)
+        if auth_mode == "session":
+            session_probe = pool.get("session_probe_command") or provider.get("session_probe_command")
+            if session_probe:
+                try:
+                    probe_command = format_command(
+                        session_probe,
+                        self.provider_probe_values(pool_name, provider_name, pool, binary, binary_path),
+                    )
+                except Exception as exc:
+                    return auth_mode, False, f"session probe formatting failed for pool {pool_name}: {exc}", False
+                try:
+                    result = run_command(probe_command, timeout=self.provider_probe_timeout(provider, pool))
+                except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+                    return auth_mode, False, f"session probe failed for pool {pool_name}: {exc}", False
+                output = result.stdout.strip() or result.stderr.strip()
+                if result.returncode == 0:
+                    detail = output or f"session ready for pool {pool_name}"
+                    return auth_mode, True, detail, False
+                detail = output or f"session auth unavailable for pool {pool_name}"
+                return auth_mode, False, detail, False
+            return auth_mode, True, f"session auth enabled for pool {pool_name}", False
+
+        api_env_name = str(provider.get("api_key_env_name") or "").strip()
+        api_key = self.configured_api_key(provider, pool)
+        if api_key:
+            return (
+                auth_mode,
+                True,
+                (f"api key available via {api_env_name}" if api_env_name else "api key configured"),
+                True,
+            )
+        if api_env_name:
+            return auth_mode, False, f"api key missing for pool {pool_name}; expected env {api_env_name}", False
+        return auth_mode, False, f"api key missing for pool {pool_name}", False
+
     def score_work_quality(self, stats: dict[str, Any], active_workers: int) -> float:
         successes = int(stats.get("launch_successes", 0))
         launch_failures = int(stats.get("launch_failures", 0))
@@ -1454,11 +1545,18 @@ class ControlPlaneService:
         elif isinstance(template, list) and template:
             binary = str(template[0])
         binary_path = shutil.which(binary) if binary else None
-        has_api_key = bool(self.configured_api_key(provider, pool))
-        probe_ok = bool(binary_path) and has_api_key
+        auth_mode, auth_ready, auth_detail, has_api_key = self.provider_auth_status(
+            pool_name,
+            provider_name,
+            provider,
+            pool,
+            str(binary or ""),
+            str(binary_path or ""),
+        )
+        launch_ready = bool(binary_path) and auth_ready
         latency_ms = round((time.perf_counter() - start) * 1000, 2)
         stats["last_latency_ms"] = latency_ms
-        stats["last_probe_ok"] = probe_ok
+        stats["last_probe_ok"] = launch_ready
 
         active_workers = sum(
             1
@@ -1468,16 +1566,22 @@ class ControlPlaneService:
         work_quality = self.score_work_quality(stats, active_workers)
         stats["last_work_quality"] = work_quality
 
-        connection_quality = 1.0 if probe_ok else 0.0
-        if probe_ok and latency_ms < 25:
+        connection_quality = 1.0 if launch_ready else 0.0
+        if launch_ready and latency_ms < 25:
             connection_quality = 1.0
-        elif probe_ok and latency_ms < 100:
+        elif launch_ready and latency_ms < 100:
             connection_quality = 0.9
-        elif probe_ok:
+        elif launch_ready:
             connection_quality = 0.8
 
         base_priority = int(pool.get("priority", 100))
         score = round(base_priority * 100 + connection_quality * 30 + work_quality * 70, 3)
+
+        failure_detail = stats.get("last_failure", "")
+        if not binary_path:
+            failure_detail = f"provider binary missing for pool {pool_name}: {binary or 'unassigned'}"
+        elif not auth_ready:
+            failure_detail = auth_detail
 
         return {
             "resource_pool": pool_name,
@@ -1486,13 +1590,17 @@ class ControlPlaneService:
             "priority": base_priority,
             "binary": binary or "unassigned",
             "binary_found": bool(binary_path),
+            "auth_mode": auth_mode,
+            "auth_ready": auth_ready,
+            "auth_detail": auth_detail,
             "api_key_present": has_api_key,
+            "launch_ready": launch_ready,
             "connection_quality": connection_quality,
             "work_quality": work_quality,
             "score": score,
             "latency_ms": latency_ms,
             "active_workers": active_workers,
-            "last_failure": stats.get("last_failure", ""),
+            "last_failure": failure_detail,
         }
 
     def provider_queue(self) -> list[dict[str, Any]]:
@@ -1579,7 +1687,7 @@ class ControlPlaneService:
         if not ordered_candidates:
             raise RuntimeError(f"no eligible resource pool candidates exist for provider {provider_name}")
         for item in ordered_candidates:
-            if item["binary_found"] and item["api_key_present"]:
+            if item["launch_ready"]:
                 return item["resource_pool"], item
         return ordered_candidates[0]["resource_pool"], ordered_candidates[0]
 
@@ -1592,7 +1700,7 @@ class ControlPlaneService:
                 ordered_candidates.append(evaluations[pool_name])
         ordered_candidates.sort(key=lambda item: (-item["score"], -item["priority"], item["resource_pool"]))
         for item in ordered_candidates:
-            if item["binary_found"] and item["api_key_present"]:
+            if item["launch_ready"]:
                 return item["resource_pool"], item
         if ordered_candidates:
             return ordered_candidates[0]["resource_pool"], ordered_candidates[0]
@@ -1975,8 +2083,8 @@ Primary test command:
 
         if not evaluation["binary_found"]:
             raise RuntimeError(f"provider binary missing for pool {pool_name}: {evaluation['binary']}")
-        if not evaluation["api_key_present"]:
-            raise RuntimeError(f"api key missing for pool {pool_name}")
+        if not evaluation["auth_ready"]:
+            raise RuntimeError(str(evaluation.get("auth_detail") or f"provider auth unavailable for pool {pool_name}"))
 
         values = {
             "agent": worker["agent"],
@@ -1991,9 +2099,16 @@ Primary test command:
         env = os.environ.copy()
         api_value = pool.get("api_key", "")
         api_env_name = provider.get("api_key_env_name")
-        if api_env_name and api_value and api_value != "replace_me_or_use_api_key_env":
+        if (
+            self.provider_auth_mode(provider) == "api_key"
+            and api_env_name
+            and api_value
+            and api_value != "replace_me_or_use_api_key_env"
+        ):
             env[api_env_name] = api_value
-        env.update({str(key): str(value) for key, value in pool.get("extra_env", {}).items()})
+        extra_env = pool.get("extra_env", {})
+        if isinstance(extra_env, dict):
+            env.update({str(key): str(value) for key, value in extra_env.items()})
 
         log_path = LOG_DIR / f"{worker['agent']}.log"
         log_handle = log_path.open("w", encoding="utf-8")

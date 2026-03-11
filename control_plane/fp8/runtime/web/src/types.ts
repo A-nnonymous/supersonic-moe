@@ -35,7 +35,11 @@ export type ProviderQueueItem = {
   priority: number;
   binary: string;
   binary_found: boolean;
+  auth_mode: string;
+  auth_ready: boolean;
+  auth_detail: string;
   api_key_present: boolean;
+  launch_ready: boolean;
   connection_quality: number;
   work_quality: number;
   score: number;

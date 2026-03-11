@@ -37,6 +37,16 @@ providers:
       - "{prompt_file}"
       - --cwd
       - "{worktree_path}"
+  ducc:
+    auth_mode: session
+    command_template:
+      - ducc
+      - --model
+      - "{model}"
+      - --prompt-file
+      - "{prompt_file}"
+      - --cwd
+      - "{worktree_path}"
   opencode:
     api_key_env_name: OPENCODE_API_KEY
     command_template:
@@ -61,6 +71,11 @@ resource_pools:
     model: claude-sonnet-4-5
     api_key: replace_me_or_use_api_key_env
     extra_env: {}
+  ducc_pool:
+    priority: 250
+    provider: ducc
+    model: claude-sonnet-4-5
+    extra_env: {}
   opencode_pool:
     priority: 100
     provider: opencode
@@ -75,6 +90,7 @@ task_policies:
       - copilot
       - claude_code
       - opencode
+      - ducc
     suggested_test_command: uv run pytest tests/moe_test.py -k test_moe
   types:
     protocol:
@@ -82,28 +98,33 @@ task_policies:
         - copilot
         - claude_code
         - opencode
+        - ducc
       suggested_test_command: uv run pytest tests/reference_layers/standalone_moe_layer/tests/test_imports_and_interfaces.py
     baseline:
       preferred_providers:
         - claude_code
         - copilot
         - opencode
+        - ducc
       suggested_test_command: uv run pytest tests/reference_layers/standalone_moe_layer/tests/test_imports_and_interfaces.py
     audit_hopper:
       preferred_providers:
         - copilot
         - claude_code
         - opencode
+        - ducc
       suggested_test_command: uv run pytest tests/moe_test.py -k test_moe
     audit_blackwell:
       preferred_providers:
         - claude_code
+        - ducc
         - opencode
         - copilot
       suggested_test_command: USE_QUACK_GEMM=1 uv run pytest tests/moe_test.py -k test_moe
     reference:
       preferred_providers:
         - opencode
+        - ducc
         - copilot
         - claude_code
       suggested_test_command: uv run pytest tests/moe_test.py -k test_moe
@@ -112,12 +133,14 @@ task_policies:
         - opencode
         - copilot
         - claude_code
+        - ducc
       suggested_test_command: uv run pytest tests/moe_test.py -k test_moe
     benchmark:
       preferred_providers:
         - opencode
         - copilot
         - claude_code
+        - ducc
       suggested_test_command: python -m py_compile benchmarks/bench_triton_moe.py
   rules:
     - name: freeze-protocol
@@ -146,6 +169,7 @@ worker_defaults:
   resource_pool_queue:
     - copilot_pool
     - claude_pool
+    - ducc_pool
     - opencode_pool
   environment_type: uv
   environment_path: /absolute/path/to/local/supersonic-moe/.venv

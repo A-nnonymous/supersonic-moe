@@ -25464,7 +25464,7 @@ function OperationsTab({ data }) {
   ];
   const processRows = Object.entries(data.processes || {}).map(([agent, item]) => ({ agent, provider: item.provider, model: item.model, alive: item.alive, pid: item.pid, resource_pool: item.resource_pool, returncode: item.returncode }));
   const mergeRows = data.merge_queue.map((item) => ({ agent: item.agent, branch: item.branch, submit_strategy: item.submit_strategy, worker_identity: item.worker_identity, merge_target: item.merge_target, status: item.status, manager_action: item.manager_action }));
-  const providerRows = data.provider_queue.map((item) => ({ resource_pool: item.resource_pool, provider: item.provider, priority: item.priority, binary_found: item.binary_found, api_key_present: item.api_key_present, connection_quality: item.connection_quality, work_quality: item.work_quality, score: item.score }));
+  const providerRows = data.provider_queue.map((item) => ({ resource_pool: item.resource_pool, provider: item.provider, priority: item.priority, binary_found: item.binary_found, auth_mode: item.auth_mode, auth_ready: item.auth_ready, launch_ready: item.launch_ready, auth_detail: item.auth_detail, connection_quality: item.connection_quality, work_quality: item.work_quality, score: item.score }));
   return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "tab-body", children: [
     /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "grid", children: [
       /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "card", children: [
@@ -25483,7 +25483,7 @@ ${data.commands.up}` })
     /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "grid", children: [
       /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "card", children: [
         /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", { children: "Provider Queue" }),
-        /* @__PURE__ */ (0, import_jsx_runtime.jsx)(DataTable, { columns: ["resource_pool", "provider", "priority", "binary_found", "api_key_present", "connection_quality", "work_quality", "score"], rows: providerRows })
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)(DataTable, { columns: ["resource_pool", "provider", "priority", "binary_found", "auth_mode", "auth_ready", "launch_ready", "auth_detail", "connection_quality", "work_quality", "score"], rows: providerRows })
       ] }),
       /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "card", children: [
         /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", { children: "Merge Queue" }),
