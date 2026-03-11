@@ -76,7 +76,7 @@ make test
 
 ## Control Plane
 
-This repository includes a local multi-agent control plane under `control_plane/fp8/` for upgrading SonicMoE with coordinated FP8 delivery work.
+The FP8 multi-agent control plane has been migrated out of this repository into the standalone sibling repository `../warp`.
 
 ### Control Plane Deployment
 
@@ -84,20 +84,30 @@ The default deployment target is a Linux machine with NVIDIA Hopper or Blackwell
 
 - recommended hardware: H100, H200, B200, or GB200
 - recommended runtime state: CUDA, PyTorch, Triton, and SonicMoE dependencies already installed in the active environment
-- recommended workflow: launch the control plane from the same provisioned repository checkout that will run FP8 tests and benchmarks
+- recommended workflow: launch the standalone `warp` control plane against this SonicMoE checkout on the same provisioned machine
 
 If you are testing Blackwell kernels directly on B200 or GB200, export `USE_QUACK_GEMM=1` in the worker environment before running Blackwell-specific commands.
 
 ### Control Plane Quickstart
 
-Use the simplest commands first. They cover the normal manager workflow and match the runtime defaults:
+Use the external `warp` checkout as the canonical entrypoint. If you keep it as a sibling repository, these commands cover the normal manager workflow and match the runtime defaults:
 
 ```bash
-python control_plane/fp8/runtime/control_plane.py serve
-python control_plane/fp8/runtime/control_plane.py up
-python control_plane/fp8/runtime/control_plane.py stop-agents
-python control_plane/fp8/runtime/control_plane.py silent
-python control_plane/fp8/runtime/control_plane.py stop-all
+python3 ../warp/runtime/control_plane.py serve
+python3 ../warp/runtime/control_plane.py up
+python3 ../warp/runtime/control_plane.py stop-agents
+python3 ../warp/runtime/control_plane.py silent
+python3 ../warp/runtime/control_plane.py stop-all
+```
+
+Or launch the same commands from this repository through the convenience wrapper:
+
+```bash
+make warp-serve
+make warp-up
+make warp-stop-agents
+make warp-silent
+make warp-stop-all
 ```
 
 - `serve` starts the dashboard only
@@ -112,7 +122,7 @@ For the default deployment, these commands already do the reliable thing:
 - they bind the dashboard to `0.0.0.0:8233` unless you override host or port
 - `serve` detaches by default so the control plane keeps running after the shell returns
 
-Before using `up`, fill `control_plane/fp8/runtime/local_config.yaml` with:
+Before using `up`, fill `../warp/runtime/local_config.yaml` with:
 
 - resource pool API keys
 - provider and model assignments
@@ -124,8 +134,8 @@ Before using `up`, fill `control_plane/fp8/runtime/local_config.yaml` with:
 If you want browser auto-open during local debugging, add `--open-browser` to either launch command:
 
 ```bash
-python control_plane/fp8/runtime/control_plane.py serve --open-browser
-python control_plane/fp8/runtime/control_plane.py up --open-browser
+python3 ../warp/runtime/control_plane.py serve --open-browser
+python3 ../warp/runtime/control_plane.py up --open-browser
 ```
 
 Use additional parameters only when you actually need them:
@@ -141,20 +151,20 @@ Use additional parameters only when you actually need them:
 For lightweight manager machines that do not carry the full CUDA stack, keep the same command shape and only swap the launcher:
 
 ```bash
-uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/control_plane.py serve
+uv run --no-project --with 'PyYAML>=6.0.2' python ../warp/runtime/control_plane.py serve
 ```
 
 That fallback launcher also supports the same optional parameters, for example:
 
 ```bash
-uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/control_plane.py serve --bootstrap --open-browser
+uv run --no-project --with 'PyYAML>=6.0.2' python ../warp/runtime/control_plane.py serve --bootstrap --open-browser
 ```
 
 ### Control Plane Behavior
 
 - the first screen shows every manager and worker agent as a status card
 - the overview page stays focused on agent dashboards and overall program progress
-- the dashboard now uses a compiled React frontend served from `control_plane/fp8/runtime/web/static/`
+- the dashboard now uses a compiled React frontend served from `../warp/runtime/web/static/`
 - the dashboard can save validated form-based config, launch workers, restart workers, enter silent mode, stop agents, stop all, and copy startup commands
 - the Settings page now uses `worker_defaults` plus lean per-worker overrides so common fields are filled once instead of repeated on every worker
 - resource pools are shown in a horizontal strip so provider routing stays visible without a long vertical form
@@ -164,10 +174,10 @@ uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/cont
 - every worker may still declare its own `resource_pool_queue` for fallback ordering when the default queue is not enough
 - provider queue, runtime topology, heartbeats, and validation errors remain available in the dashboard
 
-If you change the frontend source under `control_plane/fp8/runtime/web/src/`, rebuild it with:
+If you change the frontend source under `../warp/runtime/web/src/`, rebuild it with:
 
 ```bash
-cd control_plane/fp8/runtime/web
+cd ../warp/runtime/web
 npm install
 npm run build
 ```
@@ -176,8 +186,8 @@ npm run build
 
 - on a real Hopper or Blackwell deployment host, the direct `python ...` commands above are the default path
 - keep `worker_defaults.test_command` and benchmark commands pointed at the same CUDA-capable environment that will run real validation on the target GPU
-- the control plane source of truth remains `control_plane/fp8/README.md`
-- use `control_plane/fp8/README.md` for the full manager workflow, including cold-start, start, pause, and resume guidance
+- the control plane source of truth is now `../warp/README.md`
+- use `../warp/README.md` for the full manager workflow, including cold-start, start, pause, and resume guidance
 - stop commands are available separately for agents, listener, or both: `stop-agents`, `stop-listener`, and `stop-all`
 
 ### Example usage

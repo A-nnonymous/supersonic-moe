@@ -1,15 +1,16 @@
 # Control Plane Agent Context
 
-Use this as the cold-start context for any new agent working in `control_plane/`.
+Use this as the cold-start context for any new agent working on the external `warp` control plane paired with this repository.
 For migration-oriented handoff context and recent runtime/testing decisions, also read `agent.md` at the repository root.
 
 ## Scope
 
 - The FP8 control plane is the operator-facing runtime and dashboard for worker launch, stop, validation, backlog visibility, provider routing, and manager-owned merge flow.
-- Backend entry: `control_plane/fp8/runtime/control_plane.py`.
-- Frontend source: `control_plane/fp8/runtime/web/src`.
-- Frontend build output served in production: `control_plane/fp8/runtime/web/static`.
-- Live integration test: `control_plane/fp8/runtime/test_control_plane_integration.py`.
+- Standalone repo location is expected at sibling path `../warp` unless `WARP_ROOT` overrides it.
+- Backend entry: `../warp/runtime/control_plane.py`.
+- Frontend source: `../warp/runtime/web/src`.
+- Frontend build output served in production: `../warp/runtime/web/static`.
+- Live integration test: `../warp/runtime/test_control_plane_integration.py`.
 
 ## Non-Negotiable Workflow Decisions
 
@@ -41,7 +42,7 @@ For migration-oriented handoff context and recent runtime/testing decisions, als
 
 - Config supports top-level `worker_defaults`, merged into each worker for validation and launch.
 - Runtime now derives task-aware branch names, test commands, and resource-pool recommendations/locks from explicit backlog `task_type` metadata plus config-driven `task_policies`, not backend keyword matching.
-- Backlog/runtime files are part of the planning model. Use `control_plane/fp8/state/backlog.yaml` and `control_plane/fp8/state/agent_runtime.yaml` when deriving or syncing worker roster.
+- Backlog/runtime files are part of the planning model. Use `../warp/state/backlog.yaml` and `../warp/state/agent_runtime.yaml` when deriving or syncing worker roster.
 - Provider-quality history is part of live scheduling. Preserve and use persisted quality signals instead of treating every restart like a blank slate.
 - Project-level shared references should flow through `project.reference_workspace_root`, `project.reference_inputs`, and `project.prompt_context_files` instead of task-specific field names in the runtime.
 - Missing-but-plausible worktree paths are acceptable if runtime can create the worktree at launch time.
@@ -60,20 +61,20 @@ For migration-oriented handoff context and recent runtime/testing decisions, als
 
 ## Read First
 
-- `control_plane/fp8/README.md`
-- `control_plane/fp8/governance/worker_launch_playbook.md`
-- `control_plane/fp8/governance/control_plane_playbook.md`
-- `control_plane/fp8/runtime/control_plane.py`
-- `control_plane/fp8/runtime/config_template.yaml`
-- `control_plane/fp8/runtime/web/src/App.tsx`
-- `control_plane/fp8/runtime/web/src/api.ts`
-- `control_plane/fp8/runtime/web/src/types.ts`
-- `control_plane/fp8/runtime/web/src/styles.css`
+- `../warp/README.md`
+- `../warp/governance/worker_launch_playbook.md`
+- `../warp/governance/control_plane_playbook.md`
+- `../warp/runtime/control_plane.py`
+- `../warp/runtime/config_template.yaml`
+- `../warp/runtime/web/src/App.tsx`
+- `../warp/runtime/web/src/api.ts`
+- `../warp/runtime/web/src/types.ts`
+- `../warp/runtime/web/src/styles.css`
 
 ## Validation Expectations
 
 - For backend changes, run Python compile checks on touched runtime/test files when feasible.
-- For frontend changes, rebuild `control_plane/fp8/runtime/web` and keep `runtime/web/static` in sync.
+- For frontend changes, rebuild `../warp/runtime/web` and keep `runtime/web/static` in sync.
 - For meaningful workflow changes, run the live control-plane integration test when feasible.
 - If pre-commit reformats files, restage and continue.
 

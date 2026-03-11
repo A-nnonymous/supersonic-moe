@@ -24,3 +24,18 @@ style:
 
 cutotune-cache:
 	DEBUG_CUTOTUNE=1 LOAD_CUTOTUNE_CACHE=1 TORCH_CUDA_ARCH_LIST=9.0 python tools/build_cutotune_cache.py
+
+warp-serve:
+	./tools/warp-control-plane.sh serve
+
+warp-up:
+	./tools/warp-control-plane.sh up
+
+warp-stop-agents:
+	./tools/warp-control-plane.sh stop-agents
+
+warp-silent:
+	./tools/warp-control-plane.sh silent
+
+warp-stop-all:
+	./tools/warp-control-plane.sh stop-all

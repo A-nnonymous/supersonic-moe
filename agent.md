@@ -1,6 +1,6 @@
 # Control Plane Migration Context
 
-This file is the handoff context for a new A0 that needs to keep evolving the FP8 control plane without reconstructing prior intent from scratch.
+This file is the handoff context for a new A0 that needs to keep evolving the external `warp` FP8 control plane without reconstructing prior intent from scratch.
 
 ## Current Role
 
@@ -10,10 +10,11 @@ This file is the handoff context for a new A0 that needs to keep evolving the FP
 
 ## Current Architecture
 
-- Backend runtime: `control_plane/fp8/runtime/control_plane.py`
-- Frontend source: `control_plane/fp8/runtime/web/src`
-- Served frontend assets: `control_plane/fp8/runtime/web/static`
-- Primary regression suite: `control_plane/fp8/runtime/test_control_plane_integration.py`
+- Standalone repo location is expected at sibling path `../warp` unless `WARP_ROOT` overrides it.
+- Backend runtime: `../warp/runtime/control_plane.py`
+- Frontend source: `../warp/runtime/web/src`
+- Served frontend assets: `../warp/runtime/web/static`
+- Primary regression suite: `../warp/runtime/test_control_plane_integration.py`
 
 ## Design Decisions To Preserve
 
@@ -46,9 +47,9 @@ The integration suite currently covers:
 
 ## Commands To Trust During Maintenance
 
-- `python3 -m py_compile control_plane/fp8/runtime/control_plane.py control_plane/fp8/runtime/test_control_plane_integration.py`
-- `python3 control_plane/fp8/runtime/test_control_plane_integration.py`
-- `cd control_plane/fp8/runtime/web && npm run build`
+- `python3 -m py_compile ../warp/runtime/control_plane.py ../warp/runtime/test_control_plane_integration.py`
+- `python3 ../warp/runtime/test_control_plane_integration.py`
+- `cd ../warp/runtime/web && npm run build`
 
 ## Maintenance Heuristics
 
@@ -66,4 +67,4 @@ The integration suite currently covers:
 
 ## Delivery Convention
 
-- Default remote target for this repo is `myrepo main`.
+- Default remote target for this repo is `origin main`.
