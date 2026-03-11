@@ -9,22 +9,68 @@ import type {
   SilentModeResponse,
   StopAllResponse,
   StopWorkersResponse,
+  ValidationIssue,
 } from './types';
+
+type ErrorPayload = {
+  error?: string;
+  errors?: string[];
+  failures?: Array<{ agent?: string; error?: string }>;
+  validation_issues?: ValidationIssue[];
+  validation_errors?: string[];
+  launch_blockers?: string[];
+};
+
+function summarizeItems(items: string[], limit = 4): string {
+  if (!items.length) {
+    return '';
+  }
+  if (items.length <= limit) {
+    return items.join('; ');
+  }
+  return `${items.slice(0, limit).join('; ')}; ... (+${items.length - limit} more)`;
+}
+
+function extractErrorText(data: ErrorPayload | null, requestPath: string, status: number): string {
+  if (!data) {
+    return `request ${requestPath} failed with status ${status}`;
+  }
+  if (data.error) {
+    return data.error;
+  }
+  if (data.failures?.length) {
+    const failures = data.failures.map((item) => `${item.agent || 'worker'}: ${item.error || 'unknown launch failure'}`);
+    return `request ${requestPath} failed with status ${status}: ${summarizeItems(failures)}`;
+  }
+  if (data.validation_issues?.length) {
+    const issues = data.validation_issues.map((item) => `${item.field}: ${item.message}`);
+    return `request ${requestPath} failed with status ${status}: ${summarizeItems(issues)}`;
+  }
+  if (data.launch_blockers?.length) {
+    return `request ${requestPath} failed with status ${status}: ${summarizeItems(data.launch_blockers)}`;
+  }
+  if (data.validation_errors?.length) {
+    return `request ${requestPath} failed with status ${status}: ${summarizeItems(data.validation_errors)}`;
+  }
+  if (data.errors?.length) {
+    return `request ${requestPath} failed with status ${status}: ${summarizeItems(data.errors)}`;
+  }
+  return `request ${requestPath} failed with status ${status}`;
+}
 
 async function parseJson<T>(response: Response, requestPath: string): Promise<T> {
   const bodyText = await response.text();
-  let data: (T & { error?: string; errors?: string[] }) | null = null;
+  let data: (T & ErrorPayload) | null = null;
   if (bodyText) {
     try {
-      data = JSON.parse(bodyText) as T & { error?: string; errors?: string[] };
+      data = JSON.parse(bodyText) as T & ErrorPayload;
     } catch {
       const snippet = bodyText.slice(0, 160).replace(/\s+/g, ' ').trim();
       throw new Error(`request ${requestPath} failed with status ${response.status}: expected JSON, received ${snippet || 'empty response'}`);
     }
   }
   if (!response.ok) {
-    const errorText = data?.error || data?.errors?.join('\n') || `request ${requestPath} failed with status ${response.status}`;
-    throw new Error(errorText);
+    throw new Error(extractErrorText(data, requestPath, response.status));
   }
   if (data === null) {
     throw new Error(`request ${requestPath} failed with status ${response.status}: empty response body`);

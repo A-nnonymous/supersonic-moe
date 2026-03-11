@@ -100,6 +100,15 @@ def dedupe_strings(values: list[Any]) -> list[str]:
     return ordered
 
 
+def summarize_list(values: list[str], limit: int = 4) -> str:
+    items = [str(value).strip() for value in values if str(value or "").strip()]
+    if not items:
+        return ""
+    if len(items) <= limit:
+        return "; ".join(items)
+    return "; ".join(items[:limit]) + f"; ... (+{len(items) - limit} more)"
+
+
 def is_placeholder_path(value: Any) -> bool:
     if not isinstance(value, str):
         return False
@@ -2031,7 +2040,11 @@ Primary test command:
         with self.lock:
             errors = self.launch_blockers()
             if errors:
-                return {"ok": False, "errors": errors}
+                return {
+                    "ok": False,
+                    "errors": errors,
+                    "error": f"launch blocked by {len(errors)} issue(s): {summarize_list(errors)}",
+                }
             resolved_policy = policy or self.default_launch_policy()
             if restart:
                 self.stop_workers()
@@ -2059,10 +2072,15 @@ Primary test command:
                     failures.append({"agent": worker["agent"], "error": str(exc)})
             self.last_event = f"launch:{resolved_policy.strategy}:{len(launched)} workers"
             self.write_session_state()
+            error_summary = ""
+            if failures:
+                failure_messages = [f"{item['agent']}: {item['error']}" for item in failures]
+                error_summary = f"launch failed for {len(failures)} worker(s): {summarize_list(failure_messages)}"
             return {
                 "ok": len(failures) == 0,
                 "launched": launched,
                 "failures": failures,
+                "error": error_summary,
                 "launch_policy": {
                     "strategy": resolved_policy.strategy,
                     "provider": resolved_policy.provider,

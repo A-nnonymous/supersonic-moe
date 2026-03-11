@@ -24493,6 +24493,41 @@ var import_client = __toESM(require_client(), 1);
 var import_react = __toESM(require_react(), 1);
 
 // src/api.ts
+function summarizeItems(items, limit = 4) {
+  if (!items.length) {
+    return "";
+  }
+  if (items.length <= limit) {
+    return items.join("; ");
+  }
+  return `${items.slice(0, limit).join("; ")}; ... (+${items.length - limit} more)`;
+}
+function extractErrorText(data, requestPath, status) {
+  if (!data) {
+    return `request ${requestPath} failed with status ${status}`;
+  }
+  if (data.error) {
+    return data.error;
+  }
+  if (data.failures?.length) {
+    const failures = data.failures.map((item) => `${item.agent || "worker"}: ${item.error || "unknown launch failure"}`);
+    return `request ${requestPath} failed with status ${status}: ${summarizeItems(failures)}`;
+  }
+  if (data.validation_issues?.length) {
+    const issues = data.validation_issues.map((item) => `${item.field}: ${item.message}`);
+    return `request ${requestPath} failed with status ${status}: ${summarizeItems(issues)}`;
+  }
+  if (data.launch_blockers?.length) {
+    return `request ${requestPath} failed with status ${status}: ${summarizeItems(data.launch_blockers)}`;
+  }
+  if (data.validation_errors?.length) {
+    return `request ${requestPath} failed with status ${status}: ${summarizeItems(data.validation_errors)}`;
+  }
+  if (data.errors?.length) {
+    return `request ${requestPath} failed with status ${status}: ${summarizeItems(data.errors)}`;
+  }
+  return `request ${requestPath} failed with status ${status}`;
+}
 async function parseJson(response, requestPath) {
   const bodyText = await response.text();
   let data = null;
@@ -24505,8 +24540,7 @@ async function parseJson(response, requestPath) {
     }
   }
   if (!response.ok) {
-    const errorText = data?.error || data?.errors?.join("\n") || `request ${requestPath} failed with status ${response.status}`;
-    throw new Error(errorText);
+    throw new Error(extractErrorText(data, requestPath, response.status));
   }
   if (data === null) {
     throw new Error(`request ${requestPath} failed with status ${response.status}: empty response body`);
