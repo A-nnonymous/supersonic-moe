@@ -58,6 +58,14 @@ export type MergeQueueItem = {
   worker_identity: string;
   manager_identity: string;
   status: string;
+  checkpoint_status?: string;
+  attention_summary?: string;
+  blockers?: string[];
+  pending_work?: string[];
+  requested_unlocks?: string[];
+  dependencies?: string[];
+  resume_instruction?: string;
+  next_checkin?: string;
   manager_action: string;
 };
 

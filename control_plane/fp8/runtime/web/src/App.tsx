@@ -322,7 +322,7 @@ function stringifyQueue(values: string[] | undefined): string {
 
 function launchStrategyLabel(strategy: LaunchStrategy): string {
   if (strategy === 'initial_copilot') {
-    return 'Initial Copilot';
+    return 'Initial Provider';
   }
   if (strategy === 'selected_model') {
     return 'Selected Model';
@@ -1340,6 +1340,10 @@ function MergeCard({ item }: { item: MergeQueueItem }) {
       : raw === 'offline' || raw === 'stopped'
         ? { label: 'Ready for review', className: 'state-offline' }
         : { label: 'Queued', className: 'state-not_started' };
+  const blockers = item.blockers || [];
+  const pendingWork = item.pending_work || [];
+  const requestedUnlocks = item.requested_unlocks || [];
+  const dependencies = item.dependencies || [];
   return (
     <article className="merge-card">
       <div className="merge-card-header">
@@ -1357,7 +1361,15 @@ function MergeCard({ item }: { item: MergeQueueItem }) {
         <div><strong>Submit</strong> {item.submit_strategy}</div>
         <div><strong>Worker identity</strong> {item.worker_identity}</div>
         <div><strong>Manager</strong> {item.manager_identity}</div>
+        <div><strong>Checkpoint</strong> {item.checkpoint_status || 'unknown'}</div>
       </div>
+      {item.attention_summary ? <div className="merge-attention"><strong>Attention</strong> {item.attention_summary}</div> : null}
+      {blockers.length ? <div className="merge-list-block"><strong>Blockers</strong><ul>{blockers.map((entry) => <li key={entry}>{entry}</li>)}</ul></div> : null}
+      {pendingWork.length ? <div className="merge-list-block"><strong>Pending Work</strong><ul>{pendingWork.map((entry) => <li key={entry}>{entry}</li>)}</ul></div> : null}
+      {requestedUnlocks.length ? <div className="merge-list-block"><strong>Requested Unlocks</strong><ul>{requestedUnlocks.map((entry) => <li key={entry}>{entry}</li>)}</ul></div> : null}
+      {dependencies.length ? <div className="merge-list-block"><strong>Dependencies</strong><ul>{dependencies.map((entry) => <li key={entry}>{entry}</li>)}</ul></div> : null}
+      {item.resume_instruction ? <div className="merge-attention"><strong>Resume</strong> {item.resume_instruction}</div> : null}
+      {item.next_checkin ? <div className="merge-note"><strong>Next check-in</strong> {item.next_checkin}</div> : null}
       <div className="merge-note">{item.manager_action}</div>
     </article>
   );
@@ -1986,7 +1998,7 @@ export function App() {
                       <input
                         className="field-input compact-input"
                         value={launchModel}
-                        placeholder="gpt-5.4"
+                        placeholder={data.launch_policy.default_model || 'model id'}
                         onChange={(event) => {
                           setLaunchDirty(true);
                           setLaunchModel(event.target.value);
