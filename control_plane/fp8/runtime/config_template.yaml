@@ -44,8 +44,6 @@ providers:
       - ducc
       - --model
       - "{model}"
-      - --cwd
-      - "{worktree_path}"
   opencode:
     api_key_env_name: OPENCODE_API_KEY
     command_template:

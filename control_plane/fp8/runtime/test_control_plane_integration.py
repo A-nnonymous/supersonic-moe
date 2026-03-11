@@ -244,8 +244,6 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
                         "ducc",
                         "--model",
                         "{model}",
-                        "--cwd",
-                        "{worktree_path}",
                     ],
                 },
             },
@@ -648,6 +646,7 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
         self.assertTrue(str(process_snapshot["wrapper_path"]).endswith("ducc_single_layer.sh"))
         self.assertTrue(str(process_snapshot["command"][0]).endswith("ducc_single_layer.sh"))
         self.assertNotIn("--prompt-file", process_snapshot["command"])
+        self.assertNotIn("--cwd", process_snapshot["command"])
 
         self.stop_workers()
 
@@ -730,6 +729,7 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
         state = self.wait_for_agent_state(expected_provider="ducc", expected_model="ducc-sonnet-it")
         process_snapshot = state["processes"]["A1"]
         self.assertNotIn("--prompt-file", process_snapshot["command"])
+        self.assertNotIn("--cwd", process_snapshot["command"])
         self.stop_workers()
 
     def test_session_probe_failure_surfaces_actionable_error(self) -> None:
