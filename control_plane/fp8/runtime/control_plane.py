@@ -157,14 +157,14 @@ def parse_markdown_paragraph(section_text: str) -> str:
     return " ".join(lines)
 
 
-def strip_prompt_file_args(command: list[str]) -> list[str]:
+def strip_command_args(command: list[str], flags: set[str]) -> list[str]:
     cleaned: list[str] = []
     skip_next = False
     for part in command:
         if skip_next:
             skip_next = False
             continue
-        if part == "--prompt-file":
+        if part in flags:
             skip_next = True
             continue
         cleaned.append(part)
@@ -2549,6 +2549,16 @@ Primary test command:
             return "stdin"
         return "prompt-file"
 
+    def sanitize_provider_command(self, provider_name: str, command: list[str], prompt_transport: str) -> list[str]:
+        flags_to_strip: set[str] = set()
+        if prompt_transport == "stdin":
+            flags_to_strip.add("--prompt-file")
+        if provider_name == "ducc":
+            flags_to_strip.add("--cwd")
+        if not flags_to_strip:
+            return command
+        return strip_command_args(command, flags_to_strip)
+
     def branch_exists(self, branch: str) -> bool:
         result = subprocess.run(
             ["git", "show-ref", "--verify", f"refs/heads/{branch}"],
@@ -2677,8 +2687,7 @@ Primary test command:
         }
         command = format_command(template, values)
         prompt_transport = self.provider_prompt_transport(provider_name, provider)
-        if prompt_transport == "stdin":
-            command = strip_prompt_file_args(command)
+        command = self.sanitize_provider_command(provider_name, command, prompt_transport)
         env = os.environ.copy()
         recursion_guard = self.provider_recursion_guard_mode(provider_name, provider)
         launch_wrapper = ""
