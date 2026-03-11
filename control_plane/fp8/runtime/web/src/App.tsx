@@ -4,6 +4,7 @@ import type {
   ConfigResourcePool,
   ConfigShape,
   ConfigWorker,
+  ConfigWorkerDefaults,
   DashboardState,
   GateItem,
   HeartbeatAgent,
@@ -82,8 +83,46 @@ function normalizeConfig(config: ConfigShape): ConfigShape {
     project: config.project || {},
     providers: config.providers || {},
     resource_pools: config.resource_pools || {},
+    worker_defaults: config.worker_defaults || {},
     workers: config.workers || [],
   };
+}
+
+function mergeWorkerWithDefaults(worker: ConfigWorker, defaults: ConfigWorkerDefaults | undefined): ConfigWorker {
+  const merged: ConfigWorker = { ...worker };
+  const workerDefaults = defaults || {};
+  const inheritableFields: Array<keyof ConfigWorkerDefaults> = [
+    'resource_pool',
+    'environment_type',
+    'environment_path',
+    'sync_command',
+    'submit_strategy',
+    'test_command',
+  ];
+
+  inheritableFields.forEach((field) => {
+    const workerValue = merged[field as keyof ConfigWorker];
+    const defaultValue = workerDefaults[field];
+    if ((workerValue === undefined || workerValue === '') && defaultValue !== undefined && defaultValue !== '') {
+      (merged as Record<string, unknown>)[field] = defaultValue;
+    }
+  });
+
+  if ((!Array.isArray(merged.resource_pool_queue) || merged.resource_pool_queue.length === 0) && Array.isArray(workerDefaults.resource_pool_queue) && workerDefaults.resource_pool_queue.length > 0) {
+    merged.resource_pool_queue = [...workerDefaults.resource_pool_queue];
+  }
+
+  const defaultIdentity = workerDefaults.git_identity || {};
+  const workerIdentity = merged.git_identity || {};
+  const mergedIdentity = {
+    name: workerIdentity.name || defaultIdentity.name || '',
+    email: workerIdentity.email || defaultIdentity.email || '',
+  };
+  if (mergedIdentity.name || mergedIdentity.email) {
+    merged.git_identity = mergedIdentity;
+  }
+
+  return merged;
 }
 
 function buildIssueMap(...issueSets: ValidationIssue[][]): IssueMap {
@@ -213,6 +252,7 @@ function getLocalValidationIssues(config: ConfigShape): ValidationIssue[] {
   const project = draft.project || {};
   const dashboard = project.dashboard || {};
   const pools = draft.resource_pools || {};
+  const workerDefaults = draft.worker_defaults || {};
   const workers = draft.workers || [];
 
   if (!String(project.repository_name || '').trim()) {
@@ -250,7 +290,21 @@ function getLocalValidationIssues(config: ConfigShape): ValidationIssue[] {
     }
   });
 
+  if (workerDefaults.resource_pool && !pools[workerDefaults.resource_pool]) {
+    add('worker_defaults.resource_pool', 'default resource pool must refer to an existing pool');
+  }
+  if (workerDefaults.resource_pool_queue && workerDefaults.resource_pool_queue.some((poolName) => !pools[poolName])) {
+    add('worker_defaults.resource_pool_queue', 'default queue must contain only existing pools');
+  }
+  if (workerDefaults.git_identity?.name && !workerDefaults.git_identity?.email) {
+    add('worker_defaults.git_identity.email', 'default git identity email is required when name is set');
+  }
+  if (workerDefaults.git_identity?.email && !workerDefaults.git_identity?.name) {
+    add('worker_defaults.git_identity.name', 'default git identity name is required when email is set');
+  }
+
   workers.forEach((worker, index) => {
+    const effectiveWorker = mergeWorkerWithDefaults(worker, workerDefaults);
     const root = `workers[${index}]`;
     const agent = String(worker.agent || '').trim();
     const branch = String(worker.branch || '').trim();
@@ -276,18 +330,18 @@ function getLocalValidationIssues(config: ConfigShape): ValidationIssue[] {
     } else {
       seenWorktrees.add(worktreePath);
     }
-    const poolName = String(worker.resource_pool || '').trim();
-    const queue = worker.resource_pool_queue || [];
+    const poolName = String(effectiveWorker.resource_pool || '').trim();
+    const queue = effectiveWorker.resource_pool_queue || [];
     if (!poolName && !queue.length) {
       add(`${root}.resource_pool`, 'resource pool or queue is required');
     }
-    if (!String(worker.test_command || '').trim()) {
+    if (!String(effectiveWorker.test_command || '').trim()) {
       add(`${root}.test_command`, 'test command is required');
     }
-    if (!String(worker.submit_strategy || '').trim()) {
+    if (!String(effectiveWorker.submit_strategy || '').trim()) {
       add(`${root}.submit_strategy`, 'submit strategy is required');
     }
-    if (String(worker.environment_type || 'uv') !== 'none' && !String(worker.environment_path || '').trim()) {
+    if (String(effectiveWorker.environment_type || 'uv') !== 'none' && !String(effectiveWorker.environment_path || '').trim()) {
       add(`${root}.environment_path`, 'environment path is required unless environment type is none');
     }
   });
@@ -322,6 +376,7 @@ function Field({
   value,
   onChange,
   issues,
+  helpText,
   placeholder,
   type = 'text',
 }: {
@@ -329,6 +384,7 @@ function Field({
   value: string | number;
   onChange: (value: string) => void;
   issues?: string[];
+  helpText?: string;
   placeholder?: string;
   type?: 'text' | 'number';
 }) {
@@ -342,6 +398,7 @@ function Field({
         placeholder={placeholder}
         onChange={(event) => onChange(event.target.value)}
       />
+      {helpText ? <span className="field-help">{helpText}</span> : null}
       {issues && issues.length > 0 ? <span className="field-error">{issues[0]}</span> : null}
     </label>
   );
@@ -527,6 +584,7 @@ function SettingsTab({
   const project = draftConfig.project || {};
   const dashboard = project.dashboard || {};
   const pools = draftConfig.resource_pools || {};
+  const workerDefaults = draftConfig.worker_defaults || {};
   const workers = draftConfig.workers || [];
   return (
     <div className="tab-body">
@@ -551,14 +609,14 @@ function SettingsTab({
             </div>
           </section>
 
-          <section className="helper-card settings-card">
+          <section className="helper-card settings-card settings-card-wide">
             <div className="section-head">
               <h3>Resource Pools</h3>
               <button className="ghost" type="button" onClick={onAddPool}>Add Pool</button>
             </div>
-            <div className="stack-list">
+            <div className="pool-strip">
               {Object.entries(pools).map(([poolName, pool]) => (
-                <div key={poolName} className="subcard">
+                <div key={poolName} className="subcard pool-card">
                   <div className="subcard-title">{poolName}</div>
                   <div className="field-grid">
                     <SelectField label="Provider" value={String(pool.provider || '')} onChange={(value) => onPoolChange(poolName, 'provider', value)} issues={issues[`resource_pools.${poolName}.provider`]} options={providerOptions} />
@@ -581,10 +639,27 @@ function SettingsTab({
           </section>
 
           <section className="helper-card settings-card settings-card-wide">
+            <div className="section-head"><h3>Worker Defaults</h3></div>
+            <p className="small muted">These values apply to every worker unless a row below overrides them.</p>
+            <div className="field-grid">
+              <Field label="Default Pool" value={workerDefaults.resource_pool || ''} onChange={(value) => onWorkerChange(-1, 'worker_defaults.resource_pool', value)} issues={issues['worker_defaults.resource_pool']} helpText="Leave blank to rely on pool queue or per-worker overrides." />
+              <Field label="Default Pool Queue" value={stringifyQueue(workerDefaults.resource_pool_queue)} onChange={(value) => onWorkerChange(-1, 'worker_defaults.resource_pool_queue', value)} issues={issues['worker_defaults.resource_pool_queue']} placeholder="copilot_pool, claude_pool" />
+              <SelectField label="Default Environment" value={workerDefaults.environment_type || 'uv'} onChange={(value) => onWorkerChange(-1, 'worker_defaults.environment_type', value)} options={['uv', 'venv', 'none']} />
+              <Field label="Default Environment Path" value={workerDefaults.environment_path || ''} onChange={(value) => onWorkerChange(-1, 'worker_defaults.environment_path', value)} issues={issues['worker_defaults.environment_path']} />
+              <Field label="Default Sync Command" value={workerDefaults.sync_command || ''} onChange={(value) => onWorkerChange(-1, 'worker_defaults.sync_command', value)} />
+              <Field label="Default Test Command" value={workerDefaults.test_command || ''} onChange={(value) => onWorkerChange(-1, 'worker_defaults.test_command', value)} issues={issues['worker_defaults.test_command']} />
+              <Field label="Default Submit Strategy" value={workerDefaults.submit_strategy || ''} onChange={(value) => onWorkerChange(-1, 'worker_defaults.submit_strategy', value)} issues={issues['worker_defaults.submit_strategy']} />
+              <Field label="Default Git Name" value={workerDefaults.git_identity?.name || ''} onChange={(value) => onWorkerChange(-1, 'worker_defaults.git_identity.name', value)} issues={issues['worker_defaults.git_identity.name']} />
+              <Field label="Default Git Email" value={workerDefaults.git_identity?.email || ''} onChange={(value) => onWorkerChange(-1, 'worker_defaults.git_identity.email', value)} issues={issues['worker_defaults.git_identity.email']} />
+            </div>
+          </section>
+
+          <section className="helper-card settings-card settings-card-wide">
             <div className="section-head">
               <h3>Worker Config</h3>
               <button className="ghost" type="button" onClick={onAddWorker}>Add Worker</button>
             </div>
+            <p className="small muted">Keep each row focused on identity and routing. Leave override fields blank to inherit Worker Defaults.</p>
             <div className="stack-list">
               {workers.map((worker, index) => (
                 <div key={`${worker.agent || 'worker'}-${index}`} className="subcard">
@@ -592,18 +667,23 @@ function SettingsTab({
                   <div className="field-grid">
                     <Field label="Agent" value={worker.agent || ''} onChange={(value) => onWorkerChange(index, 'agent', value)} issues={issues[`workers[${index}].agent`]} />
                     <Field label="Task ID" value={worker.task_id || ''} onChange={(value) => onWorkerChange(index, 'task_id', value)} />
-                    <Field label="Resource Pool" value={worker.resource_pool || ''} onChange={(value) => onWorkerChange(index, 'resource_pool', value)} issues={issues[`workers[${index}].resource_pool`]} />
-                    <Field label="Pool Queue" value={stringifyQueue(worker.resource_pool_queue)} onChange={(value) => onWorkerChange(index, 'resource_pool_queue', value)} issues={issues[`workers[${index}].resource_pool_queue`]} placeholder="pool_a, pool_b" />
                     <Field label="Branch" value={worker.branch || ''} onChange={(value) => onWorkerChange(index, 'branch', value)} issues={issues[`workers[${index}].branch`]} />
                     <Field label="Worktree Path" value={worker.worktree_path || ''} onChange={(value) => onWorkerChange(index, 'worktree_path', value)} issues={issues[`workers[${index}].worktree_path`]} />
-                    <SelectField label="Environment Type" value={worker.environment_type || 'uv'} onChange={(value) => onWorkerChange(index, 'environment_type', value)} options={['uv', 'venv', 'none']} />
-                    <Field label="Environment Path" value={worker.environment_path || ''} onChange={(value) => onWorkerChange(index, 'environment_path', value)} issues={issues[`workers[${index}].environment_path`]} />
-                    <Field label="Sync Command" value={worker.sync_command || ''} onChange={(value) => onWorkerChange(index, 'sync_command', value)} />
-                    <Field label="Test Command" value={worker.test_command || ''} onChange={(value) => onWorkerChange(index, 'test_command', value)} issues={issues[`workers[${index}].test_command`]} />
-                    <Field label="Submit Strategy" value={worker.submit_strategy || ''} onChange={(value) => onWorkerChange(index, 'submit_strategy', value)} issues={issues[`workers[${index}].submit_strategy`]} />
-                    <Field label="Git Name" value={worker.git_identity?.name || ''} onChange={(value) => onWorkerChange(index, 'git_identity.name', value)} />
-                    <Field label="Git Email" value={worker.git_identity?.email || ''} onChange={(value) => onWorkerChange(index, 'git_identity.email', value)} />
+                    <Field label="Pool Override" value={worker.resource_pool || ''} onChange={(value) => onWorkerChange(index, 'resource_pool', value)} issues={issues[`workers[${index}].resource_pool`]} helpText={workerDefaults.resource_pool ? `Default: ${workerDefaults.resource_pool}` : 'Blank means inherit default routing.'} />
+                    <Field label="Queue Override" value={stringifyQueue(worker.resource_pool_queue)} onChange={(value) => onWorkerChange(index, 'resource_pool_queue', value)} issues={issues[`workers[${index}].resource_pool_queue`]} placeholder="pool_a, pool_b" helpText={workerDefaults.resource_pool_queue?.length ? `Default: ${stringifyQueue(workerDefaults.resource_pool_queue)}` : 'Blank means inherit default queue.'} />
                   </div>
+                  <details className="advanced-panel">
+                    <summary>Advanced overrides</summary>
+                    <div className="field-grid advanced-grid">
+                      <SelectField label="Environment Type" value={worker.environment_type || ''} onChange={(value) => onWorkerChange(index, 'environment_type', value)} options={['uv', 'venv', 'none']} />
+                      <Field label="Environment Path" value={worker.environment_path || ''} onChange={(value) => onWorkerChange(index, 'environment_path', value)} issues={issues[`workers[${index}].environment_path`]} helpText={workerDefaults.environment_path ? `Default: ${workerDefaults.environment_path}` : undefined} />
+                      <Field label="Sync Command" value={worker.sync_command || ''} onChange={(value) => onWorkerChange(index, 'sync_command', value)} helpText={workerDefaults.sync_command ? `Default: ${workerDefaults.sync_command}` : undefined} />
+                      <Field label="Test Command" value={worker.test_command || ''} onChange={(value) => onWorkerChange(index, 'test_command', value)} issues={issues[`workers[${index}].test_command`]} helpText={workerDefaults.test_command ? `Default: ${workerDefaults.test_command}` : undefined} />
+                      <Field label="Submit Strategy" value={worker.submit_strategy || ''} onChange={(value) => onWorkerChange(index, 'submit_strategy', value)} issues={issues[`workers[${index}].submit_strategy`]} helpText={workerDefaults.submit_strategy ? `Default: ${workerDefaults.submit_strategy}` : undefined} />
+                      <Field label="Git Name" value={worker.git_identity?.name || ''} onChange={(value) => onWorkerChange(index, 'git_identity.name', value)} helpText={workerDefaults.git_identity?.name ? `Default: ${workerDefaults.git_identity.name}` : undefined} />
+                      <Field label="Git Email" value={worker.git_identity?.email || ''} onChange={(value) => onWorkerChange(index, 'git_identity.email', value)} helpText={workerDefaults.git_identity?.email ? `Default: ${workerDefaults.git_identity.email}` : undefined} />
+                    </div>
+                  </details>
                 </div>
               ))}
             </div>
@@ -698,7 +778,7 @@ async function writeClipboard(text: string): Promise<void> {
 export function App() {
   const [tab, setTab] = useState<TabKey>('overview');
   const [data, setData] = useState<DashboardState | null>(null);
-  const [draftConfig, setDraftConfig] = useState<ConfigShape>({ project: {}, providers: {}, resource_pools: {}, workers: [] });
+  const [draftConfig, setDraftConfig] = useState<ConfigShape>({ project: {}, providers: {}, resource_pools: {}, worker_defaults: {}, workers: [] });
   const [configDirty, setConfigDirty] = useState(false);
   const [launchStrategy, setLaunchStrategy] = useState<LaunchStrategy>('initial_copilot');
   const [launchProvider, setLaunchProvider] = useState('copilot');
@@ -855,6 +935,23 @@ export function App() {
   const onWorkerChange = (index: number, field: string, value: string) => {
     updateConfig((current) => {
       const next = normalizeConfig(current);
+      if (index === -1) {
+        next.worker_defaults = next.worker_defaults || {};
+        if (field === 'worker_defaults.resource_pool_queue') {
+          next.worker_defaults.resource_pool_queue = parseQueue(value);
+        } else if (field === 'worker_defaults.git_identity.name' || field === 'worker_defaults.git_identity.email') {
+          next.worker_defaults.git_identity = next.worker_defaults.git_identity || {};
+          if (field.endsWith('.name')) {
+            next.worker_defaults.git_identity.name = value;
+          } else {
+            next.worker_defaults.git_identity.email = value;
+          }
+        } else {
+          const normalizedField = field.replace('worker_defaults.', '');
+          (next.worker_defaults as Record<string, unknown>)[normalizedField] = value;
+        }
+        return next;
+      }
       const workers = [...(next.workers || [])];
       const worker = { ...(workers[index] || { agent: `A${index + 1}` }) };
       if (field === 'resource_pool_queue') {
@@ -882,16 +979,10 @@ export function App() {
       workers.push({
         agent: `A${workers.length + 1}`,
         task_id: '',
-        resource_pool: Object.keys(next.resource_pools || {})[0] || '',
+        resource_pool: '',
         resource_pool_queue: [],
         worktree_path: '',
         branch: '',
-        environment_type: 'uv',
-        environment_path: '',
-        sync_command: 'uv sync',
-        test_command: '',
-        submit_strategy: 'patch_handoff',
-        git_identity: { name: '', email: '' },
       });
       next.workers = workers;
       return next;

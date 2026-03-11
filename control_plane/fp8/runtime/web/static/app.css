@@ -245,6 +245,12 @@ button:disabled {
 .stack-list {
   gap: 12px;
 }
+.pool-strip {
+  display: flex;
+  gap: 12px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
 .subcard {
   border: 1px solid rgba(120, 147, 194, 0.22);
   border-radius: 12px;
@@ -256,6 +262,10 @@ button:disabled {
   font-weight: 700;
   color: #d5e4ff;
   margin-bottom: 12px;
+}
+.pool-card {
+  min-width: 320px;
+  flex: 0 0 320px;
 }
 .section-head {
   grid-template-columns: minmax(0, 1fr) auto;
@@ -381,6 +391,24 @@ button:disabled {
   font-size: 12px;
   color: #ffbfd0;
 }
+.field-help {
+  font-size: 12px;
+  color: #8ea6d4;
+}
+.advanced-panel {
+  margin-top: 14px;
+  border-top: 1px solid rgba(120, 147, 194, 0.18);
+  padding-top: 12px;
+}
+.advanced-panel summary {
+  cursor: pointer;
+  color: #d5e4ff;
+  font-weight: 700;
+  margin-bottom: 12px;
+}
+.advanced-grid {
+  margin-top: 12px;
+}
 .merge-branch {
   font-size: 18px;
   font-weight: 700;
@@ -499,6 +527,15 @@ th {
   .field-grid,
   .section-head {
     grid-template-columns: 1fr;
+  }
+  .pool-strip {
+    display: grid;
+    grid-template-columns: 1fr;
+    overflow: visible;
+  }
+  .pool-card {
+    min-width: 0;
+    flex: initial;
   }
   .agent-wall,
   .merge-board,

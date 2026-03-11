@@ -116,12 +116,20 @@ Fill `runtime/local_config.yaml` from the Settings page or by editing YAML direc
 
 - `project.local_repo_root`
 - `project.paddle_repo_path`
-- worker `worktree_path`
-- worker `environment_path`
 - resource pool credentials or credential env vars
-- real worker `test_command` values
+- `worker_defaults.environment_path`
+- `worker_defaults.test_command`
+- every worker `worktree_path`
 
-Also set `project.integration_branch`, optional `project.manager_git_identity`, and any per-worker `git_identity` values you want the runtime to apply inside worker worktrees.
+Then use the settings workflow in this order:
+
+1. set Project and Merge Policy once
+2. tune Resource Pools in the horizontal pool strip
+3. fill `worker_defaults` for the shared environment, sync, test, submit, and git identity behavior
+4. add workers with only agent identity, branch, worktree, and any routing overrides that differ from the defaults
+5. open the advanced override panel for a worker only when that worker truly needs a different environment path, test command, submit strategy, or git identity
+
+Also set `project.integration_branch`, optional `project.manager_git_identity`, and any per-worker `git_identity` overrides you want the runtime to apply inside worker worktrees.
 
 ### 3. Optional launch flags
 
@@ -222,7 +230,10 @@ The local webpage now provides:
 - launch modes for first-run Copilot, explicit provider/model pinning, or elastic provider selection
 - an `Overview` page that shows agent dashboards, overall delivery progress, and branch merge status at a glance
 - an `Operations` page for commands, validation, provider queue, merge queue, runtime state, heartbeats, backlog, and manager report
-- a `Settings` page with responsive editable project, pool, merge-policy, and worker forms
+- a `Settings` page with responsive editable project, pool, merge-policy, worker-default, and worker-override forms
+- a horizontal resource-pool strip so pool routing stays visible without a long vertical stack
+- a `worker_defaults` layer that fills common environment, sync, test, submit, and git identity values once for the whole fleet
+- lean worker cards that focus on identity and branch routing, with advanced overrides hidden until needed
 - strict config validation before save, including path checks via `ls` and host checks via `ping`
 - provider priority queue with runtime connection-quality and work-quality scoring
 - per-worker git commit identities that are applied inside each worker worktree before launch
@@ -234,7 +245,7 @@ The local webpage now provides:
 For actual SonicMoE FP8 multi-agent delivery, the normal manager loop is:
 
 1. bring the control plane up with `serve`
-2. verify Settings and validation output are clean
+2. verify Settings and validation output are clean, starting with shared `worker_defaults`
 3. use `Initial Copilot` for the first fleet launch, then switch to `Selected Model` or `Elastic` as needed before pressing `Launch`
 4. monitor agent health, backlog progress, and branch merge status from `Overview`
 5. inspect provider routing, runtime topology, and heartbeats in `Operations`
@@ -248,7 +259,7 @@ The dashboard is intentionally simple:
 
 1. start on `Overview` to judge agent health, overall delivery progress, and which worker branches are waiting for manager merge review
 2. move to `Operations` when you need runtime inspection, launch commands, validation, or provider scheduling detail
-3. move to `Settings` when you need to edit API keys, provider assignments, Paddle paths, worker commands, or per-worker git identities
+3. move to `Settings` when you need to edit API keys, provider assignments, Paddle paths, shared worker defaults, or a small number of per-worker overrides
 4. let A0 own merge timing and final integration into `project.integration_branch`
 5. use `Launch`, `Restart`, `Stop Agents`, or `Stop All` from the top bar for normal operations
 6. copy the `serve` or `up` command when you need terminal control

@@ -117,9 +117,9 @@ Before using `up`, fill `control_plane/fp8/runtime/local_config.yaml` with:
 - resource pool API keys
 - provider and model assignments
 - Paddle absolute path
-- worker worktree paths and branches
-- per-worker git commit identities when different agents should submit under different names
-- real `test_command` values that can run immediately on the local Hopper or Blackwell host
+- shared worker defaults for environment path, sync command, test command, submit strategy, and default git identity
+- per-worker worktree paths and branches
+- only the per-worker overrides that truly differ from the shared defaults
 
 If you want browser auto-open during local debugging, add `--open-browser` to either launch command:
 
@@ -156,10 +156,12 @@ uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/cont
 - the overview page stays focused on agent dashboards and overall program progress
 - the dashboard now uses a compiled React frontend served from `control_plane/fp8/runtime/web/static/`
 - the dashboard can save validated form-based config, launch workers, restart workers, enter silent mode, stop agents, stop all, and copy startup commands
+- the Settings page now uses `worker_defaults` plus lean per-worker overrides so common fields are filled once instead of repeated on every worker
+- resource pools are shown in a horizontal strip so provider routing stays visible without a long vertical form
 - the launch bar supports first-run Copilot, explicit provider/model pinning, and elastic provider selection
 - worker launch decisions use static pool priority plus runtime connection-quality and work-quality scoring
-- each worker can carry its own git identity, and A0 owns final merge into the integration branch
-- every worker may declare a `resource_pool_queue` for fallback ordering
+- each worker can still override git identity, test command, environment, and routing when it needs a non-default path, and A0 owns final merge into the integration branch
+- every worker may still declare its own `resource_pool_queue` for fallback ordering when the default queue is not enough
 - provider queue, runtime topology, heartbeats, and validation errors remain available in the dashboard
 
 If you change the frontend source under `control_plane/fp8/runtime/web/src/`, rebuild it with:
@@ -173,7 +175,7 @@ npm run build
 ### Control Plane Notes
 
 - on a real Hopper or Blackwell deployment host, the direct `python ...` commands above are the default path
-- keep worker `test_command` and benchmark commands pointed at the same CUDA-capable environment that will run real validation on the target GPU
+- keep `worker_defaults.test_command` and benchmark commands pointed at the same CUDA-capable environment that will run real validation on the target GPU
 - the control plane source of truth remains `control_plane/fp8/README.md`
 - use `control_plane/fp8/README.md` for the full manager workflow, including cold-start, start, pause, and resume guidance
 - stop commands are available separately for agents, listener, or both: `stop-agents`, `stop-listener`, and `stop-all`

@@ -364,6 +364,56 @@ class ControlPlaneService:
         self.listener_active = False
         self.reload_config()
 
+    def worker_defaults(self, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        cfg = config or self.config
+        if not isinstance(cfg, dict):
+            return {}
+        defaults = cfg.get("worker_defaults", {})
+        return defaults if isinstance(defaults, dict) else {}
+
+    def merge_worker_config(self, worker: dict[str, Any], defaults: dict[str, Any] | None = None) -> dict[str, Any]:
+        if not isinstance(worker, dict):
+            return {}
+
+        merged = dict(worker)
+        worker_defaults = defaults if isinstance(defaults, dict) else self.worker_defaults()
+
+        inheritable_fields = (
+            "resource_pool",
+            "environment_type",
+            "environment_path",
+            "sync_command",
+            "test_command",
+            "submit_strategy",
+        )
+        for field_name in inheritable_fields:
+            raw_value = merged.get(field_name)
+            if raw_value in {None, ""} and worker_defaults.get(field_name) not in {None, ""}:
+                merged[field_name] = worker_defaults[field_name]
+
+        raw_queue = merged.get("resource_pool_queue")
+        default_queue = worker_defaults.get("resource_pool_queue")
+        if (not isinstance(raw_queue, list) or not raw_queue) and isinstance(default_queue, list) and default_queue:
+            merged["resource_pool_queue"] = list(default_queue)
+
+        default_identity = worker_defaults.get("git_identity")
+        raw_identity = merged.get("git_identity")
+        if isinstance(default_identity, dict) or isinstance(raw_identity, dict):
+            merged_identity: dict[str, str] = {}
+            for key in ("name", "email"):
+                worker_value = str((raw_identity or {}).get(key, "")).strip() if isinstance(raw_identity, dict) else ""
+                default_value = (
+                    str((default_identity or {}).get(key, "")).strip() if isinstance(default_identity, dict) else ""
+                )
+                if worker_value:
+                    merged_identity[key] = worker_value
+                elif default_value:
+                    merged_identity[key] = default_value
+            if merged_identity:
+                merged["git_identity"] = merged_identity
+
+        return merged
+
     def config_validation_issues(self, config: dict[str, Any] | None = None) -> list[dict[str, str]]:
         cfg = config or self.config
         issues: list[dict[str, str]] = []
@@ -378,6 +428,7 @@ class ControlPlaneService:
         project = cfg.get("project", {})
         providers = cfg.get("providers", {})
         resource_pools = cfg.get("resource_pools", {})
+        worker_defaults = cfg.get("worker_defaults", {})
         workers = cfg.get("workers", [])
 
         if not isinstance(project, dict):
@@ -389,6 +440,9 @@ class ControlPlaneService:
         if not isinstance(resource_pools, dict):
             add_issue("resource_pools", "resource_pools must be a mapping")
             resource_pools = {}
+        if not isinstance(worker_defaults, dict):
+            add_issue("worker_defaults", "worker_defaults must be a mapping")
+            worker_defaults = {}
         if not isinstance(workers, list):
             add_issue("workers", "workers must be a list")
             workers = []
@@ -439,11 +493,47 @@ class ControlPlaneService:
             if not isinstance(priority, int):
                 add_issue(f"resource_pools.{pool_name}.priority", "priority must be an integer")
 
+        default_pool_name = str(worker_defaults.get("resource_pool", "")).strip()
+        if default_pool_name and default_pool_name not in resource_pools:
+            add_issue("worker_defaults.resource_pool", f"unknown resource pool: {default_pool_name}")
+        default_pool_queue = worker_defaults.get("resource_pool_queue", [])
+        if default_pool_queue and not isinstance(default_pool_queue, list):
+            add_issue("worker_defaults.resource_pool_queue", "resource_pool_queue must be a list")
+        if isinstance(default_pool_queue, list):
+            for queue_index, candidate_pool in enumerate(default_pool_queue):
+                if str(candidate_pool) not in resource_pools:
+                    add_issue(
+                        f"worker_defaults.resource_pool_queue[{queue_index}]",
+                        f"unknown resource pool: {candidate_pool}",
+                    )
+
+        default_environment_type = str(worker_defaults.get("environment_type", "uv")).strip() or "uv"
+        default_environment_path = str(worker_defaults.get("environment_path", "")).strip()
+        if default_environment_type != "none" and default_environment_path:
+            if is_placeholder_path(default_environment_path):
+                add_issue("worker_defaults.environment_path", "environment path must be replaced with a real path")
+            elif not path_exists_via_ls(default_environment_path):
+                add_issue(
+                    "worker_defaults.environment_path",
+                    f"environment path does not exist: {default_environment_path}",
+                )
+
+        default_git_identity = worker_defaults.get("git_identity")
+        if default_git_identity is not None:
+            if not isinstance(default_git_identity, dict):
+                add_issue("worker_defaults.git_identity", "git_identity must be a mapping")
+            else:
+                if default_git_identity.get("name") and not str(default_git_identity.get("email", "")).strip():
+                    add_issue("worker_defaults.git_identity.email", "email is required when git_identity.name is set")
+                if default_git_identity.get("email") and not str(default_git_identity.get("name", "")).strip():
+                    add_issue("worker_defaults.git_identity.name", "name is required when git_identity.email is set")
+
         for worker_index, worker in enumerate(workers):
             field_root = f"workers[{worker_index}]"
             if not isinstance(worker, dict):
                 add_issue(field_root, "worker must be a mapping")
                 continue
+            effective_worker = self.merge_worker_config(worker, worker_defaults)
             agent = str(worker.get("agent", "")).strip()
             if not agent:
                 add_issue(f"{field_root}.agent", "agent is required")
@@ -472,8 +562,8 @@ class ControlPlaneService:
             else:
                 seen_worktrees.add(worktree_path)
 
-            pool_name = str(worker.get("resource_pool", "")).strip()
-            pool_queue = worker.get("resource_pool_queue", [])
+            pool_name = str(effective_worker.get("resource_pool", "")).strip()
+            pool_queue = effective_worker.get("resource_pool_queue", [])
             if not pool_name and not pool_queue:
                 add_issue(f"{field_root}.resource_pool", "resource_pool or resource_pool_queue is required")
             if pool_name and pool_name not in resource_pools:
@@ -488,8 +578,8 @@ class ControlPlaneService:
                             f"unknown resource pool: {candidate_pool}",
                         )
 
-            environment_type = str(worker.get("environment_type", "uv")).strip() or "uv"
-            environment_path = str(worker.get("environment_path", "")).strip()
+            environment_type = str(effective_worker.get("environment_type", "uv")).strip() or "uv"
+            environment_path = str(effective_worker.get("environment_path", "")).strip()
             if environment_type != "none":
                 if not environment_path:
                     add_issue(
@@ -501,9 +591,9 @@ class ControlPlaneService:
                 elif not path_exists_via_ls(environment_path):
                     add_issue(f"{field_root}.environment_path", f"environment path does not exist: {environment_path}")
 
-            if not str(worker.get("test_command", "")).strip():
+            if not str(effective_worker.get("test_command", "")).strip():
                 add_issue(f"{field_root}.test_command", "test_command is required")
-            if not str(worker.get("submit_strategy", "")).strip():
+            if not str(effective_worker.get("submit_strategy", "")).strip():
                 add_issue(f"{field_root}.submit_strategy", "submit_strategy is required")
 
         return issues
@@ -535,7 +625,12 @@ class ControlPlaneService:
             self.project = self.config.get("project", {})
             self.providers = self.config.get("providers", {})
             self.resource_pools = self.config.get("resource_pools", {})
-            self.workers = self.config.get("workers", [])
+            self.worker_defaults_config = self.worker_defaults(self.config)
+            self.workers = [
+                self.merge_worker_config(worker, self.worker_defaults_config)
+                for worker in self.config.get("workers", [])
+                if isinstance(worker, dict)
+            ]
             self.refresh_runtime_mode()
             self.provider_stats = self.provider_stats or {
                 pool_name: {
@@ -573,6 +668,7 @@ class ControlPlaneService:
         project = cfg.get("project", {})
         providers = cfg.get("providers", {})
         resource_pools = cfg.get("resource_pools", {})
+        worker_defaults = self.worker_defaults(cfg)
         workers = cfg.get("workers", [])
 
         if not project.get("repository_name"):
@@ -612,6 +708,10 @@ class ControlPlaneService:
                 errors.append(f"resource_pools.{pool_name}.priority must be an integer")
 
         for worker in workers:
+            if not isinstance(worker, dict):
+                errors.append("worker entries must be mappings")
+                continue
+            effective_worker = self.merge_worker_config(worker, worker_defaults)
             agent = str(worker.get("agent", "")).strip()
             if not agent:
                 errors.append("worker.agent is required")
@@ -620,8 +720,8 @@ class ControlPlaneService:
                 errors.append(f"duplicate worker agent {agent}")
             seen_agents.add(agent)
 
-            pool_name = worker.get("resource_pool")
-            pool_queue = worker.get("resource_pool_queue", [])
+            pool_name = effective_worker.get("resource_pool")
+            pool_queue = effective_worker.get("resource_pool_queue", [])
             if pool_name and pool_name not in resource_pools:
                 errors.append(f"worker {agent} references unknown resource_pool {pool_name}")
             if not pool_name and not pool_queue:
@@ -649,15 +749,17 @@ class ControlPlaneService:
             else:
                 seen_worktrees.add(worktree)
 
-            environment_path = worker.get("environment_path")
-            if worker.get("environment_type") not in {"none", None} and is_placeholder_path(environment_path):
+            environment_path = effective_worker.get("environment_path")
+            if effective_worker.get("environment_type") not in {"none", None} and is_placeholder_path(
+                environment_path
+            ):
                 errors.append(f"worker {agent} environment_path still points at a placeholder path")
 
-            if not worker.get("test_command"):
+            if not effective_worker.get("test_command"):
                 errors.append(f"worker {agent} test_command is recommended")
-            if not worker.get("submit_strategy"):
+            if not effective_worker.get("submit_strategy"):
                 errors.append(f"worker {agent} submit_strategy is recommended")
-            git_identity = worker.get("git_identity")
+            git_identity = effective_worker.get("git_identity")
             if git_identity is not None:
                 if not isinstance(git_identity, dict):
                     errors.append(f"worker {agent} git_identity must be a mapping")
@@ -677,6 +779,7 @@ class ControlPlaneService:
         blockers: list[str] = []
         providers = cfg.get("providers", {})
         resource_pools = cfg.get("resource_pools", {})
+        worker_defaults = self.worker_defaults(cfg)
         workers = cfg.get("workers", [])
 
         if not isinstance(providers, dict):
@@ -713,6 +816,10 @@ class ControlPlaneService:
                 blockers.append(f"providers.{provider_name}.command_template is required")
 
         for worker in workers:
+            if not isinstance(worker, dict):
+                blockers.append("worker entries must be mappings")
+                continue
+            effective_worker = self.merge_worker_config(worker, worker_defaults)
             agent = str(worker.get("agent", "")).strip()
             if not agent:
                 blockers.append("worker.agent is required")
@@ -739,8 +846,8 @@ class ControlPlaneService:
             else:
                 seen_worktrees.add(worktree)
 
-            pool_name = worker.get("resource_pool")
-            pool_queue = worker.get("resource_pool_queue", [])
+            pool_name = effective_worker.get("resource_pool")
+            pool_queue = effective_worker.get("resource_pool_queue", [])
             if pool_name and pool_name not in resource_pools:
                 blockers.append(f"worker {agent} references unknown resource_pool {pool_name}")
             if not pool_name and not pool_queue:
@@ -751,12 +858,14 @@ class ControlPlaneService:
                 if candidate_pool not in resource_pools:
                     blockers.append(f"worker {agent} resource_pool_queue references unknown pool {candidate_pool}")
 
-            environment_path = worker.get("environment_path")
-            if worker.get("environment_type") not in {"none", None} and is_placeholder_path(environment_path):
+            environment_path = effective_worker.get("environment_path")
+            if effective_worker.get("environment_type") not in {"none", None} and is_placeholder_path(
+                environment_path
+            ):
                 blockers.append(f"worker {agent} environment_path must be replaced with a real path")
-            if not worker.get("test_command"):
+            if not effective_worker.get("test_command"):
                 blockers.append(f"worker {agent} test_command is required")
-            if not worker.get("submit_strategy"):
+            if not effective_worker.get("submit_strategy"):
                 blockers.append(f"worker {agent} submit_strategy is required")
 
         return blockers
