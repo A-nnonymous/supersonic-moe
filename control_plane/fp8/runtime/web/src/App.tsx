@@ -75,6 +75,8 @@ type WorkerPlanView = {
   suggestedTestCommand: string;
 };
 
+type WorkerResetScope = 'all' | 'routing' | 'runtime';
+
 function normalizedText(value: unknown): string {
   return String(value ?? '').trim();
 }
@@ -246,6 +248,36 @@ function mergeWorkerWithDefaults(worker: ConfigWorker, defaults: ConfigWorkerDef
   }
 
   return merged;
+}
+
+function resetWorkerDefaultsToA0(defaults: ConfigWorkerDefaults | undefined): ConfigWorkerDefaults {
+  return {};
+}
+
+function resetWorkerOverridesToA0(worker: ConfigWorker, scope: WorkerResetScope = 'all'): ConfigWorker {
+  const next: ConfigWorker = { agent: worker.agent };
+  if (scope === 'routing') {
+    return {
+      ...worker,
+      resource_pool: undefined,
+      resource_pool_queue: undefined,
+      task_id: undefined,
+      branch: undefined,
+      worktree_path: undefined,
+    };
+  }
+  if (scope === 'runtime') {
+    return {
+      ...worker,
+      environment_type: undefined,
+      environment_path: undefined,
+      sync_command: undefined,
+      test_command: undefined,
+      submit_strategy: undefined,
+      git_identity: undefined,
+    };
+  }
+  return next;
 }
 
 function buildIssueMap(...issueSets: ValidationIssue[][]): IssueMap {
@@ -820,6 +852,7 @@ function SectionHeader({
   onValidate,
   onSave,
   action,
+  subtitle,
 }: {
   title: string;
   section: ConfigSection;
@@ -827,10 +860,14 @@ function SectionHeader({
   onValidate: (section: ConfigSection) => void;
   onSave: (section: ConfigSection) => void;
   action?: ReactNode;
+  subtitle?: ReactNode;
 }) {
   return (
     <div className="section-head section-head-actions">
-      <h3>{title}</h3>
+      <div>
+        <h3>{title}</h3>
+        {subtitle ? <div className="section-subtitle small muted">{subtitle}</div> : null}
+      </div>
       <div className="section-actions">
         {status?.message ? <span className={classNames('section-status', status.error && 'error')}>{status.message}</span> : null}
         <button className="ghost" type="button" onClick={() => onValidate(section)}>Validate</button>
@@ -870,7 +907,7 @@ function AutomationSummary({ draftConfig, data }: { draftConfig: ConfigShape; da
         <h3>A0-Managed Defaults</h3>
         <div className="small muted">{autoManaged.length} areas auto-managed, {userOnly.length} areas still need human confirmation</div>
       </div>
-      <p className="small muted">Planned workers currently detected: {plannedWorkers.map((worker) => worker.agent).join(', ') || 'none'}.</p>
+      <p className="small muted">Planned workers currently detected: {plannedWorkers.map((worker) => worker.agent).join(', ') || 'none'}. In Settings, A0 plan means the derived target state; override means a human-pinned exception that should be rare and easy to reset.</p>
       <div className="automation-grid">
         <div className="subcard">
           <div className="subcard-title">You should usually not need to fill these by hand</div>
@@ -1018,6 +1055,8 @@ function SettingsTab({
   onSaveSection,
   onSyncWorkers,
   onAutoFillWorktreePaths,
+  onResetWorkerDefaults,
+  onResetWorkerOverrides,
 }: {
   data: DashboardState;
   draftConfig: ConfigShape;
@@ -1034,6 +1073,8 @@ function SettingsTab({
   onSaveSection: (section: ConfigSection) => void;
   onSyncWorkers: () => void;
   onAutoFillWorktreePaths: () => void;
+  onResetWorkerDefaults: () => void;
+  onResetWorkerOverrides: (index: number, scope?: WorkerResetScope) => void;
 }) {
   const project = draftConfig.project || {};
   const dashboard = project.dashboard || {};
@@ -1096,20 +1137,33 @@ function SettingsTab({
           </div>
 
           <section className="helper-card settings-card settings-card-wide">
-            <SectionHeader title="Worker Defaults" section="worker_defaults" status={sectionStatuses.worker_defaults} onValidate={onValidateSection} onSave={onSaveSection} />
+            <SectionHeader
+              title="Worker Defaults"
+              section="worker_defaults"
+              status={sectionStatuses.worker_defaults}
+              onValidate={onValidateSection}
+              onSave={onSaveSection}
+              subtitle="Common defaults are the few knobs you may actually standardize across workers. Advanced defaults are fallback overrides for exceptional environments."
+              action={<button className="ghost" type="button" onClick={onResetWorkerDefaults}>Reset to A0</button>}
+            />
             <SectionIssueList issues={collectSectionIssues('worker_defaults', allIssues)} />
-            <p className="small muted">These values apply to every worker unless a row below overrides them. Blank fields are auto-filled from runtime conventions or sensible defaults where possible.</p>
-            <div className="field-grid">
+            <p className="small muted">These values apply to every worker unless a row below overrides them. Blank fields are auto-filled from runtime conventions or sensible defaults where possible, so the main path should stay sparse.</p>
+            <div className="field-grid compact-field-grid">
               <Field label="Default Pool" value={workerDefaults.resource_pool || ''} onChange={(value) => onWorkerChange(-1, 'worker_defaults.resource_pool', value)} issues={issues['worker_defaults.resource_pool']} helpText="Leave blank to rely on pool queue or per-worker overrides." />
               <Field label="Default Pool Queue" value={stringifyQueue(workerDefaults.resource_pool_queue)} onChange={(value) => onWorkerChange(-1, 'worker_defaults.resource_pool_queue', value)} issues={issues['worker_defaults.resource_pool_queue']} placeholder="copilot_pool, claude_pool" />
               <SelectField label="Default Environment" value={workerDefaults.environment_type || 'uv'} onChange={(value) => onWorkerChange(-1, 'worker_defaults.environment_type', value)} options={['uv', 'venv', 'none']} />
               <Field label="Default Environment Path" value={workerDefaults.environment_path || ''} onChange={(value) => onWorkerChange(-1, 'worker_defaults.environment_path', value)} issues={issues['worker_defaults.environment_path']} />
-              <Field label="Default Sync Command" value={workerDefaults.sync_command || ''} onChange={(value) => onWorkerChange(-1, 'worker_defaults.sync_command', value)} />
-              <Field label="Default Test Command" value={workerDefaults.test_command || ''} onChange={(value) => onWorkerChange(-1, 'worker_defaults.test_command', value)} issues={issues['worker_defaults.test_command']} />
-              <Field label="Default Submit Strategy" value={workerDefaults.submit_strategy || ''} onChange={(value) => onWorkerChange(-1, 'worker_defaults.submit_strategy', value)} issues={issues['worker_defaults.submit_strategy']} />
-              <Field label="Default Git Name" value={workerDefaults.git_identity?.name || ''} onChange={(value) => onWorkerChange(-1, 'worker_defaults.git_identity.name', value)} issues={issues['worker_defaults.git_identity.name']} />
-              <Field label="Default Git Email" value={workerDefaults.git_identity?.email || ''} onChange={(value) => onWorkerChange(-1, 'worker_defaults.git_identity.email', value)} issues={issues['worker_defaults.git_identity.email']} />
             </div>
+            <details className="advanced-panel defaults-panel">
+              <summary>Advanced defaults</summary>
+              <div className="field-grid advanced-grid">
+                <Field label="Default Sync Command" value={workerDefaults.sync_command || ''} onChange={(value) => onWorkerChange(-1, 'worker_defaults.sync_command', value)} helpText="Leave blank to let A0 follow the environment convention." />
+                <Field label="Default Test Command" value={workerDefaults.test_command || ''} onChange={(value) => onWorkerChange(-1, 'worker_defaults.test_command', value)} issues={issues['worker_defaults.test_command']} helpText="Leave blank to let task policy choose per worker." />
+                <Field label="Default Submit Strategy" value={workerDefaults.submit_strategy || ''} onChange={(value) => onWorkerChange(-1, 'worker_defaults.submit_strategy', value)} issues={issues['worker_defaults.submit_strategy']} helpText="Leave blank to keep A0's standard handoff flow." />
+                <Field label="Default Git Name" value={workerDefaults.git_identity?.name || ''} onChange={(value) => onWorkerChange(-1, 'worker_defaults.git_identity.name', value)} issues={issues['worker_defaults.git_identity.name']} />
+                <Field label="Default Git Email" value={workerDefaults.git_identity?.email || ''} onChange={(value) => onWorkerChange(-1, 'worker_defaults.git_identity.email', value)} issues={issues['worker_defaults.git_identity.email']} />
+              </div>
+            </details>
           </section>
 
           <AutomationSummary draftConfig={draftConfig} data={data} />
@@ -1130,7 +1184,7 @@ function SettingsTab({
               }
             />
             <SectionIssueList issues={collectSectionIssues('workers', allIssues)} />
-            <p className="small muted">Detected workers from backlog/runtime: {plannedWorkers.map((item) => item.agent).join(', ') || 'none'}. Main cards now show A0's current plan first; most editable fields are hidden under advanced overrides so you only touch real exceptions.</p>
+            <p className="small muted">Detected workers from backlog/runtime: {plannedWorkers.map((item) => item.agent).join(', ') || 'none'}. A0 plan is the derived execution target. Any filled override below becomes a human-pinned exception; use Reset to A0 to clear those pins and fall back to the plan.</p>
             <div className="worker-grid">
               {workers.map((worker, index) => (
                 <div key={`${worker.agent || 'worker'}-${index}`} className="subcard">
@@ -1141,7 +1195,10 @@ function SettingsTab({
                     const suggestedTest = planned.suggestedTestCommand || '';
                     return (
                       <>
-                  <div className="subcard-title">{worker.agent || `Worker ${index + 1}`}</div>
+                  <div className="subcard-title worker-card-title-row">
+                    <span>{worker.agent || `Worker ${index + 1}`}</span>
+                    <button className="ghost" type="button" onClick={() => onResetWorkerOverrides(index)}>Reset to A0</button>
+                  </div>
                   {recommendation ? <p className="small muted">{recommendation}</p> : null}
                   <div className="plan-grid">
                     <div className="plan-row"><span className="muted">Task</span><strong>{planned.taskId || 'A0 will assign'}</strong></div>
@@ -1157,6 +1214,10 @@ function SettingsTab({
                   </div>
                   <details className="advanced-panel">
                     <summary>Advanced overrides</summary>
+                    <div className="override-toolbar">
+                      <button className="ghost" type="button" onClick={() => onResetWorkerOverrides(index, 'routing')}>Reset routing</button>
+                      <button className="ghost" type="button" onClick={() => onResetWorkerOverrides(index, 'runtime')}>Reset runtime</button>
+                    </div>
                     <div className="field-grid advanced-grid">
                       <Field label="Task ID Override" value={worker.task_id || ''} onChange={(value) => onWorkerChange(index, 'task_id', value)} helpText={planned.taskId ? `A0 plan: ${planned.taskId}` : 'Leave blank to inherit A0 task assignment.'} />
                       <Field label="Branch Override" value={worker.branch || ''} onChange={(value) => onWorkerChange(index, 'branch', value)} issues={issues[`workers[${index}].branch`]} helpText={planned.branch ? `A0 plan: ${planned.branch}` : 'Leave blank to let A0 derive the branch.'} />
@@ -1588,6 +1649,33 @@ export function App() {
     setStampedStatus('missing worktree paths filled from local repo root');
   };
 
+  const onResetWorkerDefaults = () => {
+    updateConfig((current) => ({
+      ...normalizeConfig(current),
+      worker_defaults: resetWorkerDefaultsToA0(current.worker_defaults),
+    }));
+    setStampedStatus('worker defaults reset to A0-managed defaults');
+  };
+
+  const onResetWorkerOverrides = (index: number, scope: WorkerResetScope = 'all') => {
+    updateConfig((current) => {
+      const next = normalizeConfig(current);
+      const workers = [...(next.workers || [])];
+      if (!workers[index]) {
+        return next;
+      }
+      workers[index] = resetWorkerOverridesToA0(workers[index], scope);
+      next.workers = workers;
+      return next;
+    });
+    const message = scope === 'all'
+      ? 'worker overrides reset to A0 plan'
+      : scope === 'routing'
+        ? 'worker routing overrides cleared'
+        : 'worker runtime overrides cleared';
+    setStampedStatus(message);
+  };
+
   const onValidateSection = (section: ConfigSection) => void runAction(`validating ${section}`, async () => {
     const sectionValue = buildSectionValue(draftConfig, section);
     const validation = await validateConfigSection(section, sectionValue);
@@ -1815,6 +1903,8 @@ export function App() {
                   onSaveSection={onSaveSection}
                   onSyncWorkers={onSyncWorkers}
                   onAutoFillWorktreePaths={onAutoFillWorktreePaths}
+                  onResetWorkerDefaults={onResetWorkerDefaults}
+                  onResetWorkerOverrides={onResetWorkerOverrides}
                 />
         ) : (
           <section className="card"><div className="small muted">Loading dashboard state...</div></section>
