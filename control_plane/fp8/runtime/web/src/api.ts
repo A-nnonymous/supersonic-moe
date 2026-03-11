@@ -12,10 +12,22 @@ import type {
 } from './types';
 
 async function parseJson<T>(response: Response): Promise<T> {
-  const data = (await response.json()) as T & { error?: string; errors?: string[] };
+  const bodyText = await response.text();
+  let data: (T & { error?: string; errors?: string[] }) | null = null;
+  if (bodyText) {
+    try {
+      data = JSON.parse(bodyText) as T & { error?: string; errors?: string[] };
+    } catch {
+      const snippet = bodyText.slice(0, 160).replace(/\s+/g, ' ').trim();
+      throw new Error(`request failed with status ${response.status}: expected JSON, received ${snippet || 'empty response'}`);
+    }
+  }
   if (!response.ok) {
-    const errorText = data.error || data.errors?.join('\n') || `request failed with status ${response.status}`;
+    const errorText = data?.error || data?.errors?.join('\n') || `request failed with status ${response.status}`;
     throw new Error(errorText);
+  }
+  if (data === null) {
+    throw new Error(`request failed with status ${response.status}: empty response body`);
   }
   return data;
 }
