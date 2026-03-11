@@ -41,6 +41,7 @@ PROMPT_DIR = RUNTIME_DIR / "generated_prompts"
 LOG_DIR = RUNTIME_DIR / "logs"
 MANAGER_REPORT = CONTROL_ROOT / "reports" / "manager_report.md"
 SESSION_STATE = RUNTIME_DIR / "session_state.json"
+PROVIDER_STATS_PATH = STATE_DIR / "provider_stats.yaml"
 CONTROL_PLANE_RUNTIME = "uv run --no-project --with 'PyYAML>=6.0.2' python"
 WEB_STATIC_DIR = RUNTIME_DIR / "web" / "static"
 WEB_INDEX_FILE = WEB_STATIC_DIR / "index.html"
@@ -79,6 +80,24 @@ def format_command(template: Any, values: dict[str, str]) -> list[str]:
     if isinstance(template, str):
         return shlex.split(template.format(**values))
     return [str(part).format(**values) for part in template]
+
+
+def slugify(value: str) -> str:
+    normalized = "".join(char.lower() if char.isalnum() else "_" for char in str(value))
+    compact = "_".join(part for part in normalized.split("_") if part)
+    return compact or "unassigned"
+
+
+def dedupe_strings(values: list[Any]) -> list[str]:
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        ordered.append(text)
+    return ordered
 
 
 def is_placeholder_path(value: Any) -> bool:
@@ -373,6 +392,310 @@ class ControlPlaneService:
         defaults = cfg.get("worker_defaults", {})
         return defaults if isinstance(defaults, dict) else {}
 
+    def default_provider_stat_entry(self) -> dict[str, Any]:
+        return {
+            "launch_successes": 0,
+            "launch_failures": 0,
+            "clean_exits": 0,
+            "failed_exits": 0,
+            "last_failure": "",
+            "last_latency_ms": None,
+            "last_probe_ok": False,
+            "last_work_quality": 0.0,
+        }
+
+    def load_provider_stats(self) -> dict[str, dict[str, Any]]:
+        data = load_yaml(PROVIDER_STATS_PATH) if PROVIDER_STATS_PATH.exists() else {}
+        if not isinstance(data, dict):
+            return {}
+        stats: dict[str, dict[str, Any]] = {}
+        for pool_name, entry in data.items():
+            if isinstance(entry, dict):
+                stats[str(pool_name)] = {**self.default_provider_stat_entry(), **entry}
+        return stats
+
+    def persist_provider_stats(self) -> None:
+        PROVIDER_STATS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        dump_yaml(PROVIDER_STATS_PATH, self.provider_stats)
+
+    def backlog_items(self) -> list[dict[str, Any]]:
+        backlog = load_yaml(STATE_DIR / "backlog.yaml")
+        items = backlog.get("items", [])
+        return items if isinstance(items, list) else []
+
+    def runtime_worker_entries(self) -> list[dict[str, Any]]:
+        runtime = load_yaml(STATE_DIR / "agent_runtime.yaml")
+        items = runtime.get("workers", [])
+        return items if isinstance(items, list) else []
+
+    def reference_workspace_root(self, config: dict[str, Any] | None = None) -> str:
+        cfg = config or self.config
+        project = cfg.get("project", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(project, dict):
+            return ""
+        return str(project.get("reference_workspace_root") or project.get("paddle_repo_path") or "").strip()
+
+    def reference_inputs(self, config: dict[str, Any] | None = None) -> list[str]:
+        cfg = config or self.config
+        project = cfg.get("project", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(project, dict):
+            return []
+        configured = project.get("reference_inputs", [])
+        values = configured if isinstance(configured, list) else []
+        reference_root = self.reference_workspace_root(cfg)
+        if reference_root:
+            values = [reference_root, *values]
+        return dedupe_strings(values)
+
+    def prompt_context_files(self, config: dict[str, Any] | None = None) -> list[str]:
+        cfg = config or self.config
+        project = cfg.get("project", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(project, dict):
+            return []
+        values = project.get("prompt_context_files", [])
+        return dedupe_strings(values if isinstance(values, list) else [])
+
+    def task_policy_config(self, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        cfg = config or self.config
+        task_policies = cfg.get("task_policies", {}) if isinstance(cfg, dict) else {}
+        return task_policies if isinstance(task_policies, dict) else {}
+
+    def provider_preference_default(self, config: dict[str, Any] | None = None) -> list[str]:
+        cfg = config or self.config
+        configured_providers = cfg.get("providers", {}) if isinstance(cfg, dict) else {}
+        resource_pools = cfg.get("resource_pools", {}) if isinstance(cfg, dict) else {}
+        ordered_pools = []
+        if isinstance(resource_pools, dict):
+            ordered_pools = sorted(
+                resource_pools.items(),
+                key=lambda item: (-int(item[1].get("priority", 0)), str(item[0])),
+            )
+        ordered = [entry.get("provider", "") for _, entry in ordered_pools if isinstance(entry, dict)]
+        fallback = [DEFAULT_INITIAL_PROVIDER, *sorted(str(key) for key in configured_providers.keys())]
+        return dedupe_strings([*ordered, *fallback])
+
+    def task_policy_defaults(self, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        policy_config = self.task_policy_config(config)
+        defaults = policy_config.get("defaults", {})
+        if not isinstance(defaults, dict):
+            defaults = {}
+        preferred_providers = defaults.get("preferred_providers")
+        if not isinstance(preferred_providers, list) or not preferred_providers:
+            preferred_providers = self.provider_preference_default(config)
+        return {
+            "task_type": str(defaults.get("task_type") or "default").strip() or "default",
+            "preferred_providers": dedupe_strings(preferred_providers),
+            "suggested_test_command": str(defaults.get("suggested_test_command") or "").strip(),
+            "prompt_context_files": dedupe_strings(defaults.get("prompt_context_files") or []),
+        }
+
+    def task_policy_types(self, config: dict[str, Any] | None = None) -> dict[str, dict[str, Any]]:
+        policy_config = self.task_policy_config(config)
+        types = policy_config.get("types", {})
+        if not isinstance(types, dict):
+            return {}
+        normalized: dict[str, dict[str, Any]] = {}
+        for task_type, entry in types.items():
+            if not isinstance(entry, dict):
+                continue
+            normalized[str(task_type).strip()] = {
+                "preferred_providers": dedupe_strings(entry.get("preferred_providers") or []),
+                "suggested_test_command": str(entry.get("suggested_test_command") or "").strip(),
+                "prompt_context_files": dedupe_strings(entry.get("prompt_context_files") or []),
+            }
+        return normalized
+
+    def task_policy_rules(self, config: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        policy_config = self.task_policy_config(config)
+        rules = policy_config.get("rules", [])
+        if not isinstance(rules, list):
+            return []
+        return [rule for rule in rules if isinstance(rule, dict)]
+
+    def task_policy_rule_matches(self, rule: dict[str, Any], worker: dict[str, Any], task: dict[str, Any]) -> bool:
+        task_id = str(task.get("id") or worker.get("task_id") or "").strip()
+        title = str(task.get("title") or "").strip().lower()
+        agent = str(worker.get("agent") or "").strip()
+
+        agents = rule.get("agents")
+        if agents is not None:
+            allowed_agents = dedupe_strings(agents if isinstance(agents, list) else [])
+            if not allowed_agents or agent not in allowed_agents:
+                return False
+
+        task_ids = rule.get("task_ids")
+        if task_ids is not None:
+            allowed_task_ids = dedupe_strings(task_ids if isinstance(task_ids, list) else [])
+            if not allowed_task_ids or task_id not in allowed_task_ids:
+                return False
+
+        title_contains = rule.get("title_contains")
+        if title_contains is not None:
+            if not isinstance(title_contains, list) or not any(
+                str(fragment).strip().lower() in title for fragment in title_contains if str(fragment).strip()
+            ):
+                return False
+
+        return True
+
+    def task_record_for_worker(self, worker: dict[str, Any]) -> dict[str, Any]:
+        task_id = str(worker.get("task_id", "")).strip()
+        agent = str(worker.get("agent", "")).strip()
+        backlog_items = self.backlog_items()
+        if task_id:
+            for item in backlog_items:
+                if str(item.get("id", "")).strip() == task_id:
+                    return item
+        if agent:
+            owned = [item for item in backlog_items if str(item.get("owner", "")).strip() == agent]
+            if len(owned) == 1:
+                return owned[0]
+            for item in owned:
+                if str(item.get("status", "")).strip() in {"pending", "blocked", "active", "in_progress"}:
+                    return item
+        return {}
+
+    def suggested_task_id(self, worker: dict[str, Any]) -> str:
+        if str(worker.get("task_id", "")).strip():
+            return str(worker.get("task_id", "")).strip()
+        task = self.task_record_for_worker(worker)
+        if task:
+            return str(task.get("id", "")).strip()
+        agent = str(worker.get("agent", "")).strip()
+        return f"{agent}-001" if agent else ""
+
+    def task_profile_for_worker(self, worker: dict[str, Any]) -> dict[str, Any]:
+        task = self.task_record_for_worker(worker)
+        task_id = str(task.get("id") or worker.get("task_id") or "").strip()
+        title = str(task.get("title") or task_id or worker.get("agent") or "").strip()
+        defaults = self.task_policy_defaults()
+        explicit_task_type = str(worker.get("task_type") or task.get("task_type") or "").strip()
+        task_type = explicit_task_type or defaults["task_type"]
+        matched_rule_name = ""
+        if not explicit_task_type:
+            for rule in self.task_policy_rules():
+                candidate_type = str(rule.get("task_type") or "").strip()
+                if not candidate_type:
+                    continue
+                if self.task_policy_rule_matches(rule, worker, task):
+                    task_type = candidate_type
+                    matched_rule_name = str(rule.get("name") or candidate_type).strip()
+                    break
+
+        policy = {**defaults, **self.task_policy_types().get(task_type, {})}
+        preferred_providers = dedupe_strings(policy.get("preferred_providers") or self.provider_preference_default())
+        return {
+            "task_id": task_id,
+            "title": title,
+            "task_type": task_type,
+            "category": task_type,
+            "preferred_providers": preferred_providers,
+            "suggested_test_command": str(policy.get("suggested_test_command") or "").strip(),
+            "prompt_context_files": dedupe_strings(policy.get("prompt_context_files") or []),
+            "matched_rule_name": matched_rule_name,
+            "task": task,
+        }
+
+    def suggested_branch_name(self, worker: dict[str, Any]) -> str:
+        explicit_branch = str(worker.get("branch", "")).strip()
+        if explicit_branch:
+            return explicit_branch
+        profile = self.task_profile_for_worker(worker)
+        agent = str(worker.get("agent", "")).strip().lower()
+        suffix = slugify(profile.get("title") or profile.get("task_id") or agent)
+        if agent and suffix:
+            return f"{agent}_{suffix}"
+        return ""
+
+    def suggested_test_command(self, worker: dict[str, Any]) -> str:
+        profile = self.task_profile_for_worker(worker)
+        return str(profile.get("suggested_test_command") or "").strip()
+
+    def recommended_pool_plan(self, worker: dict[str, Any], config: dict[str, Any] | None = None) -> dict[str, Any]:
+        cfg = config or self.config
+        resource_pools = cfg.get("resource_pools", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(resource_pools, dict) or not resource_pools:
+            return {
+                "recommended_pool": "",
+                "locked_pool": "",
+                "recommended_queue": [],
+                "reason": "no resource pools configured",
+            }
+
+        explicit_pool = str(worker.get("resource_pool", "")).strip()
+        explicit_queue = worker.get("resource_pool_queue")
+        defaults = self.worker_defaults(cfg)
+        candidate_pools: list[str] = []
+        if explicit_pool:
+            candidate_pools = [explicit_pool]
+        elif isinstance(explicit_queue, list) and explicit_queue:
+            candidate_pools = [str(item) for item in explicit_queue if str(item)]
+        else:
+            default_queue = defaults.get("resource_pool_queue")
+            if isinstance(default_queue, list) and default_queue:
+                candidate_pools = [str(item) for item in default_queue if str(item)]
+            elif defaults.get("resource_pool"):
+                candidate_pools = [str(defaults.get("resource_pool"))]
+            else:
+                candidate_pools = list(resource_pools.keys())
+
+        evaluations = {
+            item["resource_pool"]: item for item in self.provider_queue() if item["resource_pool"] in candidate_pools
+        }
+        profile = self.task_profile_for_worker(worker)
+        preferred_providers = profile["preferred_providers"]
+
+        def pool_rank(pool_name: str) -> tuple[float, int, str]:
+            evaluation = evaluations.get(pool_name)
+            if not evaluation:
+                return (-1.0, len(preferred_providers), pool_name)
+            provider_name = str(evaluation.get("provider", ""))
+            provider_rank = (
+                preferred_providers.index(provider_name)
+                if provider_name in preferred_providers
+                else len(preferred_providers)
+            )
+            affinity_bonus = max(0, len(preferred_providers) - provider_rank) * 40
+            lock_bonus = 500 if explicit_pool and pool_name == explicit_pool else 0
+            return (float(evaluation.get("score", 0.0)) + affinity_bonus + lock_bonus, -provider_rank, pool_name)
+
+        ordered_candidates = sorted(candidate_pools, key=pool_rank, reverse=True)
+        recommended_pool = ordered_candidates[0] if ordered_candidates else ""
+        recommended_queue = ordered_candidates if ordered_candidates else candidate_pools
+        locked_pool = explicit_pool
+        reason = "explicit worker pool override"
+        if not locked_pool and recommended_pool:
+            preferred_usable_candidates: list[str] = []
+            for preferred_provider in preferred_providers:
+                provider_candidates = [
+                    pool_name
+                    for pool_name in ordered_candidates
+                    if str(evaluations.get(pool_name, {}).get("provider", "")) == preferred_provider
+                    and bool(evaluations.get(pool_name, {}).get("binary_found"))
+                    and bool(evaluations.get(pool_name, {}).get("api_key_present"))
+                ]
+                if provider_candidates:
+                    preferred_usable_candidates = provider_candidates
+                    break
+
+            if preferred_usable_candidates:
+                locked_pool = preferred_usable_candidates[0]
+                recommended_pool = locked_pool
+                recommended_queue = [locked_pool] + [pool for pool in ordered_candidates if pool != locked_pool]
+                reason = (
+                    f"A0 locked {locked_pool} for {profile['task_type']} work using task policy plus provider quality"
+                )
+            else:
+                reason = f"A0 recommends {recommended_pool} for {profile['task_type']} work"
+        return {
+            "recommended_pool": recommended_pool,
+            "locked_pool": locked_pool,
+            "recommended_queue": recommended_queue,
+            "reason": reason,
+            "category": profile["task_type"],
+            "preferred_providers": preferred_providers,
+        }
+
     def suggested_worktree_path(self, worker: dict[str, Any], config: dict[str, Any] | None = None) -> str:
         cfg = config or self.config
         if not isinstance(cfg, dict) or not isinstance(worker, dict):
@@ -422,6 +745,36 @@ class ControlPlaneService:
             if suggested_path:
                 merged["worktree_path"] = suggested_path
 
+        raw_task_id = str(merged.get("task_id", "")).strip()
+        if not raw_task_id:
+            suggested_task_id = self.suggested_task_id(merged)
+            if suggested_task_id:
+                merged["task_id"] = suggested_task_id
+
+        raw_branch = str(merged.get("branch", "")).strip()
+        if not raw_branch:
+            suggested_branch = self.suggested_branch_name(merged)
+            if suggested_branch:
+                merged["branch"] = suggested_branch
+
+        resource_plan = self.recommended_pool_plan(merged)
+        raw_resource_pool = str(worker.get("resource_pool", "")).strip()
+        raw_resource_pool_queue = worker.get("resource_pool_queue")
+        if not raw_resource_pool and resource_plan.get("locked_pool"):
+            merged["resource_pool"] = resource_plan["locked_pool"]
+        if (
+            (not isinstance(raw_resource_pool_queue, list) or not raw_resource_pool_queue)
+            and not str(merged.get("resource_pool", "")).strip()
+            and resource_plan.get("recommended_queue")
+        ):
+            merged["resource_pool_queue"] = list(resource_plan["recommended_queue"])
+
+        raw_test_command = str(worker.get("test_command", "")).strip()
+        if not raw_test_command:
+            suggested_test_command = self.suggested_test_command(merged)
+            if suggested_test_command:
+                merged["test_command"] = suggested_test_command
+
         default_identity = worker_defaults.get("git_identity")
         raw_identity = merged.get("git_identity")
         if isinstance(default_identity, dict) or isinstance(raw_identity, dict):
@@ -462,7 +815,7 @@ class ControlPlaneService:
             keywords = (
                 "project.repository_name",
                 "project.local_repo_root",
-                "project.paddle_repo_path",
+                "project.reference_workspace_root",
                 "project.dashboard",
             )
         elif section == "merge_policy":
@@ -499,14 +852,22 @@ class ControlPlaneService:
             if not isinstance(project, dict):
                 project = {}
             payload = value if isinstance(value, dict) else {}
+            reference_workspace_root = payload.get(
+                "reference_workspace_root",
+                payload.get(
+                    "paddle_repo_path",
+                    project.get("reference_workspace_root") or project.get("paddle_repo_path"),
+                ),
+            )
             project.update(
                 {
                     "repository_name": payload.get("repository_name", project.get("repository_name")),
                     "local_repo_root": payload.get("local_repo_root", project.get("local_repo_root")),
-                    "paddle_repo_path": payload.get("paddle_repo_path", project.get("paddle_repo_path")),
+                    "reference_workspace_root": reference_workspace_root,
                     "dashboard": payload.get("dashboard", project.get("dashboard", {})),
                 }
             )
+            project.pop("paddle_repo_path", None)
             current["project"] = project
             return current
 
@@ -566,7 +927,7 @@ class ControlPlaneService:
         if not repository_name:
             add_issue("project.repository_name", "repository name is required")
 
-        for field_name in ("local_repo_root", "paddle_repo_path"):
+        for field_name in ("local_repo_root",):
             raw_value = str(project.get(field_name, "")).strip()
             field_path = f"project.{field_name}"
             if not raw_value:
@@ -576,11 +937,25 @@ class ControlPlaneService:
             elif not path_exists_via_ls(raw_value):
                 add_issue(field_path, f"{field_name} does not exist: {raw_value}")
 
+        reference_workspace_root = self.reference_workspace_root(cfg)
+        if reference_workspace_root:
+            if is_placeholder_path(reference_workspace_root):
+                add_issue(
+                    "project.reference_workspace_root",
+                    "reference_workspace_root must be replaced with a real path",
+                )
+            elif not path_exists_via_ls(reference_workspace_root):
+                add_issue(
+                    "project.reference_workspace_root",
+                    f"reference_workspace_root does not exist: {reference_workspace_root}",
+                )
+
         dashboard = project.get("dashboard", {})
         if not isinstance(dashboard, dict):
             add_issue("project.dashboard", "dashboard must be a mapping")
             dashboard = {}
         host = str(dashboard.get("host", "")).strip()
+
         if not host:
             add_issue("project.dashboard.host", "dashboard host is required")
         elif not host_reachable_via_ping(host):
@@ -588,6 +963,27 @@ class ControlPlaneService:
         port = dashboard.get("port")
         if not isinstance(port, int) or not (1 <= int(port) <= 65535):
             add_issue("project.dashboard.port", "dashboard port must be an integer between 1 and 65535")
+
+        task_policies = self.task_policy_config(cfg)
+        if task_policies and not isinstance(task_policies, dict):
+            add_issue("task_policies", "task_policies must be a mapping")
+        known_task_types = {self.task_policy_defaults(cfg)["task_type"], *self.task_policy_types(cfg).keys()}
+        for task_type, entry in self.task_policy_types(cfg).items():
+            for provider_name in entry.get("preferred_providers", []):
+                if provider_name not in providers:
+                    add_issue(
+                        f"task_policies.types.{task_type}.preferred_providers",
+                        f"unknown provider in preferred_providers: {provider_name}",
+                    )
+        for rule_index, rule in enumerate(self.task_policy_rules(cfg)):
+            task_type = str(rule.get("task_type") or "").strip()
+            if not task_type:
+                add_issue(f"task_policies.rules[{rule_index}].task_type", "task_type is required")
+            elif task_type not in known_task_types:
+                add_issue(
+                    f"task_policies.rules[{rule_index}].task_type",
+                    f"task_type references unknown policy type: {task_type}",
+                )
 
         seen_agents: set[str] = set()
         seen_branches: set[str] = set()
@@ -657,7 +1053,7 @@ class ControlPlaneService:
             else:
                 seen_agents.add(agent)
 
-            branch = str(worker.get("branch", "")).strip()
+            branch = str(effective_worker.get("branch", "")).strip()
             if not branch:
                 add_issue(f"{field_root}.branch", "branch is required")
             elif branch in seen_branches:
@@ -750,6 +1146,7 @@ class ControlPlaneService:
             self.providers = self.config.get("providers", {})
             self.resource_pools = self.config.get("resource_pools", {})
             self.worker_defaults_config = self.worker_defaults(self.config)
+            self.provider_stats = self.load_provider_stats()
             self.workers = [
                 self.merge_worker_config(worker, self.worker_defaults_config)
                 for worker in self.config.get("workers", [])
@@ -757,32 +1154,14 @@ class ControlPlaneService:
             ]
             self.refresh_runtime_mode()
             self.provider_stats = self.provider_stats or {
-                pool_name: {
-                    "launch_successes": 0,
-                    "launch_failures": 0,
-                    "clean_exits": 0,
-                    "failed_exits": 0,
-                    "last_failure": "",
-                    "last_latency_ms": None,
-                    "last_probe_ok": False,
-                    "last_work_quality": 0.0,
-                }
-                for pool_name in self.resource_pools
+                pool_name: self.default_provider_stat_entry() for pool_name in self.resource_pools
             }
             for pool_name in self.resource_pools:
                 self.provider_stats.setdefault(
                     pool_name,
-                    {
-                        "launch_successes": 0,
-                        "launch_failures": 0,
-                        "clean_exits": 0,
-                        "failed_exits": 0,
-                        "last_failure": "",
-                        "last_latency_ms": None,
-                        "last_probe_ok": False,
-                        "last_work_quality": 0.0,
-                    },
+                    self.default_provider_stat_entry(),
                 )
+            self.persist_provider_stats()
 
     def validation_errors(self, config: dict[str, Any] | None = None) -> list[str]:
         cfg = config or self.config
@@ -801,10 +1180,9 @@ class ControlPlaneService:
             errors.append(f"project.local_repo_root is recommended; default runtime root is {REPO_ROOT}")
         elif is_placeholder_path(project.get("local_repo_root")):
             errors.append("project.local_repo_root still points at a placeholder path")
-        if not project.get("paddle_repo_path"):
-            errors.append("project.paddle_repo_path is recommended for reference tracing")
-        elif is_placeholder_path(project.get("paddle_repo_path")):
-            errors.append("project.paddle_repo_path still points at a placeholder path")
+        reference_workspace_root = self.reference_workspace_root(cfg)
+        if reference_workspace_root and is_placeholder_path(reference_workspace_root):
+            errors.append("project.reference_workspace_root still points at a placeholder path")
         dashboard = project.get("dashboard", {})
         if not dashboard.get("host"):
             errors.append("project.dashboard.host is recommended")
@@ -831,6 +1209,13 @@ class ControlPlaneService:
             if not isinstance(priority, int):
                 errors.append(f"resource_pools.{pool_name}.priority must be an integer")
 
+        for task_type, entry in self.task_policy_types(cfg).items():
+            for provider_name in entry.get("preferred_providers", []):
+                if provider_name not in providers:
+                    errors.append(
+                        f"task_policies.types.{task_type}.preferred_providers references unknown provider {provider_name}"
+                    )
+
         for worker in workers:
             if not isinstance(worker, dict):
                 errors.append("worker entries must be mappings")
@@ -855,7 +1240,7 @@ class ControlPlaneService:
             for candidate_pool in pool_queue if isinstance(pool_queue, list) else []:
                 if candidate_pool not in resource_pools:
                     errors.append(f"worker {agent} resource_pool_queue references unknown pool {candidate_pool}")
-            branch = str(worker.get("branch", "")).strip()
+            branch = str(effective_worker.get("branch", "")).strip()
             if not branch:
                 errors.append(f"worker {agent} branch is required for launch")
             elif branch in seen_branches:
@@ -952,7 +1337,7 @@ class ControlPlaneService:
                 blockers.append(f"duplicate worker agent {agent}")
             seen_agents.add(agent)
 
-            branch = str(worker.get("branch", "")).strip()
+            branch = str(effective_worker.get("branch", "")).strip()
             if not branch:
                 blockers.append(f"worker {agent} branch is required")
             elif branch in seen_branches:
@@ -1173,11 +1558,11 @@ class ControlPlaneService:
         }
 
     def candidate_pools_for_worker(self, worker: dict[str, Any]) -> list[str]:
+        if worker.get("resource_pool"):
+            return [str(worker["resource_pool"])]
         configured_queue = worker.get("resource_pool_queue")
         if isinstance(configured_queue, list) and configured_queue:
             return configured_queue
-        if worker.get("resource_pool"):
-            return [str(worker["resource_pool"])]
         return [item["resource_pool"] for item in self.provider_queue()]
 
     def best_pool_for_provider(self, provider_name: str) -> tuple[str, dict[str, Any]]:
@@ -1380,23 +1765,60 @@ class ControlPlaneService:
             )
         return queue
 
+    def resolved_worker_plan(self, worker: dict[str, Any]) -> dict[str, Any]:
+        pool_plan = self.recommended_pool_plan(worker)
+        profile = self.task_profile_for_worker(worker)
+        return {
+            "agent": worker.get("agent", ""),
+            "task_id": worker.get("task_id", ""),
+            "task_title": profile.get("title", ""),
+            "task_type": profile.get("task_type", "default"),
+            "task_category": profile.get("task_type", "default"),
+            "preferred_providers": profile.get("preferred_providers", []),
+            "branch": worker.get("branch", ""),
+            "worktree_path": worker.get("worktree_path", ""),
+            "resource_pool": worker.get("resource_pool", ""),
+            "resource_pool_queue": worker.get("resource_pool_queue", []),
+            "recommended_pool": pool_plan.get("recommended_pool", ""),
+            "locked_pool": pool_plan.get("locked_pool", ""),
+            "pool_reason": pool_plan.get("reason", ""),
+            "test_command": worker.get("test_command", ""),
+            "suggested_test_command": self.suggested_test_command(worker),
+        }
+
     def render_prompt(self, worker: dict[str, Any], provider_name: str, model: str) -> Path:
         prompt_path = PROMPT_DIR / f"{worker['agent']}.md"
         task_id = worker.get("task_id", "unassigned")
         task_title = self.task_title(task_id)
+        profile = self.task_profile_for_worker(worker)
         git_identity = self.worker_git_identity(worker)
         git_identity_text = (
             f"{git_identity['name']} <{git_identity['email']}>"
             if git_identity["name"] and git_identity["email"]
             else "environment default"
         )
+        reference_workspace_root = self.reference_workspace_root() or "unassigned"
+        reference_inputs = self.reference_inputs()
+        prompt_context_files = dedupe_strings(
+            [
+                *self.prompt_context_files(),
+                *profile.get("prompt_context_files", []),
+                "control_plane/fp8/governance/operating_model.md",
+                "control_plane/fp8/state/backlog.yaml",
+                "control_plane/fp8/state/gates.yaml",
+                "control_plane/fp8/state/agent_runtime.yaml",
+            ]
+        )
+        reference_input_text = "\n".join(f"- {item}" for item in reference_inputs) or "- none configured"
+        context_file_text = "\n".join(f"- {item}" for item in prompt_context_files)
         text = f"""# {worker['agent']} Worker Prompt
 
 Repository name: {self.project.get('repository_name', 'supersonic-moe')}
 Local workspace root: {self.project.get('local_repo_root', str(REPO_ROOT))}
-Paddle reference repo: {self.project.get('paddle_repo_path', 'unassigned')}
+Reference workspace: {reference_workspace_root}
 Agent: {worker['agent']}
 Task: {task_id} - {task_title}
+Task type: {profile.get('task_type', 'default')}
 Provider: {provider_name}
 Model: {model}
 Worktree: {worker['worktree_path']}
@@ -1404,23 +1826,22 @@ Branch: {worker['branch']}
 Commit identity: {git_identity_text}
 Manager merge target: {self.integration_branch()}
 
+Reference inputs:
+
+{reference_input_text}
+
 Mandatory rules:
 
 1. Work only inside the assigned worktree.
 2. Do not edit shared control-plane files unless the manager explicitly asks and the lock is held.
 3. Update your status file in `control_plane/fp8/status/agents/` and your checkpoint in `control_plane/fp8/checkpoints/agents/`.
-4. Treat `tests/reference_layers/standalone_moe_layer` and `{self.project.get('paddle_repo_path', 'unassigned')}` as reference inputs, not as the final host implementation.
+4. Treat configured reference inputs as guidance, not as the final host implementation.
 5. Report blockers before widening scope.
 6. Commit only on your assigned branch; A0 owns final merge or cherry-pick into `{self.integration_branch()}`.
 
 First files to read:
 
-- control_plane/fp8/strategy/integration_plan.md
-- control_plane/fp8/strategy/baseline_trace.md
-- control_plane/fp8/governance/operating_model.md
-- control_plane/fp8/state/backlog.yaml
-- control_plane/fp8/state/gates.yaml
-- control_plane/fp8/state/agent_runtime.yaml
+{context_file_text}
 
 Primary test command:
 
@@ -1555,7 +1976,7 @@ Primary test command:
             "worktree_path": worker["worktree_path"],
             "branch": worker["branch"],
             "repository_name": self.project.get("repository_name", "supersonic-moe"),
-            "paddle_repo_path": self.project.get("paddle_repo_path", "unassigned"),
+            "reference_workspace_root": self.reference_workspace_root() or "unassigned",
         }
         command = format_command(template, values)
         env = os.environ.copy()
@@ -1581,6 +2002,7 @@ Primary test command:
             previous.process.terminate()
         self.provider_stats[pool_name]["launch_successes"] += 1
         self.provider_stats[pool_name]["last_failure"] = ""
+        self.persist_provider_stats()
         self.processes[worker["agent"]] = WorkerProcess(
             agent=worker["agent"],
             resource_pool=pool_name,
@@ -1629,6 +2051,7 @@ Primary test command:
                     if pool_name in self.provider_stats:
                         self.provider_stats[pool_name]["launch_failures"] += 1
                         self.provider_stats[pool_name]["last_failure"] = str(exc)
+                        self.persist_provider_stats()
                     provider_name = resolved_policy.provider or worker.get("provider", "unassigned") or "unassigned"
                     model = resolved_policy.model or worker.get("model", "unassigned") or "unassigned"
                     self.update_runtime_entry(worker, pool_name, provider_name, model, f"launch_failed: {exc}")
@@ -1710,6 +2133,7 @@ Primary test command:
             "gates": load_yaml(STATE_DIR / "gates.yaml"),
             "processes": self.process_snapshot(),
             "provider_queue": self.provider_queue(),
+            "resolved_workers": [self.resolved_worker_plan(worker) for worker in self.workers],
             "merge_queue": self.merge_queue(),
             "config": self.config,
             "config_text": config_text,
@@ -1741,6 +2165,7 @@ Primary test command:
                             self.provider_stats[worker.resource_pool][
                                 "last_failure"
                             ] = f"worker exited with {returncode}"
+                        self.persist_provider_stats()
                         state = "offline" if returncode == 0 else "stale"
                         escalation = "worker exited cleanly" if returncode == 0 else f"worker exited with {returncode}"
                         self.update_heartbeat(agent, state, "process_exit", escalation)

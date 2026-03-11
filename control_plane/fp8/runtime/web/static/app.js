@@ -24535,13 +24535,43 @@ function enableSilentMode() {
 // src/App.tsx
 var import_jsx_runtime = __toESM(require_jsx_runtime(), 1);
 var AUTO_REFRESH_MS = 4e3;
+function normalizedText(value) {
+  return String(value ?? "").trim();
+}
+function isAutoManagedBlank(value) {
+  const normalized = normalizedText(value).toLowerCase();
+  return !normalized || normalized === "unassigned";
+}
+function isAutoManagedCommandBlank(value) {
+  const normalized = normalizedText(value).toLowerCase();
+  return !normalized || normalized === "unassigned" || normalized === "none";
+}
+function firstMeaningfulValue(...values) {
+  for (const value of values) {
+    if (!isAutoManagedBlank(value)) {
+      return normalizedText(value);
+    }
+  }
+  return "";
+}
+function firstMeaningfulCommand(...values) {
+  for (const value of values) {
+    if (!isAutoManagedCommandBlank(value)) {
+      return normalizedText(value);
+    }
+  }
+  return "";
+}
+function projectReferenceWorkspace(project) {
+  return normalizedText(project?.reference_workspace_root) || normalizedText(project?.paddle_repo_path);
+}
 function buildSectionValue(config, section) {
   if (section === "project") {
     const project = config.project || {};
     return {
       repository_name: project.repository_name || "",
       local_repo_root: project.local_repo_root || "",
-      paddle_repo_path: project.paddle_repo_path || "",
+      reference_workspace_root: projectReferenceWorkspace(project),
       dashboard: project.dashboard || {}
     };
   }
@@ -24665,6 +24695,120 @@ function deriveWorktreePath(config, agent) {
 function deriveBranchName(agent, title, taskId) {
   const branchSuffix = slugify(title || taskId || agent) || agent.toLowerCase();
   return `${agent.toLowerCase()}_${branchSuffix}`;
+}
+function deriveDefaultEnvironmentPath(config) {
+  const localRepoRoot = normalizedText(config.project?.local_repo_root);
+  if (!localRepoRoot) {
+    return "";
+  }
+  return `${localRepoRoot.replace(/\/$/, "")}/.venv`;
+}
+function deriveDefaultPoolQueue(config, data) {
+  if (data?.provider_queue?.length) {
+    return data.provider_queue.map((item) => item.resource_pool);
+  }
+  return Object.entries(config.resource_pools || {}).sort((left, right) => Number(right[1].priority ?? 100) - Number(left[1].priority ?? 100)).map(([poolName]) => poolName);
+}
+function inferRuntimeWorkerValue(data, field, allowNone = false) {
+  const counts = /* @__PURE__ */ new Map();
+  (data?.runtime.workers || []).forEach((worker) => {
+    if (worker.agent === "A0") {
+      return;
+    }
+    const value = normalizedText(worker[field]);
+    const lowered = value.toLowerCase();
+    if (!value || lowered === "unassigned" || !allowNone && lowered === "none") {
+      return;
+    }
+    counts.set(value, (counts.get(value) || 0) + 1);
+  });
+  return Array.from(counts.entries()).sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))[0]?.[0] || "";
+}
+function buildRuntimeWorkerMap(data) {
+  return new Map((data?.runtime.workers || []).map((worker) => [worker.agent, worker]));
+}
+function buildResolvedWorkerMap(data) {
+  return new Map((data?.resolved_workers || []).map((worker) => [worker.agent, worker]));
+}
+function hydrateConfigForA0(data, config) {
+  const next = normalizeConfig(cloneConfig(config));
+  const runtimeByAgent = buildRuntimeWorkerMap(data);
+  const resolvedByAgent = buildResolvedWorkerMap(data);
+  const managerRuntime = runtimeByAgent.get("A0");
+  next.project = next.project || {};
+  next.project.repository_name = firstMeaningfulValue(next.project.repository_name, managerRuntime?.repository_name);
+  next.project.local_repo_root = firstMeaningfulValue(
+    next.project.local_repo_root,
+    managerRuntime?.local_workspace_root,
+    managerRuntime?.repository_root
+  );
+  next.project.integration_branch = firstMeaningfulValue(next.project.integration_branch, next.project.base_branch, "main");
+  next.project.dashboard = next.project.dashboard || {};
+  next.project.dashboard.host = firstMeaningfulValue(next.project.dashboard.host, "0.0.0.0");
+  if (!Number.isInteger(Number(next.project.dashboard.port)) || Number(next.project.dashboard.port) <= 0) {
+    next.project.dashboard.port = 8233;
+  }
+  next.worker_defaults = next.worker_defaults || {};
+  if (!Array.isArray(next.worker_defaults.resource_pool_queue) || next.worker_defaults.resource_pool_queue.length === 0) {
+    next.worker_defaults.resource_pool_queue = deriveDefaultPoolQueue(next, data);
+  }
+  next.worker_defaults.environment_type = firstMeaningfulValue(
+    next.worker_defaults.environment_type,
+    inferRuntimeWorkerValue(data, "environment_type", true),
+    "uv"
+  );
+  if (next.worker_defaults.environment_type !== "none") {
+    next.worker_defaults.environment_path = firstMeaningfulValue(
+      next.worker_defaults.environment_path,
+      inferRuntimeWorkerValue(data, "environment_path"),
+      deriveDefaultEnvironmentPath(next)
+    );
+  }
+  next.worker_defaults.sync_command = firstMeaningfulCommand(
+    next.worker_defaults.sync_command,
+    inferRuntimeWorkerValue(data, "sync_command"),
+    next.worker_defaults.environment_type === "uv" ? "uv sync" : ""
+  );
+  next.worker_defaults.submit_strategy = firstMeaningfulCommand(
+    next.worker_defaults.submit_strategy,
+    inferRuntimeWorkerValue(data, "submit_strategy"),
+    "patch_handoff"
+  );
+  next.worker_defaults.test_command = firstMeaningfulCommand(
+    next.worker_defaults.test_command,
+    inferRuntimeWorkerValue(data, "test_command"),
+    "uv run pytest tests/moe_test.py"
+  );
+  const plannedWorkers = buildPlannedWorkers(data, next);
+  const plannedAgents = new Set(plannedWorkers.map((worker) => worker.agent));
+  const existingByAgent = new Map((next.workers || []).filter((worker) => normalizedText(worker.agent)).map((worker) => [worker.agent, worker]));
+  const hydratedPlannedWorkers = plannedWorkers.map((plannedWorker) => {
+    const existing = existingByAgent.get(plannedWorker.agent);
+    const runtimeWorker = runtimeByAgent.get(plannedWorker.agent);
+    const resolvedWorker = resolvedByAgent.get(plannedWorker.agent);
+    const gitIdentity = existing?.git_identity && (existing.git_identity.name || existing.git_identity.email) ? existing.git_identity : void 0;
+    return {
+      agent: plannedWorker.agent,
+      task_id: firstMeaningfulValue(existing?.task_id, resolvedWorker?.task_id, plannedWorker.task_id),
+      branch: firstMeaningfulValue(existing?.branch, resolvedWorker?.branch, runtimeWorker?.branch, plannedWorker.branch),
+      worktree_path: firstMeaningfulValue(existing?.worktree_path, resolvedWorker?.worktree_path, runtimeWorker?.worktree_path, plannedWorker.worktree_path),
+      resource_pool: firstMeaningfulValue(existing?.resource_pool, resolvedWorker?.resource_pool, resolvedWorker?.locked_pool, runtimeWorker?.resource_pool),
+      resource_pool_queue: Array.isArray(existing?.resource_pool_queue) && existing.resource_pool_queue.length > 0 ? existing.resource_pool_queue : resolvedWorker?.resource_pool_queue || [],
+      environment_type: firstMeaningfulValue(existing?.environment_type, runtimeWorker?.environment_type),
+      environment_path: firstMeaningfulValue(existing?.environment_path, runtimeWorker?.environment_path),
+      sync_command: firstMeaningfulCommand(existing?.sync_command, runtimeWorker?.sync_command),
+      test_command: firstMeaningfulCommand(existing?.test_command, resolvedWorker?.test_command, runtimeWorker?.test_command),
+      submit_strategy: firstMeaningfulCommand(existing?.submit_strategy, runtimeWorker?.submit_strategy),
+      git_identity: gitIdentity
+    };
+  });
+  const extraWorkers = (next.workers || []).filter((worker) => !plannedAgents.has(worker.agent)).map((worker) => ({
+    ...worker,
+    branch: worker.branch || (worker.agent ? deriveBranchName(worker.agent, worker.task_id || worker.agent, worker.task_id || worker.agent) : ""),
+    worktree_path: worker.worktree_path || deriveWorktreePath(next, worker.agent)
+  }));
+  next.workers = [...hydratedPlannedWorkers, ...extraWorkers];
+  return next;
 }
 function sectionMatchesField(section, field) {
   if (section === "project") {
@@ -24816,8 +24960,9 @@ function getLocalValidationIssues(config) {
   if (!String(project.local_repo_root || "").trim()) {
     add("project.local_repo_root", "local repo root is required");
   }
-  if (!String(project.paddle_repo_path || "").trim()) {
-    add("project.paddle_repo_path", "Paddle path is required");
+  const referenceWorkspace = projectReferenceWorkspace(project);
+  if (referenceWorkspace && referenceWorkspace.startsWith("/absolute/path/")) {
+    add("project.reference_workspace_root", "reference workspace must be replaced with a real path");
   }
   if (!String(dashboard.host || "").trim()) {
     add("project.dashboard.host", "dashboard host is required");
@@ -24979,6 +25124,55 @@ function SectionHeader({
     ] })
   ] });
 }
+function AutomationSummary({ draftConfig, data }) {
+  const plannedWorkers = buildPlannedWorkers(data, draftConfig);
+  const autoManaged = [
+    "Repository name and dashboard host/port defaults",
+    "Worker roster from backlog and runtime state",
+    "Worker task IDs from the current plan",
+    "Suggested branch names from task ownership and title",
+    "Worktree paths from repo root plus agent ID",
+    "Task-aware resource-pool recommendation and lock from provider quality history",
+    "Default pool queue from live provider ranking",
+    "Environment type/path defaults",
+    "Default sync command",
+    "Default submit strategy",
+    "Task-aware test-command selection with safe fallbacks"
+  ];
+  const userOnly = [
+    "Local repo root if A0 cannot infer it correctly",
+    "Paddle repo path",
+    "Integration branch policy",
+    "Resource-pool credentials, provider choice, and model choice",
+    "Only the exceptional per-worker overrides that truly differ from the default path"
+  ];
+  return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "helper-card settings-card settings-card-wide", children: [
+    /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "section-head", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", { children: "A0-Managed Defaults" }),
+      /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "small muted", children: [
+        autoManaged.length,
+        " areas auto-managed, ",
+        userOnly.length,
+        " areas still need human confirmation"
+      ] })
+    ] }),
+    /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", { className: "small muted", children: [
+      "Planned workers currently detected: ",
+      plannedWorkers.map((worker) => worker.agent).join(", ") || "none",
+      "."
+    ] }),
+    /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "automation-grid", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "subcard", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "subcard-title", children: "You should usually not need to fill these by hand" }),
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("ul", { className: "automation-list", children: autoManaged.map((item) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("li", { children: item }, item)) })
+      ] }),
+      /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "subcard", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "subcard-title", children: "You should mostly only confirm these" }),
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("ul", { className: "automation-list", children: userOnly.map((item) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("li", { children: item }, item)) })
+      ] })
+    ] })
+  ] });
+}
 function OverviewTab({ data, agentRows, progress }) {
   const mergeQueue = data.merge_queue || [];
   const mergeReady = mergeQueue.filter((item) => ["offline", "stopped"].includes(String(item.status))).length;
@@ -25061,7 +25255,7 @@ function OperationsTab({ data }) {
   const projectRows = [
     { key: "repository_name", value: data.project.repository_name || "" },
     { key: "local_repo_root", value: data.project.local_repo_root || "" },
-    { key: "paddle_repo_path", value: data.project.paddle_repo_path || "" },
+    { key: "reference_workspace_root", value: projectReferenceWorkspace(data.project) },
     { key: "integration_branch", value: data.project.integration_branch || data.project.base_branch || "" },
     { key: "dashboard", value: data.project.dashboard?.host && data.project.dashboard?.port ? `${data.project.dashboard.host}:${data.project.dashboard.port}` : "" },
     { key: "listener_active", value: data.mode.listener_active }
@@ -25153,24 +25347,14 @@ function SettingsTab({
   const workerDefaults = draftConfig.worker_defaults || {};
   const workers = draftConfig.workers || [];
   const plannedWorkers = buildPlannedWorkers(data, draftConfig);
+  const resolvedByAgent = buildResolvedWorkerMap(data);
   const issues = buildIssueMap(allIssues);
   return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "tab-body", children: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "card", children: [
     /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "page-header", children: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
       /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", { children: "Settings" }),
-      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { className: "small", children: "Each block can be validated and saved independently. Worker paths and plan coverage can be generated automatically." })
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { className: "small", children: "A0 now auto-hydrates the worker roster, branch proposals, worktree paths, and shared defaults. You should mostly verify project paths, pool routing, and true exceptions." })
     ] }) }),
-    /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "settings-grid", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "helper-card settings-card", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SectionHeader, { title: "Project", section: "project", status: sectionStatuses.project, onValidate: onValidateSection, onSave: onSaveSection }),
-        /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SectionIssueList, { issues: collectSectionIssues("project", allIssues) }),
-        /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "field-grid", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Repository", value: project.repository_name || "", onChange: (value) => onProjectChange("repository_name", value), issues: issues["project.repository_name"] }),
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Local Repo Root", value: project.local_repo_root || "", onChange: (value) => onProjectChange("local_repo_root", value), issues: issues["project.local_repo_root"] }),
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Paddle Repo Path", value: project.paddle_repo_path || "", onChange: (value) => onProjectChange("paddle_repo_path", value), issues: issues["project.paddle_repo_path"] }),
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Dashboard Host", value: dashboard.host || "", onChange: (value) => onProjectChange("dashboard.host", value), issues: issues["project.dashboard.host"] }),
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Dashboard Port", type: "number", value: dashboard.port || 8233, onChange: (value) => onProjectChange("dashboard.port", value), issues: issues["project.dashboard.port"] })
-        ] })
-      ] }),
+    /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "settings-stack", children: [
       /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "helper-card settings-card settings-card-wide", children: [
         /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SectionHeader, { title: "Resource Pools", section: "resource_pools", status: sectionStatuses.resource_pools, onValidate: onValidateSection, onSave: onSaveSection, action: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { className: "ghost", type: "button", onClick: onAddPool, children: "Add Pool" }) }),
         /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SectionIssueList, { issues: collectSectionIssues("resource_pools", allIssues) }),
@@ -25184,19 +25368,32 @@ function SettingsTab({
           ] })
         ] }, poolName)) })
       ] }),
-      /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "helper-card settings-card", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SectionHeader, { title: "Merge Policy", section: "merge_policy", status: sectionStatuses.merge_policy, onValidate: onValidateSection, onSave: onSaveSection }),
-        /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SectionIssueList, { issues: collectSectionIssues("merge_policy", allIssues) }),
-        /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "field-grid", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Integration Branch", value: project.integration_branch || project.base_branch || "", onChange: (value) => onMergeChange("integration_branch", value), issues: issues["project.integration_branch"] }),
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Manager Name", value: project.manager_git_identity?.name || "", onChange: (value) => onMergeChange("manager_git_identity.name", value) }),
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Manager Email", value: project.manager_git_identity?.email || "", onChange: (value) => onMergeChange("manager_git_identity.email", value) })
+      /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "settings-duo", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "helper-card settings-card", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SectionHeader, { title: "Project", section: "project", status: sectionStatuses.project, onValidate: onValidateSection, onSave: onSaveSection }),
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SectionIssueList, { issues: collectSectionIssues("project", allIssues) }),
+          /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "field-grid", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Repository", value: project.repository_name || "", onChange: (value) => onProjectChange("repository_name", value), issues: issues["project.repository_name"] }),
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Local Repo Root", value: project.local_repo_root || "", onChange: (value) => onProjectChange("local_repo_root", value), issues: issues["project.local_repo_root"] }),
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Reference Workspace", value: projectReferenceWorkspace(project), onChange: (value) => onProjectChange("reference_workspace_root", value), issues: issues["project.reference_workspace_root"], helpText: "Optional shared reference repo or baseline workspace for task guidance." }),
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Dashboard Host", value: dashboard.host || "", onChange: (value) => onProjectChange("dashboard.host", value), issues: issues["project.dashboard.host"] }),
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Dashboard Port", type: "number", value: dashboard.port || 8233, onChange: (value) => onProjectChange("dashboard.port", value), issues: issues["project.dashboard.port"] })
+          ] })
+        ] }),
+        /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "helper-card settings-card", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SectionHeader, { title: "Merge Policy", section: "merge_policy", status: sectionStatuses.merge_policy, onValidate: onValidateSection, onSave: onSaveSection }),
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SectionIssueList, { issues: collectSectionIssues("merge_policy", allIssues) }),
+          /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "field-grid", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Integration Branch", value: project.integration_branch || project.base_branch || "", onChange: (value) => onMergeChange("integration_branch", value), issues: issues["project.integration_branch"] }),
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Manager Name", value: project.manager_git_identity?.name || "", onChange: (value) => onMergeChange("manager_git_identity.name", value) }),
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Manager Email", value: project.manager_git_identity?.email || "", onChange: (value) => onMergeChange("manager_git_identity.email", value) })
+          ] })
         ] })
       ] }),
       /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "helper-card settings-card settings-card-wide", children: [
         /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SectionHeader, { title: "Worker Defaults", section: "worker_defaults", status: sectionStatuses.worker_defaults, onValidate: onValidateSection, onSave: onSaveSection }),
         /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SectionIssueList, { issues: collectSectionIssues("worker_defaults", allIssues) }),
-        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { className: "small muted", children: "These values apply to every worker unless a row below overrides them." }),
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { className: "small muted", children: "These values apply to every worker unless a row below overrides them. Blank fields are auto-filled from runtime conventions or sensible defaults where possible." }),
         /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "field-grid", children: [
           /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Default Pool", value: workerDefaults.resource_pool || "", onChange: (value) => onWorkerChange(-1, "worker_defaults.resource_pool", value), issues: issues["worker_defaults.resource_pool"], helpText: "Leave blank to rely on pool queue or per-worker overrides." }),
           /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Default Pool Queue", value: stringifyQueue(workerDefaults.resource_pool_queue), onChange: (value) => onWorkerChange(-1, "worker_defaults.resource_pool_queue", value), issues: issues["worker_defaults.resource_pool_queue"], placeholder: "copilot_pool, claude_pool" }),
@@ -25209,6 +25406,7 @@ function SettingsTab({
           /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Default Git Email", value: workerDefaults.git_identity?.email || "", onChange: (value) => onWorkerChange(-1, "worker_defaults.git_identity.email", value), issues: issues["worker_defaults.git_identity.email"] })
         ] })
       ] }),
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)(AutomationSummary, { draftConfig, data }),
       /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "helper-card settings-card settings-card-wide", children: [
         /* @__PURE__ */ (0, import_jsx_runtime.jsx)(
           SectionHeader,
@@ -25229,31 +25427,37 @@ function SettingsTab({
         /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", { className: "small muted", children: [
           "Detected workers from backlog/runtime: ",
           plannedWorkers.map((item) => item.agent).join(", ") || "none",
-          ". Leave overrides blank to inherit defaults."
+          ". A0 keeps roster, task IDs, branches, and worktree suggestions hydrated by default; leave overrides blank unless this worker is an exception."
         ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "worker-grid", children: workers.map((worker, index) => /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "subcard", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "subcard-title", children: worker.agent || `Worker ${index + 1}` }),
-          /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "field-grid", children: [
-            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Agent", value: worker.agent || "", onChange: (value) => onWorkerChange(index, "agent", value), issues: issues[`workers[${index}].agent`] }),
-            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Task ID", value: worker.task_id || "", onChange: (value) => onWorkerChange(index, "task_id", value) }),
-            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Branch", value: worker.branch || "", onChange: (value) => onWorkerChange(index, "branch", value), issues: issues[`workers[${index}].branch`] }),
-            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Worktree Path", value: worker.worktree_path || "", onChange: (value) => onWorkerChange(index, "worktree_path", value), issues: issues[`workers[${index}].worktree_path`] }),
-            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Pool Override", value: worker.resource_pool || "", onChange: (value) => onWorkerChange(index, "resource_pool", value), issues: issues[`workers[${index}].resource_pool`], helpText: workerDefaults.resource_pool ? `Default: ${workerDefaults.resource_pool}` : "Blank means inherit default routing." }),
-            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Queue Override", value: stringifyQueue(worker.resource_pool_queue), onChange: (value) => onWorkerChange(index, "resource_pool_queue", value), issues: issues[`workers[${index}].resource_pool_queue`], placeholder: "pool_a, pool_b", helpText: workerDefaults.resource_pool_queue?.length ? `Default: ${stringifyQueue(workerDefaults.resource_pool_queue)}` : "Blank means inherit default queue." })
-          ] }),
-          /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("details", { className: "advanced-panel", children: [
-            /* @__PURE__ */ (0, import_jsx_runtime.jsx)("summary", { children: "Advanced overrides" }),
-            /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "field-grid advanced-grid", children: [
-              /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SelectField, { label: "Environment Type", value: worker.environment_type || "", onChange: (value) => onWorkerChange(index, "environment_type", value), options: ["uv", "venv", "none"] }),
-              /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Environment Path", value: worker.environment_path || "", onChange: (value) => onWorkerChange(index, "environment_path", value), issues: issues[`workers[${index}].environment_path`], helpText: workerDefaults.environment_path ? `Default: ${workerDefaults.environment_path}` : void 0 }),
-              /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Sync Command", value: worker.sync_command || "", onChange: (value) => onWorkerChange(index, "sync_command", value), helpText: workerDefaults.sync_command ? `Default: ${workerDefaults.sync_command}` : void 0 }),
-              /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Test Command", value: worker.test_command || "", onChange: (value) => onWorkerChange(index, "test_command", value), issues: issues[`workers[${index}].test_command`], helpText: workerDefaults.test_command ? `Default: ${workerDefaults.test_command}` : void 0 }),
-              /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Submit Strategy", value: worker.submit_strategy || "", onChange: (value) => onWorkerChange(index, "submit_strategy", value), issues: issues[`workers[${index}].submit_strategy`], helpText: workerDefaults.submit_strategy ? `Default: ${workerDefaults.submit_strategy}` : void 0 }),
-              /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Git Name", value: worker.git_identity?.name || "", onChange: (value) => onWorkerChange(index, "git_identity.name", value), helpText: workerDefaults.git_identity?.name ? `Default: ${workerDefaults.git_identity.name}` : void 0 }),
-              /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Git Email", value: worker.git_identity?.email || "", onChange: (value) => onWorkerChange(index, "git_identity.email", value), helpText: workerDefaults.git_identity?.email ? `Default: ${workerDefaults.git_identity.email}` : void 0 })
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "worker-grid", children: workers.map((worker, index) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "subcard", children: (() => {
+          const resolved = resolvedByAgent.get(worker.agent || "");
+          const recommendation = resolved?.pool_reason || "";
+          const suggestedTest = resolved?.suggested_test_command || "";
+          return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "subcard-title", children: worker.agent || `Worker ${index + 1}` }),
+            recommendation ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { className: "small muted", children: recommendation }) : null,
+            /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "field-grid", children: [
+              /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Agent", value: worker.agent || "", onChange: (value) => onWorkerChange(index, "agent", value), issues: issues[`workers[${index}].agent`] }),
+              /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Task ID", value: worker.task_id || "", onChange: (value) => onWorkerChange(index, "task_id", value) }),
+              /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Branch", value: worker.branch || "", onChange: (value) => onWorkerChange(index, "branch", value), issues: issues[`workers[${index}].branch`] }),
+              /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Worktree Path", value: worker.worktree_path || "", onChange: (value) => onWorkerChange(index, "worktree_path", value), issues: issues[`workers[${index}].worktree_path`] }),
+              /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Pool Override", value: worker.resource_pool || "", onChange: (value) => onWorkerChange(index, "resource_pool", value), issues: issues[`workers[${index}].resource_pool`], helpText: resolved?.locked_pool ? `A0 lock: ${resolved.locked_pool}` : resolved?.recommended_pool ? `A0 recommends: ${resolved.recommended_pool}` : workerDefaults.resource_pool ? `Default: ${workerDefaults.resource_pool}` : "Blank means inherit A0 routing." }),
+              /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Queue Override", value: stringifyQueue(worker.resource_pool_queue), onChange: (value) => onWorkerChange(index, "resource_pool_queue", value), issues: issues[`workers[${index}].resource_pool_queue`], placeholder: "pool_a, pool_b", helpText: resolved?.resource_pool_queue?.length ? `A0 order: ${stringifyQueue(resolved.resource_pool_queue)}` : workerDefaults.resource_pool_queue?.length ? `Default: ${stringifyQueue(workerDefaults.resource_pool_queue)}` : "Blank means inherit A0 queue." })
+            ] }),
+            /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("details", { className: "advanced-panel", children: [
+              /* @__PURE__ */ (0, import_jsx_runtime.jsx)("summary", { children: "Advanced overrides" }),
+              /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "field-grid advanced-grid", children: [
+                /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SelectField, { label: "Environment Type", value: worker.environment_type || "", onChange: (value) => onWorkerChange(index, "environment_type", value), options: ["uv", "venv", "none"] }),
+                /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Environment Path", value: worker.environment_path || "", onChange: (value) => onWorkerChange(index, "environment_path", value), issues: issues[`workers[${index}].environment_path`], helpText: workerDefaults.environment_path ? `Default: ${workerDefaults.environment_path}` : void 0 }),
+                /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Sync Command", value: worker.sync_command || "", onChange: (value) => onWorkerChange(index, "sync_command", value), helpText: workerDefaults.sync_command ? `Default: ${workerDefaults.sync_command}` : void 0 }),
+                /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Test Command", value: worker.test_command || "", onChange: (value) => onWorkerChange(index, "test_command", value), issues: issues[`workers[${index}].test_command`], helpText: suggestedTest ? `A0 picked: ${suggestedTest}` : workerDefaults.test_command ? `Default: ${workerDefaults.test_command}` : void 0 }),
+                /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Submit Strategy", value: worker.submit_strategy || "", onChange: (value) => onWorkerChange(index, "submit_strategy", value), issues: issues[`workers[${index}].submit_strategy`], helpText: workerDefaults.submit_strategy ? `Default: ${workerDefaults.submit_strategy}` : void 0 }),
+                /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Git Name", value: worker.git_identity?.name || "", onChange: (value) => onWorkerChange(index, "git_identity.name", value), helpText: workerDefaults.git_identity?.name ? `Default: ${workerDefaults.git_identity.name}` : void 0 }),
+                /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Git Email", value: worker.git_identity?.email || "", onChange: (value) => onWorkerChange(index, "git_identity.email", value), helpText: workerDefaults.git_identity?.email ? `Default: ${workerDefaults.git_identity.email}` : void 0 })
+              ] })
             ] })
-          ] })
-        ] }, `${worker.agent || "worker"}-${index}`)) })
+          ] });
+        })() }, `${worker.agent || "worker"}-${index}`)) })
       ] })
     ] })
   ] }) });
@@ -25397,7 +25601,7 @@ function App() {
       const nextData = await fetchState(controller.signal);
       setData(nextData);
       if (!configDirty) {
-        setDraftConfig(cloneConfig(nextData.config));
+        setDraftConfig(hydrateConfigForA0(nextData, cloneConfig(nextData.config)));
         setBackendIssues([]);
         setSectionStatuses({});
       }
@@ -25445,7 +25649,7 @@ function App() {
   const updateConfig = (updater) => {
     setConfigDirty(true);
     setBackendIssues([]);
-    setDraftConfig((current) => normalizeConfig(updater(normalizeConfig(cloneConfig(current)))));
+    setDraftConfig((current) => hydrateConfigForA0(data, normalizeConfig(updater(normalizeConfig(cloneConfig(current))))));
   };
   const refreshStateOnly = async () => {
     const controller = new AbortController();
@@ -25468,8 +25672,8 @@ function App() {
         next.project.repository_name = value;
       } else if (field === "local_repo_root") {
         next.project.local_repo_root = value;
-      } else if (field === "paddle_repo_path") {
-        next.project.paddle_repo_path = value;
+      } else if (field === "reference_workspace_root" || field === "paddle_repo_path") {
+        next.project.reference_workspace_root = value;
       }
       next.workers = (next.workers || []).map((worker) => ({
         ...worker,
@@ -25567,14 +25771,28 @@ function App() {
     updateConfig((current) => {
       const next = normalizeConfig(current);
       const workers = [...next.workers || []];
-      workers.push({
-        agent: `A${workers.length + 1}`,
-        task_id: "",
-        resource_pool: "",
-        resource_pool_queue: [],
-        worktree_path: "",
-        branch: ""
-      });
+      const usedAgents = new Set(workers.map((worker) => worker.agent));
+      const plannedCandidate = buildPlannedWorkers(data, next).find((worker) => !usedAgents.has(worker.agent));
+      if (plannedCandidate) {
+        workers.push({
+          agent: plannedCandidate.agent,
+          task_id: plannedCandidate.task_id,
+          resource_pool: "",
+          resource_pool_queue: [],
+          worktree_path: plannedCandidate.worktree_path,
+          branch: plannedCandidate.branch
+        });
+      } else {
+        const nextAgent = `A${workers.length + 1}`;
+        workers.push({
+          agent: nextAgent,
+          task_id: `${nextAgent}-001`,
+          resource_pool: "",
+          resource_pool_queue: [],
+          worktree_path: deriveWorktreePath(next, nextAgent),
+          branch: deriveBranchName(nextAgent, nextAgent, `${nextAgent}-001`)
+        });
+      }
       next.workers = workers;
       return next;
     });

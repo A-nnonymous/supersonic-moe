@@ -226,6 +226,9 @@ button:disabled {
 .merge-board,
 .agent-wall,
 .helper-list,
+.settings-stack,
+.settings-duo,
+.automation-grid,
 .progress-card,
 .tab-body,
 .settings-grid,
@@ -263,6 +266,15 @@ button:disabled {
   align-items: start;
 }
 
+.settings-stack {
+  gap: 16px;
+}
+
+.settings-duo {
+  grid-template-columns: minmax(0, 1.3fr) minmax(320px, 0.7fr);
+  align-items: start;
+}
+
 .settings-card-wide {
   grid-column: 1 / -1;
 }
@@ -278,6 +290,20 @@ button:disabled {
 .worker-grid {
   grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
   align-items: start;
+}
+
+.automation-grid {
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  align-items: start;
+}
+
+.automation-list {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 13px;
 }
 
 .pool-strip {
@@ -624,6 +650,8 @@ th {
   }
 
   .overview-hero,
+  .settings-duo,
+  .automation-grid,
   .settings-grid,
   .field-grid,
   .worker-grid,

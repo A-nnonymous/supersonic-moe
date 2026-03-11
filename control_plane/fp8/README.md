@@ -116,11 +116,12 @@ What these do by default:
 Fill `runtime/local_config.yaml` from the Settings page or by editing YAML directly. At minimum, replace placeholder values for:
 
 - `project.local_repo_root`
-- `project.paddle_repo_path`
+- `project.reference_workspace_root` if your workflow depends on a shared reference repo or baseline workspace
 - resource pool credentials or credential env vars
 - `worker_defaults.environment_path`
-- `worker_defaults.test_command`
 - every worker `worktree_path`
+
+Task-aware defaults now come from explicit `task_policies` plus backlog `task_type` metadata, so you should only set `worker_defaults.test_command` when you want to override A0's policy-driven selection for every worker.
 
 Then use the settings workflow in this order:
 

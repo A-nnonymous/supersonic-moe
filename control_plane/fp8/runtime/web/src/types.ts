@@ -57,11 +57,39 @@ export type MergeQueueItem = {
 
 export type RuntimeWorker = {
   agent: string;
+  task_id?: string;
+  repository_name?: string;
   resource_pool: string;
   provider: string;
   model: string;
+  local_workspace_root?: string;
+  repository_root?: string;
+  worktree_path?: string;
   branch: string;
+  environment_type?: string;
+  environment_path?: string;
+  sync_command?: string;
+  test_command?: string;
+  submit_strategy?: string;
   status: string;
+};
+
+export type ResolvedWorkerPlan = {
+  agent: string;
+  task_id: string;
+  task_title: string;
+  task_type: string;
+  task_category: string;
+  preferred_providers: string[];
+  branch: string;
+  worktree_path: string;
+  resource_pool: string;
+  resource_pool_queue: string[];
+  recommended_pool: string;
+  locked_pool: string;
+  pool_reason: string;
+  test_command: string;
+  suggested_test_command: string;
 };
 
 export type HeartbeatAgent = {
@@ -104,6 +132,7 @@ export type GateItem = {
 export type ConfigProject = {
   repository_name?: string;
   local_repo_root?: string;
+  reference_workspace_root?: string;
   paddle_repo_path?: string;
   integration_branch?: string;
   base_branch?: string;
@@ -189,6 +218,7 @@ export type DashboardState = {
   gates: { gates?: GateItem[] };
   processes: Record<string, ProcessSnapshot>;
   provider_queue: ProviderQueueItem[];
+  resolved_workers: ResolvedWorkerPlan[];
   merge_queue: MergeQueueItem[];
   config: ConfigShape;
   config_text: string;

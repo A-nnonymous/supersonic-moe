@@ -26,18 +26,19 @@ Operate or evolve the FP8 control plane without losing the simplified workflow t
 1. Preserve the simplest reliable operator path first.
 2. Do not reintroduce dry-run-first or YAML-first workflow unless explicitly requested.
 3. Keep shared defaults in `worker_defaults`; keep worker-specific cards lean.
-4. Auto-fill safe values like derived worktree paths instead of forcing manual entry.
+4. A0 should auto-fill safe values like task IDs, branch names, worktree paths, test commands, and default routing instead of forcing manual entry.
 5. Let operators validate and save one settings block at a time.
 6. Keep worker roster logic synchronized with backlog/runtime plan.
-7. Keep docs and runtime behavior aligned in the same change.
+7. Use provider availability plus persisted quality history when A0 recommends or locks a resource pool.
+8. Keep docs and runtime behavior aligned in the same change.
 
 ## High-Frequency Operator Path
 
 1. Start the dashboard with `python control_plane/fp8/runtime/control_plane.py serve`.
-2. Open Settings and fill Project and Merge Policy first.
+2. Open Settings and fill only the project paths and pool credentials A0 cannot infer.
 3. Configure Resource Pools.
-4. Fill `worker_defaults` for environment, sync, test, submit, and git identity behavior.
-5. Sync or add workers, then only adjust per-worker identity, branch, worktree, and routing overrides.
+4. Let A0 hydrate `worker_defaults` and worker roster from runtime/backlog first.
+5. Change per-worker fields only when a worker is a real exception to the default path.
 6. Validate and save only the section being edited.
 7. Launch with the default flow or the selected launch policy.
 8. Use `stop-agents`, `silent`, or `stop-all` according to how much of the system should remain alive.
@@ -48,9 +49,15 @@ Operate or evolve the FP8 control plane without losing the simplified workflow t
 
 - set `repository_name`
 - set `local_repo_root`
-- set `paddle_repo_path`
+- set `reference_workspace_root` only if the project has a shared reference repo or baseline workspace
 - confirm dashboard host/port behavior if changed
 - verify worktree auto-derivation still makes sense from the project root
+
+### Task Policies
+
+- prefer explicit backlog `task_type` fields over title-based inference
+- keep `task_policies.rules` and `task_policies.types` aligned so A0 routing stays data-driven
+- set a shared default test command only in `task_policies.defaults` or `worker_defaults` when every task really shares it
 
 ### Merge Policy
 
@@ -68,7 +75,7 @@ Operate or evolve the FP8 control plane without losing the simplified workflow t
 
 - set shared environment type/path
 - set shared sync command
-- set shared test command
+- set shared test command only if you need to override A0's task-aware default selection
 - set shared submit strategy
 - set shared git identity if workers should inherit one
 
@@ -76,8 +83,9 @@ Operate or evolve the FP8 control plane without losing the simplified workflow t
 
 - sync from backlog/runtime if roster should match plan
 - confirm all expected agents are present, not just template leftovers
-- verify branch naming is plausible
-- verify worktree paths are unique and auto-filled where possible
+- verify A0-generated branch naming is plausible
+- verify A0-generated worktree paths are unique
+- verify A0-selected test commands and pool locks only where the task is unusual
 - open advanced overrides only for real exceptions
 
 ## Change Checklist For Agents
@@ -85,6 +93,7 @@ Operate or evolve the FP8 control plane without losing the simplified workflow t
 ### If Changing Backend Runtime
 
 - check how the change affects `worker_defaults` merge behavior
+- check how the change affects A0 task policy resolution and inferred worker defaults
 - check whether validation errors still map cleanly to settings sections
 - check whether launch blockers remain consistent with runtime launch behavior
 - check whether stop/listener semantics still honor per-port session state
@@ -113,6 +122,7 @@ Operate or evolve the FP8 control plane without losing the simplified workflow t
 
 - Did this make the common launch/stop flow longer or harder to trust?
 - Did this push users back toward repetitive per-worker entry?
+- Did this make the operator enter information that A0 already knew from backlog/runtime/provider state?
 - Did this reintroduce large blank areas in Settings?
 - Did docs drift away from current runtime behavior?
 - Did worker roster behavior fall back to stale examples instead of live plan state?

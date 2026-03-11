@@ -137,7 +137,7 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
             "project": {
                 "repository_name": "sonicmoe-fp8-it",
                 "local_repo_root": str(self.project_root),
-                "paddle_repo_path": str(self.paddle_root),
+                "reference_workspace_root": str(self.paddle_root),
                 "base_branch": "main",
                 "integration_branch": "main",
                 "manager_git_identity": {
@@ -187,6 +187,27 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
                     ],
                 },
             },
+            "task_policies": {
+                "defaults": {
+                    "task_type": "default",
+                    "preferred_providers": ["copilot", "claude_code", "opencode"],
+                    "suggested_test_command": "uv run pytest tests/moe_test.py -k test_moe",
+                },
+                "types": {
+                    "protocol": {
+                        "preferred_providers": ["copilot", "claude_code", "opencode"],
+                        "suggested_test_command": "uv run pytest tests/reference_layers/standalone_moe_layer/tests/test_imports_and_interfaces.py",
+                    },
+                    "audit_hopper": {
+                        "preferred_providers": ["copilot", "claude_code", "opencode"],
+                        "suggested_test_command": "uv run pytest tests/moe_test.py -k test_moe",
+                    },
+                },
+                "rules": [
+                    {"name": "protocol-a1", "task_type": "protocol", "task_ids": ["A1-001"]},
+                    {"name": "audit-a2", "task_type": "audit_hopper", "task_ids": ["A2-001"]},
+                ],
+            },
             "resource_pools": {
                 "copilot_pool": {
                     "priority": 100,
@@ -214,13 +235,12 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
                 "resource_pool_queue": ["copilot_pool", "opencode_pool", "claude_pool"],
                 "environment_type": "none",
                 "sync_command": "none",
-                "test_command": "true",
                 "submit_strategy": "patch_handoff",
             },
             "workers": [
                 {
                     "agent": "A1",
-                    "task_id": "A1-it",
+                    "task_id": "A1-001",
                     "branch": "integration-a1",
                     "worktree_path": str(self.worker_roots["A1"]),
                     "git_identity": {
@@ -230,7 +250,7 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
                 },
                 {
                     "agent": "A2",
-                    "task_id": "A2-it",
+                    "task_id": "A2-001",
                     "branch": "integration-a2",
                     "worktree_path": str(self.worker_roots["A2"]),
                     "git_identity": {
@@ -293,6 +313,16 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
     def test_multi_agent_launch_policies_and_heartbeats(self) -> None:
         initial_state = self.fetch_state()
         self.assertEqual(initial_state["launch_policy"]["default_strategy"], "initial_copilot")
+        resolved_workers = {item["agent"]: item for item in initial_state["resolved_workers"]}
+        self.assertEqual(
+            resolved_workers["A1"]["test_command"],
+            "uv run pytest tests/reference_layers/standalone_moe_layer/tests/test_imports_and_interfaces.py",
+        )
+        self.assertEqual(resolved_workers["A1"]["task_type"], "protocol")
+        self.assertEqual(resolved_workers["A1"]["locked_pool"], "copilot_pool")
+        self.assertEqual(resolved_workers["A2"]["test_command"], "uv run pytest tests/moe_test.py -k test_moe")
+        self.assertEqual(resolved_workers["A2"]["task_type"], "audit_hopper")
+        self.assertEqual(resolved_workers["A2"]["locked_pool"], "copilot_pool")
 
         launch_result = read_json(f"{self.base_url}/api/launch", {"restart": False})
         self.assertTrue(launch_result["ok"])
@@ -321,10 +351,10 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
 
         elastic_result = read_json(f"{self.base_url}/api/launch", {"restart": False, "strategy": "elastic"})
         self.assertTrue(elastic_result["ok"])
-        elastic_state = self.wait_for_agent_state(expected_provider="opencode", expected_model="o4-mini")
+        elastic_state = self.wait_for_agent_state(expected_provider="copilot", expected_model="gpt-5.4")
         elastic_runtime = {item["agent"]: item for item in elastic_state["runtime"]["workers"]}
-        self.assertEqual(elastic_runtime["A1"]["provider"], "opencode")
-        self.assertEqual(elastic_runtime["A2"]["provider"], "opencode")
+        self.assertEqual(elastic_runtime["A1"]["provider"], "copilot")
+        self.assertEqual(elastic_runtime["A2"]["provider"], "copilot")
 
         self.stop_workers()
 
