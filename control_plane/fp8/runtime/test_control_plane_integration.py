@@ -238,13 +238,12 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
                 },
                 "ducc": {
                     "auth_mode": "session",
+                    "prompt_transport": "stdin",
                     "session_probe_command": ["ducc", "session-ok"],
                     "command_template": [
                         "ducc",
                         "--model",
                         "{model}",
-                        "--prompt-file",
-                        "{prompt_file}",
                         "--cwd",
                         "{worktree_path}",
                     ],
@@ -648,6 +647,7 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
         self.assertEqual(process_snapshot["recursion_guard"], "env+exec-wrapper")
         self.assertTrue(str(process_snapshot["wrapper_path"]).endswith("ducc_single_layer.sh"))
         self.assertTrue(str(process_snapshot["command"][0]).endswith("ducc_single_layer.sh"))
+        self.assertNotIn("--prompt-file", process_snapshot["command"])
 
         self.stop_workers()
 
@@ -656,6 +656,15 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
         runtime_workers = {item["agent"]: item for item in state["runtime"]["workers"]}
         self.assertEqual(runtime_workers["A0"]["provider"], "manager-local")
         self.assertEqual(runtime_workers["A0"]["model"], "environment default")
+
+        heartbeats = {item["agent"]: item for item in state["heartbeats"]["agents"]}
+        self.assertEqual(heartbeats["A0"]["state"], "healthy")
+        self.assertIn("polling", heartbeats["A0"]["evidence"])
+        self.assertNotEqual(heartbeats["A0"]["last_seen"], "2026-03-10")
+
+        manager_report = state["manager_report"]
+        self.assertIn("Stage: live manager polling", manager_report)
+        self.assertIn("Poll loop: every 5 seconds", manager_report)
 
         merge_queue = {item["agent"]: item for item in state["merge_queue"]}
         self.assertEqual(merge_queue["A1"]["checkpoint_status"], "not started")
@@ -670,6 +679,58 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
             "Update when protocol names and scale encoding proposal are ready for review",
             merge_queue["A1"]["next_checkin"],
         )
+
+    def test_process_exit_surfaces_escalation_in_attention_summary(self) -> None:
+        failing_binary = self.bin_dir / "copilot"
+        failing_binary.write_text("#!/bin/sh\nexit 7\n", encoding="utf-8")
+        failing_binary.chmod(0o755)
+
+        launch_result = read_json(f"{self.base_url}/api/launch", {"restart": False})
+        self.assertTrue(launch_result["ok"])
+
+        wait_for(
+            lambda: any(
+                item.get("agent") == "A1" and item.get("status") == "stale"
+                for item in self.fetch_state()["merge_queue"]
+            ),
+            timeout=15,
+            interval=0.5,
+        )
+
+        state = self.fetch_state()
+        merge_queue = {item["agent"]: item for item in state["merge_queue"]}
+        self.assertNotEqual(merge_queue["A1"]["attention_summary"], "process_exit")
+        self.assertIn("worker exited with 7", merge_queue["A1"]["attention_summary"])
+
+    def test_ducc_prompt_file_flag_is_sanitized_for_stale_configs(self) -> None:
+        current_state = self.fetch_state()
+        session_config = deepcopy(current_state["config"])
+        session_config["providers"] = {"ducc": session_config["providers"]["ducc"]}
+        session_config["resource_pools"] = {"ducc_pool": session_config["resource_pools"]["ducc_pool"]}
+        session_config["worker_defaults"]["resource_pool_queue"] = ["ducc_pool"]
+        session_config["providers"]["ducc"]["command_template"] = [
+            "ducc",
+            "--model",
+            "{model}",
+            "--prompt-file",
+            "{prompt_file}",
+            "--cwd",
+            "{worktree_path}",
+        ]
+
+        save_result = read_json(f"{self.base_url}/api/config", {"config": session_config})
+        self.assertTrue(save_result["ok"])
+
+        launch_result = read_json(
+            f"{self.base_url}/api/launch",
+            {"restart": False, "strategy": "selected_model", "provider": "ducc", "model": "ducc-sonnet-it"},
+        )
+        self.assertTrue(launch_result["ok"])
+
+        state = self.wait_for_agent_state(expected_provider="ducc", expected_model="ducc-sonnet-it")
+        process_snapshot = state["processes"]["A1"]
+        self.assertNotIn("--prompt-file", process_snapshot["command"])
+        self.stop_workers()
 
     def test_session_probe_failure_surfaces_actionable_error(self) -> None:
         current_state = self.fetch_state()

@@ -157,6 +157,20 @@ def parse_markdown_paragraph(section_text: str) -> str:
     return " ".join(lines)
 
 
+def strip_prompt_file_args(command: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    skip_next = False
+    for part in command:
+        if skip_next:
+            skip_next = False
+            continue
+        if part == "--prompt-file":
+            skip_next = True
+            continue
+        cleaned.append(part)
+    return cleaned
+
+
 def is_placeholder_path(value: Any) -> bool:
     if not isinstance(value, str):
         return False
@@ -2102,6 +2116,210 @@ class ControlPlaneService:
         runtime["last_updated"] = runtime.get("last_updated") or now_iso()
         return runtime
 
+    def compute_manager_control_state(
+        self,
+        runtime_state: dict[str, Any] | None = None,
+        heartbeat_state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        runtime_state = runtime_state or self.dashboard_runtime_state()
+        heartbeat_state = heartbeat_state or self.dashboard_heartbeats_state()
+        runtime_workers = {
+            str(item.get("agent", "")).strip(): item
+            for item in runtime_state.get("workers", [])
+            if isinstance(item, dict)
+        }
+        heartbeat_workers = {
+            str(item.get("agent", "")).strip(): item
+            for item in heartbeat_state.get("agents", [])
+            if isinstance(item, dict)
+        }
+        backlog_items = self.backlog_items()
+        completed_task_ids = {
+            str(item.get("id", "")).strip()
+            for item in backlog_items
+            if str(item.get("status", "")).strip() in {"done", "completed", "merged"}
+        }
+
+        active_agents: list[str] = []
+        attention_agents: list[str] = []
+        runnable_agents: list[str] = []
+        blocked_agents: list[str] = []
+
+        for worker in self.workers:
+            agent = str(worker.get("agent", "")).strip()
+            runtime_entry = runtime_workers.get(agent, {})
+            heartbeat = heartbeat_workers.get(agent, {})
+            runtime_status = str(runtime_entry.get("status", "")).strip()
+            heartbeat_value = str(heartbeat.get("state", "")).strip()
+            backlog_item = self.task_record_for_worker(worker)
+            backlog_status = str(backlog_item.get("status", "")).strip()
+            dependencies = [str(item).strip() for item in backlog_item.get("dependencies", []) if str(item).strip()]
+            dependencies_ready = all(item in completed_task_ids for item in dependencies)
+
+            if runtime_status in {"launching", "healthy", "active"}:
+                active_agents.append(agent)
+                continue
+            if runtime_status.startswith("launch_failed") or heartbeat_value in {"stale", "error"}:
+                attention_agents.append(agent)
+                continue
+            if backlog_status == "blocked" or (dependencies and not dependencies_ready):
+                blocked_agents.append(agent)
+                continue
+            if backlog_status in {"pending", "queued", "not-started", "not_started", ""}:
+                runnable_agents.append(agent)
+
+        return {
+            "worker_count": len(self.workers),
+            "active_agents": active_agents,
+            "attention_agents": attention_agents,
+            "runnable_agents": runnable_agents,
+            "blocked_agents": blocked_agents,
+        }
+
+    def render_manager_report(
+        self,
+        runtime_state: dict[str, Any] | None = None,
+        heartbeat_state: dict[str, Any] | None = None,
+    ) -> str:
+        runtime_state = runtime_state or self.dashboard_runtime_state()
+        heartbeat_state = heartbeat_state or self.dashboard_heartbeats_state()
+        control = self.compute_manager_control_state(runtime_state, heartbeat_state)
+        gates = load_yaml(STATE_DIR / "gates.yaml").get("gates", [])
+        gate_list = gates if isinstance(gates, list) else []
+        open_gate = next((item for item in gate_list if str(item.get("status", "")).strip() == "open"), None)
+        current_gate = (
+            f"{open_gate.get('id', 'unknown')} {open_gate.get('name', '')}".strip()
+            if isinstance(open_gate, dict)
+            else "none"
+        )
+        heartbeat_map = {
+            str(item.get("agent", "")).strip(): item
+            for item in heartbeat_state.get("agents", [])
+            if isinstance(item, dict)
+        }
+        runtime_map = {
+            str(item.get("agent", "")).strip(): item
+            for item in runtime_state.get("workers", [])
+            if isinstance(item, dict)
+        }
+        liveness_lines: list[str] = []
+        for agent in ["A0", *[str(worker.get("agent", "")).strip() for worker in self.workers]]:
+            if not agent:
+                continue
+            heartbeat = heartbeat_map.get(agent, {})
+            runtime_entry = runtime_map.get(agent, {})
+            state = (
+                str(heartbeat.get("state", "")).strip() or str(runtime_entry.get("status", "")).strip() or "unknown"
+            )
+            liveness_lines.append(f"- {agent}: {state}")
+
+        blocker_lines: list[str] = []
+        if control["attention_agents"]:
+            blocker_lines.append(f"attention required: {', '.join(control['attention_agents'])}")
+        if control["blocked_agents"]:
+            blocker_lines.append(f"blocked by dependency or gate: {', '.join(control['blocked_agents'])}")
+        if not blocker_lines:
+            blocker_lines.append("no manager-side incidents detected")
+
+        return f"""# Manager Report
+
+Last updated: {now_iso()}
+
+## Production View
+
+- Stage: live manager polling
+- Delivery mode: {'listener active' if self.listener_active else 'listener offline'}
+- Current gate: {current_gate}
+- Current manager: A0
+- Poll loop: every 5 seconds
+
+## Real Liveness
+
+{chr(10).join(liveness_lines)}
+
+## Control Snapshot
+
+- Active agents: {', '.join(control['active_agents']) or 'none'}
+- Attention agents: {', '.join(control['attention_agents']) or 'none'}
+- Runnable agents: {', '.join(control['runnable_agents']) or 'none'}
+- Blocked agents: {', '.join(control['blocked_agents']) or 'none'}
+
+## Active Blockers
+
+{chr(10).join(f'- {item}' for item in blocker_lines)}
+
+## Immediate Action
+
+1. Review attention agents first and clear launch or runtime faults.
+2. Launch the next runnable set when provider readiness is green.
+3. Keep gate ordering aligned with backlog dependencies before widening scope.
+"""
+
+    def persist_manager_report(
+        self,
+        runtime_state: dict[str, Any] | None = None,
+        heartbeat_state: dict[str, Any] | None = None,
+    ) -> str:
+        report = self.render_manager_report(runtime_state, heartbeat_state)
+        MANAGER_REPORT.write_text(report, encoding="utf-8")
+        return report
+
+    def manager_heartbeat_entry(self, heartbeats: dict[str, Any] | None = None) -> dict[str, Any]:
+        agents = heartbeats.get("agents", []) if isinstance(heartbeats, dict) else []
+        existing = next(
+            (item for item in agents if isinstance(item, dict) and str(item.get("agent", "")).strip() == "A0"),
+            {},
+        )
+        listener_active = bool(self.listener_active)
+        control = self.compute_manager_control_state(
+            self.dashboard_runtime_state(),
+            {
+                "agents": [
+                    item for item in agents if isinstance(item, dict) and str(item.get("agent", "")).strip() != "A0"
+                ]
+            },
+        )
+        if listener_active:
+            evidence = f"polling {control['worker_count']} workers"
+            if control["attention_agents"]:
+                evidence += f"; attention: {', '.join(control['attention_agents'])}"
+            elif control["active_agents"]:
+                evidence += f"; active: {', '.join(control['active_agents'])}"
+            elif control["runnable_agents"]:
+                evidence += f"; runnable: {', '.join(control['runnable_agents'])}"
+            else:
+                evidence += "; no immediate action set"
+            expected_next_checkin = "within monitor loop interval"
+            escalation = (
+                "review attention queue and launch runnable workers" if control["attention_agents"] else "none"
+            )
+        else:
+            evidence = "control-plane listener offline"
+            expected_next_checkin = "when listener restarts"
+            escalation = "restart control-plane listener to resume manager orchestration"
+        return {
+            "agent": "A0",
+            "role": str(existing.get("role", "")).strip() or "manager",
+            "state": "healthy" if listener_active else "offline",
+            "last_seen": now_iso(),
+            "evidence": evidence,
+            "expected_next_checkin": expected_next_checkin,
+            "escalation": escalation,
+        }
+
+    def dashboard_heartbeats_state(self) -> dict[str, Any]:
+        heartbeats = load_yaml(STATE_DIR / "heartbeats.yaml")
+        agents = heartbeats.get("agents", [])
+        if not isinstance(agents, list):
+            agents = []
+        filtered_agents = [
+            item for item in agents if isinstance(item, dict) and str(item.get("agent", "")).strip() != "A0"
+        ]
+        filtered_agents.insert(0, self.manager_heartbeat_entry(heartbeats))
+        heartbeats["agents"] = filtered_agents
+        heartbeats["last_updated"] = now_iso()
+        return heartbeats
+
     def worker_handoff_summary(
         self, agent: str, runtime_entry: dict[str, Any], heartbeat: dict[str, Any]
     ) -> dict[str, Any]:
@@ -2126,17 +2344,20 @@ class ControlPlaneService:
         runtime_status = str(runtime_entry.get("status", "")).strip()
         heartbeat_state = str(heartbeat.get("state", "")).strip()
         heartbeat_evidence = str(heartbeat.get("evidence", "")).strip()
+        heartbeat_escalation = str(heartbeat.get("escalation", "")).strip()
         attention_summary = ""
         if runtime_status.startswith("launch_failed"):
             attention_summary = runtime_status
+        elif heartbeat_evidence == "process_exit" and heartbeat_escalation and heartbeat_escalation != "none":
+            attention_summary = heartbeat_escalation
         elif heartbeat_state in {"stale", "error"} and heartbeat_evidence:
-            attention_summary = heartbeat_evidence
+            attention_summary = heartbeat_escalation or heartbeat_evidence
         elif blockers:
             attention_summary = blockers[0]
         elif pending_work:
             attention_summary = pending_work[0]
         elif heartbeat_evidence and heartbeat_evidence.lower() != "no runtime heartbeat yet":
-            attention_summary = heartbeat_evidence
+            attention_summary = heartbeat_escalation or heartbeat_evidence
 
         return {
             "checkpoint_status": checkpoint_meta.get("status")
@@ -2179,9 +2400,8 @@ class ControlPlaneService:
     def merge_queue(self) -> list[dict[str, Any]]:
         runtime_state = self.dashboard_runtime_state()
         runtime_workers = {str(item.get("agent")): item for item in runtime_state.get("workers", [])}
-        heartbeats = {
-            str(item.get("agent")): item for item in load_yaml(STATE_DIR / "heartbeats.yaml").get("agents", [])
-        }
+        heartbeat_state = self.dashboard_heartbeats_state()
+        heartbeats = {str(item.get("agent")): item for item in heartbeat_state.get("agents", [])}
         queue: list[dict[str, Any]] = []
         manager_identity = self.manager_git_identity()
         manager_display = (
@@ -2321,6 +2541,14 @@ Primary test command:
         model = model_override or worker.get("model") or pool["model"]
         return provider, pool, provider_name, model
 
+    def provider_prompt_transport(self, provider_name: str, provider: dict[str, Any]) -> str:
+        configured = str(provider.get("prompt_transport") or "").strip().lower()
+        if configured in {"stdin", "prompt-file"}:
+            return configured
+        if provider_name == "ducc":
+            return "stdin"
+        return "prompt-file"
+
     def branch_exists(self, branch: str) -> bool:
         result = subprocess.run(
             ["git", "show-ref", "--verify", f"refs/heads/{branch}"],
@@ -2448,6 +2676,9 @@ Primary test command:
             "reference_workspace_root": self.reference_workspace_root() or "unassigned",
         }
         command = format_command(template, values)
+        prompt_transport = self.provider_prompt_transport(provider_name, provider)
+        if prompt_transport == "stdin":
+            command = strip_prompt_file_args(command)
         env = os.environ.copy()
         recursion_guard = self.provider_recursion_guard_mode(provider_name, provider)
         launch_wrapper = ""
@@ -2471,15 +2702,19 @@ Primary test command:
 
         log_path = LOG_DIR / f"{worker['agent']}.log"
         log_handle = log_path.open("w", encoding="utf-8")
+        prompt_handle = prompt_path.open("r", encoding="utf-8") if prompt_transport == "stdin" else None
         process = subprocess.Popen(
             command,
             cwd=worker["worktree_path"],
             stdout=log_handle,
             stderr=subprocess.STDOUT,
+            stdin=prompt_handle if prompt_handle is not None else subprocess.DEVNULL,
             text=True,
             env=env,
             start_new_session=True,
         )
+        if prompt_handle is not None:
+            prompt_handle.close()
         previous = self.processes.get(worker["agent"])
         if previous and previous.process.poll() is None:
             previous.process.terminate()
@@ -2638,6 +2873,8 @@ Primary test command:
     def build_dashboard_state(self) -> dict[str, Any]:
         config_text = self.config_path.read_text(encoding="utf-8") if self.config_path.exists() else ""
         runtime_state = self.dashboard_runtime_state()
+        heartbeat_state = self.dashboard_heartbeats_state()
+        manager_report = self.persist_manager_report(runtime_state, heartbeat_state)
         return {
             "updated_at": now_iso(),
             "last_event": self.last_event,
@@ -2652,9 +2889,9 @@ Primary test command:
             "project": self.project,
             "commands": self.build_cli_commands(),
             "launch_policy": self.launch_policy_state(),
-            "manager_report": MANAGER_REPORT.read_text(encoding="utf-8"),
+            "manager_report": manager_report,
             "runtime": runtime_state,
-            "heartbeats": load_yaml(STATE_DIR / "heartbeats.yaml"),
+            "heartbeats": heartbeat_state,
             "backlog": load_yaml(STATE_DIR / "backlog.yaml"),
             "gates": load_yaml(STATE_DIR / "gates.yaml"),
             "processes": self.process_snapshot(),
@@ -2704,6 +2941,7 @@ Primary test command:
                                 worker.model,
                                 state,
                             )
+                self.persist_manager_report()
                 self.write_session_state()
             time.sleep(5)
 

@@ -39,12 +39,11 @@ providers:
       - "{worktree_path}"
   ducc:
     auth_mode: session
+    prompt_transport: stdin
     command_template:
       - ducc
       - --model
       - "{model}"
-      - --prompt-file
-      - "{prompt_file}"
       - --cwd
       - "{worktree_path}"
   opencode:
