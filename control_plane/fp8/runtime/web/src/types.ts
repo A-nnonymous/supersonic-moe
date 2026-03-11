@@ -133,6 +133,20 @@ export type ConfigWorker = {
   test_command?: string;
 };
 
+export type ConfigWorkerDefaults = {
+  resource_pool?: string;
+  resource_pool_queue?: string[];
+  environment_type?: string;
+  environment_path?: string;
+  sync_command?: string;
+  submit_strategy?: string;
+  test_command?: string;
+  git_identity?: {
+    name?: string;
+    email?: string;
+  };
+};
+
 export type ConfigProvider = {
   api_key_env_name?: string;
   command_template?: string[];
@@ -150,6 +164,7 @@ export type ConfigShape = {
   project?: ConfigProject;
   providers?: Record<string, ConfigProvider>;
   resource_pools?: Record<string, ConfigResourcePool>;
+  worker_defaults?: ConfigWorkerDefaults;
   workers?: ConfigWorker[];
 };
 

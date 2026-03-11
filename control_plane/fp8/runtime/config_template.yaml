@@ -63,38 +63,32 @@ resource_pools:
     api_key: replace_me_or_use_api_key_env
     extra_env: {}
 
+worker_defaults:
+  resource_pool_queue:
+    - copilot_pool
+    - claude_pool
+    - opencode_pool
+  environment_type: uv
+  environment_path: /absolute/path/to/shared/.venv
+  sync_command: uv sync
+  test_command: uv run pytest tests/moe_test.py
+  submit_strategy: patch_handoff
+  git_identity:
+    name: FP8 Worker
+    email: fp8-worker@example.com
+
 workers:
   - agent: A1
     task_id: A1-001
-    resource_pool: copilot_pool
-    resource_pool_queue:
-      - copilot_pool
-      - claude_pool
-      - opencode_pool
     worktree_path: /absolute/path/to/supersonic_moe_a1
     branch: a1_protocol_freeze
-    environment_type: uv
-    environment_path: /absolute/path/to/supersonic_moe_a1/.venv
-    sync_command: uv sync
     test_command: uv run pytest tests/moe_test.py -k protocol
-    git_identity:
-      name: A1 Protocol Worker
-      email: a1-protocol@example.com
-    submit_strategy: patch_handoff
   - agent: A6
     task_id: A6-001
     resource_pool: claude_pool
-    resource_pool_queue:
-      - claude_pool
-      - copilot_pool
-      - opencode_pool
     worktree_path: /absolute/path/to/supersonic_moe_a6
     branch: a6_baseline_trace
-    environment_type: uv
-    environment_path: /absolute/path/to/supersonic_moe_a6/.venv
-    sync_command: uv sync
     test_command: uv run pytest tests/moe_test.py -k baseline
     git_identity:
       name: A6 Baseline Worker
       email: a6-baseline@example.com
-    submit_strategy: patch_handoff

@@ -24564,8 +24564,41 @@ function normalizeConfig(config) {
     project: config.project || {},
     providers: config.providers || {},
     resource_pools: config.resource_pools || {},
+    worker_defaults: config.worker_defaults || {},
     workers: config.workers || []
   };
+}
+function mergeWorkerWithDefaults(worker, defaults) {
+  const merged = { ...worker };
+  const workerDefaults = defaults || {};
+  const inheritableFields = [
+    "resource_pool",
+    "environment_type",
+    "environment_path",
+    "sync_command",
+    "submit_strategy",
+    "test_command"
+  ];
+  inheritableFields.forEach((field) => {
+    const workerValue = merged[field];
+    const defaultValue = workerDefaults[field];
+    if ((workerValue === void 0 || workerValue === "") && defaultValue !== void 0 && defaultValue !== "") {
+      merged[field] = defaultValue;
+    }
+  });
+  if ((!Array.isArray(merged.resource_pool_queue) || merged.resource_pool_queue.length === 0) && Array.isArray(workerDefaults.resource_pool_queue) && workerDefaults.resource_pool_queue.length > 0) {
+    merged.resource_pool_queue = [...workerDefaults.resource_pool_queue];
+  }
+  const defaultIdentity = workerDefaults.git_identity || {};
+  const workerIdentity = merged.git_identity || {};
+  const mergedIdentity = {
+    name: workerIdentity.name || defaultIdentity.name || "",
+    email: workerIdentity.email || defaultIdentity.email || ""
+  };
+  if (mergedIdentity.name || mergedIdentity.email) {
+    merged.git_identity = mergedIdentity;
+  }
+  return merged;
 }
 function buildIssueMap(...issueSets) {
   return issueSets.reduce((acc, issues) => {
@@ -24679,6 +24712,7 @@ function getLocalValidationIssues(config) {
   const project = draft.project || {};
   const dashboard = project.dashboard || {};
   const pools = draft.resource_pools || {};
+  const workerDefaults = draft.worker_defaults || {};
   const workers = draft.workers || [];
   if (!String(project.repository_name || "").trim()) {
     add("project.repository_name", "repository name is required");
@@ -24712,7 +24746,20 @@ function getLocalValidationIssues(config) {
       add(`resource_pools.${poolName}.priority`, "priority must be an integer");
     }
   });
+  if (workerDefaults.resource_pool && !pools[workerDefaults.resource_pool]) {
+    add("worker_defaults.resource_pool", "default resource pool must refer to an existing pool");
+  }
+  if (workerDefaults.resource_pool_queue && workerDefaults.resource_pool_queue.some((poolName) => !pools[poolName])) {
+    add("worker_defaults.resource_pool_queue", "default queue must contain only existing pools");
+  }
+  if (workerDefaults.git_identity?.name && !workerDefaults.git_identity?.email) {
+    add("worker_defaults.git_identity.email", "default git identity email is required when name is set");
+  }
+  if (workerDefaults.git_identity?.email && !workerDefaults.git_identity?.name) {
+    add("worker_defaults.git_identity.name", "default git identity name is required when email is set");
+  }
   workers.forEach((worker, index) => {
+    const effectiveWorker = mergeWorkerWithDefaults(worker, workerDefaults);
     const root = `workers[${index}]`;
     const agent = String(worker.agent || "").trim();
     const branch = String(worker.branch || "").trim();
@@ -24738,18 +24785,18 @@ function getLocalValidationIssues(config) {
     } else {
       seenWorktrees.add(worktreePath);
     }
-    const poolName = String(worker.resource_pool || "").trim();
-    const queue = worker.resource_pool_queue || [];
+    const poolName = String(effectiveWorker.resource_pool || "").trim();
+    const queue = effectiveWorker.resource_pool_queue || [];
     if (!poolName && !queue.length) {
       add(`${root}.resource_pool`, "resource pool or queue is required");
     }
-    if (!String(worker.test_command || "").trim()) {
+    if (!String(effectiveWorker.test_command || "").trim()) {
       add(`${root}.test_command`, "test command is required");
     }
-    if (!String(worker.submit_strategy || "").trim()) {
+    if (!String(effectiveWorker.submit_strategy || "").trim()) {
       add(`${root}.submit_strategy`, "submit strategy is required");
     }
-    if (String(worker.environment_type || "uv") !== "none" && !String(worker.environment_path || "").trim()) {
+    if (String(effectiveWorker.environment_type || "uv") !== "none" && !String(effectiveWorker.environment_path || "").trim()) {
       add(`${root}.environment_path`, "environment path is required unless environment type is none");
     }
   });
@@ -24769,6 +24816,7 @@ function Field({
   value,
   onChange,
   issues,
+  helpText,
   placeholder,
   type = "text"
 }) {
@@ -24784,6 +24832,7 @@ function Field({
         onChange: (event) => onChange(event.target.value)
       }
     ),
+    helpText ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { className: "field-help", children: helpText }) : null,
     issues && issues.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { className: "field-error", children: issues[0] }) : null
   ] });
 }
@@ -24983,6 +25032,7 @@ function SettingsTab({
   const project = draftConfig.project || {};
   const dashboard = project.dashboard || {};
   const pools = draftConfig.resource_pools || {};
+  const workerDefaults = draftConfig.worker_defaults || {};
   const workers = draftConfig.workers || [];
   return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "tab-body", children: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "card", children: [
     /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "page-header", children: [
@@ -25004,12 +25054,12 @@ function SettingsTab({
           /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Dashboard Port", type: "number", value: dashboard.port || 8233, onChange: (value) => onProjectChange("dashboard.port", value), issues: issues["project.dashboard.port"] })
         ] })
       ] }),
-      /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "helper-card settings-card", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "helper-card settings-card settings-card-wide", children: [
         /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "section-head", children: [
           /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", { children: "Resource Pools" }),
           /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { className: "ghost", type: "button", onClick: onAddPool, children: "Add Pool" })
         ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "stack-list", children: Object.entries(pools).map(([poolName, pool]) => /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "subcard", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "pool-strip", children: Object.entries(pools).map(([poolName, pool]) => /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "subcard pool-card", children: [
           /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "subcard-title", children: poolName }),
           /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "field-grid", children: [
             /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SelectField, { label: "Provider", value: String(pool.provider || ""), onChange: (value) => onPoolChange(poolName, "provider", value), issues: issues[`resource_pools.${poolName}.provider`], options: providerOptions }),
@@ -25028,26 +25078,47 @@ function SettingsTab({
         ] })
       ] }),
       /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "helper-card settings-card settings-card-wide", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "section-head", children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", { children: "Worker Defaults" }) }),
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { className: "small muted", children: "These values apply to every worker unless a row below overrides them." }),
+        /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "field-grid", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Default Pool", value: workerDefaults.resource_pool || "", onChange: (value) => onWorkerChange(-1, "worker_defaults.resource_pool", value), issues: issues["worker_defaults.resource_pool"], helpText: "Leave blank to rely on pool queue or per-worker overrides." }),
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Default Pool Queue", value: stringifyQueue(workerDefaults.resource_pool_queue), onChange: (value) => onWorkerChange(-1, "worker_defaults.resource_pool_queue", value), issues: issues["worker_defaults.resource_pool_queue"], placeholder: "copilot_pool, claude_pool" }),
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SelectField, { label: "Default Environment", value: workerDefaults.environment_type || "uv", onChange: (value) => onWorkerChange(-1, "worker_defaults.environment_type", value), options: ["uv", "venv", "none"] }),
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Default Environment Path", value: workerDefaults.environment_path || "", onChange: (value) => onWorkerChange(-1, "worker_defaults.environment_path", value), issues: issues["worker_defaults.environment_path"] }),
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Default Sync Command", value: workerDefaults.sync_command || "", onChange: (value) => onWorkerChange(-1, "worker_defaults.sync_command", value) }),
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Default Test Command", value: workerDefaults.test_command || "", onChange: (value) => onWorkerChange(-1, "worker_defaults.test_command", value), issues: issues["worker_defaults.test_command"] }),
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Default Submit Strategy", value: workerDefaults.submit_strategy || "", onChange: (value) => onWorkerChange(-1, "worker_defaults.submit_strategy", value), issues: issues["worker_defaults.submit_strategy"] }),
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Default Git Name", value: workerDefaults.git_identity?.name || "", onChange: (value) => onWorkerChange(-1, "worker_defaults.git_identity.name", value), issues: issues["worker_defaults.git_identity.name"] }),
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Default Git Email", value: workerDefaults.git_identity?.email || "", onChange: (value) => onWorkerChange(-1, "worker_defaults.git_identity.email", value), issues: issues["worker_defaults.git_identity.email"] })
+        ] })
+      ] }),
+      /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "helper-card settings-card settings-card-wide", children: [
         /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "section-head", children: [
           /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", { children: "Worker Config" }),
           /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { className: "ghost", type: "button", onClick: onAddWorker, children: "Add Worker" })
         ] }),
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { className: "small muted", children: "Keep each row focused on identity and routing. Leave override fields blank to inherit Worker Defaults." }),
         /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "stack-list", children: workers.map((worker, index) => /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "subcard", children: [
           /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "subcard-title", children: worker.agent || `Worker ${index + 1}` }),
           /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "field-grid", children: [
             /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Agent", value: worker.agent || "", onChange: (value) => onWorkerChange(index, "agent", value), issues: issues[`workers[${index}].agent`] }),
             /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Task ID", value: worker.task_id || "", onChange: (value) => onWorkerChange(index, "task_id", value) }),
-            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Resource Pool", value: worker.resource_pool || "", onChange: (value) => onWorkerChange(index, "resource_pool", value), issues: issues[`workers[${index}].resource_pool`] }),
-            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Pool Queue", value: stringifyQueue(worker.resource_pool_queue), onChange: (value) => onWorkerChange(index, "resource_pool_queue", value), issues: issues[`workers[${index}].resource_pool_queue`], placeholder: "pool_a, pool_b" }),
             /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Branch", value: worker.branch || "", onChange: (value) => onWorkerChange(index, "branch", value), issues: issues[`workers[${index}].branch`] }),
             /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Worktree Path", value: worker.worktree_path || "", onChange: (value) => onWorkerChange(index, "worktree_path", value), issues: issues[`workers[${index}].worktree_path`] }),
-            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SelectField, { label: "Environment Type", value: worker.environment_type || "uv", onChange: (value) => onWorkerChange(index, "environment_type", value), options: ["uv", "venv", "none"] }),
-            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Environment Path", value: worker.environment_path || "", onChange: (value) => onWorkerChange(index, "environment_path", value), issues: issues[`workers[${index}].environment_path`] }),
-            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Sync Command", value: worker.sync_command || "", onChange: (value) => onWorkerChange(index, "sync_command", value) }),
-            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Test Command", value: worker.test_command || "", onChange: (value) => onWorkerChange(index, "test_command", value), issues: issues[`workers[${index}].test_command`] }),
-            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Submit Strategy", value: worker.submit_strategy || "", onChange: (value) => onWorkerChange(index, "submit_strategy", value), issues: issues[`workers[${index}].submit_strategy`] }),
-            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Git Name", value: worker.git_identity?.name || "", onChange: (value) => onWorkerChange(index, "git_identity.name", value) }),
-            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Git Email", value: worker.git_identity?.email || "", onChange: (value) => onWorkerChange(index, "git_identity.email", value) })
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Pool Override", value: worker.resource_pool || "", onChange: (value) => onWorkerChange(index, "resource_pool", value), issues: issues[`workers[${index}].resource_pool`], helpText: workerDefaults.resource_pool ? `Default: ${workerDefaults.resource_pool}` : "Blank means inherit default routing." }),
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Queue Override", value: stringifyQueue(worker.resource_pool_queue), onChange: (value) => onWorkerChange(index, "resource_pool_queue", value), issues: issues[`workers[${index}].resource_pool_queue`], placeholder: "pool_a, pool_b", helpText: workerDefaults.resource_pool_queue?.length ? `Default: ${stringifyQueue(workerDefaults.resource_pool_queue)}` : "Blank means inherit default queue." })
+          ] }),
+          /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("details", { className: "advanced-panel", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)("summary", { children: "Advanced overrides" }),
+            /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "field-grid advanced-grid", children: [
+              /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SelectField, { label: "Environment Type", value: worker.environment_type || "", onChange: (value) => onWorkerChange(index, "environment_type", value), options: ["uv", "venv", "none"] }),
+              /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Environment Path", value: worker.environment_path || "", onChange: (value) => onWorkerChange(index, "environment_path", value), issues: issues[`workers[${index}].environment_path`], helpText: workerDefaults.environment_path ? `Default: ${workerDefaults.environment_path}` : void 0 }),
+              /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Sync Command", value: worker.sync_command || "", onChange: (value) => onWorkerChange(index, "sync_command", value), helpText: workerDefaults.sync_command ? `Default: ${workerDefaults.sync_command}` : void 0 }),
+              /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Test Command", value: worker.test_command || "", onChange: (value) => onWorkerChange(index, "test_command", value), issues: issues[`workers[${index}].test_command`], helpText: workerDefaults.test_command ? `Default: ${workerDefaults.test_command}` : void 0 }),
+              /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Submit Strategy", value: worker.submit_strategy || "", onChange: (value) => onWorkerChange(index, "submit_strategy", value), issues: issues[`workers[${index}].submit_strategy`], helpText: workerDefaults.submit_strategy ? `Default: ${workerDefaults.submit_strategy}` : void 0 }),
+              /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Git Name", value: worker.git_identity?.name || "", onChange: (value) => onWorkerChange(index, "git_identity.name", value), helpText: workerDefaults.git_identity?.name ? `Default: ${workerDefaults.git_identity.name}` : void 0 }),
+              /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Git Email", value: worker.git_identity?.email || "", onChange: (value) => onWorkerChange(index, "git_identity.email", value), helpText: workerDefaults.git_identity?.email ? `Default: ${workerDefaults.git_identity.email}` : void 0 })
+            ] })
           ] })
         ] }, `${worker.agent || "worker"}-${index}`)) })
       ] })
@@ -25164,7 +25235,7 @@ async function writeClipboard(text) {
 function App() {
   const [tab, setTab] = (0, import_react.useState)("overview");
   const [data, setData] = (0, import_react.useState)(null);
-  const [draftConfig, setDraftConfig] = (0, import_react.useState)({ project: {}, providers: {}, resource_pools: {}, workers: [] });
+  const [draftConfig, setDraftConfig] = (0, import_react.useState)({ project: {}, providers: {}, resource_pools: {}, worker_defaults: {}, workers: [] });
   const [configDirty, setConfigDirty] = (0, import_react.useState)(false);
   const [launchStrategy, setLaunchStrategy] = (0, import_react.useState)("initial_copilot");
   const [launchProvider, setLaunchProvider] = (0, import_react.useState)("copilot");
@@ -25309,6 +25380,23 @@ function App() {
   const onWorkerChange = (index, field, value) => {
     updateConfig((current) => {
       const next = normalizeConfig(current);
+      if (index === -1) {
+        next.worker_defaults = next.worker_defaults || {};
+        if (field === "worker_defaults.resource_pool_queue") {
+          next.worker_defaults.resource_pool_queue = parseQueue(value);
+        } else if (field === "worker_defaults.git_identity.name" || field === "worker_defaults.git_identity.email") {
+          next.worker_defaults.git_identity = next.worker_defaults.git_identity || {};
+          if (field.endsWith(".name")) {
+            next.worker_defaults.git_identity.name = value;
+          } else {
+            next.worker_defaults.git_identity.email = value;
+          }
+        } else {
+          const normalizedField = field.replace("worker_defaults.", "");
+          next.worker_defaults[normalizedField] = value;
+        }
+        return next;
+      }
       const workers = [...next.workers || []];
       const worker = { ...workers[index] || { agent: `A${index + 1}` } };
       if (field === "resource_pool_queue") {
@@ -25335,16 +25423,10 @@ function App() {
       workers.push({
         agent: `A${workers.length + 1}`,
         task_id: "",
-        resource_pool: Object.keys(next.resource_pools || {})[0] || "",
+        resource_pool: "",
         resource_pool_queue: [],
         worktree_path: "",
-        branch: "",
-        environment_type: "uv",
-        environment_path: "",
-        sync_command: "uv sync",
-        test_command: "",
-        submit_strategy: "patch_handoff",
-        git_identity: { name: "", email: "" }
+        branch: ""
       });
       next.workers = workers;
       return next;

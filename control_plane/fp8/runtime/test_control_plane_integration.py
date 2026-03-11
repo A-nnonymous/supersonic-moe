@@ -210,17 +210,19 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
                     "extra_env": {},
                 },
             },
+            "worker_defaults": {
+                "resource_pool_queue": ["copilot_pool", "opencode_pool", "claude_pool"],
+                "environment_type": "none",
+                "sync_command": "none",
+                "test_command": "true",
+                "submit_strategy": "patch_handoff",
+            },
             "workers": [
                 {
                     "agent": "A1",
                     "task_id": "A1-it",
-                    "resource_pool_queue": ["copilot_pool", "opencode_pool", "claude_pool"],
                     "branch": "integration-a1",
                     "worktree_path": str(self.worker_roots["A1"]),
-                    "environment_type": "none",
-                    "sync_command": "none",
-                    "test_command": "true",
-                    "submit_strategy": "patch_handoff",
                     "git_identity": {
                         "name": "Integration A1",
                         "email": "a1@example.com",
@@ -229,13 +231,8 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
                 {
                     "agent": "A2",
                     "task_id": "A2-it",
-                    "resource_pool_queue": ["copilot_pool", "opencode_pool", "claude_pool"],
                     "branch": "integration-a2",
                     "worktree_path": str(self.worker_roots["A2"]),
-                    "environment_type": "none",
-                    "sync_command": "none",
-                    "test_command": "true",
-                    "submit_strategy": "patch_handoff",
                     "git_identity": {
                         "name": "Integration A2",
                         "email": "a2@example.com",
