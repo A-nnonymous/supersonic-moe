@@ -627,6 +627,54 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
         self.wait_for_agent_state(expected_provider="ducc", expected_model="claude-sonnet-4-5")
         self.stop_workers()
 
+    def test_worker_prompt_forbids_nested_agent_orchestration(self) -> None:
+        launch_result = read_json(f"{self.base_url}/api/launch", {"restart": False})
+        self.assertTrue(launch_result["ok"])
+        self.wait_for_agent_state(expected_provider="copilot", expected_model="gpt-5.4")
+
+        prompt_path = self.fp8_root / "runtime" / "generated_prompts" / "A1.md"
+        prompt_text = prompt_path.read_text(encoding="utf-8")
+        self.assertIn("Do not start nested control-plane sessions", prompt_text)
+        self.assertIn("claude-code", prompt_text)
+        self.assertIn("ducc", prompt_text)
+
+        self.stop_workers()
+
+    def test_worker_context_cannot_start_nested_control_plane(self) -> None:
+        nested_port = find_free_port()
+        nested_env = dict(self.env)
+        nested_env["CONTROL_PLANE_WORKER_CONTEXT"] = "1"
+        nested_env["CONTROL_PLANE_WORKER_AGENT"] = "A1"
+        nested_env["CONTROL_PLANE_RECURSION_POLICY"] = "forbid-nested-control-plane"
+
+        result = subprocess.run(
+            [
+                "uv",
+                "run",
+                "--with",
+                "PyYAML>=6.0.2",
+                "python",
+                str(self.runtime_script),
+                "up",
+                "--config",
+                str(self.config_path),
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(nested_port),
+            ],
+            cwd=self.root,
+            env=nested_env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("refusing to start nested control plane", result.stderr)
+        self.assertFalse(port_is_listening(nested_port))
+
     def test_silent_and_stop_all_cli_preserve_then_release_workers(self) -> None:
         launch_result = read_json(f"{self.base_url}/api/launch", {"restart": False})
         self.assertTrue(launch_result["ok"])

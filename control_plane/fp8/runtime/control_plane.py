@@ -49,6 +49,10 @@ DEFAULT_INITIAL_PROVIDER = "copilot"
 LAUNCH_STRATEGIES = {"initial_copilot", "selected_model", "elastic"}
 CONFIG_SECTIONS = {"project", "merge_policy", "resource_pools", "worker_defaults", "workers"}
 PROVIDER_AUTH_MODES = {"api_key", "session"}
+CONTROL_PLANE_WORKER_CONTEXT_ENV = "CONTROL_PLANE_WORKER_CONTEXT"
+CONTROL_PLANE_WORKER_AGENT_ENV = "CONTROL_PLANE_WORKER_AGENT"
+CONTROL_PLANE_RECURSION_POLICY_ENV = "CONTROL_PLANE_RECURSION_POLICY"
+CONTROL_PLANE_ALLOW_NESTED_ENV = "CONTROL_PLANE_ALLOW_NESTED"
 
 
 def now_iso() -> str:
@@ -1970,11 +1974,12 @@ Reference inputs:
 Mandatory rules:
 
 1. Work only inside the assigned worktree.
-2. Do not edit shared control-plane files unless the manager explicitly asks and the lock is held.
+2. Do not start nested control-plane sessions or launch additional agent CLI processes such as `control_plane.py up`, `control_plane.py serve`, `claude-code`, `ducc`, `copilot`, or `opencode` from inside this worker session.
 3. Update your status file in `control_plane/fp8/status/agents/` and your checkpoint in `control_plane/fp8/checkpoints/agents/`.
 4. Treat configured reference inputs as guidance, not as the final host implementation.
 5. Report blockers before widening scope.
-6. Commit only on your assigned branch; A0 owns final merge or cherry-pick into `{self.integration_branch()}`.
+6. Do not edit shared control-plane files unless the manager explicitly asks and the lock is held.
+7. Commit only on your assigned branch; A0 owns final merge or cherry-pick into `{self.integration_branch()}`.
 
 First files to read:
 
@@ -2129,6 +2134,9 @@ Primary test command:
         extra_env = pool.get("extra_env", {})
         if isinstance(extra_env, dict):
             env.update({str(key): str(value) for key, value in extra_env.items()})
+        env[CONTROL_PLANE_WORKER_CONTEXT_ENV] = "1"
+        env[CONTROL_PLANE_WORKER_AGENT_ENV] = str(worker["agent"])
+        env[CONTROL_PLANE_RECURSION_POLICY_ENV] = "forbid-nested-control-plane"
 
         log_path = LOG_DIR / f"{worker['agent']}.log"
         log_handle = log_path.open("w", encoding="utf-8")
@@ -2897,6 +2905,18 @@ def detach_process(args: argparse.Namespace) -> int:
 
 def main() -> int:
     args = parse_args()
+    if (
+        args.command in {"up", "serve"}
+        and os.environ.get(CONTROL_PLANE_WORKER_CONTEXT_ENV) == "1"
+        and os.environ.get(CONTROL_PLANE_ALLOW_NESTED_ENV) != "1"
+    ):
+        agent = os.environ.get(CONTROL_PLANE_WORKER_AGENT_ENV, "worker")
+        policy = os.environ.get(CONTROL_PLANE_RECURSION_POLICY_ENV, "forbid-nested-control-plane")
+        print(
+            f"refusing to start nested control plane from worker context {agent} ({policy}); unset {CONTROL_PLANE_WORKER_CONTEXT_ENV} or set {CONTROL_PLANE_ALLOW_NESTED_ENV}=1 only for explicit debugging",
+            file=sys.stderr,
+        )
+        return 2
     if args.command == "silent":
         return stop_listener_command(args)
     if args.command == "stop-agents":
