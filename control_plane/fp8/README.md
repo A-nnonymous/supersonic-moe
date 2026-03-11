@@ -45,6 +45,7 @@ No work is considered active unless it is reflected here.
 
 - cold start on a new machine: `new_machine_prompt.md`
 - resume an interrupted session: `RESUME.md`
+- control-plane execution checklist: `governance/control_plane_playbook.md`
 - launch workers: `governance/worker_launch_playbook.md`
 - run integrated frontend and backend: `runtime/control_plane.py`
 - current production snapshot: `reports/manager_report.md`
