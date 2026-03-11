@@ -330,6 +330,10 @@ function launchStrategyLabel(strategy: LaunchStrategy): string {
   return 'Elastic';
 }
 
+function preferredLaunchProvider(launchPolicy: DashboardState['launch_policy']): string {
+  return launchPolicy.default_provider || launchPolicy.initial_provider || launchPolicy.available_providers[0] || '';
+}
+
 function slugify(value: string): string {
   return value
     .toLowerCase()
@@ -1437,7 +1441,7 @@ export function App() {
       }
       if (!launchDirty) {
         setLaunchStrategy(nextData.launch_policy.default_strategy);
-        setLaunchProvider(nextData.launch_policy.default_provider || nextData.launch_policy.initial_provider || 'copilot');
+        setLaunchProvider(preferredLaunchProvider(nextData.launch_policy));
         setLaunchModel(nextData.launch_policy.default_model || '');
       }
       if (forceStatus) {
@@ -1949,7 +1953,7 @@ export function App() {
                         setLaunchDirty(true);
                         setLaunchStrategy(event.target.value as LaunchStrategy);
                         if (event.target.value === 'initial_copilot') {
-                          setLaunchProvider(data.launch_policy.initial_provider || 'copilot');
+                          setLaunchProvider(preferredLaunchProvider(data.launch_policy));
                         }
                       }}
                     >

@@ -24810,6 +24810,9 @@ function launchStrategyLabel(strategy) {
   }
   return "Elastic";
 }
+function preferredLaunchProvider(launchPolicy) {
+  return launchPolicy.default_provider || launchPolicy.initial_provider || launchPolicy.available_providers[0] || "";
+}
 function slugify(value) {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "").replace(/_{2,}/g, "_");
 }
@@ -25861,7 +25864,7 @@ function App() {
       }
       if (!launchDirty) {
         setLaunchStrategy(nextData.launch_policy.default_strategy);
-        setLaunchProvider(nextData.launch_policy.default_provider || nextData.launch_policy.initial_provider || "copilot");
+        setLaunchProvider(preferredLaunchProvider(nextData.launch_policy));
         setLaunchModel(nextData.launch_policy.default_model || "");
       }
       if (forceStatus) {
@@ -26312,7 +26315,7 @@ function App() {
                       setLaunchDirty(true);
                       setLaunchStrategy(event.target.value);
                       if (event.target.value === "initial_copilot") {
-                        setLaunchProvider(data.launch_policy.initial_provider || "copilot");
+                        setLaunchProvider(preferredLaunchProvider(data.launch_policy));
                       }
                     },
                     children: data.launch_policy.available_strategies.map((strategy) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", { value: strategy, children: launchStrategyLabel(strategy) }, strategy))
