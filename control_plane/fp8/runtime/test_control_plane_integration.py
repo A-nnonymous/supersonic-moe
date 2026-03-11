@@ -310,6 +310,45 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
             interval=1,
         )
 
+    def test_project_section_validate_and_save(self) -> None:
+        updated_local_repo_root = self.project_root / "repo-updated"
+        updated_reference_workspace_root = self.paddle_root / "ref-updated"
+        updated_local_repo_root.mkdir(parents=True, exist_ok=True)
+        updated_reference_workspace_root.mkdir(parents=True, exist_ok=True)
+        updated_project = {
+            "repository_name": "sonicmoe-fp8-it-updated",
+            "local_repo_root": str(updated_local_repo_root),
+            "reference_workspace_root": str(updated_reference_workspace_root),
+            "dashboard": {
+                "host": "127.0.0.1",
+                "port": self.port,
+            },
+        }
+
+        validation_result = read_json(
+            f"{self.base_url}/api/config/validate-section",
+            {"section": "project", "value": updated_project},
+        )
+        self.assertTrue(validation_result["ok"])
+        self.assertEqual(validation_result["validation_issues"], [])
+
+        save_result = read_json(
+            f"{self.base_url}/api/config/section",
+            {"section": "project", "value": updated_project},
+        )
+        self.assertTrue(save_result["ok"])
+        self.assertEqual(save_result["validation_issues"], [])
+
+        state = self.fetch_state()
+        project = state["config"]["project"]
+        self.assertEqual(project["repository_name"], updated_project["repository_name"])
+        self.assertEqual(project["local_repo_root"], updated_project["local_repo_root"])
+        self.assertEqual(project["reference_workspace_root"], updated_project["reference_workspace_root"])
+
+        saved_config_text = self.config_path.read_text(encoding="utf-8")
+        self.assertIn(updated_project["local_repo_root"], saved_config_text)
+        self.assertIn(updated_project["reference_workspace_root"], saved_config_text)
+
     def test_multi_agent_launch_policies_and_heartbeats(self) -> None:
         initial_state = self.fetch_state()
         self.assertEqual(initial_state["launch_policy"]["default_strategy"], "initial_copilot")
