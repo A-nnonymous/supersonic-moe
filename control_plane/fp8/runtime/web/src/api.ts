@@ -11,7 +11,7 @@ import type {
   StopWorkersResponse,
 } from './types';
 
-async function parseJson<T>(response: Response): Promise<T> {
+async function parseJson<T>(response: Response, requestPath: string): Promise<T> {
   const bodyText = await response.text();
   let data: (T & { error?: string; errors?: string[] }) | null = null;
   if (bodyText) {
@@ -19,15 +19,15 @@ async function parseJson<T>(response: Response): Promise<T> {
       data = JSON.parse(bodyText) as T & { error?: string; errors?: string[] };
     } catch {
       const snippet = bodyText.slice(0, 160).replace(/\s+/g, ' ').trim();
-      throw new Error(`request failed with status ${response.status}: expected JSON, received ${snippet || 'empty response'}`);
+      throw new Error(`request ${requestPath} failed with status ${response.status}: expected JSON, received ${snippet || 'empty response'}`);
     }
   }
   if (!response.ok) {
-    const errorText = data?.error || data?.errors?.join('\n') || `request failed with status ${response.status}`;
+    const errorText = data?.error || data?.errors?.join('\n') || `request ${requestPath} failed with status ${response.status}`;
     throw new Error(errorText);
   }
   if (data === null) {
-    throw new Error(`request failed with status ${response.status}: empty response body`);
+    throw new Error(`request ${requestPath} failed with status ${response.status}: empty response body`);
   }
   return data;
 }
@@ -38,12 +38,13 @@ async function postJson<T>(path: string, payload: Record<string, unknown>): Prom
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
-  return parseJson<T>(response);
+  return parseJson<T>(response, path);
 }
 
 export async function fetchState(signal?: AbortSignal): Promise<DashboardState> {
-  const response = await fetch('/api/state', { signal });
-  return parseJson<DashboardState>(response);
+  const path = '/api/state';
+  const response = await fetch(path, { signal });
+  return parseJson<DashboardState>(response, path);
 }
 
 export function validateConfig(config: ConfigShape): Promise<ConfigValidationResponse> {

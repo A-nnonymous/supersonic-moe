@@ -24493,7 +24493,7 @@ var import_client = __toESM(require_client(), 1);
 var import_react = __toESM(require_react(), 1);
 
 // src/api.ts
-async function parseJson(response) {
+async function parseJson(response, requestPath) {
   const bodyText = await response.text();
   let data = null;
   if (bodyText) {
@@ -24501,15 +24501,15 @@ async function parseJson(response) {
       data = JSON.parse(bodyText);
     } catch {
       const snippet = bodyText.slice(0, 160).replace(/\s+/g, " ").trim();
-      throw new Error(`request failed with status ${response.status}: expected JSON, received ${snippet || "empty response"}`);
+      throw new Error(`request ${requestPath} failed with status ${response.status}: expected JSON, received ${snippet || "empty response"}`);
     }
   }
   if (!response.ok) {
-    const errorText = data?.error || data?.errors?.join("\n") || `request failed with status ${response.status}`;
+    const errorText = data?.error || data?.errors?.join("\n") || `request ${requestPath} failed with status ${response.status}`;
     throw new Error(errorText);
   }
   if (data === null) {
-    throw new Error(`request failed with status ${response.status}: empty response body`);
+    throw new Error(`request ${requestPath} failed with status ${response.status}: empty response body`);
   }
   return data;
 }
@@ -24519,11 +24519,12 @@ async function postJson(path, payload) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
   });
-  return parseJson(response);
+  return parseJson(response, path);
 }
 async function fetchState(signal) {
-  const response = await fetch("/api/state", { signal });
-  return parseJson(response);
+  const path = "/api/state";
+  const response = await fetch(path, { signal });
+  return parseJson(response, path);
 }
 function validateConfigSection(section, value) {
   return postJson("/api/config/validate-section", { section, value });
