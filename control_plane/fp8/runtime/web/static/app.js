@@ -25100,6 +25100,7 @@ function buildAgentRows(data) {
       heartbeat_state: item.state,
       last_seen: item.last_seen,
       evidence: item.evidence,
+      escalation: item.escalation,
       expected_next_checkin: item.expected_next_checkin
     });
   });
@@ -25127,6 +25128,7 @@ function buildAgentRows(data) {
         process_alive: item.process_alive,
         pid: item.pid,
         evidence: item.evidence,
+        escalation: item.escalation,
         expected_next_checkin: item.expected_next_checkin,
         last_seen: item.last_seen,
         display_state: state
@@ -25815,7 +25817,7 @@ function MergeCard({ item }) {
 }
 function AgentCard({ item }) {
   const processLine = item.process_alive ? `pid ${item.pid}` : item.last_seen || "no heartbeat yet";
-  const detailLine = item.process_alive ? "process alive" : item.evidence || item.expected_next_checkin || "waiting for launch";
+  const detailLine = item.process_alive ? "process alive" : item.escalation && item.escalation !== "none" ? item.escalation : item.evidence || item.expected_next_checkin || "waiting for launch";
   return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("article", { className: "agent-card", children: [
     /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("header", { children: [
       /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [

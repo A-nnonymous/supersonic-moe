@@ -32,6 +32,7 @@ type AgentRow = {
   process_alive?: boolean;
   pid?: number;
   evidence?: string;
+  escalation?: string;
   expected_next_checkin?: string;
   last_seen?: string;
   display_state: string;
@@ -670,6 +671,7 @@ function buildAgentRows(data: DashboardState | null): AgentRow[] {
       heartbeat_state: item.state,
       last_seen: item.last_seen,
       evidence: item.evidence,
+      escalation: item.escalation,
       expected_next_checkin: item.expected_next_checkin,
     });
   });
@@ -699,6 +701,7 @@ function buildAgentRows(data: DashboardState | null): AgentRow[] {
         process_alive: item.process_alive,
         pid: item.pid,
         evidence: item.evidence,
+        escalation: item.escalation,
         expected_next_checkin: item.expected_next_checkin,
         last_seen: item.last_seen,
         display_state: state,
@@ -1377,7 +1380,11 @@ function MergeCard({ item }: { item: MergeQueueItem }) {
 
 function AgentCard({ item }: { item: AgentRow }) {
   const processLine = item.process_alive ? `pid ${item.pid}` : item.last_seen || 'no heartbeat yet';
-  const detailLine = item.process_alive ? 'process alive' : item.evidence || item.expected_next_checkin || 'waiting for launch';
+  const detailLine = item.process_alive
+    ? 'process alive'
+    : item.escalation && item.escalation !== 'none'
+      ? item.escalation
+      : item.evidence || item.expected_next_checkin || 'waiting for launch';
   return (
     <article className="agent-card">
       <header>
