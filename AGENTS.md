@@ -1,6 +1,7 @@
 # Control Plane Agent Context
 
 Use this as the cold-start context for any new agent working in `control_plane/`.
+For migration-oriented handoff context and recent runtime/testing decisions, also read `agent.md` at the repository root.
 
 ## Scope
 

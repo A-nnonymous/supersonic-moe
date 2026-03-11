@@ -393,6 +393,29 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertIn("unknown api route", payload["error"])
 
+    def test_stop_agents_cli_stops_workers_and_keeps_listener(self) -> None:
+        launch_result = read_json(f"{self.base_url}/api/launch", {"restart": False})
+        self.assertTrue(launch_result["ok"])
+        self.wait_for_agent_state(expected_provider="copilot", expected_model="gpt-5.4")
+
+        stop_result = self.run_cli_command("stop-agents")
+        stop_payload = json.loads(stop_result.stdout)
+        self.assertTrue(stop_payload["ok"])
+        self.assertEqual(sorted(stop_payload["stopped"]), ["A1", "A2"])
+
+        wait_for(lambda: port_is_listening(self.port), timeout=10, interval=0.5)
+        state = self.fetch_state()
+        heartbeats = {item["agent"]: item for item in state["heartbeats"]["agents"]}
+        runtime_workers = {item["agent"]: item for item in state["runtime"]["workers"]}
+        self.assertEqual(heartbeats["A1"]["state"], "offline")
+        self.assertEqual(heartbeats["A2"]["state"], "offline")
+        self.assertEqual(runtime_workers["A1"]["status"], "stopped")
+        self.assertEqual(runtime_workers["A2"]["status"], "stopped")
+
+        session_state = self.session_state()
+        self.assertTrue(session_state["server"]["listener_active"])
+        self.assertEqual(session_state["workers"], {})
+
     def test_silent_and_stop_all_cli_preserve_then_release_workers(self) -> None:
         launch_result = read_json(f"{self.base_url}/api/launch", {"restart": False})
         self.assertTrue(launch_result["ok"])
