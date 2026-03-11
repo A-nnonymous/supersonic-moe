@@ -1083,9 +1083,9 @@ function OperationsTab({ data }: { data: DashboardState }) {
     { key: 'dashboard', value: data.project.dashboard?.host && data.project.dashboard?.port ? `${data.project.dashboard.host}:${data.project.dashboard.port}` : '' },
     { key: 'listener_active', value: data.mode.listener_active },
   ];
-  const processRows = Object.entries(data.processes || {}).map(([agent, item]) => ({ agent, provider: item.provider, model: item.model, alive: item.alive, pid: item.pid, resource_pool: item.resource_pool, returncode: item.returncode }));
+  const processRows = Object.entries(data.processes || {}).map(([agent, item]) => ({ agent, provider: item.provider, model: item.model, alive: item.alive, pid: item.pid, resource_pool: item.resource_pool, recursion_guard: item.recursion_guard, wrapper_path: item.wrapper_path, returncode: item.returncode }));
   const mergeRows = data.merge_queue.map((item) => ({ agent: item.agent, branch: item.branch, submit_strategy: item.submit_strategy, worker_identity: item.worker_identity, merge_target: item.merge_target, status: item.status, manager_action: item.manager_action }));
-  const providerRows = data.provider_queue.map((item) => ({ resource_pool: item.resource_pool, provider: item.provider, priority: item.priority, binary_found: item.binary_found, auth_mode: item.auth_mode, auth_ready: item.auth_ready, launch_ready: item.launch_ready, auth_detail: item.auth_detail, connection_quality: item.connection_quality, work_quality: item.work_quality, score: item.score }));
+  const providerRows = data.provider_queue.map((item) => ({ resource_pool: item.resource_pool, provider: item.provider, priority: item.priority, binary_found: item.binary_found, recursion_guard: item.recursion_guard, launch_wrapper: item.launch_wrapper, auth_mode: item.auth_mode, auth_ready: item.auth_ready, launch_ready: item.launch_ready, auth_detail: item.auth_detail, connection_quality: item.connection_quality, work_quality: item.work_quality, score: item.score }));
   return (
     <div className="tab-body">
       <section className="grid">
@@ -1093,15 +1093,15 @@ function OperationsTab({ data }: { data: DashboardState }) {
         <section className="card"><h2>Validation</h2><pre>{renderValidation(data)}</pre></section>
       </section>
       <section className="grid">
-        <section className="card"><h2>Provider Queue</h2><DataTable columns={['resource_pool', 'provider', 'priority', 'binary_found', 'auth_mode', 'auth_ready', 'launch_ready', 'auth_detail', 'connection_quality', 'work_quality', 'score']} rows={providerRows} /></section>
+        <section className="card"><h2>Provider Queue</h2><DataTable columns={['resource_pool', 'provider', 'priority', 'binary_found', 'recursion_guard', 'launch_wrapper', 'auth_mode', 'auth_ready', 'launch_ready', 'auth_detail', 'connection_quality', 'work_quality', 'score']} rows={providerRows} /></section>
         <section className="card"><h2>Merge Queue</h2><DataTable columns={['agent', 'branch', 'submit_strategy', 'worker_identity', 'merge_target', 'status', 'manager_action']} rows={mergeRows} /></section>
       </section>
       <section className="grid">
-        <section className="card"><h2>Active Processes</h2><DataTable columns={['agent', 'provider', 'model', 'alive', 'pid', 'resource_pool', 'returncode']} rows={processRows} /></section>
+        <section className="card"><h2>Active Processes</h2><DataTable columns={['agent', 'provider', 'model', 'alive', 'pid', 'resource_pool', 'recursion_guard', 'wrapper_path', 'returncode']} rows={processRows} /></section>
         <section className="card"><h2>Project</h2><DataTable columns={['key', 'value']} rows={projectRows} /></section>
       </section>
       <section className="grid">
-        <section className="card"><h2>Runtime Topology</h2><DataTable columns={['agent', 'resource_pool', 'provider', 'model', 'branch', 'status']} rows={data.runtime.workers || []} /></section>
+        <section className="card"><h2>Runtime Topology</h2><DataTable columns={['agent', 'resource_pool', 'provider', 'model', 'branch', 'recursion_guard', 'launch_wrapper', 'status']} rows={data.runtime.workers || []} /></section>
         <section className="card"><h2>Heartbeats</h2><DataTable columns={['agent', 'state', 'last_seen', 'expected_next_checkin']} rows={data.heartbeats.agents || []} /></section>
       </section>
       <section className="grid">

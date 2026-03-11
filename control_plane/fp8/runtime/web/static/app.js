@@ -25465,9 +25465,9 @@ function OperationsTab({ data }) {
     { key: "dashboard", value: data.project.dashboard?.host && data.project.dashboard?.port ? `${data.project.dashboard.host}:${data.project.dashboard.port}` : "" },
     { key: "listener_active", value: data.mode.listener_active }
   ];
-  const processRows = Object.entries(data.processes || {}).map(([agent, item]) => ({ agent, provider: item.provider, model: item.model, alive: item.alive, pid: item.pid, resource_pool: item.resource_pool, returncode: item.returncode }));
+  const processRows = Object.entries(data.processes || {}).map(([agent, item]) => ({ agent, provider: item.provider, model: item.model, alive: item.alive, pid: item.pid, resource_pool: item.resource_pool, recursion_guard: item.recursion_guard, wrapper_path: item.wrapper_path, returncode: item.returncode }));
   const mergeRows = data.merge_queue.map((item) => ({ agent: item.agent, branch: item.branch, submit_strategy: item.submit_strategy, worker_identity: item.worker_identity, merge_target: item.merge_target, status: item.status, manager_action: item.manager_action }));
-  const providerRows = data.provider_queue.map((item) => ({ resource_pool: item.resource_pool, provider: item.provider, priority: item.priority, binary_found: item.binary_found, auth_mode: item.auth_mode, auth_ready: item.auth_ready, launch_ready: item.launch_ready, auth_detail: item.auth_detail, connection_quality: item.connection_quality, work_quality: item.work_quality, score: item.score }));
+  const providerRows = data.provider_queue.map((item) => ({ resource_pool: item.resource_pool, provider: item.provider, priority: item.priority, binary_found: item.binary_found, recursion_guard: item.recursion_guard, launch_wrapper: item.launch_wrapper, auth_mode: item.auth_mode, auth_ready: item.auth_ready, launch_ready: item.launch_ready, auth_detail: item.auth_detail, connection_quality: item.connection_quality, work_quality: item.work_quality, score: item.score }));
   return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "tab-body", children: [
     /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "grid", children: [
       /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "card", children: [
@@ -25486,7 +25486,7 @@ ${data.commands.up}` })
     /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "grid", children: [
       /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "card", children: [
         /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", { children: "Provider Queue" }),
-        /* @__PURE__ */ (0, import_jsx_runtime.jsx)(DataTable, { columns: ["resource_pool", "provider", "priority", "binary_found", "auth_mode", "auth_ready", "launch_ready", "auth_detail", "connection_quality", "work_quality", "score"], rows: providerRows })
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)(DataTable, { columns: ["resource_pool", "provider", "priority", "binary_found", "recursion_guard", "launch_wrapper", "auth_mode", "auth_ready", "launch_ready", "auth_detail", "connection_quality", "work_quality", "score"], rows: providerRows })
       ] }),
       /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "card", children: [
         /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", { children: "Merge Queue" }),
@@ -25496,7 +25496,7 @@ ${data.commands.up}` })
     /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "grid", children: [
       /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "card", children: [
         /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", { children: "Active Processes" }),
-        /* @__PURE__ */ (0, import_jsx_runtime.jsx)(DataTable, { columns: ["agent", "provider", "model", "alive", "pid", "resource_pool", "returncode"], rows: processRows })
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)(DataTable, { columns: ["agent", "provider", "model", "alive", "pid", "resource_pool", "recursion_guard", "wrapper_path", "returncode"], rows: processRows })
       ] }),
       /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "card", children: [
         /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", { children: "Project" }),
@@ -25506,7 +25506,7 @@ ${data.commands.up}` })
     /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "grid", children: [
       /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "card", children: [
         /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", { children: "Runtime Topology" }),
-        /* @__PURE__ */ (0, import_jsx_runtime.jsx)(DataTable, { columns: ["agent", "resource_pool", "provider", "model", "branch", "status"], rows: data.runtime.workers || [] })
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)(DataTable, { columns: ["agent", "resource_pool", "provider", "model", "branch", "recursion_guard", "launch_wrapper", "status"], rows: data.runtime.workers || [] })
       ] }),
       /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "card", children: [
         /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", { children: "Heartbeats" }),
