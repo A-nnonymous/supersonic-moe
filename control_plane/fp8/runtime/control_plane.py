@@ -2635,10 +2635,10 @@ def stop_all_command(args: argparse.Namespace) -> int:
                         stopped_worker_names.append(agent)
         listener_released = wait_for_port_release(listener_port)
         if not listener_released and server_pid and pid_is_running(server_pid):
-            terminate_process_tree(server_pid, signal.SIGTERM)
+            terminate_pid(server_pid, signal.SIGTERM)
             listener_released = wait_for_port_release(listener_port)
         if not listener_released and server_pid and pid_is_running(server_pid):
-            terminate_process_tree(server_pid, signal.SIGKILL)
+            terminate_pid(server_pid, signal.SIGKILL)
             listener_released = wait_for_port_release(listener_port)
         result["listener_port"] = listener_port
         result["listener_released"] = listener_released
@@ -2657,9 +2657,9 @@ def stop_all_command(args: argparse.Namespace) -> int:
             if not pid or not pid_is_running(pid):
                 stopped_workers.append(agent)
         if server_pid and pid_is_running(server_pid):
-            terminate_process_tree(server_pid, signal.SIGTERM)
+            terminate_pid(server_pid, signal.SIGTERM)
             if not wait_for_port_release(listener_port):
-                terminate_process_tree(server_pid, signal.SIGKILL)
+                terminate_pid(server_pid, signal.SIGKILL)
         listener_released = wait_for_port_release(listener_port)
         print(
             json.dumps(
