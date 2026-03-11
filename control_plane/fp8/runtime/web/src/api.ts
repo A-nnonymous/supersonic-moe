@@ -1,7 +1,11 @@
 import type {
+  ConfigShape,
   ConfigSaveResponse,
+  ConfigValidationResponse,
   DashboardState,
+  LaunchStrategy,
   LaunchResponse,
+  SilentModeResponse,
   StopAllResponse,
   StopWorkersResponse,
 } from './types';
@@ -29,12 +33,19 @@ export async function fetchState(signal?: AbortSignal): Promise<DashboardState> 
   return parseJson<DashboardState>(response);
 }
 
-export function saveConfig(configText: string): Promise<ConfigSaveResponse> {
-  return postJson<ConfigSaveResponse>('/api/config', { config_text: configText });
+export function validateConfig(config: ConfigShape): Promise<ConfigValidationResponse> {
+  return postJson<ConfigValidationResponse>('/api/config/validate', { config });
 }
 
-export function launchWorkers(restart: boolean): Promise<LaunchResponse> {
-  return postJson<LaunchResponse>('/api/launch', { restart });
+export function saveConfig(config: ConfigShape): Promise<ConfigSaveResponse> {
+  return postJson<ConfigSaveResponse>('/api/config', { config });
+}
+
+export function launchWorkers(
+  restart: boolean,
+  launchPolicy?: { strategy: LaunchStrategy; provider?: string; model?: string },
+): Promise<LaunchResponse> {
+  return postJson<LaunchResponse>('/api/launch', { restart, ...launchPolicy });
 }
 
 export function stopWorkers(): Promise<StopWorkersResponse> {
@@ -43,4 +54,8 @@ export function stopWorkers(): Promise<StopWorkersResponse> {
 
 export function stopAll(): Promise<StopAllResponse> {
   return postJson<StopAllResponse>('/api/stop-all', {});
+}
+
+export function enableSilentMode(): Promise<SilentModeResponse> {
+  return postJson<SilentModeResponse>('/api/silent', {});
 }

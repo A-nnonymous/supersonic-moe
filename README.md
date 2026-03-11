@@ -128,17 +128,19 @@ python control_plane/fp8/runtime/control_plane.py stop-agents
 You can also stop the listener only or stop both listener and agents:
 
 ```bash
-python control_plane/fp8/runtime/control_plane.py stop-listener
+python control_plane/fp8/runtime/control_plane.py silent
 python control_plane/fp8/runtime/control_plane.py stop-all
 ```
 
-When you use `stop-all`, the runtime terminates worker process groups and waits for the dashboard port to be released before reporting success. For the default listener, `stop-all --port 8233` is the safest explicit form.
+`silent` closes only the dashboard listener and leaves workers running. `stop-listener` remains as a compatibility alias. When you use `stop-all`, the runtime terminates worker process groups and waits for the dashboard port to be released before reporting success. For the default listener, `stop-all --port 8233` is the safest explicit form.
 
-6. Override bind address when needed:
+6. Default detached serve path:
 
 ```bash
-python control_plane/fp8/runtime/control_plane.py serve --host 0.0.0.0 --port 8233
+python control_plane/fp8/runtime/control_plane.py serve
 ```
+
+That default path now binds `0.0.0.0:8233` and detaches automatically. Add `--foreground` when you want to keep it attached to the current shell, or `--host/--port` only when deviating from the default.
 
 7. Optional compatibility path for non-GPU manager machines:
 
@@ -151,7 +153,8 @@ uv run --no-project --with 'PyYAML>=6.0.2' python control_plane/fp8/runtime/cont
 - the first screen shows every manager and worker agent as a status card
 - the overview page stays focused on agent dashboards and overall program progress
 - the dashboard now uses a compiled React frontend served from `control_plane/fp8/runtime/web/static/`
-- the dashboard can save config, launch workers, restart workers, stop agents, stop all, and copy startup commands
+- the dashboard can save validated form-based config, launch workers, restart workers, enter silent mode, stop agents, stop all, and copy startup commands
+- the launch bar supports first-run Copilot, explicit provider/model pinning, and elastic provider selection
 - worker launch decisions use static pool priority plus runtime connection-quality and work-quality scoring
 - each worker can carry its own git identity, and A0 owns final merge into the integration branch
 - every worker may declare a `resource_pool_queue` for fallback ordering

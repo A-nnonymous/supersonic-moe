@@ -142,13 +142,13 @@ Use the short form by default:
 - `up` opens the control plane and launches workers
 - `--bootstrap` forces template-backed cold-start mode
 - `--open-browser` opens the dashboard automatically
-- `--foreground` disables the auto-detach behavior for remote cold-start `serve`
+- `--foreground` disables the default fire-and-forget behavior of `serve`
 
 Add these only when needed:
 
-- `--host 0.0.0.0` to override the listener explicitly
 - `--port 9000` to change the dashboard port
-- `--detach` to keep the control plane running after the shell returns
+- `--host 127.0.0.1` or another address if you do not want the default `0.0.0.0`
+- `--detach` only if you want to force detach on a non-serve command
 - `--log-file <path>` to change the detached log path
 - `--config <path>` only if you do not want the default `runtime/local_config.yaml`
 
@@ -157,8 +157,15 @@ Add these only when needed:
 Use these shell commands when you want to control a running detached session from the same machine. The runtime now records per-port session state, so `--port 8233` targets the listener you actually care about even if another control-plane instance was started elsewhere.
 
 - stop worker agents only: `python control_plane/fp8/runtime/control_plane.py stop-agents`
-- stop the dashboard listener only: `python control_plane/fp8/runtime/control_plane.py stop-listener`
+- enter silent mode by closing the dashboard listener only: `python control_plane/fp8/runtime/control_plane.py silent`
+- compatibility alias for silent mode: `python control_plane/fp8/runtime/control_plane.py stop-listener`
 - stop both the dashboard listener and all worker agents: `python control_plane/fp8/runtime/control_plane.py stop-all`
+
+`silent` is the soft stop path:
+
+- it closes the HTTP listener but leaves worker processes running
+- it updates session state so later stop commands still know the listener is already gone
+- it is the right option when you want to reduce exposure to scans without interrupting work
 
 `stop-all` is the hard stop path:
 
@@ -170,7 +177,9 @@ Use these shell commands when you want to control a running detached session fro
 
 If you want the control plane to keep running after the shell returns, use detached mode:
 
-`python control_plane/fp8/runtime/control_plane.py serve --bootstrap`
+`python control_plane/fp8/runtime/control_plane.py serve`
+
+That default path now binds `0.0.0.0:8233` and detaches automatically. Use `--foreground` only when you want logs in the current shell.
 
 The detached process writes combined stdout and stderr to `control_plane/fp8/runtime/control_plane.log` by default. You can override that path with `--log-file`.
 
@@ -188,17 +197,19 @@ That same standalone path also supports cold-start startup with no `local_config
 
 ### Remote access note
 
-If your deployment hostname resolves to IPv6 first, an IPv6-only listener can still look like `ERR_CONNECTION_REFUSED` from the browser when your clients reach the node over IPv4. The runtime now always brings up an IPv4 listener first when you pass `--host 0.0.0.0`, then adds IPv6 as a secondary listener when possible.
+If your deployment hostname resolves to IPv6 first, an IPv6-only listener can still look like `ERR_CONNECTION_REFUSED` from the browser when your clients reach the node over IPv4. The runtime now brings up an IPv4 listener on `0.0.0.0` by default, then adds IPv6 as a secondary listener when possible.
 
 ## Dashboard capabilities
 
 The local webpage now provides:
 
 - a compact top bar for launch, restart, stop agents, stop all, refresh, and command copy actions
+- a `Silent Mode` action that closes the listener without stopping workers
+- launch modes for first-run Copilot, explicit provider/model pinning, or elastic provider selection
 - an `Overview` page that shows agent dashboards, overall delivery progress, and branch merge status at a glance
 - an `Operations` page for commands, validation, provider queue, merge queue, runtime state, heartbeats, backlog, and manager report
-- a `Settings` page for API keys, provider routing, Paddle path, worktrees, worker commands, and git submission identities
-- an editable local YAML config with supporting project, resource-pool, and worker summaries
+- a `Settings` page with responsive editable project, pool, merge-policy, and worker forms
+- strict config validation before save, including path checks via `ls` and host checks via `ping`
 - provider priority queue with runtime connection-quality and work-quality scoring
 - per-worker git commit identities that are applied inside each worker worktree before launch
 - a manager-owned merge queue that tracks which worker branch should be integrated into the target branch
@@ -210,7 +221,7 @@ For actual SonicMoE FP8 multi-agent delivery, the normal manager loop is:
 
 1. bring the control plane up with `serve --bootstrap` or `serve --open-browser`
 2. verify Settings and validation output are clean
-3. press `Launch` or run `up --open-browser`
+3. use `Initial Copilot` for the first fleet launch, then switch to `Selected Model` or `Elastic` as needed before pressing `Launch`
 4. monitor agent health, backlog progress, and branch merge status from `Overview`
 5. inspect provider routing, runtime topology, and heartbeats in `Operations`
 6. press `Stop Agents` or run `stop-agents` when you want to pause the worker fleet without losing dashboard state

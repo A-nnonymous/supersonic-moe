@@ -2433,7 +2433,7 @@ var require_react_dom_development = __commonJS({
         var HostPortal = 4;
         var HostComponent = 5;
         var HostText = 6;
-        var Fragment = 7;
+        var Fragment2 = 7;
         var Mode = 8;
         var ContextConsumer = 9;
         var ContextProvider = 10;
@@ -3590,7 +3590,7 @@ var require_react_dom_development = __commonJS({
               return "DehydratedFragment";
             case ForwardRef:
               return getWrappedName$1(type, type.render, "ForwardRef");
-            case Fragment:
+            case Fragment2:
               return "Fragment";
             case HostComponent:
               return type;
@@ -12019,7 +12019,7 @@ var require_react_dom_development = __commonJS({
             }
           }
           function updateFragment2(returnFiber, current2, fragment, lanes, key) {
-            if (current2 === null || current2.tag !== Fragment) {
+            if (current2 === null || current2.tag !== Fragment2) {
               var created = createFiberFromFragment(fragment, returnFiber.mode, lanes, key);
               created.return = returnFiber;
               return created;
@@ -12422,7 +12422,7 @@ var require_react_dom_development = __commonJS({
               if (child.key === key) {
                 var elementType = element.type;
                 if (elementType === REACT_FRAGMENT_TYPE) {
-                  if (child.tag === Fragment) {
+                  if (child.tag === Fragment2) {
                     deleteRemainingChildren(returnFiber, child.sibling);
                     var existing = useFiber(child, element.props.children);
                     existing.return = returnFiber;
@@ -17898,7 +17898,7 @@ var require_react_dom_development = __commonJS({
               var _resolvedProps2 = workInProgress2.elementType === type ? _unresolvedProps2 : resolveDefaultProps(type, _unresolvedProps2);
               return updateForwardRef(current2, workInProgress2, type, _resolvedProps2, renderLanes2);
             }
-            case Fragment:
+            case Fragment2:
               return updateFragment(current2, workInProgress2, renderLanes2);
             case Mode:
               return updateMode(current2, workInProgress2, renderLanes2);
@@ -18170,7 +18170,7 @@ var require_react_dom_development = __commonJS({
             case SimpleMemoComponent:
             case FunctionComponent:
             case ForwardRef:
-            case Fragment:
+            case Fragment2:
             case Mode:
             case Profiler:
             case ContextConsumer:
@@ -22431,7 +22431,7 @@ var require_react_dom_development = __commonJS({
           return fiber;
         }
         function createFiberFromFragment(elements, mode, lanes, key) {
-          var fiber = createFiber(Fragment, elements, key, mode);
+          var fiber = createFiber(Fragment2, elements, key, mode);
           fiber.lanes = lanes;
           return fiber;
         }
@@ -24513,17 +24513,23 @@ async function fetchState(signal) {
   const response = await fetch("/api/state", { signal });
   return parseJson(response);
 }
-function saveConfig(configText) {
-  return postJson("/api/config", { config_text: configText });
+function validateConfig(config) {
+  return postJson("/api/config/validate", { config });
 }
-function launchWorkers(restart) {
-  return postJson("/api/launch", { restart });
+function saveConfig(config) {
+  return postJson("/api/config", { config });
+}
+function launchWorkers(restart, launchPolicy) {
+  return postJson("/api/launch", { restart, ...launchPolicy });
 }
 function stopWorkers() {
   return postJson("/api/stop", {});
 }
 function stopAll() {
   return postJson("/api/stop-all", {});
+}
+function enableSilentMode() {
+  return postJson("/api/silent", {});
 }
 
 // src/App.tsx
@@ -24532,11 +24538,11 @@ var AUTO_REFRESH_MS = 4e3;
 function classNames(...values) {
   return values.filter(Boolean).join(" ");
 }
-function stateClass(value) {
-  return `state-${String(value || "unknown").replace(/[^a-zA-Z0-9]+/g, "_")}`;
-}
 function displayState(value) {
   return String(value || "unknown").replaceAll("_", " ");
+}
+function stateClass(value) {
+  return `state-${String(value || "unknown").replace(/[^a-zA-Z0-9]+/g, "_")}`;
 }
 function renderCell(value) {
   if (value === null || value === void 0 || value === "") {
@@ -24546,6 +24552,43 @@ function renderCell(value) {
     return value ? "yes" : "no";
   }
   return String(value);
+}
+function cloneConfig(config) {
+  if (!config) {
+    return { project: {}, providers: {}, resource_pools: {}, workers: [] };
+  }
+  return JSON.parse(JSON.stringify(config));
+}
+function normalizeConfig(config) {
+  return {
+    project: config.project || {},
+    providers: config.providers || {},
+    resource_pools: config.resource_pools || {},
+    workers: config.workers || []
+  };
+}
+function buildIssueMap(...issueSets) {
+  return issueSets.reduce((acc, issues) => {
+    issues.forEach((issue) => {
+      acc[issue.field] = [...acc[issue.field] || [], issue.message];
+    });
+    return acc;
+  }, {});
+}
+function parseQueue(value) {
+  return value.split(",").map((item) => item.trim()).filter(Boolean);
+}
+function stringifyQueue(values) {
+  return (values || []).join(", ");
+}
+function launchStrategyLabel(strategy) {
+  if (strategy === "initial_copilot") {
+    return "Initial Copilot";
+  }
+  if (strategy === "selected_model") {
+    return "Selected Model";
+  }
+  return "Elastic";
 }
 function sortAgents(rows) {
   return [...rows].sort((left, right) => {
@@ -24575,9 +24618,7 @@ function buildAgentRows(data) {
     });
   });
   (data.config?.workers || []).forEach((item) => {
-    remember(item.agent, {
-      branch: item.branch
-    });
+    remember(item.agent, { branch: item.branch });
   });
   (data.heartbeats?.agents || []).forEach((item) => {
     remember(item.agent, {
@@ -24631,13 +24672,148 @@ function buildProgressModel(data, agentRows) {
   const openGate = gates.find((item) => item.status !== "passed");
   return { progress, passedGates, totalGates: gates.length, completedItems, totalItems: backlog.length, blockedItems, activeAgents, attentionAgents, openGate };
 }
+function getLocalValidationIssues(config) {
+  const draft = normalizeConfig(config);
+  const issues = [];
+  const add = (field, message) => issues.push({ field, message });
+  const project = draft.project || {};
+  const dashboard = project.dashboard || {};
+  const pools = draft.resource_pools || {};
+  const workers = draft.workers || [];
+  if (!String(project.repository_name || "").trim()) {
+    add("project.repository_name", "repository name is required");
+  }
+  if (!String(project.local_repo_root || "").trim()) {
+    add("project.local_repo_root", "local repo root is required");
+  }
+  if (!String(project.paddle_repo_path || "").trim()) {
+    add("project.paddle_repo_path", "Paddle path is required");
+  }
+  if (!String(dashboard.host || "").trim()) {
+    add("project.dashboard.host", "dashboard host is required");
+  }
+  if (!Number.isInteger(Number(dashboard.port)) || Number(dashboard.port) < 1 || Number(dashboard.port) > 65535) {
+    add("project.dashboard.port", "dashboard port must be between 1 and 65535");
+  }
+  if (!String(project.integration_branch || project.base_branch || "").trim()) {
+    add("project.integration_branch", "integration branch is required");
+  }
+  const seenAgents = /* @__PURE__ */ new Set();
+  const seenBranches = /* @__PURE__ */ new Set();
+  const seenWorktrees = /* @__PURE__ */ new Set();
+  Object.entries(pools).forEach(([poolName, pool]) => {
+    if (!String(pool.provider || "").trim()) {
+      add(`resource_pools.${poolName}.provider`, "provider is required");
+    }
+    if (!String(pool.model || "").trim()) {
+      add(`resource_pools.${poolName}.model`, "model is required");
+    }
+    if (!Number.isInteger(Number(pool.priority ?? 100))) {
+      add(`resource_pools.${poolName}.priority`, "priority must be an integer");
+    }
+  });
+  workers.forEach((worker, index) => {
+    const root = `workers[${index}]`;
+    const agent = String(worker.agent || "").trim();
+    const branch = String(worker.branch || "").trim();
+    const worktreePath = String(worker.worktree_path || "").trim();
+    if (!agent) {
+      add(`${root}.agent`, "agent is required");
+    } else if (seenAgents.has(agent)) {
+      add(`${root}.agent`, "agent must be unique");
+    } else {
+      seenAgents.add(agent);
+    }
+    if (!branch) {
+      add(`${root}.branch`, "branch is required");
+    } else if (seenBranches.has(branch)) {
+      add(`${root}.branch`, "branch must be unique");
+    } else {
+      seenBranches.add(branch);
+    }
+    if (!worktreePath) {
+      add(`${root}.worktree_path`, "worktree path is required");
+    } else if (seenWorktrees.has(worktreePath)) {
+      add(`${root}.worktree_path`, "worktree path must be unique");
+    } else {
+      seenWorktrees.add(worktreePath);
+    }
+    const poolName = String(worker.resource_pool || "").trim();
+    const queue = worker.resource_pool_queue || [];
+    if (!poolName && !queue.length) {
+      add(`${root}.resource_pool`, "resource pool or queue is required");
+    }
+    if (!String(worker.test_command || "").trim()) {
+      add(`${root}.test_command`, "test command is required");
+    }
+    if (!String(worker.submit_strategy || "").trim()) {
+      add(`${root}.submit_strategy`, "submit strategy is required");
+    }
+    if (String(worker.environment_type || "uv") !== "none" && !String(worker.environment_path || "").trim()) {
+      add(`${root}.environment_path`, "environment path is required unless environment type is none");
+    }
+  });
+  return issues;
+}
 function DataTable({ columns, rows }) {
   if (!rows.length) {
     return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "small muted", children: "No data" });
   }
-  return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("table", { children: [
+  return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "table-shell", children: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("table", { children: [
     /* @__PURE__ */ (0, import_jsx_runtime.jsx)("thead", { children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("tr", { children: columns.map((column) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("th", { children: column }, column)) }) }),
     /* @__PURE__ */ (0, import_jsx_runtime.jsx)("tbody", { children: rows.map((row, rowIndex) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("tr", { children: columns.map((column) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("td", { children: renderCell(row[column]) }, column)) }, rowIndex)) })
+  ] }) });
+}
+function Field({
+  label,
+  value,
+  onChange,
+  issues,
+  placeholder,
+  type = "text"
+}) {
+  return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("label", { className: "field", children: [
+    /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { className: "field-label", children: label }),
+    /* @__PURE__ */ (0, import_jsx_runtime.jsx)(
+      "input",
+      {
+        className: classNames("field-input", issues && issues.length > 0 && "field-input-error"),
+        type,
+        value: value ?? "",
+        placeholder,
+        onChange: (event) => onChange(event.target.value)
+      }
+    ),
+    issues && issues.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { className: "field-error", children: issues[0] }) : null
+  ] });
+}
+function SelectField({
+  label,
+  value,
+  onChange,
+  issues,
+  options
+}) {
+  return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("label", { className: "field", children: [
+    /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { className: "field-label", children: label }),
+    /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("select", { className: classNames("field-input", issues && issues.length > 0 && "field-input-error"), value, onChange: (event) => onChange(event.target.value), children: [
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", { value: "", children: "Select\u2026" }),
+      options.map((option) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", { value: option, children: option }, option))
+    ] }),
+    issues && issues.length > 0 ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { className: "field-error", children: issues[0] }) : null
+  ] });
+}
+function SectionIssueList({ issues }) {
+  if (!issues.length) {
+    return null;
+  }
+  return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "settings-issues", children: [
+    /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", { children: "Validation Warnings" }),
+    /* @__PURE__ */ (0, import_jsx_runtime.jsx)("ul", { children: issues.map((issue, index) => /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("li", { children: [
+      issue.field,
+      ": ",
+      issue.message
+    ] }, `${issue.field}-${index}`)) })
   ] });
 }
 function OverviewTab({ data, agentRows, progress }) {
@@ -24724,7 +24900,8 @@ function OperationsTab({ data }) {
     { key: "local_repo_root", value: data.project.local_repo_root || "" },
     { key: "paddle_repo_path", value: data.project.paddle_repo_path || "" },
     { key: "integration_branch", value: data.project.integration_branch || data.project.base_branch || "" },
-    { key: "dashboard", value: data.project.dashboard?.host && data.project.dashboard?.port ? `${data.project.dashboard.host}:${data.project.dashboard.port}` : "" }
+    { key: "dashboard", value: data.project.dashboard?.host && data.project.dashboard?.port ? `${data.project.dashboard.host}:${data.project.dashboard.port}` : "" },
+    { key: "listener_active", value: data.mode.listener_active }
   ];
   const processRows = Object.entries(data.processes || {}).map(([agent, item]) => ({ agent, provider: item.provider, model: item.model, alive: item.alive, pid: item.pid, resource_pool: item.resource_pool, returncode: item.returncode }));
   const mergeRows = data.merge_queue.map((item) => ({ agent: item.agent, branch: item.branch, submit_strategy: item.submit_strategy, worker_identity: item.worker_identity, merge_target: item.merge_target, status: item.status, manager_action: item.manager_action }));
@@ -24790,50 +24967,89 @@ ${data.commands.up}` })
     ] })
   ] });
 }
-function SettingsTab({ data, configText, onChange, onSave }) {
-  const pools = Object.entries(data.config.resource_pools || {}).map(([name, item]) => ({ name, priority: item.priority ?? 100, provider: item.provider, model: item.model }));
-  const workers = (data.config.workers || []).map((item) => ({ agent: item.agent, task_id: item.task_id, resource_pool: item.resource_pool, resource_pool_queue: (item.resource_pool_queue || []).join(", "), branch: item.branch, git_identity: item.git_identity ? `${item.git_identity.name || ""} <${item.git_identity.email || ""}>` : "environment default", submit_strategy: item.submit_strategy, test_command: item.test_command }));
-  const manager = data.project.manager_git_identity ? `${data.project.manager_git_identity.name || ""} <${data.project.manager_git_identity.email || ""}>` : "A0 manager identity";
-  const mergePolicy = [
-    { key: "integration_branch", value: data.project.integration_branch || data.project.base_branch || "main" },
-    { key: "manager_identity", value: manager },
-    { key: "merge_owner", value: "A0" },
-    { key: "tracked_worker_branches", value: String(data.merge_queue.length) }
-  ];
-  const projectRows = [
-    { key: "repository_name", value: data.project.repository_name || "" },
-    { key: "local_repo_root", value: data.project.local_repo_root || "" },
-    { key: "paddle_repo_path", value: data.project.paddle_repo_path || "" },
-    { key: "integration_branch", value: data.project.integration_branch || data.project.base_branch || "" },
-    { key: "dashboard", value: data.project.dashboard?.host && data.project.dashboard?.port ? `${data.project.dashboard.host}:${data.project.dashboard.port}` : "" }
-  ];
+function SettingsTab({
+  draftConfig,
+  providerOptions,
+  issues,
+  backendIssues,
+  onProjectChange,
+  onMergeChange,
+  onPoolChange,
+  onAddPool,
+  onWorkerChange,
+  onAddWorker,
+  onSave
+}) {
+  const project = draftConfig.project || {};
+  const dashboard = project.dashboard || {};
+  const pools = draftConfig.resource_pools || {};
+  const workers = draftConfig.workers || [];
   return /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "tab-body", children: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "card", children: [
     /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "page-header", children: [
       /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
         /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h2", { children: "Settings" }),
-        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { className: "small", children: "Edit API keys, provider routing, worktrees, Paddle path, and worker commands here." })
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { className: "small", children: "The four cards below are editable. Invalid values are warned and are not saved." })
       ] }),
-      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { onClick: onSave, children: "Save Settings" })
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { onClick: onSave, children: "Validate And Save" })
     ] }),
-    /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "config-layout", children: [
-      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("textarea", { value: configText, onChange: (event) => onChange(event.target.value) }) }),
-      /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "helper-list", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "helper-card", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", { children: "Project" }),
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(DataTable, { columns: ["key", "value"], rows: projectRows })
-        ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "helper-card", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", { children: "Resource Pools" }),
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(DataTable, { columns: ["name", "priority", "provider", "model"], rows: pools })
-        ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "helper-card", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", { children: "Merge Policy" }),
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(DataTable, { columns: ["key", "value"], rows: mergePolicy })
-        ] }),
-        /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "helper-card", children: [
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", { children: "Worker Config" }),
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(DataTable, { columns: ["agent", "task_id", "resource_pool", "resource_pool_queue", "branch", "git_identity", "submit_strategy", "test_command"], rows: workers })
+    /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SectionIssueList, { issues: backendIssues }),
+    /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "settings-grid", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "helper-card settings-card", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "section-head", children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", { children: "Project" }) }),
+        /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "field-grid", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Repository", value: project.repository_name || "", onChange: (value) => onProjectChange("repository_name", value), issues: issues["project.repository_name"] }),
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Local Repo Root", value: project.local_repo_root || "", onChange: (value) => onProjectChange("local_repo_root", value), issues: issues["project.local_repo_root"] }),
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Paddle Repo Path", value: project.paddle_repo_path || "", onChange: (value) => onProjectChange("paddle_repo_path", value), issues: issues["project.paddle_repo_path"] }),
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Dashboard Host", value: dashboard.host || "", onChange: (value) => onProjectChange("dashboard.host", value), issues: issues["project.dashboard.host"] }),
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Dashboard Port", type: "number", value: dashboard.port || 8233, onChange: (value) => onProjectChange("dashboard.port", value), issues: issues["project.dashboard.port"] })
         ] })
+      ] }),
+      /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "helper-card settings-card", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "section-head", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", { children: "Resource Pools" }),
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { className: "ghost", type: "button", onClick: onAddPool, children: "Add Pool" })
+        ] }),
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "stack-list", children: Object.entries(pools).map(([poolName, pool]) => /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "subcard", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "subcard-title", children: poolName }),
+          /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "field-grid", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SelectField, { label: "Provider", value: String(pool.provider || ""), onChange: (value) => onPoolChange(poolName, "provider", value), issues: issues[`resource_pools.${poolName}.provider`], options: providerOptions }),
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Model", value: String(pool.model || ""), onChange: (value) => onPoolChange(poolName, "model", value), issues: issues[`resource_pools.${poolName}.model`] }),
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Priority", type: "number", value: Number(pool.priority ?? 100), onChange: (value) => onPoolChange(poolName, "priority", value), issues: issues[`resource_pools.${poolName}.priority`] }),
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "API Key", value: String(pool.api_key || ""), onChange: (value) => onPoolChange(poolName, "api_key", value) })
+          ] })
+        ] }, poolName)) })
+      ] }),
+      /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "helper-card settings-card", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "section-head", children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", { children: "Merge Policy" }) }),
+        /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "field-grid", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Integration Branch", value: project.integration_branch || project.base_branch || "", onChange: (value) => onMergeChange("integration_branch", value), issues: issues["project.integration_branch"] }),
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Manager Name", value: project.manager_git_identity?.name || "", onChange: (value) => onMergeChange("manager_git_identity.name", value) }),
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Manager Email", value: project.manager_git_identity?.email || "", onChange: (value) => onMergeChange("manager_git_identity.email", value) })
+        ] })
+      ] }),
+      /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "helper-card settings-card settings-card-wide", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "section-head", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", { children: "Worker Config" }),
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { className: "ghost", type: "button", onClick: onAddWorker, children: "Add Worker" })
+        ] }),
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "stack-list", children: workers.map((worker, index) => /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "subcard", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "subcard-title", children: worker.agent || `Worker ${index + 1}` }),
+          /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "field-grid", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Agent", value: worker.agent || "", onChange: (value) => onWorkerChange(index, "agent", value), issues: issues[`workers[${index}].agent`] }),
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Task ID", value: worker.task_id || "", onChange: (value) => onWorkerChange(index, "task_id", value) }),
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Resource Pool", value: worker.resource_pool || "", onChange: (value) => onWorkerChange(index, "resource_pool", value), issues: issues[`workers[${index}].resource_pool`] }),
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Pool Queue", value: stringifyQueue(worker.resource_pool_queue), onChange: (value) => onWorkerChange(index, "resource_pool_queue", value), issues: issues[`workers[${index}].resource_pool_queue`], placeholder: "pool_a, pool_b" }),
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Branch", value: worker.branch || "", onChange: (value) => onWorkerChange(index, "branch", value), issues: issues[`workers[${index}].branch`] }),
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Worktree Path", value: worker.worktree_path || "", onChange: (value) => onWorkerChange(index, "worktree_path", value), issues: issues[`workers[${index}].worktree_path`] }),
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SelectField, { label: "Environment Type", value: worker.environment_type || "uv", onChange: (value) => onWorkerChange(index, "environment_type", value), options: ["uv", "venv", "none"] }),
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Environment Path", value: worker.environment_path || "", onChange: (value) => onWorkerChange(index, "environment_path", value), issues: issues[`workers[${index}].environment_path`] }),
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Sync Command", value: worker.sync_command || "", onChange: (value) => onWorkerChange(index, "sync_command", value) }),
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Test Command", value: worker.test_command || "", onChange: (value) => onWorkerChange(index, "test_command", value), issues: issues[`workers[${index}].test_command`] }),
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Submit Strategy", value: worker.submit_strategy || "", onChange: (value) => onWorkerChange(index, "submit_strategy", value), issues: issues[`workers[${index}].submit_strategy`] }),
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Git Name", value: worker.git_identity?.name || "", onChange: (value) => onWorkerChange(index, "git_identity.name", value) }),
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Git Email", value: worker.git_identity?.email || "", onChange: (value) => onWorkerChange(index, "git_identity.email", value) })
+          ] })
+        ] }, `${worker.agent || "worker"}-${index}`)) })
       ] })
     ] })
   ] }) });
@@ -24948,14 +25164,22 @@ async function writeClipboard(text) {
 function App() {
   const [tab, setTab] = (0, import_react.useState)("overview");
   const [data, setData] = (0, import_react.useState)(null);
-  const [configText, setConfigText] = (0, import_react.useState)("");
-  const [editorDirty, setEditorDirty] = (0, import_react.useState)(false);
+  const [draftConfig, setDraftConfig] = (0, import_react.useState)({ project: {}, providers: {}, resource_pools: {}, workers: [] });
+  const [configDirty, setConfigDirty] = (0, import_react.useState)(false);
+  const [launchStrategy, setLaunchStrategy] = (0, import_react.useState)("initial_copilot");
+  const [launchProvider, setLaunchProvider] = (0, import_react.useState)("copilot");
+  const [launchModel, setLaunchModel] = (0, import_react.useState)("");
+  const [launchDirty, setLaunchDirty] = (0, import_react.useState)(false);
   const [autoRefresh, setAutoRefresh] = (0, import_react.useState)(true);
   const [actionInFlight, setActionInFlight] = (0, import_react.useState)(false);
   const [status, setStatus] = (0, import_react.useState)({ message: "", error: false });
+  const [backendIssues, setBackendIssues] = (0, import_react.useState)([]);
   const abortRef = (0, import_react.useRef)(null);
   const agentRows = (0, import_react.useMemo)(() => buildAgentRows(data), [data]);
   const progress = (0, import_react.useMemo)(() => buildProgressModel(data, agentRows), [data, agentRows]);
+  const localIssues = (0, import_react.useMemo)(() => getLocalValidationIssues(draftConfig), [draftConfig]);
+  const issueMap = (0, import_react.useMemo)(() => buildIssueMap(localIssues, backendIssues), [localIssues, backendIssues]);
+  const providerOptions = (0, import_react.useMemo)(() => Object.keys(draftConfig.providers || {}), [draftConfig.providers]);
   const setStampedStatus = (message, error = false) => {
     const stamp = (/* @__PURE__ */ new Date()).toLocaleTimeString();
     setStatus({ message: `[${stamp}] ${message}`, error });
@@ -24967,8 +25191,14 @@ function App() {
     try {
       const nextData = await fetchState(controller.signal);
       setData(nextData);
-      if (!editorDirty) {
-        setConfigText(nextData.config_text || "");
+      if (!configDirty) {
+        setDraftConfig(cloneConfig(nextData.config));
+        setBackendIssues([]);
+      }
+      if (!launchDirty) {
+        setLaunchStrategy(nextData.launch_policy.default_strategy);
+        setLaunchProvider(nextData.launch_policy.default_provider || nextData.launch_policy.initial_provider || "copilot");
+        setLaunchModel(nextData.launch_policy.default_model || "");
       }
       if (forceStatus) {
         setStampedStatus(`state refreshed, last event: ${nextData.last_event || "none"}`);
@@ -24991,7 +25221,7 @@ function App() {
       void refresh(false);
     }, AUTO_REFRESH_MS);
     return () => window.clearInterval(timer);
-  }, [autoRefresh, actionInFlight, editorDirty]);
+  }, [autoRefresh, actionInFlight, configDirty, launchDirty]);
   const runAction = async (label, action) => {
     if (actionInFlight) {
       return;
@@ -25006,15 +25236,147 @@ function App() {
       setActionInFlight(false);
     }
   };
-  const onSave = () => void runAction("saving settings", async () => {
-    const response = await saveConfig(configText);
-    setEditorDirty(false);
+  const updateConfig = (updater) => {
+    setConfigDirty(true);
+    setBackendIssues([]);
+    setDraftConfig((current) => normalizeConfig(updater(normalizeConfig(cloneConfig(current)))));
+  };
+  const onProjectChange = (field, value) => {
+    updateConfig((current) => {
+      const next = normalizeConfig(current);
+      next.project = next.project || {};
+      if (field.startsWith("dashboard.")) {
+        const key = field.replace("dashboard.", "");
+        next.project.dashboard = next.project.dashboard || {};
+        if (key === "port") {
+          next.project.dashboard.port = Number(value);
+        } else {
+          next.project.dashboard.host = value;
+        }
+      } else if (field === "repository_name") {
+        next.project.repository_name = value;
+      } else if (field === "local_repo_root") {
+        next.project.local_repo_root = value;
+      } else if (field === "paddle_repo_path") {
+        next.project.paddle_repo_path = value;
+      }
+      return next;
+    });
+  };
+  const onMergeChange = (field, value) => {
+    updateConfig((current) => {
+      const next = normalizeConfig(current);
+      next.project = next.project || {};
+      if (field === "integration_branch") {
+        next.project.integration_branch = value;
+      } else {
+        next.project.manager_git_identity = next.project.manager_git_identity || {};
+        if (field.endsWith(".name")) {
+          next.project.manager_git_identity.name = value;
+        } else {
+          next.project.manager_git_identity.email = value;
+        }
+      }
+      return next;
+    });
+  };
+  const onPoolChange = (poolName, field, value) => {
+    updateConfig((current) => {
+      const next = normalizeConfig(current);
+      next.resource_pools = next.resource_pools || {};
+      const existing = next.resource_pools[poolName] || {};
+      next.resource_pools[poolName] = {
+        ...existing,
+        [field]: field === "priority" ? Number(value) : value
+      };
+      return next;
+    });
+  };
+  const onAddPool = () => {
+    updateConfig((current) => {
+      const next = normalizeConfig(current);
+      next.resource_pools = next.resource_pools || {};
+      let index = Object.keys(next.resource_pools).length + 1;
+      let name = `pool_${index}`;
+      while (next.resource_pools[name]) {
+        index += 1;
+        name = `pool_${index}`;
+      }
+      next.resource_pools[name] = { priority: 100, provider: providerOptions[0] || "", model: "", api_key: "" };
+      return next;
+    });
+  };
+  const onWorkerChange = (index, field, value) => {
+    updateConfig((current) => {
+      const next = normalizeConfig(current);
+      const workers = [...next.workers || []];
+      const worker = { ...workers[index] || { agent: `A${index + 1}` } };
+      if (field === "resource_pool_queue") {
+        worker.resource_pool_queue = parseQueue(value);
+      } else if (field === "git_identity.name" || field === "git_identity.email") {
+        worker.git_identity = worker.git_identity || {};
+        if (field.endsWith(".name")) {
+          worker.git_identity.name = value;
+        } else {
+          worker.git_identity.email = value;
+        }
+      } else {
+        worker[field] = value;
+      }
+      workers[index] = worker;
+      next.workers = workers;
+      return next;
+    });
+  };
+  const onAddWorker = () => {
+    updateConfig((current) => {
+      const next = normalizeConfig(current);
+      const workers = [...next.workers || []];
+      workers.push({
+        agent: `A${workers.length + 1}`,
+        task_id: "",
+        resource_pool: Object.keys(next.resource_pools || {})[0] || "",
+        resource_pool_queue: [],
+        worktree_path: "",
+        branch: "",
+        environment_type: "uv",
+        environment_path: "",
+        sync_command: "uv sync",
+        test_command: "",
+        submit_strategy: "patch_handoff",
+        git_identity: { name: "", email: "" }
+      });
+      next.workers = workers;
+      return next;
+    });
+  };
+  const onSave = () => void runAction("validating settings", async () => {
+    if (localIssues.length > 0) {
+      setStampedStatus(`settings contain ${localIssues.length} local validation issue(s)`, true);
+      return;
+    }
+    const validation = await validateConfig(draftConfig);
+    setBackendIssues(validation.validation_issues);
+    if (!validation.ok) {
+      setStampedStatus(`settings rejected: ${validation.validation_issues.length} validation issue(s)`, true);
+      return;
+    }
+    const response = await saveConfig(draftConfig);
+    setConfigDirty(false);
+    setBackendIssues([]);
     await refresh(true);
     setStampedStatus(`settings saved: ${response.launch_blockers.length} launch blocker(s), ${response.validation_errors.length} config note(s)`);
   });
   const onLaunch = (restart) => void runAction(restart ? "restarting workers" : "launching workers", async () => {
-    const response = await launchWorkers(restart);
-    setStampedStatus(`launch complete: ${(response.launched || []).length} launched, ${(response.failures || []).length} failures`, !response.ok);
+    const response = await launchWorkers(restart, {
+      strategy: launchStrategy,
+      provider: launchStrategy === "elastic" ? void 0 : launchProvider,
+      model: launchStrategy === "selected_model" ? launchModel : void 0
+    });
+    setStampedStatus(
+      `launch complete (${launchStrategyLabel(response.launch_policy?.strategy || launchStrategy)}): ${(response.launched || []).length} launched, ${(response.failures || []).length} failures`,
+      !response.ok
+    );
     await refresh(true);
   });
   const onStopWorkers = () => void runAction("stopping workers", async () => {
@@ -25025,8 +25387,13 @@ function App() {
   const onStopAll = () => void runAction("stopping listener and workers", async () => {
     const response = await stopAll();
     setStampedStatus(
-      response.listener_released ? `stop all requested: ${response.stopped_workers?.length || 0} worker(s) stopped, port ${response.listener_port} released` : `stop all requested${response.warning ? `: ${response.warning}` : ""}`
+      response.listener_released ? `stop all requested: ${response.stopped_workers?.length || 0} worker(s) stopped, port ${response.listener_port} released` : `stop all requested${response.warning ? `: ${response.warning}` : ""}`,
+      !response.listener_released
     );
+  });
+  const onSilentMode = () => void runAction("entering silent mode", async () => {
+    const response = await enableSilentMode();
+    setStampedStatus(`silent mode enabled: listener on port ${response.listener_port} closed`);
   });
   const onCopy = (mode) => void runAction(`copying ${mode} command`, async () => {
     if (!data?.commands[mode]) {
@@ -25037,16 +25404,17 @@ function App() {
   });
   const topMeta = data ? [
     { label: "Startup", value: data.mode.state || "configured" },
+    { label: "Listener", value: data.mode.listener_active ? "active" : "silent" },
     { label: "Launch", value: data.launch_blockers.length ? `${data.launch_blockers.length} blocker(s)` : "ready" },
+    { label: "Launch Mode", value: launchStrategyLabel(launchStrategy) },
     { label: "Config", value: data.mode.config_path || "unknown" },
-    { label: "Last event", value: data.last_event || "none" },
     { label: "Updated", value: data.updated_at || "unknown" }
   ] : [];
   return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
     /* @__PURE__ */ (0, import_jsx_runtime.jsx)("header", { children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "hero", children: /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
       /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "hero-badge", children: "FP8 delivery orchestration" }),
       /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h1", { children: "supersonic-moe control plane" }),
-      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { className: "small tagline", children: "React-structured cold-start control for agent launch, inspection, settings, and deterministic stop behavior." })
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { className: "small tagline", children: "Cold-start by default, fire-and-forget serving, editable settings forms, strict validation, and an explicit silent listener mode." })
     ] }) }) }),
     /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("main", { children: [
       /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "card", children: [
@@ -25055,10 +25423,62 @@ function App() {
             /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { disabled: actionInFlight, onClick: () => onLaunch(false), children: "Launch" }),
             /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { className: "secondary", disabled: actionInFlight, onClick: () => onLaunch(true), children: "Restart" }),
             /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { className: "danger", disabled: actionInFlight, onClick: onStopWorkers, children: "Stop Agents" }),
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { className: "ghost danger-outline", disabled: actionInFlight, onClick: onSilentMode, children: "Silent Mode" }),
             /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { className: "danger ghost-danger", disabled: actionInFlight, onClick: onStopAll, children: "Stop All" }),
             /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { className: "ghost", disabled: actionInFlight, onClick: () => void refresh(true), children: "Refresh" })
           ] }),
           /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "toolbar-group", children: [
+            data ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [
+              /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("label", { className: "field field-compact", children: [
+                /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { className: "field-label", children: "Launch Mode" }),
+                /* @__PURE__ */ (0, import_jsx_runtime.jsx)(
+                  "select",
+                  {
+                    className: "field-input compact-input",
+                    value: launchStrategy,
+                    onChange: (event) => {
+                      setLaunchDirty(true);
+                      setLaunchStrategy(event.target.value);
+                      if (event.target.value === "initial_copilot") {
+                        setLaunchProvider(data.launch_policy.initial_provider || "copilot");
+                      }
+                    },
+                    children: data.launch_policy.available_strategies.map((strategy) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", { value: strategy, children: launchStrategyLabel(strategy) }, strategy))
+                  }
+                )
+              ] }),
+              launchStrategy !== "elastic" ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("label", { className: "field field-compact", children: [
+                /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { className: "field-label", children: "Provider" }),
+                /* @__PURE__ */ (0, import_jsx_runtime.jsx)(
+                  "select",
+                  {
+                    className: "field-input compact-input",
+                    value: launchProvider,
+                    disabled: launchStrategy === "initial_copilot",
+                    onChange: (event) => {
+                      setLaunchDirty(true);
+                      setLaunchProvider(event.target.value);
+                    },
+                    children: data.launch_policy.available_providers.map((provider) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("option", { value: provider, children: provider }, provider))
+                  }
+                )
+              ] }) : null,
+              launchStrategy === "selected_model" ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("label", { className: "field field-compact field-compact-wide", children: [
+                /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { className: "field-label", children: "Model" }),
+                /* @__PURE__ */ (0, import_jsx_runtime.jsx)(
+                  "input",
+                  {
+                    className: "field-input compact-input",
+                    value: launchModel,
+                    placeholder: "gpt-5.4",
+                    onChange: (event) => {
+                      setLaunchDirty(true);
+                      setLaunchModel(event.target.value);
+                    }
+                  }
+                )
+              ] }) : null
+            ] }) : null,
             /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { className: "ghost", disabled: actionInFlight, onClick: () => onCopy("serve"), children: "Copy Serve" }),
             /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { className: "ghost", disabled: actionInFlight, onClick: () => onCopy("up"), children: "Copy Up" }),
             /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("label", { className: "toggle", children: [
@@ -25076,10 +25496,22 @@ function App() {
           /* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", { children: item.value })
         ] }, item.label)) })
       ] }) }),
-      data ? tab === "overview" ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)(OverviewTab, { data, agentRows, progress }) : tab === "operations" ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)(OperationsTab, { data }) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SettingsTab, { data, configText, onChange: (value) => {
-        setEditorDirty(true);
-        setConfigText(value);
-      }, onSave }) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)("section", { className: "card", children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "small muted", children: "Loading dashboard state..." }) })
+      data ? tab === "overview" ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)(OverviewTab, { data, agentRows, progress }) : tab === "operations" ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)(OperationsTab, { data }) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)(
+        SettingsTab,
+        {
+          draftConfig,
+          providerOptions,
+          issues: issueMap,
+          backendIssues,
+          onProjectChange,
+          onMergeChange,
+          onPoolChange,
+          onAddPool,
+          onWorkerChange,
+          onAddWorker,
+          onSave
+        }
+      ) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)("section", { className: "card", children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "small muted", children: "Loading dashboard state..." }) })
     ] })
   ] });
 }
