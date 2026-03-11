@@ -1,4 +1,5 @@
 import type {
+  ConfigSection,
   ConfigShape,
   ConfigSaveResponse,
   ConfigValidationResponse,
@@ -39,6 +40,14 @@ export function validateConfig(config: ConfigShape): Promise<ConfigValidationRes
 
 export function saveConfig(config: ConfigShape): Promise<ConfigSaveResponse> {
   return postJson<ConfigSaveResponse>('/api/config', { config });
+}
+
+export function validateConfigSection(section: ConfigSection, value: unknown): Promise<ConfigValidationResponse> {
+  return postJson<ConfigValidationResponse>('/api/config/validate-section', { section, value });
+}
+
+export function saveConfigSection(section: ConfigSection, value: unknown): Promise<ConfigSaveResponse> {
+  return postJson<ConfigSaveResponse>('/api/config/section', { section, value });
 }
 
 export function launchWorkers(

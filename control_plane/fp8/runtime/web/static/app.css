@@ -212,6 +212,7 @@ button:disabled {
 .settings-grid,
 .field-grid,
 .stack-list,
+.worker-grid,
 .table-shell,
 .section-head {
   display: grid;
@@ -233,7 +234,7 @@ button:disabled {
   grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
 }
 .settings-grid {
-  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
   align-items: start;
 }
 .settings-card-wide {
@@ -244,6 +245,10 @@ button:disabled {
 }
 .stack-list {
   gap: 12px;
+}
+.worker-grid {
+  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+  align-items: start;
 }
 .pool-strip {
   display: flex;
@@ -270,6 +275,16 @@ button:disabled {
 .section-head {
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
+}
+.section-head-actions {
+  gap: 12px;
+}
+.section-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  justify-content: flex-end;
 }
 .metric,
 .helper-card,
@@ -394,6 +409,14 @@ button:disabled {
 .field-help {
   font-size: 12px;
   color: #8ea6d4;
+}
+.section-status {
+  font-size: 12px;
+  color: #9ce5c7;
+  white-space: nowrap;
+}
+.section-status.error {
+  color: #ffbfd0;
 }
 .advanced-panel {
   margin-top: 14px;
@@ -525,6 +548,7 @@ th {
   .overview-hero,
   .settings-grid,
   .field-grid,
+  .worker-grid,
   .section-head {
     grid-template-columns: 1fr;
   }

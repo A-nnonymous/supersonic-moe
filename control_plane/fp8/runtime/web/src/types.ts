@@ -1,5 +1,7 @@
 export type TabKey = 'overview' | 'operations' | 'settings';
 
+export type ConfigSection = 'project' | 'merge_policy' | 'resource_pools' | 'worker_defaults' | 'workers';
+
 export type CommandMap = {
   serve: string;
   up: string;
