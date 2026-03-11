@@ -581,6 +581,31 @@ button:disabled {
   font-size: 12px;
 }
 
+.merge-attention,
+.merge-list-block {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(12, 19, 34, 0.72);
+  border: 1px solid rgba(120, 147, 194, 0.16);
+  font-size: 12px;
+  color: #d8e4ff;
+}
+
+.merge-attention strong,
+.merge-list-block strong {
+  display: block;
+  margin-bottom: 6px;
+  color: #9fbbe8;
+}
+
+.merge-list-block ul {
+  margin: 0;
+  padding-left: 18px;
+  display: grid;
+  gap: 6px;
+}
+
 .chip {
   display: inline-flex;
   align-items: center;

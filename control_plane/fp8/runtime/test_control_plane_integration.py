@@ -651,6 +651,26 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
 
         self.stop_workers()
 
+    def test_dashboard_exposes_manager_identity_and_handoff_details(self) -> None:
+        state = self.fetch_state()
+        runtime_workers = {item["agent"]: item for item in state["runtime"]["workers"]}
+        self.assertEqual(runtime_workers["A0"]["provider"], "manager-local")
+        self.assertEqual(runtime_workers["A0"]["model"], "environment default")
+
+        merge_queue = {item["agent"]: item for item in state["merge_queue"]}
+        self.assertEqual(merge_queue["A1"]["checkpoint_status"], "not started")
+        self.assertIn("needs baseline tensor contract from A6", merge_queue["A1"]["attention_summary"])
+        self.assertIn(
+            "needs baseline tensor contract from A6 for final public shape decisions",
+            merge_queue["A1"]["blockers"],
+        )
+        self.assertIn("freeze dtype names", merge_queue["A1"]["pending_work"])
+        self.assertIn("Start by producing the smallest protocol draft", merge_queue["A1"]["resume_instruction"])
+        self.assertIn(
+            "Update when protocol names and scale encoding proposal are ready for review",
+            merge_queue["A1"]["next_checkin"],
+        )
+
     def test_session_probe_failure_surfaces_actionable_error(self) -> None:
         current_state = self.fetch_state()
         broken_config = deepcopy(current_state["config"])

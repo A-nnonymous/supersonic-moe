@@ -41,6 +41,8 @@ PROMPT_DIR = RUNTIME_DIR / "generated_prompts"
 WRAPPER_DIR = RUNTIME_DIR / "generated_wrappers"
 LOG_DIR = RUNTIME_DIR / "logs"
 MANAGER_REPORT = CONTROL_ROOT / "reports" / "manager_report.md"
+STATUS_DIR = CONTROL_ROOT / "status" / "agents"
+CHECKPOINT_DIR = CONTROL_ROOT / "checkpoints" / "agents"
 SESSION_STATE = RUNTIME_DIR / "session_state.json"
 PROVIDER_STATS_PATH = STATE_DIR / "provider_stats.yaml"
 CONTROL_PLANE_RUNTIME = "uv run --no-project --with 'PyYAML>=6.0.2' python"
@@ -115,6 +117,44 @@ def summarize_list(values: list[str], limit: int = 4) -> str:
     if len(items) <= limit:
         return "; ".join(items)
     return "; ".join(items[:limit]) + f"; ... (+{len(items) - limit} more)"
+
+
+def parse_markdown_sections(text: str) -> tuple[dict[str, str], dict[str, str]]:
+    metadata: dict[str, str] = {}
+    sections: dict[str, list[str]] = {}
+    current_section = ""
+    before_sections = True
+    for raw_line in text.splitlines():
+        line = raw_line.rstrip()
+        if line.startswith("## "):
+            current_section = line[3:].strip().lower()
+            sections.setdefault(current_section, [])
+            before_sections = False
+            continue
+        if before_sections and line and not line.startswith("#") and ":" in line:
+            key, value = line.split(":", 1)
+            metadata[slugify(key)] = value.strip()
+            continue
+        if current_section:
+            sections.setdefault(current_section, []).append(line)
+    return metadata, {key: "\n".join(value).strip() for key, value in sections.items()}
+
+
+def parse_markdown_list(section_text: str) -> list[str]:
+    items: list[str] = []
+    for raw_line in section_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        candidate = line[2:].strip() if line.startswith("- ") else line
+        if candidate and candidate.lower() != "none":
+            items.append(candidate)
+    return items
+
+
+def parse_markdown_paragraph(section_text: str) -> str:
+    lines = [line.strip() for line in section_text.splitlines() if line.strip()]
+    return " ".join(lines)
 
 
 def is_placeholder_path(value: Any) -> bool:
@@ -2003,6 +2043,115 @@ class ControlPlaneService:
             "email": str(identity.get("email", "")).strip(),
         }
 
+    def current_repo_branch(self) -> str:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            branch = str(result.stdout).strip()
+            if branch and branch != "HEAD":
+                return branch
+        return str(self.project.get("base_branch") or self.integration_branch() or "main")
+
+    def manager_runtime_entry(self, runtime: dict[str, Any] | None = None) -> dict[str, Any]:
+        workers = runtime.get("workers", []) if isinstance(runtime, dict) else []
+        existing = next(
+            (item for item in workers if isinstance(item, dict) and str(item.get("agent", "")).strip() == "A0"),
+            {},
+        )
+        status = str(existing.get("status", "")).strip() or "healthy"
+        manager_identity = self.manager_git_identity()
+        return {
+            "agent": "A0",
+            "repository_name": self.project.get("repository_name", "supersonic-moe"),
+            "resource_pool": "manager_local",
+            "provider": "manager-local",
+            "model": "environment default",
+            "recursion_guard": str(existing.get("recursion_guard", "")).strip(),
+            "launch_wrapper": str(existing.get("launch_wrapper", "")).strip(),
+            "launch_owner": "manager",
+            "local_workspace_root": self.project.get("local_repo_root", str(REPO_ROOT)),
+            "repository_root": str(REPO_ROOT),
+            "worktree_path": str(REPO_ROOT),
+            "branch": self.current_repo_branch(),
+            "merge_target": self.integration_branch(),
+            "environment_type": "none",
+            "environment_path": "environment default",
+            "sync_command": "none",
+            "test_command": "none",
+            "submit_strategy": "direct_manager_edit",
+            "git_author_name": manager_identity.get("name", ""),
+            "git_author_email": manager_identity.get("email", ""),
+            "status": status,
+        }
+
+    def dashboard_runtime_state(self) -> dict[str, Any]:
+        runtime = load_yaml(STATE_DIR / "agent_runtime.yaml")
+        workers = runtime.get("workers", [])
+        if not isinstance(workers, list):
+            workers = []
+        filtered_workers = [
+            item for item in workers if isinstance(item, dict) and str(item.get("agent", "")).strip() != "A0"
+        ]
+        filtered_workers.insert(0, self.manager_runtime_entry(runtime))
+        runtime["workers"] = filtered_workers
+        runtime["last_updated"] = runtime.get("last_updated") or now_iso()
+        return runtime
+
+    def worker_handoff_summary(
+        self, agent: str, runtime_entry: dict[str, Any], heartbeat: dict[str, Any]
+    ) -> dict[str, Any]:
+        status_path = STATUS_DIR / f"{agent}.md"
+        checkpoint_path = CHECKPOINT_DIR / f"{agent}.md"
+        status_meta: dict[str, str] = {}
+        status_sections: dict[str, str] = {}
+        checkpoint_meta: dict[str, str] = {}
+        checkpoint_sections: dict[str, str] = {}
+        if status_path.exists():
+            status_meta, status_sections = parse_markdown_sections(status_path.read_text(encoding="utf-8"))
+        if checkpoint_path.exists():
+            checkpoint_meta, checkpoint_sections = parse_markdown_sections(checkpoint_path.read_text(encoding="utf-8"))
+
+        blockers = parse_markdown_list(status_sections.get("blockers", ""))
+        requested_unlocks = parse_markdown_list(status_sections.get("requested unlocks", ""))
+        pending_work = parse_markdown_list(checkpoint_sections.get("pending work", ""))
+        dependencies = parse_markdown_list(checkpoint_sections.get("dependencies", ""))
+        resume_instruction = parse_markdown_paragraph(checkpoint_sections.get("resume instruction", ""))
+        next_checkin = parse_markdown_paragraph(status_sections.get("next check-in condition", ""))
+
+        runtime_status = str(runtime_entry.get("status", "")).strip()
+        heartbeat_state = str(heartbeat.get("state", "")).strip()
+        heartbeat_evidence = str(heartbeat.get("evidence", "")).strip()
+        attention_summary = ""
+        if runtime_status.startswith("launch_failed"):
+            attention_summary = runtime_status
+        elif heartbeat_state in {"stale", "error"} and heartbeat_evidence:
+            attention_summary = heartbeat_evidence
+        elif blockers:
+            attention_summary = blockers[0]
+        elif pending_work:
+            attention_summary = pending_work[0]
+        elif heartbeat_evidence and heartbeat_evidence.lower() != "no runtime heartbeat yet":
+            attention_summary = heartbeat_evidence
+
+        return {
+            "checkpoint_status": checkpoint_meta.get("status")
+            or status_meta.get("status")
+            or heartbeat_state
+            or "unknown",
+            "attention_summary": attention_summary,
+            "blockers": blockers,
+            "pending_work": pending_work,
+            "requested_unlocks": requested_unlocks,
+            "dependencies": dependencies,
+            "resume_instruction": resume_instruction,
+            "next_checkin": next_checkin or str(heartbeat.get("expected_next_checkin", "")).strip(),
+        }
+
     def configure_git_identity(self, worker: dict[str, Any]) -> None:
         identity = self.worker_git_identity(worker)
         worktree_path = Path(worker["worktree_path"])
@@ -2028,9 +2177,8 @@ class ControlPlaneService:
                 raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "failed to set git user.email")
 
     def merge_queue(self) -> list[dict[str, Any]]:
-        runtime_workers = {
-            str(item.get("agent")): item for item in load_yaml(STATE_DIR / "agent_runtime.yaml").get("workers", [])
-        }
+        runtime_state = self.dashboard_runtime_state()
+        runtime_workers = {str(item.get("agent")): item for item in runtime_state.get("workers", [])}
         heartbeats = {
             str(item.get("agent")): item for item in load_yaml(STATE_DIR / "heartbeats.yaml").get("agents", [])
         }
@@ -2045,6 +2193,7 @@ class ControlPlaneService:
             agent = str(worker.get("agent", ""))
             runtime_entry = runtime_workers.get(agent, {})
             heartbeat = heartbeats.get(agent, {})
+            handoff = self.worker_handoff_summary(agent, runtime_entry, heartbeat)
             git_identity = self.worker_git_identity(worker)
             worker_display = (
                 f"{git_identity['name']} <{git_identity['email']}>"
@@ -2060,6 +2209,14 @@ class ControlPlaneService:
                     "worker_identity": worker_display,
                     "manager_identity": manager_display,
                     "status": runtime_entry.get("status", heartbeat.get("state", "not_started")),
+                    "checkpoint_status": handoff["checkpoint_status"],
+                    "attention_summary": handoff["attention_summary"],
+                    "blockers": handoff["blockers"],
+                    "pending_work": handoff["pending_work"],
+                    "requested_unlocks": handoff["requested_unlocks"],
+                    "dependencies": handoff["dependencies"],
+                    "resume_instruction": handoff["resume_instruction"],
+                    "next_checkin": handoff["next_checkin"],
                     "manager_action": f"A0 merges {worker.get('branch', 'unassigned')} into {self.integration_branch()}",
                 }
             )
@@ -2480,6 +2637,7 @@ Primary test command:
 
     def build_dashboard_state(self) -> dict[str, Any]:
         config_text = self.config_path.read_text(encoding="utf-8") if self.config_path.exists() else ""
+        runtime_state = self.dashboard_runtime_state()
         return {
             "updated_at": now_iso(),
             "last_event": self.last_event,
@@ -2495,7 +2653,7 @@ Primary test command:
             "commands": self.build_cli_commands(),
             "launch_policy": self.launch_policy_state(),
             "manager_report": MANAGER_REPORT.read_text(encoding="utf-8"),
-            "runtime": load_yaml(STATE_DIR / "agent_runtime.yaml"),
+            "runtime": runtime_state,
             "heartbeats": load_yaml(STATE_DIR / "heartbeats.yaml"),
             "backlog": load_yaml(STATE_DIR / "backlog.yaml"),
             "gates": load_yaml(STATE_DIR / "gates.yaml"),

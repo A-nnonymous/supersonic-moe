@@ -24803,7 +24803,7 @@ function stringifyQueue(values) {
 }
 function launchStrategyLabel(strategy) {
   if (strategy === "initial_copilot") {
-    return "Initial Copilot";
+    return "Initial Provider";
   }
   if (strategy === "selected_model") {
     return "Selected Model";
@@ -25741,6 +25741,10 @@ function HelperCard({ title, body }) {
 function MergeCard({ item }) {
   const raw = String(item.status || "not_started");
   const status = raw === "active" || raw === "healthy" ? { label: "In progress", className: "state-active" } : raw === "stale" || raw.startsWith("launch_failed") ? { label: "Needs attention", className: "state-stale" } : raw === "offline" || raw === "stopped" ? { label: "Ready for review", className: "state-offline" } : { label: "Queued", className: "state-not_started" };
+  const blockers = item.blockers || [];
+  const pendingWork = item.pending_work || [];
+  const requestedUnlocks = item.requested_unlocks || [];
+  const dependencies = item.dependencies || [];
   return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("article", { className: "merge-card", children: [
     /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "merge-card-header", children: [
       /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
@@ -25768,8 +25772,44 @@ function MergeCard({ item }) {
         /* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", { children: "Manager" }),
         " ",
         item.manager_identity
+      ] }),
+      /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", { children: "Checkpoint" }),
+        " ",
+        item.checkpoint_status || "unknown"
       ] })
     ] }),
+    item.attention_summary ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "merge-attention", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", { children: "Attention" }),
+      " ",
+      item.attention_summary
+    ] }) : null,
+    blockers.length ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "merge-list-block", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", { children: "Blockers" }),
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("ul", { children: blockers.map((entry) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("li", { children: entry }, entry)) })
+    ] }) : null,
+    pendingWork.length ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "merge-list-block", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", { children: "Pending Work" }),
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("ul", { children: pendingWork.map((entry) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("li", { children: entry }, entry)) })
+    ] }) : null,
+    requestedUnlocks.length ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "merge-list-block", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", { children: "Requested Unlocks" }),
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("ul", { children: requestedUnlocks.map((entry) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("li", { children: entry }, entry)) })
+    ] }) : null,
+    dependencies.length ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "merge-list-block", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", { children: "Dependencies" }),
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("ul", { children: dependencies.map((entry) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("li", { children: entry }, entry)) })
+    ] }) : null,
+    item.resume_instruction ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "merge-attention", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", { children: "Resume" }),
+      " ",
+      item.resume_instruction
+    ] }) : null,
+    item.next_checkin ? /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "merge-note", children: [
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("strong", { children: "Next check-in" }),
+      " ",
+      item.next_checkin
+    ] }) : null,
     /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "merge-note", children: item.manager_action })
   ] });
 }
@@ -26345,7 +26385,7 @@ function App() {
                   {
                     className: "field-input compact-input",
                     value: launchModel,
-                    placeholder: "gpt-5.4",
+                    placeholder: data.launch_policy.default_model || "model id",
                     onChange: (event) => {
                       setLaunchDirty(true);
                       setLaunchModel(event.target.value);
