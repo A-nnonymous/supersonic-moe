@@ -498,6 +498,8 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
         self.assertEqual(status_code, 400)
         self.assertFalse(failed_launch["ok"])
         self.assertEqual(len(failed_launch["failures"]), 2)
+        self.assertIn("launch failed for 2 worker(s)", failed_launch["error"])
+        self.assertIn("A1: api key missing for pool copilot_pool", failed_launch["error"])
         self.assertTrue(all("api key missing" in item["error"] for item in failed_launch["failures"]))
 
         state = self.fetch_state()
