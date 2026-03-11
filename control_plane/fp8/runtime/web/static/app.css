@@ -272,6 +272,24 @@ button:disabled {
   color: var(--muted);
   font-size: 13px;
 }
+.plan-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+  margin-bottom: 14px;
+}
+.plan-row {
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  background: rgba(12, 19, 34, 0.72);
+  border: 1px solid rgba(120, 147, 194, 0.16);
+  border-radius: 10px;
+}
+.compact-field-grid {
+  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+}
 .pool-strip {
   display: flex;
   gap: 12px;

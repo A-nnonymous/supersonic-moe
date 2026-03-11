@@ -59,6 +59,22 @@ type PlannedWorker = {
   worktree_path: string;
 };
 
+type WorkerPlanView = {
+  agent: string;
+  taskId: string;
+  taskTitle: string;
+  taskType: string;
+  branch: string;
+  worktreePath: string;
+  poolOverride: string;
+  queueOverride: string[];
+  recommendedPool: string;
+  lockedPool: string;
+  poolReason: string;
+  testCommand: string;
+  suggestedTestCommand: string;
+};
+
 function normalizedText(value: unknown): string {
   return String(value ?? '').trim();
 }
@@ -93,6 +109,41 @@ function firstMeaningfulCommand(...values: unknown[]): string {
 
 function projectReferenceWorkspace(project: ConfigShape['project']): string {
   return normalizedText(project?.reference_workspace_root) || normalizedText(project?.paddle_repo_path);
+}
+
+function mergeSavedSection(current: ConfigShape, server: ConfigShape, section: ConfigSection): ConfigShape {
+  const next = normalizeConfig(cloneConfig(current));
+  const serverConfig = normalizeConfig(cloneConfig(server));
+  if (section === 'project') {
+    next.project = {
+      ...(next.project || {}),
+      repository_name: serverConfig.project?.repository_name,
+      local_repo_root: serverConfig.project?.local_repo_root,
+      reference_workspace_root: serverConfig.project?.reference_workspace_root,
+      paddle_repo_path: serverConfig.project?.paddle_repo_path,
+      dashboard: serverConfig.project?.dashboard || {},
+    };
+    return next;
+  }
+  if (section === 'merge_policy') {
+    next.project = {
+      ...(next.project || {}),
+      integration_branch: serverConfig.project?.integration_branch,
+      base_branch: serverConfig.project?.base_branch,
+      manager_git_identity: serverConfig.project?.manager_git_identity || {},
+    };
+    return next;
+  }
+  if (section === 'resource_pools') {
+    next.resource_pools = serverConfig.resource_pools || {};
+    return next;
+  }
+  if (section === 'worker_defaults') {
+    next.worker_defaults = serverConfig.worker_defaults || {};
+    return next;
+  }
+  next.workers = serverConfig.workers || [];
+  return next;
 }
 
 function buildSectionValue(config: ConfigShape, section: ConfigSection): unknown {
@@ -292,6 +343,33 @@ function buildRuntimeWorkerMap(data: DashboardState | null): Map<string, Record<
 
 function buildResolvedWorkerMap(data: DashboardState | null): Map<string, ResolvedWorkerPlan> {
   return new Map((data?.resolved_workers || []).map((worker) => [worker.agent, worker]));
+}
+
+function workerPlanView(
+  worker: ConfigWorker,
+  config: ConfigShape,
+  data: DashboardState | null,
+  plannedWorkers?: PlannedWorker[],
+): WorkerPlanView {
+  const plannedByAgent = new Map((plannedWorkers || buildPlannedWorkers(data, config)).map((item) => [item.agent, item]));
+  const resolvedByAgent = buildResolvedWorkerMap(data);
+  const planned = plannedByAgent.get(worker.agent || '');
+  const resolved = resolvedByAgent.get(worker.agent || '');
+  return {
+    agent: worker.agent || '',
+    taskId: firstMeaningfulValue(worker.task_id, resolved?.task_id, planned?.task_id),
+    taskTitle: firstMeaningfulValue(resolved?.task_title, planned?.title),
+    taskType: firstMeaningfulValue(resolved?.task_type, resolved?.task_category),
+    branch: firstMeaningfulValue(worker.branch, resolved?.branch, planned?.branch),
+    worktreePath: firstMeaningfulValue(worker.worktree_path, resolved?.worktree_path, planned?.worktree_path),
+    poolOverride: normalizedText(worker.resource_pool),
+    queueOverride: Array.isArray(worker.resource_pool_queue) ? worker.resource_pool_queue : [],
+    recommendedPool: normalizedText(resolved?.recommended_pool),
+    lockedPool: normalizedText(resolved?.locked_pool),
+    poolReason: normalizedText(resolved?.pool_reason),
+    testCommand: firstMeaningfulCommand(worker.test_command, resolved?.test_command),
+    suggestedTestCommand: firstMeaningfulCommand(resolved?.suggested_test_command),
+  };
 }
 
 function hydrateConfigForA0(data: DashboardState | null, config: ConfigShape): ConfigShape {
@@ -536,8 +614,8 @@ function buildProgressModel(data: DashboardState | null, agentRows: AgentRow[]):
   return { progress, passedGates, totalGates: gates.length, completedItems, totalItems: backlog.length, blockedItems, activeAgents, attentionAgents, openGate };
 }
 
-function getLocalValidationIssues(config: ConfigShape): ValidationIssue[] {
-  const draft = normalizeConfig(config);
+function getLocalValidationIssues(config: ConfigShape, data: DashboardState | null): ValidationIssue[] {
+  const draft = hydrateConfigForA0(data, normalizeConfig(config));
   const issues: ValidationIssue[] = [];
   const add = (field: string, message: string) => issues.push({ field, message });
   const project = draft.project || {};
@@ -599,8 +677,8 @@ function getLocalValidationIssues(config: ConfigShape): ValidationIssue[] {
     const effectiveWorker = mergeWorkerWithDefaults(worker, workerDefaults);
     const root = `workers[${index}]`;
     const agent = String(worker.agent || '').trim();
-    const branch = String(worker.branch || '').trim();
-    const worktreePath = String(worker.worktree_path || '').trim();
+    const branch = String(effectiveWorker.branch || '').trim();
+    const worktreePath = String(effectiveWorker.worktree_path || '').trim();
     if (!agent) {
       add(`${root}.agent`, 'agent is required');
     } else if (seenAgents.has(agent)) {
@@ -780,10 +858,10 @@ function AutomationSummary({ draftConfig, data }: { draftConfig: ConfigShape; da
   ];
   const userOnly = [
     'Local repo root if A0 cannot infer it correctly',
-    'Paddle repo path',
+    'Reference workspace path when the project really needs one',
     'Integration branch policy',
     'Resource-pool credentials, provider choice, and model choice',
-    'Only the exceptional per-worker overrides that truly differ from the default path',
+    'Only exceptional per-worker routing or environment overrides that truly differ from the default path',
   ];
 
   return (
@@ -1052,29 +1130,38 @@ function SettingsTab({
               }
             />
             <SectionIssueList issues={collectSectionIssues('workers', allIssues)} />
-            <p className="small muted">Detected workers from backlog/runtime: {plannedWorkers.map((item) => item.agent).join(', ') || 'none'}. A0 keeps roster, task IDs, branches, and worktree suggestions hydrated by default; leave overrides blank unless this worker is an exception.</p>
+            <p className="small muted">Detected workers from backlog/runtime: {plannedWorkers.map((item) => item.agent).join(', ') || 'none'}. Main cards now show A0's current plan first; most editable fields are hidden under advanced overrides so you only touch real exceptions.</p>
             <div className="worker-grid">
               {workers.map((worker, index) => (
                 <div key={`${worker.agent || 'worker'}-${index}`} className="subcard">
                   {(() => {
                     const resolved = resolvedByAgent.get(worker.agent || '');
-                    const recommendation = resolved?.pool_reason || '';
-                    const suggestedTest = resolved?.suggested_test_command || '';
+                    const planned = workerPlanView(worker, draftConfig, data, plannedWorkers);
+                    const recommendation = planned.poolReason || '';
+                    const suggestedTest = planned.suggestedTestCommand || '';
                     return (
                       <>
                   <div className="subcard-title">{worker.agent || `Worker ${index + 1}`}</div>
                   {recommendation ? <p className="small muted">{recommendation}</p> : null}
-                  <div className="field-grid">
+                  <div className="plan-grid">
+                    <div className="plan-row"><span className="muted">Task</span><strong>{planned.taskId || 'A0 will assign'}</strong></div>
+                    <div className="plan-row"><span className="muted">Type</span><strong>{planned.taskType || 'default'}</strong></div>
+                    <div className="plan-row"><span className="muted">Branch</span><strong>{planned.branch || 'A0 will derive'}</strong></div>
+                    <div className="plan-row"><span className="muted">Worktree</span><strong>{planned.worktreePath || 'derived from Local Repo Root'}</strong></div>
+                    <div className="plan-row"><span className="muted">Pool</span><strong>{planned.lockedPool || planned.recommendedPool || 'A0 routing'}</strong></div>
+                    <div className="plan-row"><span className="muted">Test</span><strong>{planned.testCommand || suggestedTest || 'A0 default'}</strong></div>
+                  </div>
+                  <div className="field-grid compact-field-grid">
                     <Field label="Agent" value={worker.agent || ''} onChange={(value) => onWorkerChange(index, 'agent', value)} issues={issues[`workers[${index}].agent`]} />
-                    <Field label="Task ID" value={worker.task_id || ''} onChange={(value) => onWorkerChange(index, 'task_id', value)} />
-                    <Field label="Branch" value={worker.branch || ''} onChange={(value) => onWorkerChange(index, 'branch', value)} issues={issues[`workers[${index}].branch`]} />
-                    <Field label="Worktree Path" value={worker.worktree_path || ''} onChange={(value) => onWorkerChange(index, 'worktree_path', value)} issues={issues[`workers[${index}].worktree_path`]} />
                     <Field label="Pool Override" value={worker.resource_pool || ''} onChange={(value) => onWorkerChange(index, 'resource_pool', value)} issues={issues[`workers[${index}].resource_pool`]} helpText={resolved?.locked_pool ? `A0 lock: ${resolved.locked_pool}` : resolved?.recommended_pool ? `A0 recommends: ${resolved.recommended_pool}` : (workerDefaults.resource_pool ? `Default: ${workerDefaults.resource_pool}` : 'Blank means inherit A0 routing.')} />
-                    <Field label="Queue Override" value={stringifyQueue(worker.resource_pool_queue)} onChange={(value) => onWorkerChange(index, 'resource_pool_queue', value)} issues={issues[`workers[${index}].resource_pool_queue`]} placeholder="pool_a, pool_b" helpText={resolved?.resource_pool_queue?.length ? `A0 order: ${stringifyQueue(resolved.resource_pool_queue)}` : (workerDefaults.resource_pool_queue?.length ? `Default: ${stringifyQueue(workerDefaults.resource_pool_queue)}` : 'Blank means inherit A0 queue.')} />
                   </div>
                   <details className="advanced-panel">
                     <summary>Advanced overrides</summary>
                     <div className="field-grid advanced-grid">
+                      <Field label="Task ID Override" value={worker.task_id || ''} onChange={(value) => onWorkerChange(index, 'task_id', value)} helpText={planned.taskId ? `A0 plan: ${planned.taskId}` : 'Leave blank to inherit A0 task assignment.'} />
+                      <Field label="Branch Override" value={worker.branch || ''} onChange={(value) => onWorkerChange(index, 'branch', value)} issues={issues[`workers[${index}].branch`]} helpText={planned.branch ? `A0 plan: ${planned.branch}` : 'Leave blank to let A0 derive the branch.'} />
+                      <Field label="Worktree Path Override" value={worker.worktree_path || ''} onChange={(value) => onWorkerChange(index, 'worktree_path', value)} issues={issues[`workers[${index}].worktree_path`]} helpText={planned.worktreePath ? `A0 plan: ${planned.worktreePath}` : 'Leave blank to derive from Local Repo Root.'} />
+                      <Field label="Queue Override" value={stringifyQueue(worker.resource_pool_queue)} onChange={(value) => onWorkerChange(index, 'resource_pool_queue', value)} issues={issues[`workers[${index}].resource_pool_queue`]} placeholder="pool_a, pool_b" helpText={resolved?.resource_pool_queue?.length ? `A0 order: ${stringifyQueue(resolved.resource_pool_queue)}` : (workerDefaults.resource_pool_queue?.length ? `Default: ${stringifyQueue(workerDefaults.resource_pool_queue)}` : 'Blank means inherit A0 queue.')} />
                       <SelectField label="Environment Type" value={worker.environment_type || ''} onChange={(value) => onWorkerChange(index, 'environment_type', value)} options={['uv', 'venv', 'none']} />
                       <Field label="Environment Path" value={worker.environment_path || ''} onChange={(value) => onWorkerChange(index, 'environment_path', value)} issues={issues[`workers[${index}].environment_path`]} helpText={workerDefaults.environment_path ? `Default: ${workerDefaults.environment_path}` : undefined} />
                       <Field label="Sync Command" value={worker.sync_command || ''} onChange={(value) => onWorkerChange(index, 'sync_command', value)} helpText={workerDefaults.sync_command ? `Default: ${workerDefaults.sync_command}` : undefined} />
@@ -1196,7 +1283,7 @@ export function App() {
 
   const agentRows = useMemo(() => buildAgentRows(data), [data]);
   const progress = useMemo(() => buildProgressModel(data, agentRows), [data, agentRows]);
-  const localIssues = useMemo(() => getLocalValidationIssues(draftConfig), [draftConfig]);
+  const localIssues = useMemo(() => getLocalValidationIssues(draftConfig, data), [draftConfig, data]);
   const allIssues = useMemo(() => [...localIssues, ...backendIssues], [localIssues, backendIssues]);
   const providerOptions = useMemo(() => Object.keys(draftConfig.providers || {}), [draftConfig.providers]);
 
@@ -1272,11 +1359,13 @@ export function App() {
     const controller = new AbortController();
     const nextData = await fetchState(controller.signal);
     setData(nextData);
+    return nextData;
   };
 
   const onProjectChange = (field: string, value: string) => {
     updateConfig((current) => {
       const next = normalizeConfig(current);
+      const previousAutoEnvPath = deriveDefaultEnvironmentPath(current);
       next.project = next.project || {};
       if (field.startsWith('dashboard.')) {
         const key = field.replace('dashboard.', '');
@@ -1293,9 +1382,22 @@ export function App() {
       } else if (field === 'reference_workspace_root' || field === 'paddle_repo_path') {
         next.project.reference_workspace_root = value;
       }
+      const nextAutoEnvPath = deriveDefaultEnvironmentPath(next);
+      next.worker_defaults = next.worker_defaults || {};
+      if (next.worker_defaults.environment_type !== 'none') {
+        const currentEnvironmentPath = normalizedText(next.worker_defaults.environment_path);
+        if (!currentEnvironmentPath || currentEnvironmentPath === previousAutoEnvPath) {
+          next.worker_defaults.environment_path = nextAutoEnvPath;
+        }
+      }
       next.workers = (next.workers || []).map((worker) => ({
         ...worker,
-        worktree_path: worker.worktree_path || deriveWorktreePath(next, worker.agent),
+        worktree_path: (() => {
+          const previousDerived = deriveWorktreePath(current, worker.agent);
+          const nextDerived = deriveWorktreePath(next, worker.agent);
+          const currentPath = normalizedText(worker.worktree_path);
+          return !currentPath || currentPath === previousDerived ? nextDerived : worker.worktree_path;
+        })(),
       }));
       return next;
     });
@@ -1369,6 +1471,10 @@ export function App() {
       }
       const workers = [...(next.workers || [])];
       const worker = { ...(workers[index] || { agent: `A${index + 1}` }) };
+      const previousAgent = String(worker.agent || '');
+      const previousTaskId = String(worker.task_id || '');
+      const previousBranch = String(worker.branch || '');
+      const previousWorktreePath = String(worker.worktree_path || '');
       if (field === 'resource_pool_queue') {
         worker.resource_pool_queue = parseQueue(value);
       } else if (field === 'git_identity.name' || field === 'git_identity.email') {
@@ -1381,8 +1487,28 @@ export function App() {
       } else {
         (worker as Record<string, unknown>)[field] = value;
       }
-      if (field === 'agent' && !worker.worktree_path) {
-        worker.worktree_path = deriveWorktreePath(next, String(value));
+      if (field === 'agent') {
+        const nextAgent = String(value || '');
+        const previousDerivedTaskId = previousAgent ? `${previousAgent}-001` : '';
+        const nextDerivedTaskId = nextAgent ? `${nextAgent}-001` : '';
+        const previousDerivedBranch = previousAgent
+          ? deriveBranchName(previousAgent, previousTaskId || previousAgent, previousTaskId || previousAgent)
+          : '';
+        const nextDerivedBranch = nextAgent
+          ? deriveBranchName(nextAgent, worker.task_id || nextAgent, worker.task_id || nextAgent)
+          : '';
+        const previousDerivedWorktreePath = previousAgent ? deriveWorktreePath(next, previousAgent) : '';
+        const nextDerivedWorktreePath = nextAgent ? deriveWorktreePath(next, nextAgent) : '';
+
+        if (!previousTaskId || previousTaskId === previousDerivedTaskId) {
+          worker.task_id = nextDerivedTaskId;
+        }
+        if (!previousBranch || previousBranch === previousDerivedBranch) {
+          worker.branch = nextDerivedBranch;
+        }
+        if (!previousWorktreePath || previousWorktreePath === previousDerivedWorktreePath) {
+          worker.worktree_path = nextDerivedWorktreePath;
+        }
       }
       workers[index] = worker;
       next.workers = workers;
@@ -1510,7 +1636,12 @@ export function App() {
       ...current,
       [section]: { message: 'saved', error: false },
     }));
-    await refreshStateOnly();
+    const nextData = await refreshStateOnly();
+    setDraftConfig((current) => {
+      const mergedDraft = hydrateConfigForA0(nextData, mergeSavedSection(current, nextData.config, section));
+      setConfigDirty(JSON.stringify(normalizeConfig(mergedDraft)) !== JSON.stringify(normalizeConfig(nextData.config)));
+      return mergedDraft;
+    });
     setStampedStatus(`${section} saved: ${response.validation_errors.length} note(s), ${response.launch_blockers.length} blocker(s)`);
   });
 

@@ -2382,6 +2382,13 @@ Primary test command:
             def do_GET(self) -> None:  # noqa: N802
                 if service.handle_api_get(self):
                     return
+                if self.path.startswith("/api/"):
+                    service.write_json(
+                        self,
+                        {"ok": False, "error": f"unknown api route: {self.path}"},
+                        status=404,
+                    )
+                    return
                 asset = service.serve_static_asset(self.path)
                 if asset is None:
                     self.send_error(HTTPStatus.NOT_FOUND)
@@ -2398,6 +2405,13 @@ Primary test command:
 
             def do_POST(self) -> None:  # noqa: N802
                 if service.handle_api_post(self):
+                    return
+                if self.path.startswith("/api/"):
+                    service.write_json(
+                        self,
+                        {"ok": False, "error": f"unknown api route: {self.path}"},
+                        status=404,
+                    )
                     return
                 self.send_error(HTTPStatus.NOT_FOUND)
 
