@@ -35,6 +35,8 @@ export type ProviderQueueItem = {
   priority: number;
   binary: string;
   binary_found: boolean;
+  recursion_guard: string;
+  launch_wrapper: string;
   auth_mode: string;
   auth_ready: boolean;
   auth_detail: string;
@@ -66,6 +68,8 @@ export type RuntimeWorker = {
   resource_pool: string;
   provider: string;
   model: string;
+  recursion_guard?: string;
+  launch_wrapper?: string;
   local_workspace_root?: string;
   repository_root?: string;
   worktree_path?: string;
@@ -113,6 +117,8 @@ export type ProcessSnapshot = {
   pid: number;
   alive: boolean;
   returncode: number | null;
+  wrapper_path: string;
+  recursion_guard: string;
   worktree_path: string;
   log_path: string;
   command: string[];

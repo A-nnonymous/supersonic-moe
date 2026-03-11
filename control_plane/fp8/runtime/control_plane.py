@@ -38,6 +38,7 @@ CONFIG_TEMPLATE_PATH = RUNTIME_DIR / "config_template.yaml"
 DEFAULT_DASHBOARD_HOST = "0.0.0.0"
 DEFAULT_DASHBOARD_PORT = 8233
 PROMPT_DIR = RUNTIME_DIR / "generated_prompts"
+WRAPPER_DIR = RUNTIME_DIR / "generated_wrappers"
 LOG_DIR = RUNTIME_DIR / "logs"
 MANAGER_REPORT = CONTROL_ROOT / "reports" / "manager_report.md"
 SESSION_STATE = RUNTIME_DIR / "session_state.json"
@@ -53,6 +54,8 @@ CONTROL_PLANE_WORKER_CONTEXT_ENV = "CONTROL_PLANE_WORKER_CONTEXT"
 CONTROL_PLANE_WORKER_AGENT_ENV = "CONTROL_PLANE_WORKER_AGENT"
 CONTROL_PLANE_RECURSION_POLICY_ENV = "CONTROL_PLANE_RECURSION_POLICY"
 CONTROL_PLANE_ALLOW_NESTED_ENV = "CONTROL_PLANE_ALLOW_NESTED"
+CONTROL_PLANE_WRAPPED_PROVIDER_ENV = "CONTROL_PLANE_WRAPPED_PROVIDER"
+CONTROL_PLANE_GUARD_MODE_ENV = "CONTROL_PLANE_GUARD_MODE"
 
 
 def now_iso() -> str:
@@ -156,6 +159,8 @@ class WorkerProcess:
     provider: str
     model: str
     command: list[str]
+    wrapper_path: str
+    recursion_guard: str
     worktree_path: Path
     log_path: Path
     log_handle: TextIO
@@ -1534,6 +1539,51 @@ class ControlPlaneService:
             return auth_mode, False, f"api key missing for pool {pool_name}; expected env {api_env_name}", False
         return auth_mode, False, f"api key missing for pool {pool_name}", False
 
+    def provider_uses_exec_wrapper(self, provider_name: str, provider: dict[str, Any]) -> bool:
+        configured = provider.get("single_layer_wrapper")
+        if configured is not None:
+            return bool(configured)
+        return provider_name == "ducc"
+
+    def provider_recursion_guard_mode(self, provider_name: str, provider: dict[str, Any]) -> str:
+        return "env+exec-wrapper" if self.provider_uses_exec_wrapper(provider_name, provider) else "env-only"
+
+    def provider_wrapper_path(self, provider_name: str) -> Path:
+        return WRAPPER_DIR / f"{slugify(provider_name)}_single_layer.sh"
+
+    def ensure_provider_exec_wrapper(self, provider_name: str) -> Path:
+        WRAPPER_DIR.mkdir(parents=True, exist_ok=True)
+        wrapper_path = self.provider_wrapper_path(provider_name)
+        wrapper_text = "\n".join(
+            [
+                "#!/bin/sh",
+                "set -eu",
+                f"unset {CONTROL_PLANE_ALLOW_NESTED_ENV} 2>/dev/null || true",
+                f'export {CONTROL_PLANE_WORKER_CONTEXT_ENV}="${{{CONTROL_PLANE_WORKER_CONTEXT_ENV}:-1}}"',
+                f'export {CONTROL_PLANE_RECURSION_POLICY_ENV}="${{{CONTROL_PLANE_RECURSION_POLICY_ENV}:-forbid-nested-control-plane}}"',
+                f'export {CONTROL_PLANE_GUARD_MODE_ENV}="${{{CONTROL_PLANE_GUARD_MODE_ENV}:-env+exec-wrapper}}"',
+                f'export {CONTROL_PLANE_WRAPPED_PROVIDER_ENV}="{provider_name}"',
+                'exec "$@"',
+                "",
+            ]
+        )
+        if not wrapper_path.exists() or wrapper_path.read_text(encoding="utf-8") != wrapper_text:
+            wrapper_path.write_text(wrapper_text, encoding="utf-8")
+            wrapper_path.chmod(0o755)
+        return wrapper_path
+
+    def guarded_worker_env(
+        self, worker: dict[str, Any], provider_name: str, provider: dict[str, Any]
+    ) -> dict[str, str]:
+        recursion_guard = self.provider_recursion_guard_mode(provider_name, provider)
+        return {
+            CONTROL_PLANE_WORKER_CONTEXT_ENV: "1",
+            CONTROL_PLANE_WORKER_AGENT_ENV: str(worker["agent"]),
+            CONTROL_PLANE_RECURSION_POLICY_ENV: "forbid-nested-control-plane",
+            CONTROL_PLANE_GUARD_MODE_ENV: recursion_guard,
+            CONTROL_PLANE_WRAPPED_PROVIDER_ENV: provider_name,
+        }
+
     def score_work_quality(self, stats: dict[str, Any], active_workers: int) -> float:
         successes = int(stats.get("launch_successes", 0))
         launch_failures = int(stats.get("launch_failures", 0))
@@ -1547,6 +1597,12 @@ class ControlPlaneService:
         pool = self.resource_pools[pool_name]
         provider_name = str(pool.get("provider", "unassigned"))
         provider = self.providers.get(provider_name, {})
+        recursion_guard = self.provider_recursion_guard_mode(provider_name, provider)
+        launch_wrapper = (
+            str(self.provider_wrapper_path(provider_name))
+            if self.provider_uses_exec_wrapper(provider_name, provider)
+            else ""
+        )
         stats = self.provider_stats.setdefault(
             pool_name,
             {
@@ -1614,6 +1670,8 @@ class ControlPlaneService:
             "priority": base_priority,
             "binary": binary or "unassigned",
             "binary_found": bool(binary_path),
+            "recursion_guard": recursion_guard,
+            "launch_wrapper": launch_wrapper,
             "auth_mode": auth_mode,
             "auth_ready": auth_ready,
             "auth_detail": auth_detail,
@@ -1744,6 +1802,8 @@ class ControlPlaneService:
                 "provider": worker.provider,
                 "model": worker.model,
                 "command": worker.command,
+                "wrapper_path": worker.wrapper_path,
+                "recursion_guard": worker.recursion_guard,
                 "worktree_path": str(worker.worktree_path),
                 "log_path": str(worker.log_path),
                 "alive": worker.process.poll() is None,
@@ -2036,7 +2096,14 @@ Primary test command:
             raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "sync failed")
 
     def update_runtime_entry(
-        self, worker: dict[str, Any], pool_name: str, provider_name: str, model: str, status: str
+        self,
+        worker: dict[str, Any],
+        pool_name: str,
+        provider_name: str,
+        model: str,
+        status: str,
+        recursion_guard: str | None = None,
+        launch_wrapper: str | None = None,
     ) -> None:
         runtime_path = STATE_DIR / "agent_runtime.yaml"
         runtime = load_yaml(runtime_path)
@@ -2055,6 +2122,10 @@ Primary test command:
                 "resource_pool": pool_name,
                 "provider": provider_name,
                 "model": model,
+                "recursion_guard": (
+                    recursion_guard if recursion_guard is not None else target.get("recursion_guard", "")
+                ),
+                "launch_wrapper": launch_wrapper if launch_wrapper is not None else target.get("launch_wrapper", ""),
                 "launch_owner": worker.get("launch_owner", "manager"),
                 "local_workspace_root": self.project.get("local_repo_root", str(REPO_ROOT)),
                 "repository_root": str(REPO_ROOT),
@@ -2122,6 +2193,8 @@ Primary test command:
         }
         command = format_command(template, values)
         env = os.environ.copy()
+        recursion_guard = self.provider_recursion_guard_mode(provider_name, provider)
+        launch_wrapper = ""
         api_value = pool.get("api_key", "")
         api_env_name = provider.get("api_key_env_name")
         if (
@@ -2134,9 +2207,11 @@ Primary test command:
         extra_env = pool.get("extra_env", {})
         if isinstance(extra_env, dict):
             env.update({str(key): str(value) for key, value in extra_env.items()})
-        env[CONTROL_PLANE_WORKER_CONTEXT_ENV] = "1"
-        env[CONTROL_PLANE_WORKER_AGENT_ENV] = str(worker["agent"])
-        env[CONTROL_PLANE_RECURSION_POLICY_ENV] = "forbid-nested-control-plane"
+        env.update(self.guarded_worker_env(worker, provider_name, provider))
+        if self.provider_uses_exec_wrapper(provider_name, provider):
+            wrapper_path = self.ensure_provider_exec_wrapper(provider_name)
+            launch_wrapper = str(wrapper_path)
+            command = [launch_wrapper, *command]
 
         log_path = LOG_DIR / f"{worker['agent']}.log"
         log_handle = log_path.open("w", encoding="utf-8")
@@ -2161,13 +2236,23 @@ Primary test command:
             provider=provider_name,
             model=model,
             command=command,
+            wrapper_path=launch_wrapper,
+            recursion_guard=recursion_guard,
             worktree_path=Path(worker["worktree_path"]),
             log_path=log_path,
             log_handle=log_handle,
             process=process,
             started_at=time.time(),
         )
-        self.update_runtime_entry(worker, pool_name, provider_name, model, "launching")
+        self.update_runtime_entry(
+            worker,
+            pool_name,
+            provider_name,
+            model,
+            "launching",
+            recursion_guard=recursion_guard,
+            launch_wrapper=launch_wrapper,
+        )
         self.update_heartbeat(worker["agent"], "launching", "process_spawned", "waiting for first monitor check")
         return {
             "agent": worker["agent"],
@@ -2175,6 +2260,8 @@ Primary test command:
             "provider": provider_name,
             "model": model,
             "pid": process.pid,
+            "recursion_guard": recursion_guard,
+            "launch_wrapper": launch_wrapper,
             "command": command,
             "launch_strategy": resolved_policy.strategy,
         }
@@ -2210,7 +2297,26 @@ Primary test command:
                         self.persist_provider_stats()
                     provider_name = resolved_policy.provider or worker.get("provider", "unassigned") or "unassigned"
                     model = resolved_policy.model or worker.get("model", "unassigned") or "unassigned"
-                    self.update_runtime_entry(worker, pool_name, provider_name, model, f"launch_failed: {exc}")
+                    provider_config = self.providers.get(provider_name, {}) if provider_name in self.providers else {}
+                    launch_wrapper = (
+                        str(self.provider_wrapper_path(provider_name))
+                        if provider_name in self.providers
+                        and self.provider_uses_exec_wrapper(provider_name, provider_config)
+                        else ""
+                    )
+                    self.update_runtime_entry(
+                        worker,
+                        pool_name,
+                        provider_name,
+                        model,
+                        f"launch_failed: {exc}",
+                        recursion_guard=(
+                            self.provider_recursion_guard_mode(provider_name, provider_config)
+                            if provider_name in self.providers
+                            else "env-only"
+                        ),
+                        launch_wrapper=launch_wrapper,
+                    )
                     self.update_heartbeat(worker["agent"], "stale", "launch_failed", str(exc))
                     failures.append({"agent": worker["agent"], "error": str(exc)})
             self.last_event = f"launch:{resolved_policy.strategy}:{len(launched)} workers"
@@ -2265,6 +2371,8 @@ Primary test command:
                 "pid": worker.process.pid,
                 "alive": worker.process.poll() is None,
                 "returncode": worker.process.poll(),
+                "wrapper_path": worker.wrapper_path,
+                "recursion_guard": worker.recursion_guard,
                 "worktree_path": str(worker.worktree_path),
                 "log_path": str(worker.log_path),
                 "command": worker.command,

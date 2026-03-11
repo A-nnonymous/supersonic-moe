@@ -571,10 +571,19 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
         self.assertTrue(provider_queue["ducc_pool"]["auth_ready"])
         self.assertTrue(provider_queue["ducc_pool"]["launch_ready"])
         self.assertFalse(provider_queue["ducc_pool"]["api_key_present"])
+        self.assertEqual(provider_queue["ducc_pool"]["recursion_guard"], "env+exec-wrapper")
+        self.assertTrue(str(provider_queue["ducc_pool"]["launch_wrapper"]).endswith("ducc_single_layer.sh"))
 
         runtime_workers = {item["agent"]: item for item in state["runtime"]["workers"]}
         self.assertEqual(runtime_workers["A1"]["provider"], "ducc")
         self.assertEqual(runtime_workers["A2"]["provider"], "ducc")
+        self.assertEqual(runtime_workers["A1"]["recursion_guard"], "env+exec-wrapper")
+        self.assertTrue(str(runtime_workers["A1"]["launch_wrapper"]).endswith("ducc_single_layer.sh"))
+
+        process_snapshot = state["processes"]["A1"]
+        self.assertEqual(process_snapshot["recursion_guard"], "env+exec-wrapper")
+        self.assertTrue(str(process_snapshot["wrapper_path"]).endswith("ducc_single_layer.sh"))
+        self.assertTrue(str(process_snapshot["command"][0]).endswith("ducc_single_layer.sh"))
 
         self.stop_workers()
 
