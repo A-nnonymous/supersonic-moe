@@ -46,6 +46,12 @@ def find_free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def port_is_listening(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.5)
+        return sock.connect_ex(("127.0.0.1", port)) == 0
+
+
 class ControlPlaneIntegrationTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp_dir = tempfile.TemporaryDirectory(prefix="fp8-control-plane-it-")
@@ -82,6 +88,7 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
         env["GITHUB_TOKEN"] = "integration-token"
         env["OPENCODE_API_KEY"] = "integration-token"
         env["ANTHROPIC_API_KEY"] = "integration-token"
+        self.env = env
 
         self.server = subprocess.Popen(
             [
@@ -275,6 +282,31 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
     def fetch_state(self) -> dict[str, object]:
         return read_json(f"{self.base_url}/api/state")
 
+    def run_cli_command(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                "uv",
+                "run",
+                "--with",
+                "PyYAML>=6.0.2",
+                "python",
+                str(self.runtime_script),
+                *args,
+                "--port",
+                str(self.port),
+            ],
+            cwd=self.root,
+            env=self.env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=True,
+        )
+
+    def session_state(self) -> dict[str, object]:
+        session_state_path = self.fp8_root / "runtime" / f"session_state_{self.port}.json"
+        return json.loads(session_state_path.read_text(encoding="utf-8"))
+
     def wait_for_agent_state(self, expected_provider: str, expected_model: str | None = None) -> dict[str, object]:
         final_state: dict[str, object] = {}
 
@@ -348,6 +380,44 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
         saved_config_text = self.config_path.read_text(encoding="utf-8")
         self.assertIn(updated_project["local_repo_root"], saved_config_text)
         self.assertIn(updated_project["reference_workspace_root"], saved_config_text)
+
+    def test_unknown_api_routes_return_json_errors(self) -> None:
+        request = urllib.request.Request(f"{self.base_url}/api/does-not-exist", data=b"{}")
+        request.add_header("Content-Type", "application/json")
+        with self.assertRaises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(request, timeout=5)
+        error = exc_info.exception
+        self.assertEqual(error.code, 404)
+        payload = json.loads(error.read().decode("utf-8"))
+        error.close()
+        self.assertFalse(payload["ok"])
+        self.assertIn("unknown api route", payload["error"])
+
+    def test_silent_and_stop_all_cli_preserve_then_release_workers(self) -> None:
+        launch_result = read_json(f"{self.base_url}/api/launch", {"restart": False})
+        self.assertTrue(launch_result["ok"])
+        self.wait_for_agent_state(expected_provider="copilot", expected_model="gpt-5.4")
+
+        silent_result = self.run_cli_command("silent")
+        silent_payload = json.loads(silent_result.stdout)
+        self.assertTrue(silent_payload["ok"])
+        self.assertTrue(silent_payload["listener_released"])
+        wait_for(lambda: not port_is_listening(self.port), timeout=10, interval=0.5)
+
+        session_state = self.session_state()
+        self.assertFalse(session_state["server"]["listener_active"])
+        worker_pids = [
+            int(worker["pid"]) for worker in session_state["workers"].values() if int(worker.get("pid") or 0)
+        ]
+        self.assertTrue(worker_pids)
+        self.assertTrue(all(pid > 0 for pid in worker_pids))
+
+        stop_all_result = self.run_cli_command("stop-all")
+        stop_all_payload = json.loads(stop_all_result.stdout)
+        self.assertTrue(stop_all_payload["ok"])
+        self.assertTrue(stop_all_payload["listener_released"])
+        wait_for(lambda: not port_is_listening(self.port), timeout=10, interval=0.5)
+        wait_for(lambda: self.server.poll() is not None, timeout=10, interval=0.5)
 
     def test_multi_agent_launch_policies_and_heartbeats(self) -> None:
         initial_state = self.fetch_state()
