@@ -24701,6 +24701,34 @@ function mergeWorkerWithDefaults(worker, defaults) {
   }
   return merged;
 }
+function resetWorkerDefaultsToA0(defaults) {
+  return {};
+}
+function resetWorkerOverridesToA0(worker, scope = "all") {
+  const next = { agent: worker.agent };
+  if (scope === "routing") {
+    return {
+      ...worker,
+      resource_pool: void 0,
+      resource_pool_queue: void 0,
+      task_id: void 0,
+      branch: void 0,
+      worktree_path: void 0
+    };
+  }
+  if (scope === "runtime") {
+    return {
+      ...worker,
+      environment_type: void 0,
+      environment_path: void 0,
+      sync_command: void 0,
+      test_command: void 0,
+      submit_strategy: void 0,
+      git_identity: void 0
+    };
+  }
+  return next;
+}
 function buildIssueMap(...issueSets) {
   return issueSets.reduce((acc, issues) => {
     issues.forEach((issue) => {
@@ -25179,10 +25207,14 @@ function SectionHeader({
   status,
   onValidate,
   onSave,
-  action
+  action,
+  subtitle
 }) {
   return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "section-head section-head-actions", children: [
-    /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", { children: title }),
+    /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { children: [
+      /* @__PURE__ */ (0, import_jsx_runtime.jsx)("h3", { children: title }),
+      subtitle ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "section-subtitle small muted", children: subtitle }) : null
+    ] }),
     /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "section-actions", children: [
       status?.message ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { className: classNames("section-status", status.error && "error"), children: status.message }) : null,
       /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { className: "ghost", type: "button", onClick: () => onValidate(section), children: "Validate" }),
@@ -25226,7 +25258,7 @@ function AutomationSummary({ draftConfig, data }) {
     /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", { className: "small muted", children: [
       "Planned workers currently detected: ",
       plannedWorkers.map((worker) => worker.agent).join(", ") || "none",
-      "."
+      ". In Settings, A0 plan means the derived target state; override means a human-pinned exception that should be rare and easy to reset."
     ] }),
     /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "automation-grid", children: [
       /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "subcard", children: [
@@ -25406,7 +25438,9 @@ function SettingsTab({
   onValidateSection,
   onSaveSection,
   onSyncWorkers,
-  onAutoFillWorktreePaths
+  onAutoFillWorktreePaths,
+  onResetWorkerDefaults,
+  onResetWorkerOverrides
 }) {
   const project = draftConfig.project || {};
   const dashboard = project.dashboard || {};
@@ -25458,19 +25492,35 @@ function SettingsTab({
         ] })
       ] }),
       /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("section", { className: "helper-card settings-card settings-card-wide", children: [
-        /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SectionHeader, { title: "Worker Defaults", section: "worker_defaults", status: sectionStatuses.worker_defaults, onValidate: onValidateSection, onSave: onSaveSection }),
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)(
+          SectionHeader,
+          {
+            title: "Worker Defaults",
+            section: "worker_defaults",
+            status: sectionStatuses.worker_defaults,
+            onValidate: onValidateSection,
+            onSave: onSaveSection,
+            subtitle: "Common defaults are the few knobs you may actually standardize across workers. Advanced defaults are fallback overrides for exceptional environments.",
+            action: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { className: "ghost", type: "button", onClick: onResetWorkerDefaults, children: "Reset to A0" })
+          }
+        ),
         /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SectionIssueList, { issues: collectSectionIssues("worker_defaults", allIssues) }),
-        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { className: "small muted", children: "These values apply to every worker unless a row below overrides them. Blank fields are auto-filled from runtime conventions or sensible defaults where possible." }),
-        /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "field-grid", children: [
+        /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { className: "small muted", children: "These values apply to every worker unless a row below overrides them. Blank fields are auto-filled from runtime conventions or sensible defaults where possible, so the main path should stay sparse." }),
+        /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "field-grid compact-field-grid", children: [
           /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Default Pool", value: workerDefaults.resource_pool || "", onChange: (value) => onWorkerChange(-1, "worker_defaults.resource_pool", value), issues: issues["worker_defaults.resource_pool"], helpText: "Leave blank to rely on pool queue or per-worker overrides." }),
           /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Default Pool Queue", value: stringifyQueue(workerDefaults.resource_pool_queue), onChange: (value) => onWorkerChange(-1, "worker_defaults.resource_pool_queue", value), issues: issues["worker_defaults.resource_pool_queue"], placeholder: "copilot_pool, claude_pool" }),
           /* @__PURE__ */ (0, import_jsx_runtime.jsx)(SelectField, { label: "Default Environment", value: workerDefaults.environment_type || "uv", onChange: (value) => onWorkerChange(-1, "worker_defaults.environment_type", value), options: ["uv", "venv", "none"] }),
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Default Environment Path", value: workerDefaults.environment_path || "", onChange: (value) => onWorkerChange(-1, "worker_defaults.environment_path", value), issues: issues["worker_defaults.environment_path"] }),
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Default Sync Command", value: workerDefaults.sync_command || "", onChange: (value) => onWorkerChange(-1, "worker_defaults.sync_command", value) }),
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Default Test Command", value: workerDefaults.test_command || "", onChange: (value) => onWorkerChange(-1, "worker_defaults.test_command", value), issues: issues["worker_defaults.test_command"] }),
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Default Submit Strategy", value: workerDefaults.submit_strategy || "", onChange: (value) => onWorkerChange(-1, "worker_defaults.submit_strategy", value), issues: issues["worker_defaults.submit_strategy"] }),
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Default Git Name", value: workerDefaults.git_identity?.name || "", onChange: (value) => onWorkerChange(-1, "worker_defaults.git_identity.name", value), issues: issues["worker_defaults.git_identity.name"] }),
-          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Default Git Email", value: workerDefaults.git_identity?.email || "", onChange: (value) => onWorkerChange(-1, "worker_defaults.git_identity.email", value), issues: issues["worker_defaults.git_identity.email"] })
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Default Environment Path", value: workerDefaults.environment_path || "", onChange: (value) => onWorkerChange(-1, "worker_defaults.environment_path", value), issues: issues["worker_defaults.environment_path"] })
+        ] }),
+        /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("details", { className: "advanced-panel defaults-panel", children: [
+          /* @__PURE__ */ (0, import_jsx_runtime.jsx)("summary", { children: "Advanced defaults" }),
+          /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "field-grid advanced-grid", children: [
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Default Sync Command", value: workerDefaults.sync_command || "", onChange: (value) => onWorkerChange(-1, "worker_defaults.sync_command", value), helpText: "Leave blank to let A0 follow the environment convention." }),
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Default Test Command", value: workerDefaults.test_command || "", onChange: (value) => onWorkerChange(-1, "worker_defaults.test_command", value), issues: issues["worker_defaults.test_command"], helpText: "Leave blank to let task policy choose per worker." }),
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Default Submit Strategy", value: workerDefaults.submit_strategy || "", onChange: (value) => onWorkerChange(-1, "worker_defaults.submit_strategy", value), issues: issues["worker_defaults.submit_strategy"], helpText: "Leave blank to keep A0's standard handoff flow." }),
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Default Git Name", value: workerDefaults.git_identity?.name || "", onChange: (value) => onWorkerChange(-1, "worker_defaults.git_identity.name", value), issues: issues["worker_defaults.git_identity.name"] }),
+            /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Default Git Email", value: workerDefaults.git_identity?.email || "", onChange: (value) => onWorkerChange(-1, "worker_defaults.git_identity.email", value), issues: issues["worker_defaults.git_identity.email"] })
+          ] })
         ] })
       ] }),
       /* @__PURE__ */ (0, import_jsx_runtime.jsx)(AutomationSummary, { draftConfig, data }),
@@ -25494,7 +25544,7 @@ function SettingsTab({
         /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("p", { className: "small muted", children: [
           "Detected workers from backlog/runtime: ",
           plannedWorkers.map((item) => item.agent).join(", ") || "none",
-          ". Main cards now show A0's current plan first; most editable fields are hidden under advanced overrides so you only touch real exceptions."
+          ". A0 plan is the derived execution target. Any filled override below becomes a human-pinned exception; use Reset to A0 to clear those pins and fall back to the plan."
         ] }),
         /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "worker-grid", children: workers.map((worker, index) => /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "subcard", children: (() => {
           const resolved = resolvedByAgent.get(worker.agent || "");
@@ -25502,7 +25552,10 @@ function SettingsTab({
           const recommendation = planned.poolReason || "";
           const suggestedTest = planned.suggestedTestCommand || "";
           return /* @__PURE__ */ (0, import_jsx_runtime.jsxs)(import_jsx_runtime.Fragment, { children: [
-            /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "subcard-title", children: worker.agent || `Worker ${index + 1}` }),
+            /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "subcard-title worker-card-title-row", children: [
+              /* @__PURE__ */ (0, import_jsx_runtime.jsx)("span", { children: worker.agent || `Worker ${index + 1}` }),
+              /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { className: "ghost", type: "button", onClick: () => onResetWorkerOverrides(index), children: "Reset to A0" })
+            ] }),
             recommendation ? /* @__PURE__ */ (0, import_jsx_runtime.jsx)("p", { className: "small muted", children: recommendation }) : null,
             /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "plan-grid", children: [
               /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "plan-row", children: [
@@ -25536,6 +25589,10 @@ function SettingsTab({
             ] }),
             /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("details", { className: "advanced-panel", children: [
               /* @__PURE__ */ (0, import_jsx_runtime.jsx)("summary", { children: "Advanced overrides" }),
+              /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "override-toolbar", children: [
+                /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { className: "ghost", type: "button", onClick: () => onResetWorkerOverrides(index, "routing"), children: "Reset routing" }),
+                /* @__PURE__ */ (0, import_jsx_runtime.jsx)("button", { className: "ghost", type: "button", onClick: () => onResetWorkerOverrides(index, "runtime"), children: "Reset runtime" })
+              ] }),
               /* @__PURE__ */ (0, import_jsx_runtime.jsxs)("div", { className: "field-grid advanced-grid", children: [
                 /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Task ID Override", value: worker.task_id || "", onChange: (value) => onWorkerChange(index, "task_id", value), helpText: planned.taskId ? `A0 plan: ${planned.taskId}` : "Leave blank to inherit A0 task assignment." }),
                 /* @__PURE__ */ (0, import_jsx_runtime.jsx)(Field, { label: "Branch Override", value: worker.branch || "", onChange: (value) => onWorkerChange(index, "branch", value), issues: issues[`workers[${index}].branch`], helpText: planned.branch ? `A0 plan: ${planned.branch}` : "Leave blank to let A0 derive the branch." }),
@@ -25964,6 +26021,27 @@ function App() {
     });
     setStampedStatus("missing worktree paths filled from local repo root");
   };
+  const onResetWorkerDefaults = () => {
+    updateConfig((current) => ({
+      ...normalizeConfig(current),
+      worker_defaults: resetWorkerDefaultsToA0(current.worker_defaults)
+    }));
+    setStampedStatus("worker defaults reset to A0-managed defaults");
+  };
+  const onResetWorkerOverrides = (index, scope = "all") => {
+    updateConfig((current) => {
+      const next = normalizeConfig(current);
+      const workers = [...next.workers || []];
+      if (!workers[index]) {
+        return next;
+      }
+      workers[index] = resetWorkerOverridesToA0(workers[index], scope);
+      next.workers = workers;
+      return next;
+    });
+    const message = scope === "all" ? "worker overrides reset to A0 plan" : scope === "routing" ? "worker routing overrides cleared" : "worker runtime overrides cleared";
+    setStampedStatus(message);
+  };
   const onValidateSection = (section) => void runAction(`validating ${section}`, async () => {
     const sectionValue = buildSectionValue(draftConfig, section);
     const validation = await validateConfigSection(section, sectionValue);
@@ -26165,7 +26243,9 @@ function App() {
           onValidateSection,
           onSaveSection,
           onSyncWorkers,
-          onAutoFillWorktreePaths
+          onAutoFillWorktreePaths,
+          onResetWorkerDefaults,
+          onResetWorkerOverrides
         }
       ) : /* @__PURE__ */ (0, import_jsx_runtime.jsx)("section", { className: "card", children: /* @__PURE__ */ (0, import_jsx_runtime.jsx)("div", { className: "small muted", children: "Loading dashboard state..." }) })
     ] })

@@ -88,6 +88,36 @@ The built assets in `runtime/web/static/` are what the Python runtime serves in 
 
 ## Quickstart
 
+## Common operations
+
+These are the normal operator commands:
+
+- start dashboard only: `python control_plane/fp8/runtime/control_plane.py serve`
+- start dashboard and launch workers: `python control_plane/fp8/runtime/control_plane.py up`
+- stop workers but keep dashboard up: `python control_plane/fp8/runtime/control_plane.py stop-agents`
+- close dashboard but keep workers running: `python control_plane/fp8/runtime/control_plane.py silent`
+- stop everything: `python control_plane/fp8/runtime/control_plane.py stop-all`
+- run the integration check: `python3 control_plane/fp8/runtime/test_control_plane_integration.py`
+- rebuild the frontend after UI edits: `cd control_plane/fp8/runtime/web && npm run build`
+
+## Starting agent work
+
+Use this path when you want A0 to derive as much as possible and keep manual config minimal:
+
+1. Run `serve` if you only want to prepare config, or `up` if you are ready to launch the worker fleet immediately.
+2. Open the Settings tab and fill Project first, especially `Local Repo Root`. This lets A0 derive worker worktree paths.
+3. Confirm Merge Policy and Resource Pools.
+4. In Worker Defaults, touch only the common defaults you truly want to standardize. Leave advanced defaults blank unless your environment really needs a non-standard sync, test, submit, or git identity fallback.
+5. In Worker Config, treat the A0 plan as the default execution target. Only fill an override when a worker must diverge from that plan.
+6. If a worker or defaults section drifted into unnecessary manual values, use `Reset to A0` to clear the overrides and return to the derived path.
+7. Validate and save each section, then launch or restart workers from the top bar.
+
+Settings semantics:
+
+- `A0 plan` means the control plane's derived target state from backlog, runtime state, task policies, and shared defaults.
+- `override` means a human-pinned exception that takes precedence over A0 until cleared.
+- `Reset to A0` removes those pinned values so derivation can take over again.
+
 ### 1. Primary shell commands
 
 Use these first. They match the runtime defaults and cover the normal manager loop:
@@ -127,9 +157,11 @@ Then use the settings workflow in this order:
 
 1. set Project and Merge Policy once
 2. tune Resource Pools in the horizontal pool strip
-3. fill `worker_defaults` for the shared environment, sync, test, submit, and git identity behavior
-4. add workers with only agent identity, branch, worktree, and any routing overrides that differ from the defaults
-5. open the advanced override panel for a worker only when that worker truly needs a different environment path, test command, submit strategy, or git identity
+3. fill only the common `worker_defaults` you really want shared across all workers, mainly pool routing and environment defaults
+4. open `advanced defaults` only when you need non-standard shared sync, test, submit, or git identity behavior
+5. add workers with only agent identity and exceptional routing overrides that differ from the defaults or A0 plan
+6. open the advanced override panel for a worker only when that worker truly needs a different task, branch, worktree, environment, test, submit, or git identity path
+7. use `Reset to A0` whenever a worker or defaults block should fall back to derived values again
 
 Also set `project.integration_branch`, optional `project.manager_git_identity`, and any per-worker `git_identity` overrides you want the runtime to apply inside worker worktrees.
 

@@ -308,6 +308,12 @@ button:disabled {
   color: #d5e4ff;
   margin-bottom: 12px;
 }
+.worker-card-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
 .pool-card {
   min-width: 320px;
   flex: 0 0 320px;
@@ -325,6 +331,10 @@ button:disabled {
   gap: 8px;
   align-items: center;
   justify-content: flex-end;
+}
+.section-subtitle {
+  margin-top: 4px;
+  max-width: 68ch;
 }
 .metric,
 .helper-card,
@@ -467,6 +477,12 @@ button:disabled {
   cursor: pointer;
   color: #d5e4ff;
   font-weight: 700;
+  margin-bottom: 12px;
+}
+.override-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
   margin-bottom: 12px;
 }
 .advanced-grid {
