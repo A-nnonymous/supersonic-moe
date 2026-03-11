@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
-import { enableSilentMode, fetchState, launchWorkers, saveConfigSection, stopAll, stopWorkers, validateConfigSection } from './api';
+import { enableSilentMode, fetchState, launchWorkers, saveConfig, saveConfigSection, stopAll, stopWorkers, validateConfig, validateConfigSection } from './api';
 import type {
   ConfigSection,
   ConfigResourcePool,
@@ -515,6 +515,11 @@ function sectionMatchesField(section: ConfigSection, field: string): boolean {
 
 function collectSectionIssues(section: ConfigSection, issues: ValidationIssue[]): ValidationIssue[] {
   return issues.filter((issue) => sectionMatchesField(section, issue.field));
+}
+
+function sectionRouteUnavailable(error: unknown, path: string): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return (message.includes(path) && message.includes('status 404')) || message.includes(`unknown api route: ${path}`);
 }
 
 function buildPlannedWorkers(data: DashboardState | null, config: ConfigShape): PlannedWorker[] {
@@ -1678,20 +1683,44 @@ export function App() {
 
   const onValidateSection = (section: ConfigSection) => void runAction(`validating ${section}`, async () => {
     const sectionValue = buildSectionValue(draftConfig, section);
-    const validation = await validateConfigSection(section, sectionValue);
-    const nextIssues = validation.validation_issues;
+    let validation;
+    let usedFullConfigFallback = false;
+    try {
+      validation = await validateConfigSection(section, sectionValue);
+    } catch (error) {
+      if (!sectionRouteUnavailable(error, '/api/config/validate-section')) {
+        throw error;
+      }
+      validation = await validateConfig(draftConfig);
+      usedFullConfigFallback = true;
+    }
+    const nextIssues = usedFullConfigFallback
+      ? collectSectionIssues(section, validation.validation_issues)
+      : validation.validation_issues;
+    const blockingOtherIssues = usedFullConfigFallback
+      ? validation.validation_issues.filter((issue) => !sectionMatchesField(section, issue.field)).length
+      : 0;
     setBackendIssues((current) => [
-      ...current.filter((issue) => !sectionMatchesField(section, issue.field)),
-      ...nextIssues,
+      ...current.filter((issue) => usedFullConfigFallback || !sectionMatchesField(section, issue.field)),
+      ...(usedFullConfigFallback ? validation.validation_issues : nextIssues),
     ]);
     setSectionStatuses((current) => ({
       ...current,
       [section]: {
-        message: validation.ok ? 'validated' : `${nextIssues.length} issue(s)`,
+        message: validation.ok
+          ? (usedFullConfigFallback ? 'validated via full-config fallback' : 'validated')
+          : usedFullConfigFallback && blockingOtherIssues > 0
+            ? `${nextIssues.length} section issue(s), ${blockingOtherIssues} other blocker(s)`
+            : `${nextIssues.length} issue(s)`,
         error: !validation.ok,
       },
     }));
-    setStampedStatus(validation.ok ? `${section} validated` : `${section} has validation issues`, !validation.ok);
+    setStampedStatus(
+      validation.ok
+        ? `${section} validated${usedFullConfigFallback ? ' via full-config fallback' : ''}`
+        : `${section} has validation issues`,
+      !validation.ok,
+    );
   });
 
   const onSaveSection = (section: ConfigSection) => void runAction(`saving ${section}`, async () => {
@@ -1705,24 +1734,48 @@ export function App() {
       return;
     }
     const sectionValue = buildSectionValue(draftConfig, section);
-    const validation = await validateConfigSection(section, sectionValue);
+    let validation;
+    let usedFullConfigFallback = false;
+    try {
+      validation = await validateConfigSection(section, sectionValue);
+    } catch (error) {
+      if (!sectionRouteUnavailable(error, '/api/config/validate-section')) {
+        throw error;
+      }
+      validation = await validateConfig(draftConfig);
+      usedFullConfigFallback = true;
+    }
+    const validationIssues = usedFullConfigFallback
+      ? validation.validation_issues
+      : validation.validation_issues;
+    const sectionIssues = collectSectionIssues(section, validationIssues);
+    const blockingOtherIssues = usedFullConfigFallback
+      ? validationIssues.filter((issue) => !sectionMatchesField(section, issue.field)).length
+      : 0;
     if (!validation.ok) {
       setBackendIssues((current) => [
-        ...current.filter((issue) => !sectionMatchesField(section, issue.field)),
-        ...validation.validation_issues,
+        ...current.filter((issue) => usedFullConfigFallback || !sectionMatchesField(section, issue.field)),
+        ...validationIssues,
       ]);
       setSectionStatuses((current) => ({
         ...current,
-        [section]: { message: `${validation.validation_issues.length} issue(s)`, error: true },
+        [section]: {
+          message: usedFullConfigFallback && blockingOtherIssues > 0
+            ? `${sectionIssues.length} section issue(s), ${blockingOtherIssues} other blocker(s)`
+            : `${sectionIssues.length} issue(s)`,
+          error: true,
+        },
       }));
       setStampedStatus(`${section} rejected by validation`, true);
       return;
     }
-    const response = await saveConfigSection(section, sectionValue);
-    setBackendIssues((current) => current.filter((issue) => !sectionMatchesField(section, issue.field)));
+    const response = usedFullConfigFallback
+      ? await saveConfig(draftConfig)
+      : await saveConfigSection(section, sectionValue);
+    setBackendIssues((current) => current.filter((issue) => usedFullConfigFallback || !sectionMatchesField(section, issue.field)));
     setSectionStatuses((current) => ({
       ...current,
-      [section]: { message: 'saved', error: false },
+      [section]: { message: usedFullConfigFallback ? 'saved via full-config fallback' : 'saved', error: false },
     }));
     const nextData = await refreshStateOnly();
     setDraftConfig((current) => {
@@ -1730,7 +1783,9 @@ export function App() {
       setConfigDirty(JSON.stringify(normalizeConfig(mergedDraft)) !== JSON.stringify(normalizeConfig(nextData.config)));
       return mergedDraft;
     });
-    setStampedStatus(`${section} saved: ${response.validation_errors.length} note(s), ${response.launch_blockers.length} blocker(s)`);
+    setStampedStatus(
+      `${section} saved${usedFullConfigFallback ? ' via full-config fallback' : ''}: ${response.validation_errors.length} note(s), ${response.launch_blockers.length} blocker(s)`,
+    );
   });
 
   const onLaunch = (restart: boolean) => void runAction(restart ? 'restarting workers' : 'launching workers', async () => {

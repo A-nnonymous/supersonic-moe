@@ -11,6 +11,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from copy import deepcopy
 from pathlib import Path
 
 
@@ -50,6 +51,30 @@ def port_is_listening(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.settimeout(0.5)
         return sock.connect_ex(("127.0.0.1", port)) == 0
+
+
+def pid_is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def request_json_allow_error(
+    url: str, payload: dict[str, object] | None = None, timeout: float = 5.0
+) -> tuple[int, dict[str, object]]:
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(url, data=data)
+    if data is not None:
+        request.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return int(response.status), json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = json.loads(exc.read().decode("utf-8", errors="replace"))
+        exc.close()
+        return int(exc.code), body
 
 
 class ControlPlaneIntegrationTest(unittest.TestCase):
@@ -282,6 +307,20 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
     def fetch_state(self) -> dict[str, object]:
         return read_json(f"{self.base_url}/api/state")
 
+    def wait_for_state_available(self) -> dict[str, object]:
+        final_state: dict[str, object] = {}
+
+        def predicate() -> bool:
+            nonlocal final_state
+            try:
+                final_state = self.fetch_state()
+            except Exception:
+                return False
+            return bool(final_state.get("mode"))
+
+        wait_for(predicate, timeout=20, interval=0.5)
+        return final_state
+
     def run_cli_command(self, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [
@@ -415,6 +454,63 @@ class ControlPlaneIntegrationTest(unittest.TestCase):
         session_state = self.session_state()
         self.assertTrue(session_state["server"]["listener_active"])
         self.assertEqual(session_state["workers"], {})
+
+    def test_detached_serve_can_start_and_stop_via_session_state(self) -> None:
+        initial_stop = read_json(f"{self.base_url}/api/stop-all", {})
+        self.assertTrue(initial_stop["ok"])
+        wait_for(lambda: self.server.poll() is not None, timeout=15, interval=0.5)
+        wait_for(lambda: not port_is_listening(self.port), timeout=10, interval=0.5)
+
+        detached_result = self.run_cli_command(
+            "serve",
+            "--config",
+            str(self.config_path),
+            "--host",
+            "127.0.0.1",
+        )
+        self.assertIn("control plane started in background", detached_result.stdout)
+        wait_for(lambda: port_is_listening(self.port), timeout=15, interval=0.5)
+
+        state = self.wait_for_state_available()
+        self.assertEqual(state["project"]["repository_name"], "sonicmoe-fp8-it")
+        session_state = self.session_state()
+        self.assertTrue(session_state["server"]["listener_active"])
+        detached_pid = int(session_state["server"]["pid"])
+        self.assertGreater(detached_pid, 0)
+
+        detached_stop = self.run_cli_command("stop-all")
+        detached_stop_payload = json.loads(detached_stop.stdout)
+        self.assertTrue(detached_stop_payload["ok"])
+        self.assertTrue(detached_stop_payload["listener_released"])
+        wait_for(lambda: not port_is_listening(self.port), timeout=15, interval=0.5)
+        wait_for(lambda: not pid_is_running(detached_pid), timeout=15, interval=0.5)
+
+    def test_launch_failure_surfaces_missing_provider_credentials(self) -> None:
+        current_state = self.fetch_state()
+        broken_config = deepcopy(current_state["config"])
+        broken_config["providers"]["copilot"]["api_key_env_name"] = "MISSING_GITHUB_TOKEN"
+        broken_config["resource_pools"]["copilot_pool"]["api_key"] = "replace_me_or_use_api_key_env"
+
+        save_result = read_json(f"{self.base_url}/api/config", {"config": broken_config})
+        self.assertTrue(save_result["ok"])
+
+        status_code, failed_launch = request_json_allow_error(f"{self.base_url}/api/launch", {"restart": False})
+        self.assertEqual(status_code, 400)
+        self.assertFalse(failed_launch["ok"])
+        self.assertEqual(len(failed_launch["failures"]), 2)
+        self.assertTrue(all("api key missing" in item["error"] for item in failed_launch["failures"]))
+
+        state = self.fetch_state()
+        provider_queue = {item["resource_pool"]: item for item in state["provider_queue"]}
+        self.assertFalse(provider_queue["copilot_pool"]["api_key_present"])
+        self.assertIn("api key missing", provider_queue["copilot_pool"]["last_failure"])
+
+        heartbeats = {item["agent"]: item for item in state["heartbeats"]["agents"]}
+        runtime_workers = {item["agent"]: item for item in state["runtime"]["workers"]}
+        self.assertEqual(heartbeats["A1"]["state"], "stale")
+        self.assertEqual(heartbeats["A2"]["state"], "stale")
+        self.assertIn("launch_failed", runtime_workers["A1"]["status"])
+        self.assertIn("launch_failed", runtime_workers["A2"]["status"])
 
     def test_silent_and_stop_all_cli_preserve_then_release_workers(self) -> None:
         launch_result = read_json(f"{self.base_url}/api/launch", {"restart": False})
