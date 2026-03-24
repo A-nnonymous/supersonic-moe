@@ -34,7 +34,19 @@ python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py tests
 Expected result at handoff time:
 
 ```text
-17 passed, 91 skipped
+18 passed, 91 skipped
+```
+
+Faster opt-in command on this machine:
+
+```bash
+make test-blackwell-parallel PYTEST_WORKERS=2
+```
+
+Observed runtime for the parallel entry:
+
+```text
+18 passed, 91 skipped in 168.14s
 ```
 
 ## 4. What has already been settled
@@ -43,19 +55,21 @@ Expected result at handoff time:
 - the main MoE test matrix no longer tries to force unsupported non-QuACK SonicMoE execution on Blackwell
 - the FP8 protocol is now code, not just planning
 - the current protocol scope is fixed to `e4m3` activations + `e8m0` scales + `1x128` granularity
+- the protocol is now threaded through `MoE.forward(..., fp8_protocol=...)` and `moe_TC_softmax_topk_layer(..., fp8_protocol=...)`
+- the current functional-boundary implementation is intentionally correctness-first and is still slower than the baseline
 - the next kernel target is the Hopper FP8 up-projection epilogue, not a standalone gather kernel and not a monolithic full-graph rewrite
 
 ## 5. The next concrete edits
 
-### Stage 1: wire the protocol into the functional boundary
+### Stage 1: replace the torch-side boundary path with a fused epilogue
 
-Use the newly added protocol/reference modules and wire them through:
+The protocol/reference modules are already wired through:
 
 - `sonicmoe/functional/forward.py`
 - `sonicmoe/functional/backward.py`
 - `sonicmoe/functional/__init__.py`
 
-The next step should make the protocol visible at the functional boundary for:
+The next step should remove the current torch-side quant/dequant scaffold for:
 
 - grouped-gemm output activation
 - SwiGLU
@@ -99,4 +113,6 @@ Reuse:
 - `xfer` is the environment to use for SonicMoE work
 - Blackwell currently relies on QuACK; do not expect the default Hopper-only path to compile on `sm_100a`
 - current torch already provides both `torch.float8_e4m3fn` and `torch.float8_e8m0fnu`; a nightly upgrade is not currently required
+- the benchmark gate for performance-facing work is now documented in `reports/fp8_upgrade/ENGINEERING_LOG.md`
+- `pytest-xdist` is now installed in `xfer`; keep the worker count conservative (`2`) for the single-GPU Blackwell regression path
 - keep `reports/` up to date whenever the branch, validation command, or next target changes

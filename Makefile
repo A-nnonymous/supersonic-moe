@@ -16,6 +16,14 @@ test:
 test-blackwell:
 	USE_QUACK_GEMM=1 python -m pytest -q tests/moe_blackwell_test.py
 
+test-blackwell-full:
+	USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py tests/moe_test.py
+
+PYTEST_WORKERS ?= 2
+
+test-blackwell-parallel:
+	USE_QUACK_GEMM=1 python -m pytest -q -n $(PYTEST_WORKERS) --dist loadscope tests/fp8_protocol_test.py tests/moe_blackwell_test.py tests/moe_test.py
+
 test-debug:
 	DEBUG_CUTOTUNE=1 TRITON_PRINT_AUTOTUNING=1 pytest -s tests
 

@@ -80,6 +80,20 @@ For a Blackwell-only QuACK smoke test, run:
 make test-blackwell
 ```
 
+For the current Blackwell-focused regression set, run:
+
+```bash
+make test-blackwell-full
+```
+
+For an opt-in multi-process run on an idle machine, run:
+
+```bash
+make test-blackwell-parallel PYTEST_WORKERS=2
+```
+
+This parallel entry is intentionally opt-in. On a single busy GPU it may not speed up the heaviest QuACK/CuTe tests, so keep comparing it against the serial path.
+
 ## 📋 Current FP8 Upgrade TODOs
 
 Keep this list synchronized with `reports/README.md` and `reports/fp8_upgrade/HANDOFF.md`.
