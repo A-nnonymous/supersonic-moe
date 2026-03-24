@@ -6,15 +6,15 @@ This file tracks the real state of the SonicMoE FP8 upgrade, not a wish list.
 
 - environment: `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer`
 - upstream base merged: `e9190f9`
-- fork head carrying the Blackwell test work: `aaa8bfb`
+- fork head carrying the latest validated work: the current `fork-main-sync` branch head
 - Blackwell capability on this machine: `sm_100a`
 - validated command:
 
 ```bash
-python -m pytest -q tests/moe_test.py tests/moe_blackwell_test.py
+python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py tests/moe_test.py
 ```
 
-- validated result: `14 passed, 91 skipped`
+- validated result: `17 passed, 91 skipped`
 
 ## Completed work
 
@@ -42,14 +42,33 @@ grouped_gemm(varlen/gather-A) -> SwiGLU -> optional prob -> 1x128 blockwise quan
 
 Blackwell should continue to consume the same protocol through the QuACK adapter path rather than through a separate public API.
 
+## Newly landed protocol scope
+
+The current implementation intentionally supports only:
+
+- activation dtype: `torch.float8_e4m3fn`
+- scale encoding: `torch.float8_e8m0fnu`
+- scale granularity: `1x128`
+- runtime target: Blackwell with QuACK enabled
+
+Implemented files:
+
+- `sonicmoe/functional/fp8_protocol.py`
+- `sonicmoe/functional/fp8_quant.py`
+- `sonicmoe/functional/fp8_reference.py`
+- `tests/fp8_protocol_test.py`
+
+Important behavior:
+
+- scale encoding is rounded **up** to the next power-of-two before storing in `e8m0`
+- this avoids `e4m3` overflow-to-`nan` during activation quantization
+
 ## Immediate next implementation targets
 
-1. Add `sonicmoe/functional/fp8_protocol.py`
-2. Add `sonicmoe/functional/fp8_quant.py`
-3. Add `sonicmoe/functional/fp8_reference.py`
-4. Wire a reference FP8 path through `forward.py` / `backward.py`
-5. Land the Hopper fused up-projection epilogue
-6. Land the paired backward kernel and cache contract
+1. Wire the new protocol into `forward.py` / `backward.py` call boundaries
+2. Land the Hopper fused up-projection epilogue
+3. Land the paired backward kernel and cache contract
+4. Reuse the same protocol for Blackwell QuACK activation paths
 
 ## Source-of-truth inputs
 

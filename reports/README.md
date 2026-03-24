@@ -6,10 +6,10 @@ This directory is the live work log for the FP8 upgrade effort. It is not meant 
 
 - authoritative Python environment: `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer`
 - Blackwell path: QuACK-enabled (`USE_QUACK_GEMM=1`)
-- latest validated fork commit: `aaa8bfb` on `fork/main`
+- latest validated fork state: the current `fork-main-sync` working tree carrying the Blackwell FP8 protocol changes
 - latest targeted validation:
-  - `python -m pytest -q tests/moe_test.py tests/moe_blackwell_test.py`
-  - result: `14 passed, 91 skipped`
+  - `python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py tests/moe_test.py`
+  - result: `17 passed, 91 skipped`
 
 ## What is already done
 
@@ -18,13 +18,22 @@ This directory is the live work log for the FP8 upgrade effort. It is not meant 
 - `tests/moe_blackwell_test.py` was added as a dedicated QuACK smoke/regression test
 - `Makefile` now exposes `make test-blackwell`
 - `README.md` now carries the active TODO list and the FP8 roadmap instead of stale control-plane material
+- a Blackwell-only FP8 protocol layer now exists in:
+  - `sonicmoe/functional/fp8_protocol.py`
+  - `sonicmoe/functional/fp8_quant.py`
+  - `sonicmoe/functional/fp8_reference.py`
+- current protocol scope is intentionally constrained to:
+  - activation dtype: `torch.float8_e4m3fn`
+  - scale encoding: `torch.float8_e8m0fnu`
+  - scale granularity: `1x128`
+  - runtime target: Blackwell + QuACK enabled
 
 ## What the next agent should do first
 
 1. Read `reports/fp8_upgrade/HANDOFF.md`
 2. Confirm the environment with `source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate`
 3. Re-run `python -m pytest -q tests/moe_test.py tests/moe_blackwell_test.py`
-4. Start Stage 0 / Stage 1 FP8 protocol work in `sonicmoe/functional/`
+4. Start the first fused FP8 kernel work at the up-projection epilogue
 
 ## Working rule
 

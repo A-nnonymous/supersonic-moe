@@ -88,8 +88,8 @@ Keep this list synchronized with `reports/README.md` and `reports/fp8_upgrade/HA
 - [x] Merge latest upstream `main` and validate local Blackwell behavior
 - [x] Add a dedicated Blackwell QuACK pytest entry (`make test-blackwell`)
 - [x] Make `tests/moe_test.py` Blackwell-aware so unsupported non-QuACK SonicMoE paths skip instead of hard-failing
-- [ ] Add an explicit FP8 protocol layer in `sonicmoe/functional/`
-- [ ] Build a torch/reference FP8 path before adding Hopper fused kernels
+- [x] Add a Blackwell-only FP8 protocol layer in `sonicmoe/functional/` for `e4m3` activations and `e8m0` scales
+- [x] Build the first torch/reference FP8 quant/dequant path before adding Hopper fused kernels
 - [ ] Implement the Hopper up-projection FP8 epilogue: `grouped_gemm -> SwiGLU -> optional prob -> blockwise quant`
 - [ ] Implement the paired FP8 backward path and cache contract
 - [ ] Unify Hopper CuTe and Blackwell QuACK under the same FP8 protocol and test matrix
@@ -100,7 +100,7 @@ The current plan is to treat FP8 as a protocol-and-kernel migration, not a one-s
 
 1. **Freeze protocol and reference behavior first**
    - add `fp8_protocol.py`, `fp8_quant.py`, and `fp8_reference.py`
-   - define `fp8_dtype`, `scale_encoding`, `scale_granularity`, cache tensors, and backend adapter rules
+   - current scope is intentionally narrow: `e4m3` activations + `e8m0` scales + `1x128` granularity + Blackwell runtime checks
 2. **Ship the first Hopper fused kernel at the up-projection epilogue**
    - target `grouped_gemm(varlen/gather-A) -> SwiGLU -> optional prob -> 1x128 quant`
    - keep Blackwell on the QuACK adapter route
@@ -116,6 +116,12 @@ For the live work log, validated commands, and next-agent handoff, read:
 - `reports/README.md`
 - `reports/fp8_upgrade/README.md`
 - `reports/fp8_upgrade/HANDOFF.md`
+
+The current validated Blackwell-only command is:
+
+```bash
+python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py tests/moe_test.py
+```
 
 ### Example usage
 - SonicMoE with TC top-K choice routing (SwiGLU activation) on Hopper GPUs
