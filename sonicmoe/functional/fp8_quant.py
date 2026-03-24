@@ -52,14 +52,15 @@ def quantize_activation_blockwise(
     if x.device.type != "cuda":
         raise ValueError("FP8 activation quantization is only supported on CUDA tensors")
 
-    grouped_x, grouped_shape, original_last_dim = _reshape_last_dim_groups(x.float(), protocol.group_size)
-    amax = grouped_x.abs().amax(dim=-1)
+    grouped_x, grouped_shape, original_last_dim = _reshape_last_dim_groups(x, protocol.group_size)
+    amax = grouped_x.abs().amax(dim=-1).float()
     raw_scale = _safe_scale_from_amax(amax, torch.finfo(protocol.activation_torch_dtype).max)
     encoded_scale = round_scale_to_e8m0(raw_scale, protocol)
 
     scale_fp32 = encoded_scale.float()
     scale_fp32 = torch.where(scale_fp32 > 0, scale_fp32, torch.ones_like(scale_fp32))
-    scaled = grouped_x / scale_fp32.unsqueeze(-1)
+    scale_for_div = scale_fp32.to(dtype=grouped_x.dtype)
+    scaled = grouped_x / scale_for_div.unsqueeze(-1)
     quantized = scaled.to(protocol.activation_torch_dtype).reshape(*grouped_shape[:-2], grouped_shape[-2] * grouped_shape[-1])
     quantized = quantized[..., :original_last_dim]
 
@@ -70,6 +71,7 @@ def dequantize_activation_blockwise(
     x_fp8: torch.Tensor,
     scales_e8m0: torch.Tensor,
     protocol: FP8Protocol | None = None,
+    output_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     protocol = validate_fp8_protocol(protocol or FP8Protocol())
 
@@ -81,7 +83,7 @@ def dequantize_activation_blockwise(
             f"Expected scales shape {expected_scale_shape} for tensor shape {tuple(x_fp8.shape)}, got {tuple(scales_e8m0.shape)}"
         )
 
-    dequantized = (grouped_x.float() * scales_e8m0.float().unsqueeze(-1)).reshape(
+    dequantized = (grouped_x.to(dtype=output_dtype) * scales_e8m0.to(dtype=output_dtype).unsqueeze(-1)).reshape(
         *grouped_shape[:-2], grouped_shape[-2] * grouped_shape[-1]
     )
     return dequantized[..., :original_last_dim]
