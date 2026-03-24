@@ -8,7 +8,7 @@ This directory is the live work log for the FP8 upgrade effort. It is not meant 
 
 - authoritative Python environment: `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer`
 - Blackwell path: QuACK-enabled (`USE_QUACK_GEMM=1`)
-- latest validated fork state: `80271c3` on `fork-main-sync`, plus local vec4 fallback / chunked-launch changes in `operator-incubator`
+- latest validated fork state: `b93211d` (`Add runtime FP8 precision switches`) on `fork-main-sync`, plus local vec4 fallback / chunked-launch changes in `operator-incubator`
 - latest targeted validation:
   - stable Blackwell fp8 regression: `USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py`
   - stable result: `15 passed`

@@ -19,6 +19,8 @@ This is the minimum context a new agent needs to continue work without replaying
 - 最新验证：
   - `USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py`
   - 结果：`15 passed`
+- 最新已 push 里程碑：
+  - `b93211d` — `Add runtime FP8 precision switches`
 - 新结论（这一轮最重要）：
   - 已经去掉运行时无用的 scale decode；
   - inference 模式下也不再做 STE 混合；
