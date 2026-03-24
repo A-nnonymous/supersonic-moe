@@ -5,12 +5,14 @@
 from dataclasses import replace
 
 import torch
+import torch.nn.functional as F
 
 from sonicmoe import (
     FP8ActivationDType,
     KernelBackendMoE,
     MoE,
     apply_activation_fp8_protocol_cutely_fused,
+    apply_preact_activation_fp8_protocol_cutely_fused,
     FP8Protocol,
     FP8ScaleEncoding,
     apply_activation_fp8_protocol,
@@ -141,3 +143,30 @@ class FP8ProtocolTest(TestCommons):
         self.assertEqual(scales_ref.dtype, scales_adapter.dtype)
         torch.testing.assert_close(restored_ref.float(), restored_adapter.float(), atol=0.0, rtol=0.0)
         torch.testing.assert_close(scales_ref.float(), scales_adapter.float(), atol=0.0, rtol=0.0)
+
+    def test_preact_cutely_fused_path_matches_reference_boundary(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required")
+
+        major, _ = torch.cuda.get_device_capability()
+        if major < 10:
+            self.skipTest("Blackwell-only test requires SM100+")
+
+        self.set_seed(_SEED)
+        protocol = get_default_fp8_protocol()
+        preact = 0.1 * torch.randn(8, 260, device="cuda", dtype=torch.bfloat16)
+        postact = (preact[..., 1::2] * F.silu(preact[..., ::2].float()).to(dtype=preact.dtype)).contiguous()
+
+        with enable_quack_gemm(True):
+            restored_ref, scales_ref = apply_activation_fp8_protocol(postact, protocol)
+            restored_fused, scales_fused = apply_preact_activation_fp8_protocol_cutely_fused(preact, postact, protocol)
+
+        self.assertEqual(restored_ref.shape, restored_fused.shape)
+        self.assertEqual(scales_ref.shape, scales_fused.shape)
+        self.assertEqual(restored_fused.dtype, torch.bfloat16)
+        self.assertEqual(scales_fused.dtype, torch.float8_e8m0fnu)
+        diff = (restored_ref.float() - restored_fused.float()).abs()
+        self.assertLess(diff.max().item(), 3e-2)
+        self.assertLess(torch.sqrt(torch.mean(diff.square())).item(), 6e-3)
+        log2_scales = torch.log2(scales_fused.float())
+        self.assertTrue(torch.allclose(log2_scales, torch.round(log2_scales), atol=0.0, rtol=0.0))

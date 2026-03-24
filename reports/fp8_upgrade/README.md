@@ -2,6 +2,22 @@
 
 This file tracks the real state of the SonicMoE FP8 upgrade, not a wish list.
 
+## 最新进展（中文）
+
+- Blackwell + QuACK 的 `fp8_protocol` 前向路径已经不再停留在 post-SwiGLU 的 torch reference boundary。
+- 当前默认前向路径已经切到：
+
+```text
+z(pre-SwiGLU) -> fused_weighted_swiglu_act_quant_best -> fused_act_dequant_best -> y1
+```
+
+- 当前这一轮的收益来源很明确：
+  - 用现有 Cute/CUDA 储备替换了最慢的 torch-side 量化/反量化。
+  - 还没有碰 backward 主 kernel，所以当前收益主要体现在 forward。
+- 当前这一轮的主要风险也很明确：
+  - 精度相对旧 reference 路径有回退。
+  - 端到端仍然慢于 bf16。
+
 ## Validated baseline
 
 - environment: `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer`
@@ -116,12 +132,20 @@ This is the command to use when recording:
 - loss RMSE vs official bf16
 - peak memory vs official bf16
 
+本轮新增的小 shape 数据请直接看 `reports/fp8_upgrade/ENGINEERING_LOG.md` 最新中文条目；里面已经明确区分：
+
+- 精度基线：官方 bf16
+- 显存基线：官方 bf16
+- 性能基线 1：上一版 fp8 小 shape 路径
+- 性能基线 2：官方 bf16 小 shape 路径
+- 收益来源：pre-SwiGLU fused quant/dequant 替换掉旧 torch-side boundary
+
 ## Immediate next implementation targets
 
-1. Add the adapter shim for the incubator fused quant contract, then replace the torch-side boundary quant/dequant with a fused up-projection epilogue
-2. Land the paired backward kernel and cache contract
-3. Reuse the same protocol for Blackwell QuACK activation paths
-4. Keep the current benchmark command as the mandatory regression gate
+1. 把 `topk_scores/prob` 真正前移到融合 epilogue，而不是继续留在 router 后处理
+2. 评估是否需要基于 Paddle quant 参考在 `operator-incubator` 再孵化一个更贴近 SonicMoE 合同的新 Cute quant kernel
+3. 落 paired backward kernel 和 cache contract
+4. 继续把主 shape benchmark 作为强制回归门禁
 
 ## Source-of-truth inputs
 
