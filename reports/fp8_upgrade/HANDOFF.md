@@ -5,6 +5,21 @@ This is the minimum context a new agent needs to continue work without replaying
 ## 0. 最新中文结论
 
 - 新结论（这一轮最重要）：
+  - 已经用真实 `4096,4096,1024,128,8` 数据**证伪**了 grouped `fp8-direct-downproj` 原型；
+  - 结果不是更快更省，而是：
+    - stable `fp8-mainline`：peak `6867.00 MiB`，inf `2.111 ms`，e2e `7.256 ms`
+    - grouped `fp8-direct` 原型：peak `7395.25 MiB`，inf `2.824 ms`，e2e `8.256 ms`
+  - 结论：
+    - 去掉 bf16 回退本身不够；
+    - 如果重新带回 `grouped_out` / static capacity / grouped layout bridge，仍然会输；
+    - 所以 **grouped blockscaled down-proj 不是 stable 主线的正确演进方向**。
+- 新结论（这一轮最重要）：
+  - SonicMoE 真正该守的是 `varlen/gather-A` 这条内存合同；
+  - FP8 的正确融合方向应该切向：
+    - `gemm_gated` / up-proj epilogue 直接产出 `varlen FP8 postact + scales`
+    - 后续再让 down-proj 在不破坏 varlen 合同的前提下消费这些 FP8 激活
+  - 换句话说，下一阶段要做的是 **varlen-friendly FP8 epilogue/mainloop**，而不是重新引入 grouped/static layout。
+- 新结论（这一轮最重要）：
   - `ue8m0` 运行时 preact-scale 实验已经**完整回读**；
   - 在加了 capture-safe guard 之后，它是安全的，但 cudagraph capture 下会自动回退；
   - 当前没有拿到可重复、可归因的确定性能收益，因此**没有落地主线**，只保留在工程记录中。
@@ -42,6 +57,9 @@ This is the minimum context a new agent needs to continue work without replaying
   - 但 training/e2e 仍慢，根因仍是 `quant -> dequant -> bf16` 回退；
   - 下一步必须打通“量化后激活直喂 down-proj mainloop”。
 - 工程化提醒：
+  - `fp8-direct-downproj` grouped 原型已经证伪，且已从工作树撤回；
+  - 下一个 agent **不要**再从 grouped/static capacity 这条路继续深挖 stable 主线；
+  - 除非目标明确是做对照实验，而不是做交付主线。
   - 如果只是想做真实主线优化，请**不要**重新把 `SONIC_MOE_FP8_PREACT_UE8M0_SCALE` 那条实验逻辑加回去；
   - 除非先证明它在非 capture 路径下有稳定收益，并且不会把 graph capture 再次打坏。
 - 关于 float8 mainloop scout 的结论：

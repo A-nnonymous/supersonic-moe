@@ -90,6 +90,14 @@ This directory is the live work log for the FP8 upgrade effort. It is not meant 
   1. 优先优化稳定 `fp8-mainline`，让量化后激活直接进入 down-proj mainloop，去掉反量化回 bf16；
   2. 同时把激活 / 权重精度路径逐步做成外部可控开关，朝全流程 FP8 推进；
   3. blockscaled 只在能直接吃掉 `grouped_out` / router 聚合过渡层时继续重投入。
+- 2026-03-24 新证伪结论：
+  - grouped `fp8-direct-downproj` 原型虽然数值正确，但真实 `4096,4096,1024,128,8` 下显著退化：
+    - stable `fp8-mainline`：peak `6867.00 MiB`，inf `2.111 ms`，e2e `7.256 ms`
+    - grouped `fp8-direct` 原型：peak `7395.25 MiB`，inf `2.824 ms`，e2e `8.256 ms`
+  - 这说明 stable 主线真正要守的是 SonicMoE 的 `varlen/gather-A` 内存合同；
+  - 下一实现方向应切换为：
+    1. `gemm_gated` / up-proj epilogue 直接产出 `varlen FP8 postact + scales`
+    2. 后续再让 down-proj 在不引入 grouped/static layout 的前提下消费这些 FP8 激活
 - 本轮新增的运行时精度开关：
   - `SONIC_MOE_FP8_UPPROJ_EPILOGUE_PRECISION={bf16,fp8}`
   - `SONIC_MOE_FP8_DOWNPROJ_MAINLOOP_PRECISION={bf16,fp8-blockscaled}`

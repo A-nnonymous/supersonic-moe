@@ -2,6 +2,100 @@
 
 This log records concrete code changes plus their immediate validation and performance numbers.
 
+## 2026-03-24 - 证伪 grouped direct-fp8 downproj，主线切向 varlen/gather-A 友好融合
+
+### 指标注释（先看这个）
+
+- 精度基线：当前稳定 `fp8-mainline` 默认行为。
+- 显存基线：当前稳定 `fp8-mainline` 默认行为。
+- 性能基线：同一台卡、同一条 benchmark 命令下的稳定 `fp8-mainline`。
+- 本轮实验目的：
+  - 验证“只要把量化后激活直接喂进 down-proj mainloop，就一定更快/更省”这个假设是否成立。
+- 本轮实验收益来源：
+  - **不是直接性能收益**，而是把一条高风险错误路线尽早证伪；
+  - 明确 SonicMoE 的主线内存合同必须继续守住 `varlen/gather-A`，不能为了 FP8 重新引入 `grouped_out/static capacity`。
+
+### 实验原型
+
+- 本轮曾短暂实现一个未落地主线的 `fp8-direct-downproj` 原型：
+  - 目标：复用 blockscaled grouped mainloop，让量化后的 post-SwiGLU 激活直接进入 down-proj；
+  - 关键代价：需要重新进入 `grouped/static layout`，也就重新带回 `grouped_out` / static capacity / grouped router 边界。
+- 该原型随后已从代码树中撤回，**没有落地主线**。
+
+### 正确性验证
+
+原型验证期间，Blackwell 回归一度达到：
+
+```bash
+USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py
+```
+
+结果：
+
+```text
+16 passed
+```
+
+原型撤回后，主线重新回到已 push 状态。
+
+### 真实 shape 证伪数据
+
+命令：
+
+```bash
+CUDA_VISIBLE_DEVICES=6 USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 4096,4096,1024,128,8 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_fp8_metrics
+
+CUDA_VISIBLE_DEVICES=6 USE_QUACK_GEMM=1 \
+  SONIC_MOE_FP8_UPPROJ_EPILOGUE_PRECISION=fp8 \
+  SONIC_MOE_FP8_DOWNPROJ_MAINLOOP_PRECISION=fp8-direct \
+  SONIC_MOE_FP8_DOWNPROJ_WEIGHT_PRECISION=fp8 \
+  SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY=1024 \
+  python benchmarks/moe-cute.py --thiek 4096,4096,1024,128,8 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_fp8_metrics
+```
+
+结果：
+
+- 稳定 `fp8-mainline`：
+  - output RMSE：`0.01073638`
+  - loss RMSE：`0.00000020`
+  - peak：`6867.00 MiB`
+  - inf：`2.111 ms`
+  - train fwd：`2.772 ms`
+  - e2e：`7.256 ms`
+  - bwd：`5.145 ms`
+- `fp8-direct-downproj` 原型：
+  - output RMSE：`0.01073366`
+  - loss RMSE：`0.00000019`
+  - peak：`7395.25 MiB`
+  - inf：`2.824 ms`
+  - train fwd：`3.648 ms`
+  - e2e：`8.256 ms`
+  - bwd：`5.432 ms`
+
+结论：
+
+- 精度没有问题，但显存和性能都**显著退化**：
+  - peak 变差 `528.25 MiB`
+  - inference 变慢 `33.78%`
+  - e2e 变慢 `13.78%`
+- 这证明：
+  - “去掉 bf16 回退”本身不是充分条件；
+  - 如果为此重新引入 `grouped_out` / static capacity / grouped layout bridge，仍然会输给 stable varlen 主线。
+
+### 当前工程判断
+
+- SonicMoE 最精髓的省内存设计，不是某一个局部 kernel，而是整条主线对以下合同的坚持：
+  - `varlen/gather-A`
+  - 按真实 expert frequency 工作，而不是静态 capacity
+  - 避免把激活重排成 `grouped/static layout`
+  - 避免物化不必要的中间输出和边界回退
+- 因此 FP8 的下一主线应该是：
+  - **varlen/gather-A 友好的 FP8 epilogue / mainloop**
+  - 而不是 grouped blockscaled down-proj
+- 当前最值得投入的实现方向已经切换为：
+  1. 在 `gemm_gated` / up-proj epilogue 上直接产出 `varlen FP8 postact + scales`
+  2. 后续再让 down-proj mainloop 在 **不破坏 varlen 合同** 的前提下消费这些 FP8 激活
+
 ## 2026-03-24 - 收口 ue8m0 运行时实验，并补上外部精度开关骨架
 
 ### 指标注释（先看这个）
