@@ -67,15 +67,22 @@ def apply_activation_fp8_protocol_cutely_fused(
 
 def apply_preact_activation_fp8_protocol_cutely_fused(
     preact: torch.Tensor,
-    postact: torch.Tensor,
+    postact: torch.Tensor | None,
     protocol: FP8Protocol | None = None,
     quack_enabled: bool | None = None,
     return_scales: bool = True,
     use_ste: bool = True,
     scale_out: torch.Tensor | None = None,
+    output_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     protocol = validate_fp8_runtime_support(protocol or FP8Protocol(), preact.device, quack_enabled=quack_enabled)
+    if output_dtype is None:
+        if postact is None:
+            raise ValueError("output_dtype must be provided when postact is None")
+        output_dtype = postact.dtype
     if protocol.group_size != 128:
+        if postact is None:
+            raise ValueError("postact is required when using the unfused fallback path")
         return apply_activation_fp8_protocol_cutely_fused(
             postact,
             protocol,
@@ -93,9 +100,14 @@ def apply_preact_activation_fp8_protocol_cutely_fused(
         using_ue8m0_scale=False,
     )
     restored = fused_act_dequant_best(quantized, packed_scales, block_size=protocol.group_size)[..., :original_postact_width]
-    restored = restored.to(dtype=postact.dtype)
+    restored = restored.to(dtype=output_dtype)
 
-    restored_with_ste = postact + (restored - postact).detach() if use_ste else restored
+    if use_ste:
+        if postact is None:
+            raise ValueError("postact is required when use_ste=True")
+        restored_with_ste = postact + (restored - postact).detach()
+    else:
+        restored_with_ste = restored
     if not return_scales:
         return restored_with_ste, None
 

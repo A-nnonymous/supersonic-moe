@@ -434,6 +434,69 @@ class FP8ProtocolTest(TestCommons):
         log2_scales = torch.log2(scales_fused.float())
         self.assertTrue(torch.allclose(log2_scales, torch.round(log2_scales), atol=0.0, rtol=0.0))
 
+    def test_preact_cutely_fused_path_can_reconstruct_without_postact_tensor(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required")
+
+        major, _ = torch.cuda.get_device_capability()
+        if major < 10:
+            self.skipTest("Blackwell-only test requires SM100+")
+
+        self.set_seed(_SEED)
+        protocol = get_default_fp8_protocol()
+        preact = 0.1 * torch.randn(8, 260, device="cuda", dtype=torch.bfloat16)
+        postact = (preact[..., 1::2] * F.silu(preact[..., ::2].float()).to(dtype=preact.dtype)).contiguous()
+
+        with enable_quack_gemm(True):
+            restored_ref, scales_ref = apply_preact_activation_fp8_protocol_cutely_fused(
+                preact,
+                postact,
+                protocol,
+                use_ste=False,
+            )
+            restored_no_postact, scales_no_postact = apply_preact_activation_fp8_protocol_cutely_fused(
+                preact,
+                None,
+                protocol,
+                use_ste=False,
+                output_dtype=postact.dtype,
+            )
+
+        torch.testing.assert_close(restored_no_postact.float(), restored_ref.float(), atol=0.0, rtol=0.0)
+        torch.testing.assert_close(scales_no_postact.float(), scales_ref.float(), atol=0.0, rtol=0.0)
+
+    def test_blackwell_fp8_runtime_path_requests_low_precision_upproj_postact_buffer(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required")
+
+        major, _ = torch.cuda.get_device_capability()
+        if major < 10:
+            self.skipTest("Blackwell-only test requires SM100+")
+
+        self.set_seed(_SEED)
+        protocol = get_default_fp8_protocol()
+        moe = MoE(
+            num_experts=128,
+            num_experts_per_tok=8,
+            hidden_size=768,
+            intermediate_size=256,
+            activation_function=ActivationType.SWIGLU,
+            add_bias=False,
+            std=0.02,
+        ).to(device="cuda", dtype=torch.bfloat16)
+        x = (0.02 * torch.randn(256, 768, device="cuda", dtype=torch.bfloat16)).detach().requires_grad_()
+        dout = 0.02 * torch.randn_like(x)
+
+        with patch.dict(os.environ, {"SONIC_MOE_FP8_DUMMY_POSTACT_BUFFER": "1"}, clear=False):
+            with patch.object(functional, "gemm_gated", wraps=functional.gemm_gated) as patched_gemm_gated:
+                with enable_quack_gemm(True):
+                    y, _ = moe(x, kernel_backend_moe=KernelBackendMoE.sonicmoe, fp8_protocol=protocol)
+                    y.backward(dout)
+
+        self.assertTrue(patched_gemm_gated.called)
+        postact_dtypes = [call.kwargs.get("postact_dtype") for call in patched_gemm_gated.call_args_list]
+        self.assertIn(torch.float8_e4m3fn, postact_dtypes)
+
     def test_preact_cutely_fused_path_can_reuse_scale_buffer(self) -> None:
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required")

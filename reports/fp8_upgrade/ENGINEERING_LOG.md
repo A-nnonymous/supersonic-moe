@@ -2,6 +2,106 @@
 
 This log records concrete code changes plus their immediate validation and performance numbers.
 
+## 2026-03-24 - 去掉主线里无效的 STE 依赖，并把低精度 up-proj postact buffer 收口为实验开关
+
+### 指标注释（先看这个）
+
+- 精度基线：当前稳定 `fp8-mainline` 默认行为。
+- 显存基线：当前稳定 `fp8-mainline` 默认行为。
+- 性能基线：上一轮稳定 `fp8-mainline@4096,4096,1024,128,8` 的真实 benchmark。
+- 本轮收益来源：
+  - 先利用 SonicMoE 的真实 autograd 合同，去掉主线上实际上没有梯度意义的 `STE` 混合；
+  - 再把“up-proj postact 降成 FP8 dummy buffer”收口成**默认关闭**的实验开关，只保留能力，不污染稳定主线。
+
+### 改动
+
+- 在 `sonicmoe/functional/__init__.py` 中：
+  - QuACK + preact fused FP8 边界现在默认使用 `use_ste=False`；
+  - 原因是 SonicMoE 主线里：
+    - `_UpProjection.forward(...)` 返回的 `y1` 已被 `mark_non_differentiable(...)`
+    - `_DownProjection.backward(...)` 反向也不是从前向 `y1` 回传，而是重新基于 `z` 做 gated backward
+  - 所以这条边界上的 `STE` 对真实梯度路径没有贡献，只会增加一层无效 tensor 运算。
+- 在 `sonicmoe/functional/fp8_cutely_fused.py` 中：
+  - `apply_preact_activation_fp8_protocol_cutely_fused(...)` 现在支持：
+    - `postact=None`
+    - `output_dtype=...`
+  - 这允许 SonicMoE 在需要时只靠 `z` 重建 `bf16 y1`，不再强依赖额外的 `postact` 读回。
+- 在 `sonicmoe/quack_utils/gemm_gated.py` 中：
+  - 本地 wrapper 现在支持 `postact_dtype=torch.float8_e4m3fn`
+  - 原因是 QuACK 公共 wrapper 的 `torch2cute_dtype_map` 本身没有把 runtime float8 列进去；本地需要单独补 runtime fp8 tensor -> cute tensor 的包装逻辑。
+- 在 `sonicmoe/functional/__init__.py` 中新增实验开关：
+  - `SONIC_MOE_FP8_DUMMY_POSTACT_BUFFER=1`
+  - 打开后，QuACK up-proj 会请求 `float8_e4m3fn` 的 dummy `postact_out`
+  - 但当前它只是**实验开关**，默认关闭
+- 在 `tests/fp8_protocol_test.py` 中新增：
+  - fused preact path 可在 `postact=None` 下仅凭 `z` 重建
+  - 打开实验开关时，主线会显式请求低精度 `postact_dtype`
+
+### 正确性验证
+
+命令：
+
+```bash
+USE_QUACK_GEMM=1 CUDA_VISIBLE_DEVICES=6 python -m pytest -q tests/fp8_protocol_test.py -k 'preact_cutely_fused_path_can_reconstruct_without_postact_tensor or blackwell_fp8_runtime_path_requests_low_precision_upproj_postact_buffer or preact_cutely_fused_path_matches_reference_boundary'
+
+USE_QUACK_GEMM=1 CUDA_VISIBLE_DEVICES=6 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py
+```
+
+结果：
+
+```text
+3 passed, 15 deselected
+19 passed
+```
+
+### 真实 shape 数据
+
+#### 默认稳定主线（实验开关关闭）
+
+命令：
+
+```bash
+CUDA_VISIBLE_DEVICES=6 USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 4096,4096,1024,128,8 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_fp8_metrics
+```
+
+结果：
+
+- output RMSE：`0.01073675`
+- loss RMSE：`0.00000021`
+- bf16 peak / fp8 peak：`7049.88 / 6867.00 MiB`
+- inf / train fwd / e2e / bwd：
+  - `2.430 / 2.824 / 7.272 / 4.842 ms`
+
+#### 实验开关打开（`SONIC_MOE_FP8_DUMMY_POSTACT_BUFFER=1`）
+
+命令：
+
+```bash
+CUDA_VISIBLE_DEVICES=6 USE_QUACK_GEMM=1 SONIC_MOE_FP8_DUMMY_POSTACT_BUFFER=1 python benchmarks/moe-cute.py --thiek 4096,4096,1024,128,8 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_fp8_metrics --report_fp8_analysis
+```
+
+结果：
+
+- output RMSE：`0.01073675`
+- loss RMSE：`0.00000021`
+- bf16 peak / fp8 peak：`7049.88 / 6867.00 MiB`
+- inf / train fwd / e2e / bwd：
+  - `2.484 / 2.742 / 7.535 / 5.051 ms`
+
+### 结论
+
+- 这轮真正应该留在主线里的结论只有一个：
+  - **主线里的 `STE` 混合是冗余的，可以安全去掉**
+- 与此同时，本轮也明确证伪了一个看上去合理、但真实 benchmark 不赚的想法：
+  - `up-proj postact` 改成 `FP8 dummy buffer` 虽然可跑、也已具备实验能力
+  - 但 `4096` 真实 shape 下并没有带来收益，因此**默认不启用**
+- 这次结果再次说明：
+  - 不能因为某个局部 buffer 看起来更小，就默认认为整条主线会更快；
+  - SonicMoE 主线的真正优化标准仍然是：
+    - 不破坏 `varlen/gather-A` 合同
+    - 不引入额外边界搬运
+    - 用真实大 shape benchmark 判断，而不是只看局部理论
+
 ## 2026-03-24 - 补齐 bf16-vs-fp8 理论上限账本，并给 FP8 scale 路径落地可复用输出接口
 
 ### 指标注释（先看这个）

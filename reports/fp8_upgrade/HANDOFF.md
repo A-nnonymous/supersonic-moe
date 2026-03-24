@@ -5,6 +5,23 @@ This is the minimum context a new agent needs to continue work without replaying
 ## 0. 最新中文结论
 
 - 新结论（这一轮最重要）：
+  - SonicMoE 主线里 preact fused FP8 boundary 的 `STE` 混合已经确认是**语义冗余**：
+    - `_UpProjection.forward(...)` 返回的 `y1` 本来就 `mark_non_differentiable`
+    - `_DownProjection.backward(...)` 也不是从前向 `y1` 回梯度，而是重新基于 `z` 做 gated backward
+  - 因此主线现在默认使用 `use_ste=False`
+  - 这一步是安全主线优化，不是实验分支。
+- 新结论（这一轮最重要）：
+  - 已经补上一个实验开关：
+    - `SONIC_MOE_FP8_DUMMY_POSTACT_BUFFER=1`
+  - 打开后，QuACK up-proj 会把 `postact_out` 申请成 `float8_e4m3fn` dummy buffer，再由 fused preact 边界仅靠 `z` 重建 `bf16 y1`
+  - 但真实 `4096,4096,1024,128,8` benchmark 结果更差：
+    - default stable：`2.430 / 2.824 / 7.272 / 4.842 ms`
+    - env-on dummy buffer：`2.484 / 2.742 / 7.535 / 5.051 ms`
+  - 所以这条路 **只保留为实验开关，默认关闭，不落主线**
+- 新结论（这一轮最重要）：
+  - 本地 `sonicmoe/quack_utils/gemm_gated.py` wrapper 现在已经支持 runtime `float8_e4m3fn` 的 `postact_dtype`
+  - 这是因为 QuACK 公共 wrapper 的 `torch2cute_dtype_map` 不包含 runtime float8，需要 SonicMoE 本地单独补 runtime fp8 tensor -> cute tensor 包装。
+- 新结论（这一轮最重要）：
   - `benchmarks/moe-cute.py` 的 `bf16 vs fp8` 理论账本已经补齐；
   - `4096,4096,1024,128,8` 下：
     - 当前稳定 `fp8-mainline` 真正省下来的边界 payload 只有 `31.00 MiB`
@@ -57,7 +74,7 @@ This is the minimum context a new agent needs to continue work without replaying
     - `SONIC_MOE_FP8_DOWNPROJ_WEIGHT_PRECISION=fp8` 只允许和 `fp8-blockscaled` mainloop 组合使用。
 - 最新验证：
   - `USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py`
-  - 结果：`15 passed`
+  - 结果：`19 passed`
 - 最新已 push 里程碑：
   - `b93211d` — `Add runtime FP8 precision switches`
 - 新结论（这一轮最重要）：

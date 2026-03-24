@@ -11,9 +11,10 @@ This directory is the live work log for the FP8 upgrade effort. It is not meant 
 - latest validated local milestone:
   - `bf16 vs fp8` stagewise/theory comparison is now in `benchmarks/moe-cute.py`
   - FP8 quant / dequant / scale encode now support preallocated output buffers for capture-safe reuse
+  - preact fused FP8 mainline now drops redundant STE by default; experimental dummy postact buffer remains opt-in only
 - latest targeted validation:
   - stable Blackwell fp8 regression: `USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py`
-  - stable result: `15 passed`
+  - stable result: `19 passed`
   - env-on blockscaled regression: `USE_QUACK_GEMM=1 SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1 SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY=128 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py`
   - env-on blockscaled result: `13 passed`
   - serial: `python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py tests/moe_test.py`
@@ -117,7 +118,30 @@ This directory is the live work log for the FP8 upgrade effort. It is not meant 
     - 为恢复/推进 cudagraph-compatible FP8 主线打基础
   - 对应验证：
     - 定向回归 `4 passed`
-    - Blackwell 主回归 `17 passed`
+    - Blackwell 主回归 `19 passed`
+- 最新主线收口（shape `4096,4096,1024,128,8`）：
+  - 主线现在默认去掉 preact fused FP8 boundary 里的 `STE` 混合
+  - 原因：
+    - `y1` 本身在 `_UpProjection.forward(...)` 后已经 `mark_non_differentiable`
+    - `_DownProjection.backward(...)` 也不是从前向 `y1` 回梯度
+  - 最新默认稳定结果：
+    - output RMSE：`0.01073675`
+    - loss RMSE：`0.00000021`
+    - bf16 peak / fp8 peak：`7049.88 / 6867.00 MiB`
+    - inf / train fwd / e2e / bwd：`2.430 / 2.824 / 7.272 / 4.842 ms`
+  - 这说明：
+    - 主线里确实存在可以安全删掉的语义冗余
+    - 但收益仍主要体现在训练/e2e，不代表所有局部“更小 buffer”方案都会赢
+- 本轮新增实验开关（默认关闭）：
+  - `SONIC_MOE_FP8_DUMMY_POSTACT_BUFFER=1`
+  - 作用：
+    - 让 QuACK up-proj 把 `postact_out` 申请成 `float8_e4m3fn` dummy buffer
+    - 后续 fused preact 边界只靠 `z` 重建 `bf16 y1`
+  - 当前真实 benchmark 结论：
+    - 这条路可跑、也已测试锁住
+    - 但 `4096,4096,1024,128,8` 下更慢：
+      - inf / train fwd / e2e / bwd：`2.484 / 2.742 / 7.535 / 5.051 ms`
+    - 所以默认不启用，只保留为后续更深层 epilogue/mainloop 实验能力
 - 2026-03-24 新证伪结论：
   - grouped `fp8-direct-downproj` 原型虽然数值正确，但真实 `4096,4096,1024,128,8` 下显著退化：
     - stable `fp8-mainline`：peak `6867.00 MiB`，inf `2.111 ms`，e2e `7.256 ms`
@@ -150,7 +174,7 @@ This directory is the live work log for the FP8 upgrade effort. It is not meant 
 2. Confirm the environment with `source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate`
 3. Re-run `USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py`
 4. For hotspot diagnosis, first run `USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 4096,4096,1024,128,8 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_fp8_metrics --report_fp8_analysis --report_stage_memory`
-5. 优先处理稳定 `fp8-mainline` 的 `varlen FP8 epilogue -> direct mainloop` 与 cudagraph-safe buffer 复用；只有在能直接去掉 `grouped_out` 时，再继续重投 blockscaled
+5. 优先处理稳定 `fp8-mainline` 的 `varlen FP8 epilogue -> direct mainloop` 与 cudagraph-safe buffer 复用；`SONIC_MOE_FP8_DUMMY_POSTACT_BUFFER` 目前只是实验开关，不要当成默认优化路径；只有在能直接去掉 `grouped_out` 时，再继续重投 blockscaled
 
 ## Working rule
 

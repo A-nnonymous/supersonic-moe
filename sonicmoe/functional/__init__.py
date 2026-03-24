@@ -96,6 +96,10 @@ def _use_blockscaled_fp8_downproj() -> bool:
     return _downproj_mainloop_precision() == "fp8-blockscaled"
 
 
+def _use_dummy_fp8_postact_buffer() -> bool:
+    return os.getenv("SONIC_MOE_FP8_DUMMY_POSTACT_BUFFER", "").lower() in {"1", "true", "yes", "on"}
+
+
 def _validate_runtime_precision_switches(fp8_protocol: FP8Protocol | None) -> None:
     upproj_precision = _upproj_epilogue_precision()
     downproj_mainloop_precision = _downproj_mainloop_precision()
@@ -219,6 +223,7 @@ class _UpProjection(torch.autograd.Function):
         is_varlen_K: bool,
         activation_type: ActivationType,
         is_inference_mode_enabled: bool,
+        use_low_precision_postact_buffer: bool,
     ) -> torch.Tensor:
         T, H = x.shape
         I, H, E = w1.shape
@@ -236,6 +241,7 @@ class _UpProjection(torch.autograd.Function):
                 activation="swiglu",
                 cu_seqlens_m=expert_frequency_offset,
                 A_idx=x_gather_idx,
+                postact_dtype=(torch.float8_e4m3fn if use_low_precision_postact_buffer else None),
                 dynamic_scheduler=False,
             )
         else:
@@ -368,7 +374,7 @@ class _UpProjection(torch.autograd.Function):
         )
         _log_stage_memory("backward:token-reduce")
 
-        return dx_reduced, dw1, db1, *[None] * 11
+        return dx_reduced, dw1, db1, *[None] * 12
 
 
 class _DownProjection(torch.autograd.Function):
@@ -607,6 +613,12 @@ def moe_TC_softmax_topk_layer(
     if type(activation_type) == str:
         activation_type = ActivationType(activation_type)
 
+    use_low_precision_postact_buffer = (
+        fp8_protocol is not None
+        and _upproj_epilogue_precision() == "fp8"
+        and is_using_quack_gemm()
+        and _use_dummy_fp8_postact_buffer()
+    )
     y1, z = _UpProjection.apply(
         x,
         w1,
@@ -622,6 +634,7 @@ def moe_TC_softmax_topk_layer(
         False,  # is_varlen_K
         activation_type,
         is_inference_mode_enabled,
+        use_low_precision_postact_buffer,
     )
     _log_stage_memory("forward:up-proj")
 
@@ -630,11 +643,12 @@ def moe_TC_softmax_topk_layer(
         if is_using_quack_gemm():
             y1, _ = apply_preact_activation_fp8_protocol_cutely_fused(
                 z,
-                y1,
+                None if use_low_precision_postact_buffer else y1,
                 fp8_protocol,
                 quack_enabled=True,
                 return_scales=False,
-                use_ste=not is_inference_mode_enabled,
+                use_ste=False,
+                output_dtype=z.dtype,
             )
         else:
             fp8_adapter = apply_activation_fp8_protocol_cutely_fused if _use_cutely_fused_fp8_adapter() else apply_activation_fp8_protocol

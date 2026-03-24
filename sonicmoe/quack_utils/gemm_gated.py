@@ -11,6 +11,7 @@ import cutlass.torch as cutlass_torch
 import cutlass.utils.blackwell_helpers as sm100_utils
 import quack.activation
 import quack.sm90_utils as sm90_utils
+import torch
 from cutlass import const_expr
 from cutlass.cute.runtime import from_dlpack
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
@@ -23,6 +24,29 @@ from quack.layout_utils import permute_gated_Cregs_b16
 from torch import Tensor
 
 
+_TORCH_TO_CUTLASS_DTYPE = {
+    torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+    torch.float16: cutlass.Float16,
+    torch.bfloat16: cutlass.BFloat16,
+    torch.float32: cutlass.Float32,
+    torch.int32: cutlass.Int32,
+    torch.int64: cutlass.Int64,
+}
+
+
+def _is_runtime_fp8_tensor(tensor: Tensor) -> bool:
+    return tensor.dtype == torch.float8_e4m3fn
+
+
+def _make_cute_tensor_dynamic(tensor: Tensor, leading_dim: int) -> cute.Tensor:
+    if _is_runtime_fp8_tensor(tensor):
+        storage = tensor.detach().view(torch.uint8)
+        cute_tensor = from_dlpack(storage, assumed_align=16)
+        cute_tensor.element_type = _TORCH_TO_CUTLASS_DTYPE[tensor.dtype]
+        return cute_tensor.mark_layout_dynamic(leading_dim=leading_dim)
+    return from_dlpack(tensor.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=leading_dim)
+
+
 class GemmGatedMixin(GemmActMixin):
     EpilogueArguments = GemmActMixin.EpilogueArguments
     EpilogueParams = GemmActMixin.EpilogueParams
@@ -30,7 +54,7 @@ class GemmGatedMixin(GemmActMixin):
     def epi_to_underlying_arguments(self, args: EpilogueArguments, *, loc=None, ip=None) -> EpilogueParams:
         self.postact_dtype = args.mPostAct.element_type
         self.postact_layout = cutlass.utils.LayoutEnum.from_tensor(args.mPostAct)
-        assert self.postact_dtype.width == 16, "GemmGated only supports 16bit postact for now"
+        assert self.postact_dtype.width in {8, 16}, "GemmGated only supports 8bit or 16bit postact for now"
         assert self.d_layout is None or self.d_layout.is_n_major_c()
         assert self.postact_layout.is_n_major_c()
         if self.arch == 90:
@@ -186,7 +210,6 @@ def gemm_gated(
 
     tensor_infos["PostAct"] = GemmTensorInfo(PostAct)
     GemmWrapperBase.permute_tensors(tensor_infos, varlen_m=cu_seqlens_m is not None)
-    GemmWrapperBase.extract_dtypes(tensor_infos)
     major_configs = {
         "A": ("m", "k", "l"),
         "B": ("n", "k", "l"),
@@ -195,6 +218,9 @@ def gemm_gated(
         "PostAct": ("m", "n", "l"),  # PostAct has shape (m, n//2, l) after permute
     }
     GemmWrapperBase.determine_major_orders(tensor_infos, major_configs)
+    for info in tensor_infos.values():
+        if info.tensor is not None:
+            info.dtype = _TORCH_TO_CUTLASS_DTYPE[info.tensor.dtype]
 
     device_capacity = get_device_capacity(A.device)
     assert device_capacity[0] in [9, 10], "Only SM90 and SM100 are supported"
@@ -214,7 +240,10 @@ def gemm_gated(
         raise TypeError("Skipping due to unsupported combination of types and majors")
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
-    GemmWrapperBase.create_cute_tensors(tensor_infos, major_configs)
+    for name, info in tensor_infos.items():
+        if info.tensor is not None and name in major_configs:
+            leading_dim = 1 if info.major == major_configs[name][1] else 0
+            info.cute_tensor = _make_cute_tensor_dynamic(info.tensor, leading_dim)
     act_fn = gate_fn_map[activation]
     epi_args = GemmCls.EpilogueArguments(
         tensor_infos["PostAct"].cute_tensor,
