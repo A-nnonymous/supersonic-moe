@@ -2,6 +2,161 @@
 
 This log records concrete code changes plus their immediate validation and performance numbers.
 
+## 2026-03-24 - 用阶段显存 probe 锁定热点，并修掉 `8192` preact fused quant crash
+
+### 指标注释（先看这个）
+
+- 精度基线：官方 `bf16` 路径。
+- 显存基线：官方 `bf16` 路径。
+- 性能基线 1：同 shape 官方 `bf16`。
+- 性能基线 2：同 shape 的稳定 `fp8-mainline` / env-on `blockscaled` 旧结果。
+- 本轮收益来源分两类：
+  - 工程收益：把真实路径的阶段显存观测补齐，后续可以有的放矢优化；
+  - 稳定性收益：给大 row-count 的 vec4 preact fused quant 加保底 fallback，先让真实大 shape 跑通。
+- 重要说明：
+  - `stage-memory` 是默认关闭的，只在 `SONIC_MOE_STAGEWISE_MEMORY=1` 或 benchmark `--report_stage_memory` 时启用；
+  - `8192` crash 修复当前落在本地 `operator-incubator` workspace，不在 SonicMoE git 仓库里。
+
+### 改动
+
+- 在 `sonicmoe/functional/__init__.py` 中新增阶段显存 probe：
+  - 开关：`SONIC_MOE_STAGEWISE_MEMORY=1`
+  - 使用的 torch 观测接口：
+    - `torch.cuda.memory_allocated()`
+    - `torch.cuda.memory_reserved()`
+    - `torch.cuda.max_memory_allocated()`
+    - `torch.cuda.max_memory_reserved()`
+    - `torch.cuda.reset_peak_memory_stats()`
+  - 当前 forward / backward 打点位置：
+    - `forward:router-metadata`
+    - `forward:up-proj`
+    - `forward:fp8-boundary`
+    - `forward:down-proj-router`
+    - `backward:down-proj-core`
+    - `backward:up-proj-core`
+    - `backward:token-reduce`
+- 在 `benchmarks/moe-cute.py` 中新增：
+  - `--report_stage_memory`
+  - 会在正式计时前先跑一遍独立的 training-mode fwd+bwd，并打印阶段显存
+  - debug pass 改成使用独立 clone，避免污染后续计时图
+- 在本地 `operator-incubator/cutify/ops/cute/fused_weighted_swiglu_act_quant.py` 中：
+  - 给 vec4 fast path 增加 row-count guard
+  - 当 `x.shape[0] >= 4096` 时，回退到已验证可用的 generic path
+  - 目的不是极致性能，而是先消掉 `8192,4096,1024,128,8` 的 runtime crash
+
+### 阶段显存结论
+
+统一 shape：`4096,4096,1024,128,8`
+
+- 稳定 `fp8-mainline`：
+  - `forward:down-proj-router` peak alloc：`4012.00 MiB`
+  - `backward:token-reduce` final peak：`7050.88 MiB`
+  - e2e：`7.562 ms`
+- env-on `blockscaled`：
+  - `forward:down-proj-router` peak alloc：`5309.38 MiB`
+  - `backward:token-reduce` final peak：`7580.13 MiB`
+  - e2e：`10.390 ms`
+
+收益 / 诊断：
+
+- `router-metadata` / `up-proj` / `fp8-boundary` 三段两条路径几乎重合；
+- 真正拉开差距的是：
+  - `forward:down-proj-router`：blockscaled 比稳定主线多出 `1297.38 MiB`
+  - `final peak`：blockscaled 比稳定主线多出 `529.25 MiB`
+- 这说明：
+  - blockscaled 当前主矛盾已经不是前半段 pack+quant；
+  - 而是 `grouped_out` 本体及其下游 router 聚合边界；
+  - 后续如果继续抠 blockscaled，必须直接对准 `down-proj/router` 合同，而不是继续磨前半段。
+
+### 大一点真实 shape 结果
+
+#### shape `6144,4096,1024,128,8`
+
+- 官方 bf16：
+  - peak memory：`7370.25 MiB`
+  - Fwd inference：`3.254 ms`
+  - Fwd training：`3.214 ms`
+  - Fwd+Bwd：`9.550 ms`
+  - Bwd：`6.297 ms`
+- 稳定 `fp8-mainline`：
+  - output RMSE：`0.01074142`
+  - loss RMSE：`0.00000034`
+  - peak memory：`7220.63 MiB`
+  - Fwd inference：`3.189 ms`
+  - Fwd training：`3.606 ms`
+  - Fwd+Bwd：`9.954 ms`
+  - Bwd：`6.764 ms`
+- env-on `blockscaled`：
+  - output RMSE：`0.01073865`
+  - loss RMSE：`0.00000035`
+  - peak memory：`7749.88 MiB`
+  - Fwd inference：`4.163 ms`
+  - Fwd training：`6.729 ms`
+  - Fwd+Bwd：`12.207 ms`
+  - Bwd：`8.044 ms`
+
+结论：
+
+- 稳定 `fp8-mainline` 继续保持显存领先：
+  - 相对 bf16 节省 `149.62 MiB`
+- 但性能仍未超过 bf16：
+  - e2e 慢 `4.23%`
+  - bwd 慢 `7.42%`
+- env-on `blockscaled` 仍不是当前可交付主线：
+  - 显存反而比 bf16 多 `379.63 MiB`
+  - e2e 慢 `27.82%`
+
+#### shape `8192,4096,1024,128,8`
+
+- 官方 bf16：
+  - peak memory：`7690.63 MiB`
+  - Fwd inference：`4.147 ms`
+  - Fwd training：`4.174 ms`
+  - Fwd+Bwd：`12.202 ms`
+  - Bwd：`8.054 ms`
+- 稳定 `fp8-mainline`（本地 vec4 fallback 生效后）：
+  - output RMSE：`0.01074074`
+  - loss RMSE：`0.00000025`
+  - peak memory：`7572.75 MiB`
+  - Fwd inference：`4.360 ms`
+  - Fwd training：`4.464 ms`
+  - Fwd+Bwd：`12.972 ms`
+  - Bwd：`8.612 ms`
+
+结论：
+
+- 之前的 `CUresult 9` runtime crash 已经被保底 fallback 消掉；
+- 稳定 `fp8-mainline` 继续保有显存优势：
+  - 相对 bf16 节省 `117.88 MiB`
+- 但性能仍落后：
+  - inference 慢 `5.14%`
+  - e2e 慢 `6.31%`
+  - bwd 慢 `6.93%`
+- 这说明当前稳定主线已经具备继续放大 shape 的可测性；
+- 下一步性能攻关方向应优先考虑：
+  - 恢复/重建大 row-count 下的高性能 vec4 path，而不是长期依赖 generic fallback。
+
+### 验证命令
+
+```bash
+USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py
+CUDA_VISIBLE_DEVICES=2 USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 1024,512,512,32,4 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_stage_memory
+CUDA_VISIBLE_DEVICES=3 USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 4096,4096,1024,128,8 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_stage_memory
+CUDA_VISIBLE_DEVICES=4 USE_QUACK_GEMM=1 SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1 SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY=1024 python benchmarks/moe-cute.py --thiek 4096,4096,1024,128,8 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_stage_memory
+CUDA_VISIBLE_DEVICES=5 USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 8192,4096,1024,128,8 --dtype BFloat16 --activation swiglu --skip_test
+CUDA_VISIBLE_DEVICES=6 USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 8192,4096,1024,128,8 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_fp8_metrics
+```
+
+### 下一步
+
+- SonicMoE 仓库内：
+  - 继续把阶段显存 probe 用到真实热点迭代中；
+  - 优先研究稳定 `fp8-mainline` 大 row-count vec4 path 的恢复方案；
+  - blockscaled 方向只保留为长期路径，除非能直接吃掉 `grouped_out` / router 边界。
+- 本地 `operator-incubator`：
+  - 需要把当前“大 row-count fallback”升级为真正高性能的大 shape vec4/分块方案；
+  - 否则稳定主线虽然能跑，但长期仍会慢于 bf16。
+
 ## 2026-03-24 - grouped `y2` 直接喂 router 聚合，去掉 blockscaled flat unpack
 
 ### 指标注释（先看这个）

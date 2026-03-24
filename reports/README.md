@@ -8,18 +8,19 @@ This directory is the live work log for the FP8 upgrade effort. It is not meant 
 
 - authoritative Python environment: `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer`
 - Blackwell path: QuACK-enabled (`USE_QUACK_GEMM=1`)
-- latest validated fork state: the current `fork-main-sync` working tree carrying the Blackwell FP8 protocol changes
+- latest validated fork state: `1c01fc9` on `fork-main-sync`, plus uncommitted stage-memory probe changes in SonicMoE and local fallback changes in `operator-incubator`
 - latest targeted validation:
   - stable Blackwell fp8 regression: `USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py`
-  - stable result: `10 passed`
+  - stable result: `13 passed`
   - env-on blockscaled regression: `USE_QUACK_GEMM=1 SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1 SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY=128 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py`
-  - env-on blockscaled result: `10 passed`
+  - env-on blockscaled result: `13 passed`
   - serial: `python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py tests/moe_test.py`
   - serial result: `18 passed, 91 skipped`
   - opt-in parallel: `make test-blackwell-parallel PYTEST_WORKERS=2`
   - parallel result: `18 passed, 91 skipped in 168.14s`
   - multi-GPU dry-run: `python tools/run_blackwell_test_shards.py --gpus 0,1,2 --dry-run`
   - fp8 metric probe: `USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 1024,512,512,32,4 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_fp8_metrics`
+  - stagewise memory probe: `USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 4096,4096,1024,128,8 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_stage_memory`
   - latest fused-path validation:
     - `USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py -k 'preact_cutely_fused_path_matches_reference_boundary or boundary_keeps_finite_forward_backward or blackwell_fp8_protocol_runtime_and_reference_quant'`
     - `USE_QUACK_GEMM=1 python -m pytest -q tests/moe_blackwell_test.py`
@@ -65,10 +66,19 @@ This directory is the live work log for the FP8 upgrade effort. It is not meant 
   - env-on blockscaled：
     - output RMSE：`0.01073363`
     - bf16 peak / fp8 peak：`7049.88 / 7396.13 MiB`
-    - bf16 e2e / fp8 e2e：`7.338 / 11.668 ms`
+    - bf16 e2e / fp8 e2e：`7.338 / 8.196 ms`
+- 阶段显存新结论（shape `4096,4096,1024,128,8`）：
+  - 稳定 `fp8-mainline`：`forward:down-proj-router` peak alloc `4012.00 MiB`，final peak `7050.88 MiB`
+  - env-on blockscaled：`forward:down-proj-router` peak alloc `5309.38 MiB`，final peak `7580.13 MiB`
+  - 结论：blockscaled 当前真正的显存墙已经是 `grouped_out` / `down-proj-router`，不是前半段 `pack+quant`
+- 更大真实 shape 已可跑通：
+  - shape `8192,4096,1024,128,8`
+  - 官方 bf16：peak `7690.63 MiB`，e2e `12.202 ms`
+  - 稳定 `fp8-mainline`：output RMSE `0.01074074`，loss RMSE `0.00000025`，peak `7572.75 MiB`，e2e `12.972 ms`
+  - 结论：大 shape crash 已通过本地 fallback 消掉，但稳定主线性能仍慢 `6.31%`
 - 因此当前下一优先级已经明确：
-  1. 继续消掉 blockscaled 的 `grouped_out` / router 聚合过渡层；
-  2. 修掉更大 shape `8192,4096,1024,128,8` 在 preact fused quant kernel 上的 runtime crash；
+  1. 优先优化稳定 `fp8-mainline` 大 row-count preact quant 路径，恢复高性能 vec4 fast path；
+  2. blockscaled 只在能直接吃掉 `grouped_out` / router 聚合过渡层时继续重投入；
   3. 然后再继续 backward/mainloop 迁移。
 - 最新进展补充：
   - blockscaled 已经吃掉 `grouped_a` 物化，改成 `pack+quant` 融合；
@@ -85,8 +95,8 @@ This directory is the live work log for the FP8 upgrade effort. It is not meant 
 1. Read `reports/fp8_upgrade/HANDOFF.md`
 2. Confirm the environment with `source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate`
 3. Re-run `USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py`
-4. Continue from `sonicmoe/quack_utils/blockscaled_fp8_gemm.py`, and first remove GPU pack/unpack / make routing metadata directly produce static blockscaled layout
-5. 如果要快速复现实测差距，优先跑中等 shape `4096,4096,1024,128,8`，不要直接上当前会 crash 的 `8192,4096,1024,128,8`
+4. For hotspot diagnosis, first run `USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 4096,4096,1024,128,8 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_stage_memory`
+5. 优先处理稳定 `fp8-mainline` 的大 row-count vec4 fast path；只有在能直接去掉 `grouped_out` 时，再继续重投 blockscaled
 
 ## Working rule
 

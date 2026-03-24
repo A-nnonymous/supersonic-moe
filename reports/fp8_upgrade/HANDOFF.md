@@ -4,6 +4,39 @@ This is the minimum context a new agent needs to continue work without replaying
 
 ## 0. 最新中文结论
 
+- 新结论（这一轮最重要）：
+  - 已经补上真实路径的阶段显存 probe：
+    - benchmark 开关：`--report_stage_memory`
+    - 底层 env 开关：`SONIC_MOE_STAGEWISE_MEMORY=1`
+  - `4096,4096,1024,128,8` 的阶段显存已经证明：
+    - 稳定 `fp8-mainline` 的 `forward:down-proj-router` peak alloc：`4012.00 MiB`
+    - env-on `blockscaled` 的同阶段 peak alloc：`5309.38 MiB`
+    - 二者差值：`1297.38 MiB`
+    - final peak：稳定主线 `7050.88 MiB`，blockscaled `7580.13 MiB`
+  - 这说明 blockscaled 当前真正的墙就是：
+    - `grouped_out`
+    - `down-proj/router` 聚合边界
+    - 而不是前半段 pack+quant
+- 大 shape 稳定性状态已更新：
+  - 本地 `operator-incubator/cutify/ops/cute/fused_weighted_swiglu_act_quant.py` 已加 row-count fallback
+  - `8192,4096,1024,128,8` 不再 runtime crash
+  - 但这只是保底稳定性补丁，不是最终性能解
+- 更大真实 shape 结果：
+  - shape `6144,4096,1024,128,8`
+    - bf16：peak `7370.25 MiB`，e2e `9.550 ms`
+    - 稳定 `fp8-mainline`：output RMSE `0.01074142`，loss RMSE `0.00000034`，peak `7220.63 MiB`，e2e `9.954 ms`
+    - env-on `blockscaled`：output RMSE `0.01073865`，loss RMSE `0.00000035`，peak `7749.88 MiB`，e2e `12.207 ms`
+  - shape `8192,4096,1024,128,8`
+    - bf16：peak `7690.63 MiB`，e2e `12.202 ms`
+    - 稳定 `fp8-mainline`：output RMSE `0.01074074`，loss RMSE `0.00000025`，peak `7572.75 MiB`，e2e `12.972 ms`
+  - 当前结论：
+    - 稳定 `fp8-mainline` 继续保持显存优势，但 e2e 仍慢 `4%~6%`
+    - env-on `blockscaled` 依旧不是可交付主线
+- 下一任 agent 的第一优先级已经变化：
+  1. 优先优化稳定 `fp8-mainline`，而不是 blockscaled；
+  2. 目标是恢复/重建大 row-count 下的高性能 vec4 preact fused quant path；
+  3. blockscaled 仅在能直接吃掉 `grouped_out` / router 边界时再继续重投入。
+
 - 最新里程碑：
   - blockscaled 下行前向已经不再把 `grouped_out` unpack 成 flat `y2`；
   - router 聚合现在直接消费 grouped/static layout；
@@ -56,6 +89,7 @@ This is the minimum context a new agent needs to continue work without replaying
 - 工程化注意：
   - `operator-incubator` 当前不是 git repo；
   - 所以上面这条 fused kernel reciprocal 改动只存在于本地 workspace，**不会**自动跟随 SonicMoE 的 git commit/push 传播。
+  - 本轮的“大 row-count vec4 fallback”也同样只存在于本地 workspace。
   - 下一任 agent 如果换了机器或重置了该目录，需要手工同步这处改动。
 - 这一步已经验证：
   - SonicMoE blockwise quant 对旧 divide reference **完全等价**；

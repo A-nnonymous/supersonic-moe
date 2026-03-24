@@ -56,6 +56,31 @@ def _use_blockscaled_fp8_downproj() -> bool:
     return os.getenv("SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ", "").lower() in {"1", "true", "yes", "on"}
 
 
+def _stage_memory_debug_enabled() -> bool:
+    return os.getenv("SONIC_MOE_STAGEWISE_MEMORY", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _reset_stage_memory_probe() -> None:
+    if not _stage_memory_debug_enabled() or torch.cuda.is_current_stream_capturing():
+        return
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+
+
+def _log_stage_memory(stage: str) -> None:
+    if not _stage_memory_debug_enabled() or torch.cuda.is_current_stream_capturing():
+        return
+    torch.cuda.synchronize()
+    mib = 1024**2
+    print(
+        f"[stage-memory] {stage}: "
+        f"alloc_mib={torch.cuda.memory_allocated() / mib:.2f}, "
+        f"reserved_mib={torch.cuda.memory_reserved() / mib:.2f}, "
+        f"peak_alloc_mib={torch.cuda.max_memory_allocated() / mib:.2f}, "
+        f"peak_reserved_mib={torch.cuda.max_memory_reserved() / mib:.2f}"
+    )
+
+
 def general_routing_router_metadata(
     router_scores_selected: torch.Tensor, sorted_selected_T: torch.Tensor, selected_E: torch.Tensor, T: int, E: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -231,6 +256,7 @@ class _UpProjection(torch.autograd.Function):
 
         dw1 = torch.empty_like(w1)
         db1 = None if b1 is None else torch.empty_like(b1)
+        _reset_stage_memory_probe()
 
         if is_using_quack_gemm():
             assert not is_compiling
@@ -272,6 +298,8 @@ class _UpProjection(torch.autograd.Function):
                 stream_id=stream_id,
             )
 
+        _log_stage_memory("backward:up-proj-core")
+        _reset_stage_memory_probe()
         dx_reduced = torch.empty(T, H, dtype=dz.dtype, device=dz.device)
 
         _token_broadcast_backward(
@@ -283,6 +311,7 @@ class _UpProjection(torch.autograd.Function):
             H=H,
             is_varlen_K=is_varlen_K,
         )
+        _log_stage_memory("backward:token-reduce")
 
         return dx_reduced, dw1, db1, *[None] * 12
 
@@ -405,6 +434,7 @@ class _DownProjection(torch.autograd.Function):
         dw2 = torch.empty_like(w2)
         db2 = None if b2 is None else torch.empty_like(b2)
         dz = torch.empty_like(z)
+        _reset_stage_memory_probe()
 
         if is_using_quack_gemm():
             assert not torch.compiler.is_compiling()
@@ -472,6 +502,7 @@ class _DownProjection(torch.autograd.Function):
                 stream_id=stream_id,
             )
 
+        _log_stage_memory("backward:down-proj-core")
         # TC top-K routing
         if not is_varlen_K:
             ds = ds.view(T, K)
@@ -496,6 +527,7 @@ def moe_TC_softmax_topk_layer(
         (b1 is not None) and (b2 is not None)
     ), "b1 and b2 has to be None or not None at the same time!"
     E = router_w.size(0)
+    _reset_stage_memory_probe()
     router_logits = F.linear(x, router_w)
     topk_scores, topk_indices = TC_Softmax_Topk_Router_Function.apply(router_logits, E, K)
 
@@ -512,6 +544,7 @@ def moe_TC_softmax_topk_layer(
     TC_topk_router_metadata_triton(
         topk_indices, E, expert_frequency, expert_frequency_offset, x_gather_idx, s_scatter_idx, s_reverse_scatter_idx
     )
+    _log_stage_memory("forward:router-metadata")
 
     T = x.size(0)
 
@@ -534,8 +567,10 @@ def moe_TC_softmax_topk_layer(
         activation_type,
         is_inference_mode_enabled,
     )
+    _log_stage_memory("forward:up-proj")
 
     if fp8_protocol is not None:
+        _reset_stage_memory_probe()
         if is_using_quack_gemm():
             y1, _ = apply_preact_activation_fp8_protocol_cutely_fused(
                 z,
@@ -546,7 +581,9 @@ def moe_TC_softmax_topk_layer(
         else:
             fp8_adapter = apply_activation_fp8_protocol_cutely_fused if _use_cutely_fused_fp8_adapter() else apply_activation_fp8_protocol
             y1, _ = fp8_adapter(y1, fp8_protocol, quack_enabled=False)
+        _log_stage_memory("forward:fp8-boundary")
 
+    _reset_stage_memory_probe()
     o = _DownProjection.apply(
         y1,
         z,
@@ -566,6 +603,7 @@ def moe_TC_softmax_topk_layer(
         activation_type,
         fp8_protocol,
     )
+    _log_stage_memory("forward:down-proj-router")
 
     return o, router_logits, expert_frequency
 
