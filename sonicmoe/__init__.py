@@ -10,6 +10,7 @@ from .functional import (
     FP8ActivationDType,
     FP8Backend,
     apply_activation_fp8_protocol_cutely_fused,
+    apply_preact_activation_fp8_protocol_cutely_fused,
     FP8Protocol,
     FP8ScaleEncoding,
     FP8ScaleGranularity,

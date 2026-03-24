@@ -31,6 +31,7 @@ from .fp8_protocol import (
     validate_fp8_runtime_support,
 )
 from .fp8_cutely_fused import apply_activation_fp8_protocol_cutely_fused
+from .fp8_cutely_fused import apply_preact_activation_fp8_protocol_cutely_fused
 from .fp8_reference import (
     FP8Tensor,
     apply_activation_fp8_protocol,
@@ -504,8 +505,16 @@ def moe_TC_softmax_topk_layer(
     )
 
     if fp8_protocol is not None:
-        fp8_adapter = apply_activation_fp8_protocol_cutely_fused if _use_cutely_fused_fp8_adapter() else apply_activation_fp8_protocol
-        y1, _ = fp8_adapter(y1, fp8_protocol, quack_enabled=is_using_quack_gemm())
+        if is_using_quack_gemm():
+            y1, _ = apply_preact_activation_fp8_protocol_cutely_fused(
+                z,
+                y1,
+                fp8_protocol,
+                quack_enabled=True,
+            )
+        else:
+            fp8_adapter = apply_activation_fp8_protocol_cutely_fused if _use_cutely_fused_fp8_adapter() else apply_activation_fp8_protocol
+            y1, _ = fp8_adapter(y1, fp8_protocol, quack_enabled=False)
 
     o = _DownProjection.apply(
         y1,

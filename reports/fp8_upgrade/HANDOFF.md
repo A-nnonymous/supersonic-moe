@@ -2,6 +2,25 @@
 
 This is the minimum context a new agent needs to continue work without replaying the entire history.
 
+## 0. 最新中文结论
+
+- Blackwell + QuACK 的 `fp8_protocol` 默认前向路径已经切到 pre-SwiGLU 融合量化：
+
+```text
+z(pre-SwiGLU) -> fused_weighted_swiglu_act_quant_best -> fused_act_dequant_best -> y1
+```
+
+- 这一步已经通过：
+  - `tests/fp8_protocol_test.py` 的 targeted fused-path 回归
+  - `tests/moe_blackwell_test.py` smoke 回归
+- 这一步的收益来源：
+  - 替换掉了旧的 post-SwiGLU torch-side quant/dequant。
+  - 还没有改 backward 主 kernel，所以收益主要来自 forward。
+- 这一步的遗留问题：
+  - 精度相对旧 reference path 有回退。
+  - 共享机小 shape 数据显示仍慢于 bf16。
+  - `prob/topk_scores` 还没有被真正前移进 fused epilogue。
+
 ## 1. Environment
 
 - activate: `source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate`
@@ -62,6 +81,13 @@ Metric-reporting command:
 USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 32768,2880,2880,64,8 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_fp8_metrics
 ```
 
+共享机小 shape 对照命令（本轮已经跑过）：
+
+```bash
+USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 1024,512,512,32,4 --dtype BFloat16 --activation swiglu --skip_test
+USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 1024,512,512,32,4 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_fp8_metrics
+```
+
 ## 4. What has already been settled
 
 - the Blackwell smoke path is real and regression-tested
@@ -74,15 +100,22 @@ USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 32768,2880,2880,64,8 --dt
   - fp8 boundary peak memory: `15312.85 MiB -> 13017.85 MiB`
   - fp8 boundary Fwd+Bwd: `119.803 ms -> 109.117 ms`
 - a new adapter landing point now exists in `sonicmoe/functional/fp8_cutely_fused.py`
+- the first real high-performance forward step is now landed in the same file:
+  - default Blackwell/QuACK forward path consumes `z` instead of `y1`
+  - quant path uses `cutify.fused_weighted_swiglu_act_quant_best`
+  - dequant path uses `cutify.fused_act_dequant_best`
+- CUDA graph capture compatibility had to be fixed:
+  - direct `ue8m0` packing inside the incubator path broke capture
+  - current workaround is: kernel emits float32 dequant scale, SonicMoE re-encodes it to `e8m0`
 - the incubator fused quant kernel does **not** match the current SonicMoE boundary 1:1:
   - incubator input contract: pre-SwiGLU `(T, 2H)`
   - current SonicMoE boundary: post-SwiGLU `(TK, I)`
-  - so the first safe landing is the adapter shim, not a direct kernel swap
+  - this mismatch is now handled by the pre-SwiGLU bridge logic in `fp8_cutely_fused.py`
 - the next kernel target is the Hopper FP8 up-projection epilogue, not a standalone gather kernel and not a monolithic full-graph rewrite
 
 ## 5. The next concrete edits
 
-### Stage 1: wire the adapter and expose the pre-SwiGLU contract
+### Stage 1: 把 prob/topk_scores 真正吃进融合 epilogue
 
 The protocol/reference modules are already wired through:
 
@@ -91,13 +124,12 @@ The protocol/reference modules are already wired through:
 - `sonicmoe/functional/fp8_reference.py`
 - `sonicmoe/functional/fp8_cutely_fused.py`
 
-The next step should replace the current torch-side quant/dequant scaffold for:
+The next step should remove the remaining semantic gap for:
 
-- grouped-gemm output activation before the current post-SwiGLU boundary
-- SwiGLU inside the fused epilogue
 - optional router probability weighting
-- blockwise quant/dequant
+- post-router scaling placement
 - backward cache consumption
+- backward fused kernel contract
 
 ### Stage 2: first fused kernel
 
@@ -140,4 +172,5 @@ Reuse:
   - accuracy baseline: official bf16
   - memory baseline: official bf16
   - performance baselines: previous commit and official bf16
+- from this turn onward, engineering records should be written in Chinese and the metric annotations must come first
 - keep `reports/` up to date whenever the branch, validation command, or next target changes
