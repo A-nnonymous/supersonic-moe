@@ -4,6 +4,32 @@ This is the minimum context a new agent needs to continue work without replaying
 
 ## 0. 最新中文结论
 
+- 最新里程碑：
+  - `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` 已经吃掉了 blockscaled 前半段的 `grouped_a` 物化；
+  - 新主路径是：
+    - `flat sorted activation`
+    - `-> _pack_quantize_expert_segments_kernel`
+    - `-> grouped fp8 activation + grouped scale`
+    - `-> pack_blockscaled_1x32_scales(...)`
+- 中等真实 shape `4096,4096,1024,128,8` 的 env-on blockscaled 最新结果：
+  - output RMSE：`0.01073363`
+  - loss RMSE：`0.00000019`
+  - peak：`7396.13 MiB`
+  - inf fwd / train fwd / e2e / bwd：`3.095 / 3.791 / 8.414 / 5.319 ms`
+- 相对上一版 env-on blockscaled：
+  - inf fwd 提升 `29.05%`
+  - train fwd 提升 `43.54%`
+  - e2e 提升 `27.89%`
+  - bwd 提升 `27.21%`
+  - peak memory 不变
+- 这说明当前 blockscaled 的第一堵墙已经不再是前半段 pack/quant，而是：
+  - `grouped_out`
+  - `flat unpack`
+  - router 聚合边界
+- 因此下一步第一优先级再次变化：
+  1. 不再继续抠 `grouped_a` 前半段；
+  2. 直接处理 `grouped_out -> flat out`；
+  3. 尽量让 router 聚合直接消费 grouped/static layout。
 - 最新小里程碑已经落地：
   - `sonicmoe/functional/fp8_quant.py` 的 e8m0 blockwise quant 现在使用 reciprocal-multiply；
   - `operator-incubator/cutify/ops/cute/fused_weighted_swiglu_act_quant.py` 的 4 组 scale 路径也已经切到 `cute.arch.rcp_approx(...)`。
@@ -36,7 +62,7 @@ This is the minimum context a new agent needs to continue work without replaying
   - env-on blockscaled 目前显存和性能都明显落后，主因仍是 grouped bridge / static capacity buffer。
 - 当前第一优先级已经进一步收敛：
   1. 不再纠缠 reciprocal 这种小收益点；
-  2. 直接处理 blockscaled 的 `pack + quant + grouped_out` 过渡层；
+  2. 直接处理 blockscaled 的 `grouped_out` / router 聚合边界；
   3. 目标是让 routing metadata / router 聚合直接接受静态 expert layout；
   4. 同时修掉更大 shape `8192,4096,1024,128,8` 在 preact fused quant kernel 上的 runtime crash。
 - `1x32 ue8m0` blockscaled down-proj 已经收敛到一个**可交付的静态对齐合同版**：
@@ -213,7 +239,7 @@ CUDA_VISIBLE_DEVICES=1 USE_QUACK_GEMM=1 SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1 SON
 - env-on blockscaled 中等 shape：
   - output RMSE：`0.01073363`
   - peak：`7396.13 MiB`
-  - inf fwd / train fwd / e2e / bwd：`4.362 / 6.715 / 11.668 / 7.307 ms`
+  - inf fwd / train fwd / e2e / bwd：`3.095 / 3.791 / 8.414 / 5.319 ms`
 
 ## 4. What has already been settled
 
@@ -245,18 +271,16 @@ CUDA_VISIBLE_DEVICES=1 USE_QUACK_GEMM=1 SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1 SON
 
 ## 5. The next concrete edits
 
-### Stage 1: 继续消掉 blockscaled 的过渡层
+### Stage 1: 继续消掉 blockscaled 的输出过渡层
 
 当前最该做的，不再是额外的 reciprocal 微调，而是：
 
 - 把 `blockscaled_fp8_gemm.py` 里的
-  - `_pack_grouped_rows`
-  - `quantize_activation_blockwise(grouped_a, ...)`
   - `grouped_out`
   这几段过渡存储继续吃掉。
 - 优先顺序：
-  1. 先尝试 `pack + quant` 合并，避免 materialize `grouped_a`；
-  2. 再看能否让 router 聚合直接接受 grouped/static layout，去掉 `grouped_out -> flat out`。
+  1. 先让 router 聚合直接接受 grouped/static layout；
+  2. 或者让 down-proj 直接写可聚合布局，去掉 `grouped_out -> flat out`。
 
 ### Stage 2: 把 prob/topk_scores 真正吃进融合 epilogue
 

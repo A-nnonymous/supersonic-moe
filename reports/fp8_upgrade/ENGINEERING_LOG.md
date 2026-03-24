@@ -2,6 +2,152 @@
 
 This log records concrete code changes plus their immediate validation and performance numbers.
 
+## 2026-03-24 - blockscaled `pack+quant` 融合，去掉 `grouped_a` 物化
+
+### 指标注释（先看这个）
+
+- 精度基线：官方 `bf16` 路径。
+- 显存基线：官方 `bf16` 路径。
+- 性能基线 1：上一版 env-on blockscaled（专用段拷贝桥，但仍是 `pack -> grouped_a -> quantize` 两段式）。
+- 性能基线 2：同 shape 的稳定 `fp8-mainline`。
+- 重要说明：
+  - 本轮只吃掉了 blockscaled 前半段的大 buffer：
+    - 不再 materialize `grouped_a`
+    - 直接 `flat sorted activation -> grouped fp8 activation + grouped scale`
+  - `grouped_out` 还在，所以峰值显存主矛盾并没有彻底解决。
+  - 这一步的收益应该主要体现在：
+    - inference/training forward
+    - e2e
+    - 而不是最终 peak memory
+
+### 改动
+
+- 在 `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` 中新增：
+  - `_pack_quantize_expert_segments_kernel`
+  - `_pack_quantize_grouped_rows(...)`
+- 新路径直接完成：
+  - 从平铺 expert-sorted `a`
+  - 按 `expert_frequency_offset` 写入 grouped/static-capacity 布局
+  - 同时完成 `1x32` blockwise FP8 quant
+  - 直接产出：
+    - `a_fp8`
+    - grouped `dequant_scale_fp32`
+  - 然后只保留一个很小的 `round_scale_to_e8m0(...) + pack_blockscaled_1x32_scales(...)`
+- 旧的：
+  - `_pack_grouped_rows(...)`
+  - `quantize_activation_blockwise(grouped_a, ...)`
+  的串行前半段已经不再走主路径。
+
+### 收益来源说明
+
+- 本轮 forward/e2e 收益来源非常明确：
+  - 去掉了 `grouped_a` 这个大 bf16 中间张量；
+  - 去掉了 “先 pack 再 quantize” 的两次大张量往返；
+  - 直接把 sorted activation 一步落到 grouped fp8 contract。
+- 本轮为什么显存没同步改善：
+  - 现在最大的额外峰值已经不是 `grouped_a`，而是 `grouped_out`；
+  - 所以下一步必须继续处理输出布局/聚合直连，而不是停在前半段。
+
+### 正确性验证
+
+命令：
+
+```bash
+USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py -k 'blockscaled_downproj or blockwise_quant_matches_divide_reference_after_e8m0_encoding'
+USE_QUACK_GEMM=1 SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1 SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY=256 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py
+```
+
+结果：
+
+```text
+4 passed, 7 deselected
+12 passed
+```
+
+解释：
+
+- blockscaled 合同测试继续通过；
+- env-on Blackwell 回归继续通过；
+- 说明 `pack+quant` 融合没有破坏现有静态合同和数值边界。
+
+### 中等真实 shape 精度 / 显存 / 性能数据
+
+统一 shape：`4096,4096,1024,128,8`
+
+- 官方 bf16：
+  - peak memory：`7049.88 MiB`
+  - Fwd inference：`2.344 ms`
+  - Fwd training：`2.236 ms`
+  - Fwd+Bwd：`7.338 ms`
+  - Bwd：`4.994 ms`
+- 稳定 fp8-mainline（当前同机对照）：
+  - output RMSE：`0.01073638`
+  - loss RMSE：`0.00000020`
+  - peak memory：`6867.00 MiB`
+  - Fwd inference：`2.390 ms`
+  - Fwd training：`2.890 ms`
+  - Fwd+Bwd：`7.693 ms`
+  - Bwd：`5.303 ms`
+- 上一版 env-on blockscaled：
+  - output RMSE：`0.01073363`
+  - loss RMSE：`0.00000019`
+  - peak memory：`7396.13 MiB`
+  - Fwd inference：`4.362 ms`
+  - Fwd training：`6.715 ms`
+  - Fwd+Bwd：`11.668 ms`
+  - Bwd：`7.307 ms`
+- 本轮 `pack+quant` 融合后 env-on blockscaled：
+  - output RMSE：`0.01073363`
+  - loss RMSE：`0.00000019`
+  - peak memory：`7396.13 MiB`
+  - Fwd inference：`3.095 ms`
+  - Fwd training：`3.791 ms`
+  - Fwd+Bwd：`8.414 ms`
+  - Bwd：`5.319 ms`
+
+收益 / 损失：
+
+- 相对上一版 env-on blockscaled：
+  - Fwd inference 提升：`29.05%`
+  - Fwd training 提升：`43.54%`
+  - Fwd+Bwd 提升：`27.89%`
+  - Bwd 提升：`27.21%`
+  - peak memory：`持平`
+- 相对稳定 `fp8-mainline`：
+  - output RMSE 基本持平
+  - peak memory 仍多：`529.13 MiB`
+  - Fwd inference 仍慢：`29.50%`
+  - Fwd training 仍慢：`31.17%`
+  - Fwd+Bwd 仍慢：`9.37%`
+  - Bwd 基本持平：`0.30%`
+- 相对官方 bf16：
+  - peak memory 仍多：`346.25 MiB`
+  - Fwd inference 仍慢：`32.04%`
+  - Fwd training 仍慢：`69.54%`
+  - Fwd+Bwd 仍慢：`14.66%`
+  - Bwd 仍慢：`6.51%`
+
+解释：
+
+- 这一步已经把 blockscaled 从“明显不可用”拉回到“接近稳定 fp8-mainline 的 e2e 区间”；
+- 最亮眼的是：
+  - `Bwd` 已经几乎追平稳定 `fp8-mainline`
+  - `E2E` 差距已经从非常大缩到个位数百分比量级（相对稳定 fp8-mainline）
+- 但显存完全没动，说明当前下一堵墙已经非常明确：
+  - 不是前半段 pack/quant
+  - 而是 `grouped_out` + flat unpack + router 聚合边界
+
+### 当前结论
+
+- `pack+quant` 融合是一个**确定可提交**的新里程碑：
+  - Blackwell 回归继续通过；
+  - 精度保持；
+  - 中等真实 shape 的 blockscaled e2e 提升接近 `28%`。
+- 下一步第一优先级现在进一步收敛为：
+  1. 去掉 `grouped_out -> flat out` 这层过渡；
+  2. 让 router 聚合直接消费 grouped/static layout，或者让 down-proj 直接写可聚合布局；
+  3. 只有做完这一层，blockscaled 才有机会同时赢下性能和显存。
+
 ## 2026-03-24 - `e8m0` reciprocal 优化落地，并完成中等真实 shape 对照
 
 ### 指标注释（先看这个）

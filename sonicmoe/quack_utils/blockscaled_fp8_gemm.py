@@ -22,13 +22,14 @@ from quack.gemm_interface import default_config
 from quack.gemm_wrapper_utils import GemmTensorInfo, GemmWrapperBase
 
 from ..functional.fp8_protocol import FP8Protocol, FP8ScaleGranularity, validate_fp8_runtime_support
-from ..functional.fp8_quant import quantize_activation_blockwise
+from ..functional.fp8_quant import quantize_activation_blockwise, round_scale_to_e8m0
 
 
 _SF_VEC_SIZE = 32
 _SF_TILE_M = 128
 _SF_TILE_K = 128
 _SF_TILE_STORAGE = _SF_TILE_M * (_SF_TILE_K // _SF_VEC_SIZE)
+_FP8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
 
 _INDEX_CACHE: dict[tuple[int, int, int | None], torch.Tensor] = {}
 _WEIGHT_CACHE: dict[tuple[int, tuple[int, ...], tuple[int, ...], int | None, int], tuple[torch.Tensor, torch.Tensor]] = {}
@@ -165,6 +166,69 @@ def _quantize_w2_cached(
 
 
 @triton.jit
+def _pack_quantize_expert_segments_kernel(
+    src_ptr,
+    dst_fp8_ptr,
+    dst_scale_ptr,
+    offsets_ptr,
+    src_stride_row,
+    src_stride_col,
+    dst_stride_expert,
+    dst_stride_row,
+    dst_stride_col,
+    dst_scale_stride_expert,
+    dst_scale_stride_row,
+    dst_scale_stride_col,
+    cols,
+    fp8_max,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    expert_id = tl.program_id(0)
+    row_block = tl.program_id(1)
+    scale_col = tl.program_id(2)
+
+    row_offsets = row_block * BLOCK_M + tl.arange(0, BLOCK_M)
+    col_offsets = scale_col * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    expert_start = tl.load(offsets_ptr + expert_id).to(tl.int32)
+    expert_end = tl.load(offsets_ptr + expert_id + 1).to(tl.int32)
+    expert_len = expert_end - expert_start
+
+    src_rows = expert_start + row_offsets[:, None]
+    src_cols = col_offsets[None, :]
+    row_mask = row_offsets[:, None] < expert_len
+    col_mask = src_cols < cols
+    mask = row_mask & col_mask
+
+    src_ptrs = src_ptr + src_rows * src_stride_row + src_cols * src_stride_col
+    values = tl.load(src_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    block_amax = tl.max(tl.abs(values), axis=1)
+    positive_scale = tl.where(block_amax > 0, block_amax / fp8_max, 1.0)
+    exponent = tl.ceil(tl.log2(positive_scale))
+    dequant_scale = tl.where(block_amax > 0, tl.exp2(exponent), 1.0)
+    quant_scale = tl.where(block_amax > 0, tl.exp2(-exponent), 1.0)
+
+    quantized = (values * quant_scale[:, None]).to(tl.float8e4nv)
+    dst_ptrs = (
+        dst_fp8_ptr
+        + expert_id * dst_stride_expert
+        + row_offsets[:, None] * dst_stride_row
+        + src_cols * dst_stride_col
+    )
+    tl.store(dst_ptrs, quantized, mask=mask)
+
+    scale_ptrs = (
+        dst_scale_ptr
+        + expert_id * dst_scale_stride_expert
+        + row_offsets * dst_scale_stride_row
+        + scale_col * dst_scale_stride_col
+    )
+    tl.store(scale_ptrs, dequant_scale, mask=row_offsets < expert_len)
+
+
+@triton.jit
 def _pack_expert_segments_kernel(
     src_ptr,
     dst_ptr,
@@ -274,6 +338,46 @@ def _pack_grouped_rows(tensor: torch.Tensor, cu_seqlens_m: torch.Tensor, groups:
     return packed
 
 
+def _pack_quantize_grouped_rows(
+    tensor: torch.Tensor,
+    cu_seqlens_m: torch.Tensor,
+    groups: int,
+    capacity: int,
+    protocol: FP8Protocol,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if tensor.ndim != 2:
+        raise ValueError(f"expected 2D tensor to pack, got shape {tuple(tensor.shape)}")
+    if tensor.size(1) % protocol.group_size != 0:
+        raise ValueError(f"expected width divisible by group size {protocol.group_size}, got {tensor.size(1)}")
+
+    quantized = torch.empty((groups, capacity, tensor.size(1)), dtype=protocol.activation_torch_dtype, device=tensor.device)
+    dequant_scale_fp32 = torch.ones(
+        (groups, capacity, tensor.size(1) // protocol.group_size),
+        dtype=torch.float32,
+        device=tensor.device,
+    )
+    grid = (groups, triton.cdiv(capacity, 8), tensor.size(1) // protocol.group_size)
+    _pack_quantize_expert_segments_kernel[grid](
+        tensor,
+        quantized,
+        dequant_scale_fp32,
+        cu_seqlens_m,
+        tensor.stride(0),
+        tensor.stride(1),
+        quantized.stride(0),
+        quantized.stride(1),
+        quantized.stride(2),
+        dequant_scale_fp32.stride(0),
+        dequant_scale_fp32.stride(1),
+        dequant_scale_fp32.stride(2),
+        tensor.size(1),
+        _FP8_E4M3_MAX,
+        BLOCK_M=8,
+        BLOCK_N=_SF_VEC_SIZE,
+    )
+    return quantized, round_scale_to_e8m0(dequant_scale_fp32, protocol)
+
+
 def _unpack_grouped_rows(grouped: torch.Tensor, cu_seqlens_m: torch.Tensor, *, out: Optional[torch.Tensor] = None) -> torch.Tensor:
     if grouped.ndim != 3:
         raise ValueError(f"expected 3D grouped tensor, got shape {tuple(grouped.shape)}")
@@ -324,9 +428,8 @@ def blockscaled_fp8_gemm(
     _validate_blockscaled_capacity(cu_seqlens_m, expert_capacity)
     num_experts = w2.size(2)
     weight_fp8, weight_scales = _quantize_w2_cached(w2, protocol)
-    grouped_a = _pack_grouped_rows(a, cu_seqlens_m, num_experts, expert_capacity)
-    a_fp8, a_scales = quantize_activation_blockwise(grouped_a, protocol)
-    packed_a_scales = pack_blockscaled_1x32_scales(a_scales, grouped_a.size(-1))
+    a_fp8, a_scales = _pack_quantize_grouped_rows(a, cu_seqlens_m, num_experts, expert_capacity, protocol)
+    packed_a_scales = pack_blockscaled_1x32_scales(a_scales, a.size(1))
 
     if out is None:
         out = torch.empty(a.size(0), w2.size(0), dtype=a.dtype, device=a.device)

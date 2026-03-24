@@ -67,9 +67,17 @@ This directory is the live work log for the FP8 upgrade effort. It is not meant 
     - bf16 peak / fp8 peak：`7049.88 / 7396.13 MiB`
     - bf16 e2e / fp8 e2e：`7.338 / 11.668 ms`
 - 因此当前下一优先级已经明确：
-  1. 继续消掉 blockscaled 的 `pack + quant + grouped_out` 过渡层；
+  1. 继续消掉 blockscaled 的 `grouped_out` / router 聚合过渡层；
   2. 修掉更大 shape `8192,4096,1024,128,8` 在 preact fused quant kernel 上的 runtime crash；
   3. 然后再继续 backward/mainloop 迁移。
+- 最新进展补充：
+  - blockscaled 已经吃掉 `grouped_a` 物化，改成 `pack+quant` 融合；
+  - 中等 shape `4096,4096,1024,128,8`：
+    - output RMSE：`0.01073363`
+    - bf16 peak / blockscaled peak：`7049.88 / 7396.13 MiB`
+    - 上一版 blockscaled e2e / 本轮 blockscaled e2e：`11.668 / 8.414 ms`
+    - 收益：`27.89%`
+  - 结论：blockscaled 主矛盾已切换为输出布局和聚合边界，不再是前半段 `pack+quant`。
 
 ## What the next agent should do first
 
