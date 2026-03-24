@@ -24,6 +24,7 @@ from sonicmoe import (
     get_default_fp8_protocol,
     pack_blockscaled_1x32_scales,
     quantize_activation_reference,
+    make_blockscaled_grouped_reverse_scatter_idx,
     validate_fp8_protocol,
     validate_fp8_runtime_support,
 )
@@ -64,6 +65,20 @@ class FP8ProtocolTest(TestCommons):
 
         protocol = validate_fp8_protocol(replace(FP8Protocol(), scale_granularity=FP8ScaleGranularity.BLOCK_1X32))
         self.assertEqual(protocol.group_size, 32)
+
+    def test_blockscaled_grouped_reverse_scatter_idx_matches_static_capacity_layout(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required")
+
+        flat_sorted_positions = torch.tensor([0, 1, 2, 3, 4, 5], device="cuda", dtype=torch.int32)
+        cu_seqlens_m = torch.tensor([0, 2, 5, 6], device="cuda", dtype=torch.int32)
+        grouped_positions = make_blockscaled_grouped_reverse_scatter_idx(
+            flat_sorted_positions,
+            cu_seqlens_m,
+            capacity=128,
+        )
+        expected = torch.tensor([0, 1, 128, 129, 130, 256], device="cuda", dtype=torch.int32)
+        torch.testing.assert_close(grouped_positions, expected)
 
     def test_blackwell_fp8_protocol_runtime_and_reference_quant(self) -> None:
         if not torch.cuda.is_available():

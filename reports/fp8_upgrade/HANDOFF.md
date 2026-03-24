@@ -5,6 +5,26 @@ This is the minimum context a new agent needs to continue work without replaying
 ## 0. 最新中文结论
 
 - 最新里程碑：
+  - blockscaled 下行前向已经不再把 `grouped_out` unpack 成 flat `y2`；
+  - router 聚合现在直接消费 grouped/static layout；
+  - grouped reverse scatter index 直接复用 `selected_experts`，不再靠 `searchsorted` 反推 expert id。
+- 中等真实 shape `4096,4096,1024,128,8` 的 env-on blockscaled 最新结果：
+  - output RMSE：`0.01073363`
+  - loss RMSE：`0.00000019`
+  - peak：`7396.13 MiB`
+  - inf fwd / train fwd / e2e / bwd：`2.918 / 3.818 / 8.196 / 5.279 ms`
+- 相对上一版 env-on blockscaled（已做 `pack+quant` 融合，但还会 flat unpack）：
+  - inf fwd 提升 `5.72%`
+  - e2e 提升 `2.59%`
+  - bwd 提升 `0.75%`
+  - peak 不变
+- 相对稳定 `fp8-mainline`：
+  - e2e 仍慢 `6.54%`
+  - bwd 反而快 `0.45%`
+- 这说明：
+  - blockscaled 路径的“后半段额外开销”已经又去掉一层；
+  - 但真正剩下的显存/性能墙已经收敛为 `grouped_out` 本体，而不再是 unpack。
+- 最新里程碑：
   - `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` 已经吃掉了 blockscaled 前半段的 `grouped_a` 物化；
   - 新主路径是：
     - `flat sorted activation`
@@ -62,7 +82,7 @@ This is the minimum context a new agent needs to continue work without replaying
   - env-on blockscaled 目前显存和性能都明显落后，主因仍是 grouped bridge / static capacity buffer。
 - 当前第一优先级已经进一步收敛：
   1. 不再纠缠 reciprocal 这种小收益点；
-  2. 直接处理 blockscaled 的 `grouped_out` / router 聚合边界；
+  2. 直接处理 blockscaled 的 `grouped_out` 本体；
   3. 目标是让 routing metadata / router 聚合直接接受静态 expert layout；
   4. 同时修掉更大 shape `8192,4096,1024,128,8` 在 preact fused quant kernel 上的 runtime crash。
 - `1x32 ue8m0` blockscaled down-proj 已经收敛到一个**可交付的静态对齐合同版**：
@@ -239,7 +259,7 @@ CUDA_VISIBLE_DEVICES=1 USE_QUACK_GEMM=1 SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1 SON
 - env-on blockscaled 中等 shape：
   - output RMSE：`0.01073363`
   - peak：`7396.13 MiB`
-  - inf fwd / train fwd / e2e / bwd：`3.095 / 3.791 / 8.414 / 5.319 ms`
+  - inf fwd / train fwd / e2e / bwd：`2.918 / 3.818 / 8.196 / 5.279 ms`
 
 ## 4. What has already been settled
 
@@ -271,7 +291,7 @@ CUDA_VISIBLE_DEVICES=1 USE_QUACK_GEMM=1 SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1 SON
 
 ## 5. The next concrete edits
 
-### Stage 1: 继续消掉 blockscaled 的输出过渡层
+### Stage 1: 继续消掉 blockscaled 的输出本体
 
 当前最该做的，不再是额外的 reciprocal 微调，而是：
 
@@ -279,8 +299,9 @@ CUDA_VISIBLE_DEVICES=1 USE_QUACK_GEMM=1 SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1 SON
   - `grouped_out`
   这几段过渡存储继续吃掉。
 - 优先顺序：
-  1. 先让 router 聚合直接接受 grouped/static layout；
-  2. 或者让 down-proj 直接写可聚合布局，去掉 `grouped_out -> flat out`。
+  1. 现在 `grouped_out -> flat out` 已经去掉；
+  2. 下一步要么让 down-proj 直接写 router 可聚合布局；
+  3. 要么让 router 聚合原生接受 `grouped_out` contract 且不再受这个中间 buffer 约束。
 
 ### Stage 2: 把 prob/topk_scores 真正吃进融合 epilogue
 

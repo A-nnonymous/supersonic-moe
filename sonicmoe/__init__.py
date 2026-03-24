@@ -27,4 +27,4 @@ from .functional import (
     validate_fp8_runtime_support,
 )
 from .moe import MoE
-from .quack_utils import pack_blockscaled_1x32_scales
+from .quack_utils import make_blockscaled_grouped_reverse_scatter_idx, pack_blockscaled_1x32_scales

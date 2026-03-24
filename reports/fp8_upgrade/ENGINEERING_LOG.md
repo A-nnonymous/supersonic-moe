@@ -2,6 +2,157 @@
 
 This log records concrete code changes plus their immediate validation and performance numbers.
 
+## 2026-03-24 - grouped `y2` 直接喂 router 聚合，去掉 blockscaled flat unpack
+
+### 指标注释（先看这个）
+
+- 精度基线：官方 `bf16` 路径。
+- 显存基线：官方 `bf16` 路径。
+- 性能基线 1：上一版 env-on blockscaled（已经做完 `pack+quant` 融合，但仍会 `grouped_out -> flat y2 -> router`）。
+- 性能基线 2：同 shape 的稳定 `fp8-mainline`。
+- 重要说明：
+  - 本轮不是去掉 `grouped_out` 本体，而是先去掉 **`flat unpack` 这层中间表示**。
+  - 新路径：
+    - down-proj blockscaled GEMM 直接产出 `grouped_out`
+    - router gather 直接消费 grouped/static layout
+    - 不再物化 `TK x H` 的 flat `y2`
+  - 这一步如果有效，主要收益应该来自：
+    - inference/e2e
+    - 少一次大张量 unpack
+  - 但 peak memory 不一定立刻下降，因为 `grouped_out` 本体仍在。
+
+### 改动
+
+- 在 `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` 中：
+  - 新增 `blockscaled_fp8_gemm_grouped(...)`
+  - 让 blockscaled 主路径可以直接返回 grouped/static-capacity 布局输出
+  - 保留 `blockscaled_fp8_gemm(...)` 作为兼容包装：需要 flat 输出时仍可走 unpack
+- 新增 grouped 索引辅助：
+  - `make_blockscaled_grouped_reverse_scatter_idx(...)`
+  - 当前快路径直接复用已知 `selected_experts`，不再靠 `searchsorted` 反推 expert id
+- 在 `sonicmoe/functional/__init__.py` 中：
+  - blockscaled 下行前向不再调用 flat `blockscaled_fp8_gemm(...)`
+  - 改成：
+    - `blockscaled_fp8_gemm_grouped(...)`
+    - `router_perm = make_blockscaled_grouped_reverse_scatter_idx(..., expert_ids=selected_experts.reshape(-1))`
+    - `_router_forward(y2=grouped_out.view(-1, H), ...)`
+  - 同时把 `selected_experts` 直接穿过 `_DownProjection.apply(...)`
+- 在 `tests/fp8_protocol_test.py` 中新增：
+  - `test_blockscaled_grouped_reverse_scatter_idx_matches_static_capacity_layout`
+
+### 收益来源说明
+
+- 本轮 forward/e2e 收益来源：
+  - 删掉 `grouped_out -> flat y2` 的 unpack；
+  - router 聚合直接从 grouped/static layout 读取；
+  - grouped index 不再靠 `searchsorted` 反推，而是直接复用路由阶段已有 expert id。
+- 为什么 peak memory 还没掉：
+  - `grouped_out` 本体仍然存在；
+  - benchmark 的峰值点目前仍被 grouped/static-capacity output buffer 主导。
+- 这说明下一步应该继续去掉的是：
+  - `grouped_out` 本体
+  - 或者让 GEMM 直接写 router 可聚合布局
+
+### 正确性验证
+
+命令：
+
+```bash
+USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py -k 'grouped_reverse_scatter_idx or blockscaled_downproj'
+USE_QUACK_GEMM=1 SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1 SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY=256 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py
+```
+
+结果：
+
+```text
+4 passed, 8 deselected
+13 passed
+```
+
+解释：
+
+- grouped reverse scatter 的静态合同测试通过；
+- env-on blockscaled 回归从之前 `12 passed` 增长到 `13 passed`；
+- 说明 grouped router 直连本身已经被正式回归覆盖。
+
+### 中等真实 shape 精度 / 显存 / 性能数据
+
+统一 shape：`4096,4096,1024,128,8`
+
+- 官方 bf16：
+  - peak memory：`7049.88 MiB`
+  - Fwd inference：`2.344 ms`
+  - Fwd training：`2.236 ms`
+  - Fwd+Bwd：`7.338 ms`
+  - Bwd：`4.994 ms`
+- 稳定 fp8-mainline：
+  - output RMSE：`0.01073638`
+  - loss RMSE：`0.00000020`
+  - peak memory：`6867.00 MiB`
+  - Fwd inference：`2.390 ms`
+  - Fwd training：`2.890 ms`
+  - Fwd+Bwd：`7.693 ms`
+  - Bwd：`5.303 ms`
+- 上一版 env-on blockscaled（`pack+quant` 融合后）：
+  - output RMSE：`0.01073363`
+  - loss RMSE：`0.00000019`
+  - peak memory：`7396.13 MiB`
+  - Fwd inference：`3.095 ms`
+  - Fwd training：`3.791 ms`
+  - Fwd+Bwd：`8.414 ms`
+  - Bwd：`5.319 ms`
+- 本轮 grouped router 直连后 env-on blockscaled：
+  - output RMSE：`0.01073363`
+  - loss RMSE：`0.00000019`
+  - peak memory：`7396.13 MiB`
+  - Fwd inference：`2.918 ms`
+  - Fwd training：`3.818 ms`
+  - Fwd+Bwd：`8.196 ms`
+  - Bwd：`5.279 ms`
+
+收益 / 损失：
+
+- 相对上一版 env-on blockscaled：
+  - Fwd inference 提升：`5.72%`
+  - Fwd training 退化：`0.71%`
+  - Fwd+Bwd 提升：`2.59%`
+  - Bwd 提升：`0.75%`
+  - peak memory：`持平`
+- 相对稳定 `fp8-mainline`：
+  - output RMSE 基本持平
+  - peak memory 仍多：`529.13 MiB`
+  - Fwd inference 仍慢：`22.09%`
+  - Fwd training 仍慢：`32.11%`
+  - Fwd+Bwd 仍慢：`6.54%`
+  - Bwd 反而快：`0.45%`
+- 相对官方 bf16：
+  - peak memory 仍多：`346.25 MiB`
+  - Fwd inference 仍慢：`24.49%`
+  - Fwd training 仍慢：`70.75%`
+  - Fwd+Bwd 仍慢：`11.69%`
+  - Bwd 仍慢：`5.71%`
+
+解释：
+
+- 这一步已经证明：
+  - `flat unpack` 不是必须存在的；
+  - blockscaled 可以直接与 SonicMoE 的 router 聚合合同对接；
+  - e2e 继续下降，且 backward 已经略优于稳定 `fp8-mainline`。
+- 但显存没动，说明真正的下一堵墙已经更收敛了：
+  - `grouped_out` 本体
+  - 而不是它后面的 flat unpack
+
+### 当前结论
+
+- grouped router 直连是一个**值得提交**的小里程碑：
+  - 不改精度；
+  - 不破坏 Blackwell 回归；
+  - 继续压低 blockscaled e2e / bwd。
+- 下一步第一优先级：
+  1. 继续处理 `grouped_out` 本体；
+  2. 尝试让 GEMM 直接写 router 可聚合布局，或让 router 聚合原生接受 grouped output contract；
+  3. 并行修 `8192,4096,1024,128,8` 的 fused preact quant crash。
+
 ## 2026-03-24 - blockscaled `pack+quant` 融合，去掉 `grouped_a` 物化
 
 ### 指标注释（先看这个）

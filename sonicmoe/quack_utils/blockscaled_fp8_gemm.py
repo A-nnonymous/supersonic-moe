@@ -77,6 +77,38 @@ def _validate_blockscaled_capacity(cu_seqlens_m: torch.Tensor, capacity: int) ->
         )
 
 
+def make_blockscaled_grouped_reverse_scatter_idx(
+    flat_sorted_positions: torch.Tensor,
+    cu_seqlens_m: torch.Tensor,
+    *,
+    capacity: Optional[int] = None,
+    expert_ids: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    if flat_sorted_positions.ndim != 1:
+        raise ValueError(f"expected 1D flat_sorted_positions, got shape {tuple(flat_sorted_positions.shape)}")
+    if cu_seqlens_m.ndim != 1 or cu_seqlens_m.dtype != torch.int32:
+        raise ValueError("cu_seqlens_m must be a 1D int32 tensor")
+    if flat_sorted_positions.device != cu_seqlens_m.device:
+        raise ValueError("flat_sorted_positions and cu_seqlens_m must be on the same device")
+
+    if capacity is None:
+        capacity = _get_blockscaled_expert_capacity()
+    flat_sorted_positions_i64 = flat_sorted_positions.to(torch.int64)
+    if expert_ids is None:
+        expert_ids_i64 = torch.searchsorted(cu_seqlens_m[1:], flat_sorted_positions_i64, right=True)
+    else:
+        if expert_ids.ndim != 1:
+            raise ValueError(f"expected 1D expert_ids, got shape {tuple(expert_ids.shape)}")
+        if expert_ids.device != flat_sorted_positions.device:
+            raise ValueError("expert_ids and flat_sorted_positions must be on the same device")
+        if expert_ids.numel() != flat_sorted_positions.numel():
+            raise ValueError("expert_ids must have the same number of elements as flat_sorted_positions")
+        expert_ids_i64 = expert_ids.to(torch.int64)
+    expert_starts = cu_seqlens_m.index_select(0, expert_ids_i64).to(torch.int64)
+    grouped_positions = expert_ids_i64 * capacity + (flat_sorted_positions_i64 - expert_starts)
+    return grouped_positions.to(torch.int32)
+
+
 def _storage_per_batch(rows: int, cols: int) -> int:
     return _div_up(rows, _SF_TILE_M) * _div_up(cols, _SF_TILE_K) * _SF_TILE_STORAGE
 
@@ -401,13 +433,13 @@ def _unpack_grouped_rows(grouped: torch.Tensor, cu_seqlens_m: torch.Tensor, *, o
     return out
 
 
-def blockscaled_fp8_gemm(
+def blockscaled_fp8_gemm_grouped(
     a: torch.Tensor,
     w2: torch.Tensor,
     cu_seqlens_m: torch.Tensor,
     *,
     protocol: FP8Protocol,
-    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     protocol = validate_fp8_runtime_support(_blockscaled_protocol(protocol), a.device, quack_enabled=True)
     if get_device_capacity(a.device)[0] != 10:
@@ -431,9 +463,13 @@ def blockscaled_fp8_gemm(
     a_fp8, a_scales = _pack_quantize_grouped_rows(a, cu_seqlens_m, num_experts, expert_capacity, protocol)
     packed_a_scales = pack_blockscaled_1x32_scales(a_scales, a.size(1))
 
-    if out is None:
-        out = torch.empty(a.size(0), w2.size(0), dtype=a.dtype, device=a.device)
-    grouped_out = torch.empty(num_experts, expert_capacity, w2.size(0), dtype=out.dtype, device=out.device)
+    grouped_out = torch.empty(
+        num_experts,
+        expert_capacity,
+        w2.size(0),
+        dtype=(a.dtype if out_dtype is None else out_dtype),
+        device=a.device,
+    )
 
     config = default_config(a.device)
     if config.swap_ab:
@@ -543,5 +579,23 @@ def blockscaled_fp8_gemm(
         current_stream,
         a_scale_cute,
         b_scale_cute,
+    )
+    return grouped_out
+
+
+def blockscaled_fp8_gemm(
+    a: torch.Tensor,
+    w2: torch.Tensor,
+    cu_seqlens_m: torch.Tensor,
+    *,
+    protocol: FP8Protocol,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    grouped_out = blockscaled_fp8_gemm_grouped(
+        a,
+        w2,
+        cu_seqlens_m,
+        protocol=protocol,
+        out_dtype=(a.dtype if out is None else out.dtype),
     )
     return _unpack_grouped_rows(grouped_out, cu_seqlens_m, out=out)

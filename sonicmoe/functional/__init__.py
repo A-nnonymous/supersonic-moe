@@ -8,7 +8,13 @@ import torch
 import torch.nn.functional as F
 from ..count_cumsum import count_cumsum
 from ..enums import ActivationType, is_glu
-from ..quack_utils import blockscaled_fp8_gemm, gemm_dgated, gemm_gated
+from ..quack_utils import (
+    blockscaled_fp8_gemm,
+    blockscaled_fp8_gemm_grouped,
+    gemm_dgated,
+    gemm_gated,
+    make_blockscaled_grouped_reverse_scatter_idx,
+)
 from quack.gemm_interface import gemm
 from .backward import (
     _down_projection_backward_act,
@@ -290,6 +296,7 @@ class _DownProjection(torch.autograd.Function):
         w2: torch.Tensor,
         b2: torch.Tensor | None,
         topk_scores: torch.Tensor,
+        selected_experts: torch.Tensor,
         expert_frequency_offset: torch.Tensor,
         T: int,
         K: int,
@@ -310,14 +317,22 @@ class _DownProjection(torch.autograd.Function):
 
             assert b2 is None
             if fp8_protocol is not None and _use_blockscaled_fp8_downproj():
-                y2 = blockscaled_fp8_gemm(
+                y2 = blockscaled_fp8_gemm_grouped(
                     y1,
                     w2,
                     expert_frequency_offset,
                     protocol=fp8_protocol,
                 )
+                router_perm = make_blockscaled_grouped_reverse_scatter_idx(
+                    s_reverse_scatter_idx,
+                    expert_frequency_offset,
+                    expert_ids=selected_experts.reshape(-1),
+                )
+                y2_for_router = y2.view(-1, H)
             else:
                 y2 = gemm(y1, w2.permute(2, 1, 0), cu_seqlens_m=expert_frequency_offset)
+                router_perm = s_reverse_scatter_idx
+                y2_for_router = y2
         else:
             y2 = torch.empty(TK, H, dtype=y1.dtype, device=y1.device)
             _down_projection_forward(
@@ -330,15 +345,17 @@ class _DownProjection(torch.autograd.Function):
                 x_gather_idx=x_gather_idx,
                 stream_id=stream_id,
             )
+            router_perm = s_reverse_scatter_idx
+            y2_for_router = y2
 
         o = torch.empty(T, H, device=z.device, dtype=z.dtype)
         topk_scores = topk_scores.flatten()
 
         _router_forward(
-            y2=y2,
+            y2=y2_for_router,
             o=o,
             topk_scores=topk_scores,
-            s_reverse_scatter_idx=s_reverse_scatter_idx,
+            s_reverse_scatter_idx=router_perm,
             num_activated_expert_per_token_offset=num_activated_expert_per_token_offset,
             varlen_K_max=(E if is_varlen_K else K),
             H=H,
@@ -356,6 +373,7 @@ class _DownProjection(torch.autograd.Function):
             w2,
             b2,
             topk_scores,
+            selected_experts,
             expert_frequency_offset,
             x_gather_idx,
             s_scatter_idx,
@@ -377,6 +395,7 @@ class _DownProjection(torch.autograd.Function):
             w2,
             b2,
             topk_scores,
+            _selected_experts,
             expert_frequency_offset,
             x_gather_idx,
             s_scatter_idx,
@@ -457,7 +476,7 @@ class _DownProjection(torch.autograd.Function):
         if not is_varlen_K:
             ds = ds.view(T, K)
 
-        return None, dz, dw2, db2, ds, *[None] * 11
+        return None, dz, dw2, db2, ds, None, *[None] * 11
 
 
 def moe_TC_softmax_topk_layer(
@@ -534,6 +553,7 @@ def moe_TC_softmax_topk_layer(
         w2,
         b2,
         topk_scores,
+        topk_indices,
         expert_frequency_offset,
         T,
         K,
@@ -612,6 +632,7 @@ def moe_general_routing_inputs(
         w2,
         b2,
         router_scores,
+        expert_indices,
         expert_frequency_offset,
         T,
         None,  # K, not needed

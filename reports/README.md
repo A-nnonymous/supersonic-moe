@@ -75,9 +75,10 @@ This directory is the live work log for the FP8 upgrade effort. It is not meant 
   - 中等 shape `4096,4096,1024,128,8`：
     - output RMSE：`0.01073363`
     - bf16 peak / blockscaled peak：`7049.88 / 7396.13 MiB`
-    - 上一版 blockscaled e2e / 本轮 blockscaled e2e：`11.668 / 8.414 ms`
-    - 收益：`27.89%`
-  - 结论：blockscaled 主矛盾已切换为输出布局和聚合边界，不再是前半段 `pack+quant`。
+    - `pack+quant` 融合后 e2e：`8.414 ms`
+    - grouped router 直连后 e2e：`8.196 ms`
+    - 相对 `11.668 ms` 的累计收益：`29.75%`
+  - 结论：blockscaled 主矛盾已进一步切换为 `grouped_out` 本体，不再是前半段 `pack+quant` 或 flat unpack。
 
 ## What the next agent should do first
 
