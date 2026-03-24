@@ -2,6 +2,109 @@
 
 This log records concrete code changes plus their immediate validation and performance numbers.
 
+## 2026-03-24 - 补齐 bf16-vs-fp8 理论上限账本，并给 FP8 scale 路径落地可复用输出接口
+
+### 指标注释（先看这个）
+
+- 精度基线：当前稳定 `fp8-mainline` 默认行为。
+- 显存基线 1：同一条 benchmark 命令下的 `bf16 baseline`。
+- 显存基线 2：当前稳定 `fp8-mainline` 的 steady-state peak。
+- 性能基线：同一台卡、同一条 benchmark 命令下的稳定 `fp8-mainline`。
+- 本轮收益来源：
+  - 先把“还能省多少”做成可重复对排的理论账本，避免后续再盲目优化错误方向；
+  - 再把 `e8m0` scale encode / blockwise quant / dequant 的输出接口做成可写入预分配 buffer，为后续 cudagraph-safe FP8 主线铺路。
+
+### 改动
+
+- 在 `benchmarks/moe-cute.py` 中：
+  - `--report_stage_memory` 现在在 `fp8_protocol` 打开时会自动同时跑 `bf16` 和 `fp8`，并输出阶段级对排；
+  - `_print_fp8_theory_report(...)` 新增了“预期最大收益”相关账本：
+    - `direct_fp8_boundary_floor_mib`
+    - `direct_fp8_boundary_saved_mib`
+    - `aggressive_weight_fp8_storage_mib`
+    - `aggressive_weight_saved_mib`
+    - `aggressive_total_saved_mib`
+- 在 `sonicmoe/functional/fp8_quant.py` 中：
+  - `round_scale_to_e8m0(...)` 新增 `out=...`
+  - `quantize_activation_blockwise(...)` 新增：
+    - `out=...`
+    - `scale_out=...`
+  - `dequantize_activation_blockwise(...)` 新增 `out=...`
+  - 这些接口都支持把结果直接写进预分配 tensor，避免每次都新建最终输出张量。
+- 在 `sonicmoe/functional/fp8_cutely_fused.py` 中：
+  - `apply_activation_fp8_protocol_cutely_fused(...)` 新增 `scale_out=...`
+  - `apply_preact_activation_fp8_protocol_cutely_fused(...)` 新增 `scale_out=...`
+  - 这样 fused preact 路径在需要返回 `e8m0` scales 时，也能直接复用上层准备好的 buffer。
+- 在 `tests/fp8_protocol_test.py` 中补了两条新回归：
+  - blockwise quant / dequant 可以复用预分配输出
+  - fused preact path 可以复用预分配的 scale buffer
+- 在 `sonicmoe/functional/__init__.py` 中顺手收口了一个返回值个数错误：
+  - `_UpProjection.backward(...)` 末尾的 `None` 返回数量改为与输入签名一致
+
+### 正确性验证
+
+命令：
+
+```bash
+USE_QUACK_GEMM=1 CUDA_VISIBLE_DEVICES=6 python -m pytest -q tests/fp8_protocol_test.py -k 'blockwise_quant_can_reuse_preallocated_outputs or preact_cutely_fused_path_can_reuse_scale_buffer or preact_cutely_fused_path_matches_reference_boundary or blockwise_quant_matches_divide_reference_after_e8m0_encoding'
+
+USE_QUACK_GEMM=1 CUDA_VISIBLE_DEVICES=6 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py
+```
+
+结果：
+
+```text
+4 passed, 12 deselected
+17 passed
+```
+
+### 真实账本验证
+
+命令：
+
+```bash
+CUDA_VISIBLE_DEVICES=6 USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 4096,4096,1024,128,8 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_fp8_metrics --report_fp8_analysis --report_stage_memory
+```
+
+结果：
+
+- 理论账：
+  - `stable_fp8_boundary_lower_bound_mib=258.00`
+  - `stable_fp8_saved_payload_mib=31.00`
+  - `direct_fp8_boundary_floor_mib=160.25`
+  - `direct_fp8_boundary_saved_mib=97.75`
+  - `aggressive_weight_fp8_storage_mib=1548.00`
+  - `aggressive_weight_saved_mib=1524.00`
+  - `aggressive_total_saved_mib=1555.75`
+- 稳定主线精度 / steady-state 显存：
+  - output RMSE：`0.01073638`
+  - loss RMSE：`0.00000020`
+  - bf16 peak / fp8 peak：`7049.88 / 6867.00 MiB`
+- 阶段级 eager 对排：
+  - `forward:router-metadata`：`+0.00 MiB`
+  - `forward:up-proj`：`+0.00 MiB`
+  - `forward:down-proj-router`：`+1.00 MiB`
+  - `backward:down-proj-core`：`+1.00 MiB`
+  - `backward:up-proj-core`：`+1.00 MiB`
+  - `backward:token-reduce`：`+1.00 MiB`
+  - final peak：`6931.00 -> 6932.00 MiB`
+
+### 结论
+
+- 这轮最重要的新判断有两个：
+  1. 当前稳定 `fp8-mainline` 相比 `bf16` 真正已经省下来的“边界 payload”只有 `31 MiB`；
+  2. 如果能做到 **varlen-friendly direct FP8 mainloop**，理论上还能再追回约 `97.75 MiB` 的边界流量。
+- 更激进但也更值得追求的上限已经明确：
+  - 如果 `w1/w2` 也改成 FP8 存储，单是权重驻留理论上还能再省 `1524 MiB`；
+  - activation + weight 一起算，`4096,4096,1024,128,8` 这档 shape 的总理论节省上限约为 `1555.75 MiB`。
+- `--report_stage_memory` 的 bf16-vs-fp8 对排也给了一个重要信号：
+  - eager 单次前后向阶段峰值几乎一样；
+  - 这说明当前稳定主线的 steady-state peak 优势并不主要来自单个阶段瞬时峰值降低，而更像是来自长期驻留 / graph-steady-state buffer 形态差异。
+- 因此下一阶段主线仍然不变：
+  - **必须继续守住 SonicMoE 的 `varlen/gather-A` 内存合同**
+  - 优先做可 cudagraph-safe 的 `varlen FP8 epilogue + direct mainloop`
+  - 不再回到 grouped/static-capacity 路线
+
 ## 2026-03-24 - 证伪 grouped direct-fp8 downproj，主线切向 varlen/gather-A 友好融合
 
 ### 指标注释（先看这个）

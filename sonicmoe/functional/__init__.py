@@ -368,7 +368,7 @@ class _UpProjection(torch.autograd.Function):
         )
         _log_stage_memory("backward:token-reduce")
 
-        return dx_reduced, dw1, db1, *[None] * 12
+        return dx_reduced, dw1, db1, *[None] * 11
 
 
 class _DownProjection(torch.autograd.Function):

@@ -51,10 +51,11 @@ def apply_activation_fp8_protocol_cutely_fused(
     quack_enabled: bool | None = None,
     return_scales: bool = True,
     use_ste: bool = True,
+    scale_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     protocol = validate_fp8_runtime_support(protocol or FP8Protocol(), x.device, quack_enabled=quack_enabled)
     padded_x, original_last_dim = _pad_postact_tensor(x, protocol.group_size)
-    data, scales = quantize_activation_blockwise(padded_x, protocol)
+    data, scales = quantize_activation_blockwise(padded_x, protocol, scale_out=scale_out)
     dequantized = dequantize_activation_blockwise(data, scales, protocol, output_dtype=x.dtype)[..., :original_last_dim]
 
     restored_with_ste = x + (dequantized - x).detach() if use_ste else dequantized
@@ -71,6 +72,7 @@ def apply_preact_activation_fp8_protocol_cutely_fused(
     quack_enabled: bool | None = None,
     return_scales: bool = True,
     use_ste: bool = True,
+    scale_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     protocol = validate_fp8_runtime_support(protocol or FP8Protocol(), preact.device, quack_enabled=quack_enabled)
     if protocol.group_size != 128:
@@ -80,6 +82,7 @@ def apply_preact_activation_fp8_protocol_cutely_fused(
             quack_enabled=quack_enabled,
             return_scales=return_scales,
             use_ste=use_ste,
+            scale_out=scale_out,
         )
     padded_preact, original_postact_width = _pad_preact_for_group_size(preact, protocol.group_size)
     quantized, packed_scales = fused_weighted_swiglu_act_quant_best(
@@ -97,5 +100,6 @@ def apply_preact_activation_fp8_protocol_cutely_fused(
         return restored_with_ste, None
 
     scale_cols = (original_postact_width + protocol.group_size - 1) // protocol.group_size
-    decoded_scales = round_scale_to_e8m0(packed_scales[:, :scale_cols], protocol)
+    decoded_scale_input = packed_scales[:, :scale_cols]
+    decoded_scales = round_scale_to_e8m0(decoded_scale_input, protocol, out=scale_out)
     return restored_with_ste, decoded_scales

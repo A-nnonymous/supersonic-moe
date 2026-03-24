@@ -30,7 +30,11 @@ from sonicmoe import (
     validate_fp8_runtime_support,
 )
 from sonicmoe.enums import ActivationType
-from sonicmoe.functional.fp8_quant import quantize_activation_blockwise, round_scale_to_e8m0
+from sonicmoe.functional.fp8_quant import (
+    dequantize_activation_blockwise,
+    quantize_activation_blockwise,
+    round_scale_to_e8m0,
+)
 from sonicmoe.quack_utils import blockscaled_fp8_gemm
 
 from .test_commons import TestCommons
@@ -142,6 +146,33 @@ class FP8ProtocolTest(TestCommons):
         self.assertEqual(scales.dtype, torch.float8_e8m0fnu)
         torch.testing.assert_close(scales.float(), encoded_scale.float(), atol=0.0, rtol=0.0)
         torch.testing.assert_close(quantized.float(), divide_reference.float(), atol=0.0, rtol=0.0)
+
+    def test_blockwise_quant_can_reuse_preallocated_outputs(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required")
+
+        major, _ = torch.cuda.get_device_capability()
+        if major < 10:
+            self.skipTest("Blackwell-only test requires SM100+")
+
+        self.set_seed(_SEED)
+        protocol = get_default_fp8_protocol()
+        x = 0.25 * torch.randn(8, 256, device="cuda", dtype=torch.bfloat16)
+
+        quantized_ref, scales_ref = quantize_activation_blockwise(x, protocol)
+        quantized_out = torch.empty_like(quantized_ref)
+        scales_out = torch.empty_like(scales_ref)
+        quantized, scales = quantize_activation_blockwise(x, protocol, out=quantized_out, scale_out=scales_out)
+        restored_ref = dequantize_activation_blockwise(quantized_ref, scales_ref, protocol, output_dtype=x.dtype)
+        restored_out = torch.empty_like(restored_ref)
+        restored = dequantize_activation_blockwise(quantized, scales, protocol, output_dtype=x.dtype, out=restored_out)
+
+        self.assertIs(quantized, quantized_out)
+        self.assertIs(scales, scales_out)
+        self.assertIs(restored, restored_out)
+        torch.testing.assert_close(quantized.float(), quantized_ref.float(), atol=0.0, rtol=0.0)
+        torch.testing.assert_close(scales.float(), scales_ref.float(), atol=0.0, rtol=0.0)
+        torch.testing.assert_close(restored.float(), restored_ref.float(), atol=0.0, rtol=0.0)
 
     def test_blackwell_fp8_protocol_boundary_keeps_finite_forward_backward(self) -> None:
         if not torch.cuda.is_available():
@@ -402,3 +433,24 @@ class FP8ProtocolTest(TestCommons):
         self.assertLess(torch.sqrt(torch.mean(diff.square())).item(), 6e-3)
         log2_scales = torch.log2(scales_fused.float())
         self.assertTrue(torch.allclose(log2_scales, torch.round(log2_scales), atol=0.0, rtol=0.0))
+
+    def test_preact_cutely_fused_path_can_reuse_scale_buffer(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required")
+
+        major, _ = torch.cuda.get_device_capability()
+        if major < 10:
+            self.skipTest("Blackwell-only test requires SM100+")
+
+        self.set_seed(_SEED)
+        protocol = get_default_fp8_protocol()
+        preact = 0.1 * torch.randn(8, 260, device="cuda", dtype=torch.bfloat16)
+        postact = (preact[..., 1::2] * F.silu(preact[..., ::2].float()).to(dtype=preact.dtype)).contiguous()
+        scale_out = torch.empty((preact.size(0), (postact.size(1) + protocol.group_size - 1) // protocol.group_size), device="cuda", dtype=torch.float8_e8m0fnu)
+
+        with enable_quack_gemm(True):
+            _, scales_ref = apply_preact_activation_fp8_protocol_cutely_fused(preact, postact, protocol)
+            _, scales = apply_preact_activation_fp8_protocol_cutely_fused(preact, postact, protocol, scale_out=scale_out)
+
+        self.assertIs(scales, scale_out)
+        torch.testing.assert_close(scales.float(), scales_ref.float(), atol=0.0, rtol=0.0)

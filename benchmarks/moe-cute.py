@@ -3,9 +3,12 @@
 # ********************************************************************************
 
 import argparse
+import contextlib
+import io
 import math
 import os
 import random
+import re
 import time
 from typing import Tuple, Type
 
@@ -148,9 +151,16 @@ def _print_fp8_theory_report(
     postact_fp8_mib = _mib(TK * I, 1)
     scales_f32_mib = _mib(TK * scale_cols_128, 4)
     scales_e8m0_mib = _mib(TK * scale_cols_128, 1)
+    weight_fp8_data_mib = _mib(E * H * (3 * I), 1)
+    weight_fp8_scale_e8m0_mib = _mib(E * H * ((2 * I) // 128 + I // 128), 1)
+    weight_fp8_total_mib = weight_fp8_data_mib + weight_fp8_scale_e8m0_mib
 
     stable_fp8_boundary_lower_bound_mib = z_mib + postact_fp8_mib + scales_f32_mib + postact_fp8_mib + scales_f32_mib + postact_bf16_mib
     stable_fp8_saved_payload_mib = postact_bf16_mib - (postact_fp8_mib + scales_f32_mib)
+    direct_fp8_boundary_floor_mib = z_mib + postact_fp8_mib + scales_e8m0_mib
+    direct_fp8_boundary_saved_mib = stable_fp8_boundary_lower_bound_mib - direct_fp8_boundary_floor_mib
+    aggressive_weight_saved_mib = (w1_mib + w2_mib) - weight_fp8_total_mib
+    aggressive_total_saved_mib = aggressive_weight_saved_mib + (postact_bf16_mib - (postact_fp8_mib + scales_e8m0_mib))
 
     print0(
         "[bold yellow]Theoretical memory / compute analysis[/bold yellow] "
@@ -158,7 +168,12 @@ def _print_fp8_theory_report(
         f"activations_mib(x={x_mib:.2f}, z={z_mib:.2f}, postact_bf16={postact_bf16_mib:.2f}, "
         f"postact_fp8={postact_fp8_mib:.2f}, scales_f32={scales_f32_mib:.2f}, scales_e8m0={scales_e8m0_mib:.2f}); "
         f"stable_fp8_boundary_lower_bound_mib={stable_fp8_boundary_lower_bound_mib:.2f}; "
-        f"stable_fp8_saved_payload_mib={stable_fp8_saved_payload_mib:.2f}"
+        f"stable_fp8_saved_payload_mib={stable_fp8_saved_payload_mib:.2f}; "
+        f"direct_fp8_boundary_floor_mib={direct_fp8_boundary_floor_mib:.2f}; "
+        f"direct_fp8_boundary_saved_mib={direct_fp8_boundary_saved_mib:.2f}; "
+        f"aggressive_weight_fp8_storage_mib={weight_fp8_total_mib:.2f}; "
+        f"aggressive_weight_saved_mib={aggressive_weight_saved_mib:.2f}; "
+        f"aggressive_total_saved_mib={aggressive_total_saved_mib:.2f}"
     )
 
     blockscaled_capacity = os.getenv("SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY")
@@ -173,6 +188,110 @@ def _print_fp8_theory_report(
                 f"capacity={capacity}; grouped_out_bf16_mib={grouped_out_mib:.2f}; "
                 f"grouped_a_fp8_mib={grouped_a_fp8_mib:.2f}; grouped_a_scale_e8m0_mib={grouped_scale_1x32_mib:.2f}"
             )
+
+
+_STAGE_MEMORY_PATTERN = re.compile(
+    r"^\[stage-memory\] (?P<stage>.+?): "
+    r"alloc_mib=(?P<alloc>[0-9.]+), "
+    r"reserved_mib=(?P<reserved>[0-9.]+), "
+    r"peak_alloc_mib=(?P<peak_alloc>[0-9.]+), "
+    r"peak_reserved_mib=(?P<peak_reserved>[0-9.]+)$"
+)
+
+
+def _parse_stage_memory_output(output: str) -> dict[str, dict[str, float]]:
+    stages: dict[str, dict[str, float]] = {}
+    for line in output.splitlines():
+        match = _STAGE_MEMORY_PATTERN.match(line.strip())
+        if match is None:
+            continue
+        stages[match.group("stage")] = {
+            "alloc_mib": float(match.group("alloc")),
+            "reserved_mib": float(match.group("reserved")),
+            "peak_alloc_mib": float(match.group("peak_alloc")),
+            "peak_reserved_mib": float(match.group("peak_reserved")),
+        }
+    return stages
+
+
+def _run_stage_memory_case(
+    *,
+    moe,
+    x: torch.Tensor,
+    dout: torch.Tensor,
+    router_w: torch.Tensor,
+    w1: torch.Tensor,
+    b1: torch.Tensor | None,
+    w2: torch.Tensor,
+    b2: torch.Tensor | None,
+    activation: ActivationType,
+    protocol_config,
+) -> tuple[dict[str, dict[str, float]], float]:
+    previous_probe = os.environ.get("SONIC_MOE_STAGEWISE_MEMORY")
+    os.environ["SONIC_MOE_STAGEWISE_MEMORY"] = "1"
+    capture = io.StringIO()
+    try:
+        x_case = x.detach().clone().requires_grad_()
+        dout_case = dout.detach().clone()
+        for grad_tensor in [x, w1, w2, router_w]:
+            grad_tensor.grad = None
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        with contextlib.redirect_stdout(capture):
+            o_case, _, _ = moe_TC_softmax_topk_layer(
+                x_case,
+                router_w,
+                w1.permute(1, 2, 0),
+                b1,
+                w2.permute(1, 2, 0),
+                b2,
+                moe.top_k,
+                moe.stream_id,
+                activation,
+                False,
+                protocol_config,
+            )
+            o_case.backward(dout_case)
+            torch.cuda.synchronize()
+        final_peak_mib = torch.cuda.max_memory_allocated() / (1024**2)
+        for grad_tensor in [x_case, x, w1, w2, router_w]:
+            grad_tensor.grad = None
+    finally:
+        if previous_probe is None:
+            os.environ.pop("SONIC_MOE_STAGEWISE_MEMORY", None)
+        else:
+            os.environ["SONIC_MOE_STAGEWISE_MEMORY"] = previous_probe
+    return _parse_stage_memory_output(capture.getvalue()), final_peak_mib
+
+
+def _print_stage_memory_comparison(
+    *,
+    bf16_stages: dict[str, dict[str, float]],
+    bf16_final_peak_mib: float,
+    fp8_stages: dict[str, dict[str, float]],
+    fp8_final_peak_mib: float,
+) -> None:
+    ordered_stages = list(dict.fromkeys([*bf16_stages.keys(), *fp8_stages.keys()]))
+    summary_parts = []
+    for stage in ordered_stages:
+        bf16_stage = bf16_stages.get(stage)
+        fp8_stage = fp8_stages.get(stage)
+        if bf16_stage is None or fp8_stage is None:
+            continue
+        delta_peak_alloc = fp8_stage["peak_alloc_mib"] - bf16_stage["peak_alloc_mib"]
+        delta_alloc = fp8_stage["alloc_mib"] - bf16_stage["alloc_mib"]
+        summary_parts.append(
+            f"{stage}(bf16_peak_alloc={bf16_stage['peak_alloc_mib']:.2f}, "
+            f"fp8_peak_alloc={fp8_stage['peak_alloc_mib']:.2f}, "
+            f"delta_peak_alloc={delta_peak_alloc:+.2f}, "
+            f"delta_alloc={delta_alloc:+.2f})"
+        )
+    print0(
+        "[bold magenta]Stagewise memory comparison (bf16 vs fp8)[/bold magenta] "
+        + "; ".join(summary_parts)
+        + f"; final_peak_mib(bf16={bf16_final_peak_mib:.2f}, fp8={fp8_final_peak_mib:.2f}, "
+        f"delta={fp8_final_peak_mib - bf16_final_peak_mib:+.2f})"
+    )
 
 
 def run(
@@ -274,41 +393,58 @@ def run(
         )
 
     if report_stage_memory:
-        previous_probe = os.environ.get("SONIC_MOE_STAGEWISE_MEMORY")
-        os.environ["SONIC_MOE_STAGEWISE_MEMORY"] = "1"
-        try:
-            x_case = x.detach().clone().requires_grad_()
-            dout_case = dout.detach().clone()
-            for grad_tensor in [x, w1, w2, router_w]:
-                grad_tensor.grad = None
-            torch.cuda.empty_cache()
-            torch.cuda.reset_peak_memory_stats()
-            o_case, _, _ = moe_TC_softmax_topk_layer(
-                x_case,
-                router_w,
-                w1.permute(1, 2, 0),
-                b1,
-                w2.permute(1, 2, 0),
-                b2,
-                moe.top_k,
-                moe.stream_id,
-                activation,
-                False,
-                fp8_protocol_config,
+        if fp8_protocol_config is None:
+            stages, final_peak_mib = _run_stage_memory_case(
+                moe=moe,
+                x=x,
+                dout=dout,
+                router_w=router_w,
+                w1=w1,
+                b1=b1,
+                w2=w2,
+                b2=b2,
+                activation=activation,
+                protocol_config=None,
             )
-            o_case.backward(dout_case)
-            torch.cuda.synchronize()
             print0(
                 "[bold magenta]Stagewise memory probe complete[/bold magenta] "
-                f"final_peak_mib={torch.cuda.max_memory_allocated() / (1024**2):.2f}"
+                + "; ".join(
+                    f"{stage}(peak_alloc={stats['peak_alloc_mib']:.2f}, alloc={stats['alloc_mib']:.2f})"
+                    for stage, stats in stages.items()
+                )
+                + f"; final_peak_mib={final_peak_mib:.2f}"
             )
-            for grad_tensor in [x_case, x, w1, w2, router_w]:
-                grad_tensor.grad = None
-        finally:
-            if previous_probe is None:
-                os.environ.pop("SONIC_MOE_STAGEWISE_MEMORY", None)
-            else:
-                os.environ["SONIC_MOE_STAGEWISE_MEMORY"] = previous_probe
+        else:
+            bf16_stages, bf16_final_peak_mib = _run_stage_memory_case(
+                moe=moe,
+                x=x,
+                dout=dout,
+                router_w=router_w,
+                w1=w1,
+                b1=b1,
+                w2=w2,
+                b2=b2,
+                activation=activation,
+                protocol_config=None,
+            )
+            fp8_stages, fp8_final_peak_mib = _run_stage_memory_case(
+                moe=moe,
+                x=x,
+                dout=dout,
+                router_w=router_w,
+                w1=w1,
+                b1=b1,
+                w2=w2,
+                b2=b2,
+                activation=activation,
+                protocol_config=fp8_protocol_config,
+            )
+            _print_stage_memory_comparison(
+                bf16_stages=bf16_stages,
+                bf16_final_peak_mib=bf16_final_peak_mib,
+                fp8_stages=fp8_stages,
+                fp8_final_peak_mib=fp8_final_peak_mib,
+            )
 
     # # Ref check
     if not skip_test:

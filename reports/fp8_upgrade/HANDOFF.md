@@ -5,6 +5,30 @@ This is the minimum context a new agent needs to continue work without replaying
 ## 0. 最新中文结论
 
 - 新结论（这一轮最重要）：
+  - `benchmarks/moe-cute.py` 的 `bf16 vs fp8` 理论账本已经补齐；
+  - `4096,4096,1024,128,8` 下：
+    - 当前稳定 `fp8-mainline` 真正省下来的边界 payload 只有 `31.00 MiB`
+    - 如果做到 **varlen-friendly direct FP8 mainloop**，理论上还能再追回 `97.75 MiB`
+    - 如果 `w1/w2` 也改成 FP8 存储，理论上还能再省 `1524.00 MiB`
+    - activation + weight 合并后的激进总上限约为 `1555.75 MiB`
+  - 这组账本现在已经是下一阶段所有取舍的硬约束：小于这个级别的收益不值得为之破坏 `varlen/gather-A` 合同。
+- 新结论（这一轮最重要）：
+  - `--report_stage_memory` 现在在 `fp8_protocol` 打开时会自动同时跑 `bf16` 和 `fp8`；
+  - 但 `4096,4096,1024,128,8` 的阶段级 eager 对排显示：
+    - 各 stage `peak_alloc` 基本只差 `0~1 MiB`
+    - final peak `6931.00 -> 6932.00 MiB`
+  - 这说明稳定 `fp8-mainline` 相对 `bf16` 的 steady-state 显存优势，不是来自单个阶段峰值大幅降低，而更像来自 graph-steady-state / 长驻留 buffer 形态差异。
+- 新结论（这一轮最重要）：
+  - 已经把当前 FP8 scale/quant/dequant 路径做成“可复用预分配输出”的接口，为 cudagraph-safe 路径铺好了基础：
+    - `round_scale_to_e8m0(..., out=...)`
+    - `quantize_activation_blockwise(..., out=..., scale_out=...)`
+    - `dequantize_activation_blockwise(..., out=...)`
+    - `apply_activation_fp8_protocol_cutely_fused(..., scale_out=...)`
+    - `apply_preact_activation_fp8_protocol_cutely_fused(..., scale_out=...)`
+  - 对应回归已过：
+    - `17 passed`
+  - 这一步本身不改变主线性能结论，但去掉了“scale 输出必须动态新建 tensor”这个 cudagraph 兼容性障碍。
+- 新结论（这一轮最重要）：
   - 已经用真实 `4096,4096,1024,128,8` 数据**证伪**了 grouped `fp8-direct-downproj` 原型；
   - 结果不是更快更省，而是：
     - stable `fp8-mainline`：peak `6867.00 MiB`，inf `2.111 ms`，e2e `7.256 ms`
