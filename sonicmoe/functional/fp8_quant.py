@@ -59,8 +59,8 @@ def quantize_activation_blockwise(
 
     scale_fp32 = encoded_scale.float()
     scale_fp32 = torch.where(scale_fp32 > 0, scale_fp32, torch.ones_like(scale_fp32))
-    scale_for_div = scale_fp32.to(dtype=grouped_x.dtype)
-    scaled = grouped_x / scale_for_div.unsqueeze(-1)
+    scale_reciprocal = torch.reciprocal(scale_fp32).to(dtype=grouped_x.dtype)
+    scaled = grouped_x * scale_reciprocal.unsqueeze(-1)
     quantized = scaled.to(protocol.activation_torch_dtype).reshape(*grouped_shape[:-2], grouped_shape[-2] * grouped_shape[-1])
     quantized = quantized[..., :original_last_dim]
 

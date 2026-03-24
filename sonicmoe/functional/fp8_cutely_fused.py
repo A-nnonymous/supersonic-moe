@@ -66,6 +66,8 @@ def apply_preact_activation_fp8_protocol_cutely_fused(
     quack_enabled: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     protocol = validate_fp8_runtime_support(protocol or FP8Protocol(), preact.device, quack_enabled=quack_enabled)
+    if protocol.group_size != 128:
+        return apply_activation_fp8_protocol_cutely_fused(postact, protocol, quack_enabled=quack_enabled)
     padded_preact, original_postact_width = _pad_preact_for_group_size(preact, protocol.group_size)
     quantized, packed_scales = fused_weighted_swiglu_act_quant_best(
         padded_preact,

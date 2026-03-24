@@ -6,11 +6,10 @@ import os
 
 import torch
 import torch.nn.functional as F
-from quack.gemm_interface import gemm
-
 from ..count_cumsum import count_cumsum
 from ..enums import ActivationType, is_glu
-from ..quack_utils import gemm_dgated, gemm_gated
+from ..quack_utils import blockscaled_fp8_gemm, gemm_dgated, gemm_gated
+from quack.gemm_interface import gemm
 from .backward import (
     _down_projection_backward_act,
     _down_projection_backward_weight,
@@ -45,6 +44,10 @@ from .utils import enable_quack_gemm, is_using_quack_gemm
 
 def _use_cutely_fused_fp8_adapter() -> bool:
     return os.getenv("SONIC_MOE_FP8_CUTELY_FUSED", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _use_blockscaled_fp8_downproj() -> bool:
+    return os.getenv("SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ", "").lower() in {"1", "true", "yes", "on"}
 
 
 def general_routing_router_metadata(
@@ -297,6 +300,7 @@ class _DownProjection(torch.autograd.Function):
         num_activated_expert_per_token_offset: torch.Tensor,
         is_varlen_K: bool,
         activation_type: ActivationType,
+        fp8_protocol: FP8Protocol | None,
     ) -> torch.Tensor:
         TK = y1.size(0)
         H, I, E = w2.shape
@@ -305,7 +309,15 @@ class _DownProjection(torch.autograd.Function):
             assert not torch.compiler.is_compiling()
 
             assert b2 is None
-            y2 = gemm(y1, w2.permute(2, 1, 0), cu_seqlens_m=expert_frequency_offset)
+            if fp8_protocol is not None and _use_blockscaled_fp8_downproj():
+                y2 = blockscaled_fp8_gemm(
+                    y1,
+                    w2,
+                    expert_frequency_offset,
+                    protocol=fp8_protocol,
+                )
+            else:
+                y2 = gemm(y1, w2.permute(2, 1, 0), cu_seqlens_m=expert_frequency_offset)
         else:
             y2 = torch.empty(TK, H, dtype=y1.dtype, device=y1.device)
             _down_projection_forward(
@@ -445,7 +457,7 @@ class _DownProjection(torch.autograd.Function):
         if not is_varlen_K:
             ds = ds.view(T, K)
 
-        return None, dz, dw2, db2, ds, *[None] * 10
+        return None, dz, dw2, db2, ds, *[None] * 11
 
 
 def moe_TC_softmax_topk_layer(
@@ -532,6 +544,7 @@ def moe_TC_softmax_topk_layer(
         None,
         False,  # is_varlen_K
         activation_type,
+        fp8_protocol,
     )
 
     return o, router_logits, expert_frequency
@@ -609,6 +622,7 @@ def moe_general_routing_inputs(
         num_activated_expert_per_token_offset,
         True,  # is_varlen_K
         activation_type,
+        None,
     )
 
     return o, expert_frequency

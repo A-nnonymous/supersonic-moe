@@ -27,10 +27,13 @@ class FP8ScaleEncoding(Enum):
 
 
 class FP8ScaleGranularity(Enum):
+    BLOCK_1X32 = "1x32"
     BLOCK_1X128 = "1x128"
 
     @property
     def group_size(self) -> int:
+        if self is FP8ScaleGranularity.BLOCK_1X32:
+            return 32
         return 128
 
 
@@ -83,8 +86,11 @@ def validate_fp8_protocol(protocol: FP8Protocol) -> FP8Protocol:
     if protocol.scale_encoding is not FP8ScaleEncoding.E8M0:
         raise ValueError("Only e8m0 scales are supported in the current FP8 protocol")
 
-    if protocol.scale_granularity is not FP8ScaleGranularity.BLOCK_1X128:
-        raise ValueError("Only 1x128 scale granularity is supported in the current FP8 protocol")
+    if protocol.scale_granularity not in {
+        FP8ScaleGranularity.BLOCK_1X32,
+        FP8ScaleGranularity.BLOCK_1X128,
+    }:
+        raise ValueError("Only 1x32 and 1x128 scale granularities are supported in the current FP8 protocol")
 
     if protocol.backend is not FP8Backend.BLACKWELL:
         raise ValueError("The current FP8 protocol is Blackwell-only")

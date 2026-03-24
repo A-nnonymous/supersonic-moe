@@ -10,6 +10,10 @@ This directory is the live work log for the FP8 upgrade effort. It is not meant 
 - Blackwell path: QuACK-enabled (`USE_QUACK_GEMM=1`)
 - latest validated fork state: the current `fork-main-sync` working tree carrying the Blackwell FP8 protocol changes
 - latest targeted validation:
+  - stable Blackwell fp8 regression: `USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py`
+  - stable result: `10 passed`
+  - env-on blockscaled regression: `USE_QUACK_GEMM=1 SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1 SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY=128 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py`
+  - env-on blockscaled result: `10 passed`
   - serial: `python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py tests/moe_test.py`
   - serial result: `18 passed, 91 skipped`
   - opt-in parallel: `make test-blackwell-parallel PYTEST_WORKERS=2`
@@ -37,16 +41,43 @@ This directory is the live work log for the FP8 upgrade effort. It is not meant 
 - current protocol scope is intentionally constrained to:
   - activation dtype: `torch.float8_e4m3fn`
   - scale encoding: `torch.float8_e8m0fnu`
-  - scale granularity: `1x128`
+  - stable mainline scale granularity: `1x128`
   - runtime target: Blackwell + QuACK enabled
+- `1x32 ue8m0` blockscaled down-proj scaffolding is now in-tree:
+- `1x32 ue8m0` blockscaled down-proj experimental path is now runnable end-to-end with static aligned capacity:
+  - file: `sonicmoe/quack_utils/blockscaled_fp8_gemm.py`
+  - current implementation: static `expert capacity` + GPU pack/unpack transition path
+  - default status: disabled
+  - enable flag: `SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1`
+  - required contract: `SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY=<128 的整数倍>`
+  - current blocker: GPU pack/unpack overhead still dominates
 - current FP8 boundary path is still slower than baseline; see `reports/fp8_upgrade/ENGINEERING_LOG.md` for exact numbers
+- 最新 reciprocal 小里程碑已落地：
+  - `sonicmoe/functional/fp8_quant.py` 改为 reciprocal-multiply
+  - `cutify/ops/cute/fused_weighted_swiglu_act_quant.py` 的 4 组 scale 路径改为 `cute.arch.rcp_approx(...)`
+  - 局部量化微基准：`5.80%` 提速，`RMSE=0`
+- 当前最接近可交付的真实路径是稳定 `fp8-mainline`，不是 env-on blockscaled：
+  - 中等 shape `4096,4096,1024,128,8`
+  - 稳定 `fp8-mainline`：
+    - output RMSE：`0.01073638`
+    - bf16 peak / fp8 peak：`7049.88 / 6867.00 MiB`
+    - bf16 e2e / fp8 e2e：`7.338 / 7.693 ms`
+  - env-on blockscaled：
+    - output RMSE：`0.01073363`
+    - bf16 peak / fp8 peak：`7049.88 / 7396.13 MiB`
+    - bf16 e2e / fp8 e2e：`7.338 / 11.668 ms`
+- 因此当前下一优先级已经明确：
+  1. 继续消掉 blockscaled 的 `pack + quant + grouped_out` 过渡层；
+  2. 修掉更大 shape `8192,4096,1024,128,8` 在 preact fused quant kernel 上的 runtime crash；
+  3. 然后再继续 backward/mainloop 迁移。
 
 ## What the next agent should do first
 
 1. Read `reports/fp8_upgrade/HANDOFF.md`
 2. Confirm the environment with `source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate`
-3. Re-run `python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py tests/moe_test.py`
-4. Continue from the pre-SwiGLU fused path in `sonicmoe/functional/fp8_cutely_fused.py`, and start eating `topk_scores/prob` plus backward fusion into the same mainline
+3. Re-run `USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py`
+4. Continue from `sonicmoe/quack_utils/blockscaled_fp8_gemm.py`, and first remove GPU pack/unpack / make routing metadata directly produce static blockscaled layout
+5. 如果要快速复现实测差距，优先跑中等 shape `4096,4096,1024,128,8`，不要直接上当前会 crash 的 `8192,4096,1024,128,8`
 
 ## Working rule
 

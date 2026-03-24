@@ -2,7 +2,9 @@
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
 
+import os
 from dataclasses import replace
+from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
@@ -15,15 +17,19 @@ from sonicmoe import (
     apply_preact_activation_fp8_protocol_cutely_fused,
     FP8Protocol,
     FP8ScaleEncoding,
+    FP8ScaleGranularity,
     apply_activation_fp8_protocol,
     dequantize_activation_reference,
     enable_quack_gemm,
     get_default_fp8_protocol,
+    pack_blockscaled_1x32_scales,
     quantize_activation_reference,
     validate_fp8_protocol,
     validate_fp8_runtime_support,
 )
 from sonicmoe.enums import ActivationType
+from sonicmoe.functional.fp8_quant import quantize_activation_blockwise, round_scale_to_e8m0
+from sonicmoe.quack_utils import blockscaled_fp8_gemm
 
 from .test_commons import TestCommons
 
@@ -46,6 +52,18 @@ class FP8ProtocolTest(TestCommons):
 
         with self.assertRaisesRegex(ValueError, "Only e8m0 scales"):
             validate_fp8_protocol(replace(FP8Protocol(), scale_encoding=None))
+
+    def test_blockscaled_1x32_scale_pack_uses_sm100_tiled_storage(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required")
+
+        scales = torch.ones(8, 8, device="cuda", dtype=torch.float8_e8m0fnu)
+        packed = pack_blockscaled_1x32_scales(scales, cols=256)
+        self.assertEqual(tuple(packed.shape), (1, 1024))
+        self.assertEqual(packed.dtype, torch.float8_e8m0fnu)
+
+        protocol = validate_fp8_protocol(replace(FP8Protocol(), scale_granularity=FP8ScaleGranularity.BLOCK_1X32))
+        self.assertEqual(protocol.group_size, 32)
 
     def test_blackwell_fp8_protocol_runtime_and_reference_quant(self) -> None:
         if not torch.cuda.is_available():
@@ -81,6 +99,33 @@ class FP8ProtocolTest(TestCommons):
 
         self.assertEqual(restored.dtype, torch.float32)
         self.assertLess((restored - x.float()).abs().max().item(), 0.35)
+
+    def test_blockwise_quant_matches_divide_reference_after_e8m0_encoding(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required")
+
+        major, _ = torch.cuda.get_device_capability()
+        if major < 10:
+            self.skipTest("Blackwell-only test requires SM100+")
+
+        self.set_seed(_SEED)
+        protocol = get_default_fp8_protocol()
+        x = 0.25 * torch.randn(8, 256, device="cuda", dtype=torch.bfloat16)
+
+        quantized, scales = quantize_activation_blockwise(x, protocol)
+
+        grouped_x = x.reshape(8, 2, protocol.group_size)
+        amax = grouped_x.abs().amax(dim=-1).float()
+        raw_scale = amax / torch.finfo(protocol.activation_torch_dtype).max
+        safe_scale = torch.where(raw_scale > 0, raw_scale, torch.ones_like(raw_scale))
+        encoded_scale = round_scale_to_e8m0(safe_scale, protocol)
+        divide_reference = (
+            grouped_x / encoded_scale.float().to(dtype=grouped_x.dtype).unsqueeze(-1)
+        ).to(protocol.activation_torch_dtype).reshape_as(x)
+
+        self.assertEqual(scales.dtype, torch.float8_e8m0fnu)
+        torch.testing.assert_close(scales.float(), encoded_scale.float(), atol=0.0, rtol=0.0)
+        torch.testing.assert_close(quantized.float(), divide_reference.float(), atol=0.0, rtol=0.0)
 
     def test_blackwell_fp8_protocol_boundary_keeps_finite_forward_backward(self) -> None:
         if not torch.cuda.is_available():
@@ -120,6 +165,103 @@ class FP8ProtocolTest(TestCommons):
         self.assertEqual(tuple(scales.shape), (4, 2))
         self.assertEqual(tuple(restored.shape), (4, 130))
         self.assertFalse(torch.isnan(restored.float()).any().item())
+
+    def test_blockscaled_downproj_rejects_unaligned_static_capacity(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required")
+
+        major, _ = torch.cuda.get_device_capability()
+        if major < 10:
+            self.skipTest("Blackwell-only test requires SM100+")
+
+        self.set_seed(_SEED)
+        protocol = get_default_fp8_protocol()
+        moe = MoE(
+            num_experts=128,
+            num_experts_per_tok=8,
+            hidden_size=768,
+            intermediate_size=256,
+            activation_function=ActivationType.SWIGLU,
+            add_bias=False,
+            std=0.02,
+        ).to(device="cuda", dtype=torch.bfloat16)
+        x = (0.02 * torch.randn(256, 768, device="cuda", dtype=torch.bfloat16)).detach().requires_grad_()
+
+        with patch.dict(
+            os.environ,
+            {
+                "SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ": "1",
+                "SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY": "127",
+            },
+            clear=False,
+        ):
+            with enable_quack_gemm(True):
+                with self.assertRaisesRegex(RuntimeError, "SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY"):
+                    moe(x, kernel_backend_moe=KernelBackendMoE.sonicmoe, fp8_protocol=protocol)
+
+    def test_blockscaled_downproj_boundary_keeps_finite_forward_backward_with_static_capacity(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required")
+
+        major, _ = torch.cuda.get_device_capability()
+        if major < 10:
+            self.skipTest("Blackwell-only test requires SM100+")
+
+        self.set_seed(_SEED)
+        protocol = get_default_fp8_protocol()
+
+        moe = MoE(
+            num_experts=128,
+            num_experts_per_tok=8,
+            hidden_size=768,
+            intermediate_size=256,
+            activation_function=ActivationType.SWIGLU,
+            add_bias=False,
+            std=0.02,
+        ).to(device="cuda", dtype=torch.bfloat16)
+
+        x = (0.02 * torch.randn(256, 768, device="cuda", dtype=torch.bfloat16)).detach().requires_grad_()
+        dout = 0.02 * torch.randn_like(x)
+
+        with patch.dict(
+            os.environ,
+            {
+                "SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ": "1",
+                "SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY": "128",
+            },
+            clear=False,
+        ):
+            with enable_quack_gemm(True):
+                y, _ = moe(x, kernel_backend_moe=KernelBackendMoE.sonicmoe, fp8_protocol=protocol)
+                y.backward(dout)
+
+        self.assertFalse(torch.isnan(y.float()).any().item())
+        self.assertIsNotNone(x.grad)
+        self.assertFalse(torch.isnan(x.grad.float()).any().item())
+
+    def test_blockscaled_downproj_rejects_insufficient_capacity(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required")
+
+        major, _ = torch.cuda.get_device_capability()
+        if major < 10:
+            self.skipTest("Blackwell-only test requires SM100+")
+
+        protocol = get_default_fp8_protocol()
+        a = torch.randn(129, 256, device="cuda", dtype=torch.bfloat16)
+        w2 = torch.randn(256, 256, 2, device="cuda", dtype=torch.bfloat16)
+        cu_seqlens_m = torch.tensor([0, 129, 129], device="cuda", dtype=torch.int32)
+
+        with patch.dict(
+            os.environ,
+            {
+                "SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ": "1",
+                "SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY": "128",
+            },
+            clear=False,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "smaller than the routed expert load"):
+                blockscaled_fp8_gemm(a, w2, cu_seqlens_m, protocol=protocol)
 
     def test_cutely_fused_adapter_matches_reference_contract(self) -> None:
         if not torch.cuda.is_available():
