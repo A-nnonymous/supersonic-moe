@@ -23,7 +23,7 @@ class MoETest(TestCommons):
             [torch.device("cuda")],
             [torch.bfloat16],
             [
-                ((16384 + 512) * 16, 512, 512, 128, 8)
+                ((16384 + 512) * 16, 512, 512, 128, 8),
                 (8192, 768, 256, 128, 8),
                 (8192, 768, 512, 64, 4),
                 (8192, 768, 1024, 32, 2),
@@ -53,6 +53,11 @@ class MoETest(TestCommons):
         add_bias: bool,
         use_quack_gemm: bool,
     ) -> None:
+        if device.type == "cuda":
+            major, _ = torch.cuda.get_device_capability(device)
+            if major >= 10 and not use_quack_gemm:
+                self.skipTest("Blackwell requires the QuACK path for the sonicmoe kernel backend")
+
         if use_quack_gemm and (is_compiling or add_bias):
             self.skipTest("unsupported test")
 
@@ -105,7 +110,8 @@ class MoETest(TestCommons):
         W = list(moe.parameters())
 
         with torch.autocast(x_torch.device.type, torch.float32):
-            kernel_grads = torch.autograd.grad(y_kernel, [x_kernel] + W, grad_outputs=dy_kernel, retain_graph=True)
+            with enable_quack_gemm(use_quack_gemm):
+                kernel_grads = torch.autograd.grad(y_kernel, [x_kernel] + W, grad_outputs=dy_kernel, retain_graph=True)
             torch_grads = torch.autograd.grad(y_torch, [x_torch] + W, grad_outputs=dy_torch, retain_graph=True)
 
             for _torch_grad, _kernel_grad in zip(torch_grads, kernel_grads):

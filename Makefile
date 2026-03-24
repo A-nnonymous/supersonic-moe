@@ -13,6 +13,9 @@ install-dev:
 test:
 	pytest tests
 
+test-blackwell:
+	USE_QUACK_GEMM=1 python -m pytest -q tests/moe_blackwell_test.py
+
 test-debug:
 	DEBUG_CUTOTUNE=1 TRITON_PRINT_AUTOTUNING=1 pytest -s tests
 
