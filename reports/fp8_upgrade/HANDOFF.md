@@ -5,6 +5,25 @@ This is the minimum context a new agent needs to continue work without replaying
 ## 0. 最新中文结论
 
 - 新结论（这一轮最重要）：
+  - 已经把理论显存 / FLOPs 账接入 benchmark：
+    - 新开关：`--report_fp8_analysis`
+  - 核心结论：
+    - 稳定 `fp8-mainline` 当前慢，不是因为 FP8 GEMM 本身慢；
+    - 而是因为 `z -> quant -> dequant -> bf16 y1 -> down-proj` 这条边界搬运太多；
+    - 真正省下来的 payload 很小，抵不过额外边界流量
+  - `8192,4096,1024,128,8`：
+    - 稳定 `fp8` 边界理论流量下界：`516.00 MiB`
+    - 真正节省下来的 payload：`62.00 MiB`
+    - 实测：bf16 e2e `12.202 ms`，稳定 fp8 e2e `13.096 ms`
+  - `4096,4096,1024,128,8` 且 `capacity=1024`：
+    - `grouped_out_bf16` 理论大小：`1024.00 MiB`
+    - 这直接解释了为什么当前 blockscaled 仍然很难赢
+- 因此当前第一优先级再次变化：
+  1. 优先把稳定 `fp8-mainline` 改成“量化后激活直接进入 down-proj mainloop”，去掉反量化回 bf16；
+  2. 同时把激活/权重精度路径做成外部可控开关，逐步支持更激进的全流程 FP8；
+  3. blockscaled 只有在能直接吃掉 `grouped_out` / router 边界时才继续重投入。
+
+- 新结论（这一轮最重要）：
   - 已经补上真实路径的阶段显存 probe：
     - benchmark 开关：`--report_stage_memory`
     - 底层 env 开关：`SONIC_MOE_STAGEWISE_MEMORY=1`
@@ -90,6 +109,7 @@ This is the minimum context a new agent needs to continue work without replaying
   - `operator-incubator` 当前不是 git repo；
   - 所以上面这条 fused kernel reciprocal 改动只存在于本地 workspace，**不会**自动跟随 SonicMoE 的 git commit/push 传播。
   - 本轮的“大 row-count vec4 fallback”也同样只存在于本地 workspace。
+  - 本轮的“大 row-count vec4 分块 launch / 阈值调优”也同样只存在于本地 workspace。
   - 下一任 agent 如果换了机器或重置了该目录，需要手工同步这处改动。
 - 这一步已经验证：
   - SonicMoE blockwise quant 对旧 divide reference **完全等价**；

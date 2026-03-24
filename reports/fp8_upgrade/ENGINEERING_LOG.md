@@ -2,6 +2,108 @@
 
 This log records concrete code changes plus their immediate validation and performance numbers.
 
+## 2026-03-24 - 用理论显存 / FLOPs 账解释为什么当前 FP8 还会慢
+
+### 指标注释（先看这个）
+
+- 精度基线：官方 `bf16` 路径。
+- 显存基线：官方 `bf16` 路径。
+- 性能基线：同 shape 官方 `bf16` 与当前稳定 `fp8-mainline` / env-on `blockscaled`。
+- 本轮收益来源：
+  - 不是直接性能提升；
+  - 而是把“FP8 为什么还没赢”从猜测变成可重复打印的理论账 + 实测账。
+- 重要说明：
+  - 新增 benchmark 开关：`--report_fp8_analysis`
+  - 它会打印：
+    - 权重大小
+    - 关键中间结果大小
+    - 稳定 `fp8-mainline` 边界流量的理论下界
+    - blockscaled 静态布局 buffer 的理论大小
+
+### 改动
+
+- 在 `benchmarks/moe-cute.py` 中新增：
+  - `--report_fp8_analysis`
+  - 输出内容包括：
+    - `w1/w2` 理论显存
+    - `x / z / postact_bf16 / postact_fp8 / scales_f32 / scales_e8m0`
+    - `stable_fp8_boundary_lower_bound_mib`
+    - `stable_fp8_saved_payload_mib`
+    - 如果 env-on `blockscaled`：
+      - `grouped_out_bf16_mib`
+      - `grouped_a_fp8_mib`
+      - `grouped_a_scale_e8m0_mib`
+
+### 为什么稳定 `fp8-mainline` 还没赢
+
+#### shape `8192,4096,1024,128,8`
+
+- 理论账：
+  - `w1/w2` 权重总大小：`3072.00 MiB`
+  - `x`：`64.00 MiB`
+  - `z`（pre-SwiGLU）：`256.00 MiB`
+  - `postact_bf16`：`128.00 MiB`
+  - `postact_fp8`：`64.00 MiB`
+  - `scales_f32`：`2.00 MiB`
+  - `scales_e8m0`：`0.50 MiB`
+  - 稳定 `fp8` 边界理论流量下界：`516.00 MiB`
+  - 真正节省下来的 payload：`62.00 MiB`
+- 实测账：
+  - bf16：peak `7690.63 MiB`，inf `4.147 ms`，e2e `12.202 ms`
+  - 稳定 `fp8-mainline`：peak `7572.75 MiB`，inf `4.404 ms`，e2e `13.096 ms`
+  - output RMSE：`0.01074074`
+  - loss RMSE：`0.00000025`
+
+结论：
+
+- 当前稳定 `fp8-mainline` 的问题，不是权重太大：
+  - `w1/w2` 在 bf16 和当前 fp8 路径里都还是 bf16，理论上没有变小；
+- 也不是 FP8 计算本身慢：
+  - benchmark 打出来的 GEMM TFLOPS 仍然很高；
+- 真正的问题是：
+  - 现在路径是 `z -> fused quant -> fused dequant -> bf16 y1 -> down-proj`
+  - 这条边界引入了大量额外搬运；
+  - 但真正省下来的只是 `postact_bf16` 到 `postact_fp8+scale` 这一点点 payload
+  - 因此 **“节省量 < 额外边界流量”**，性能自然很难超过 bf16
+- 这说明稳定主线下一步真正应该做的是：
+  - 不是继续优化 quant/dequant 小细节；
+  - 而是让量化后的激活 **直接进入 down-proj mainloop**，去掉 `dequant -> bf16` 这层回退
+
+### 为什么当前 blockscaled 还没赢
+
+#### shape `4096,4096,1024,128,8`，`capacity=1024`
+
+- 理论账：
+  - `grouped_out_bf16`：`1024.00 MiB`
+  - `grouped_a_fp8`：`128.00 MiB`
+  - `grouped_a_scale_e8m0`：`4.00 MiB`
+  - 同 shape 稳定 `fp8` 边界理论流量下界：`258.00 MiB`
+  - 同 shape 稳定 `fp8` 真正节省下来的 payload：`31.00 MiB`
+- 实测账：
+  - env-on `blockscaled`：peak `7396.25 MiB`，inf `3.776 ms`，e2e `11.211 ms`
+  - 同 shape bf16：peak `7049.88 MiB`，e2e `7.338 ms`
+  - 同 shape 稳定 `fp8-mainline`：final peak `7050.88 MiB`（stagewise），e2e `7.562~7.693 ms`
+
+结论：
+
+- blockscaled 当前输，不是前半段 pack+quant 还不够好；
+- 而是 `grouped_out` 这种静态对齐输出 buffer 本身太大；
+- 只要 `grouped_out` 还在，显存和 e2e 都很难赢；
+- 所以后续 blockscaled 方向只有一个值得继续投入的点：
+  - 让 GEMM 直接写 router 可消费布局
+  - 或者让 router 原生消费当前 grouped 布局
+
+### 当前最高优先级（已根据理论账更新）
+
+1. 稳定 `fp8-mainline`：
+   - 目标是量化后激活直接进入 down-proj mainloop
+   - 同时引入外部开关，逐步控制激活 / 权重的精度路径
+2. env-on `blockscaled`：
+   - 只有在能直接吃掉 `grouped_out` / router 边界时才继续重投入
+3. 长期目标：
+   - 最激进情况下实现前后向 GEMM 全流程 FP8
+   - 但短期必须先把“量化后立刻反量化”的浪费拿掉
+
 ## 2026-03-24 - 用阶段显存 probe 锁定热点，并修掉 `8192` preact fused quant crash
 
 ### 指标注释（先看这个）

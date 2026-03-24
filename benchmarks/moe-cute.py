@@ -106,6 +106,12 @@ def parse_arguments() -> argparse.Namespace:
         default=False,
         help="Print stagewise CUDA memory stats for one real training-mode forward/backward pass",
     )
+    parser.add_argument(
+        "--report_fp8_analysis",
+        action="store_true",
+        default=False,
+        help="Print theoretical weight/activation memory and FP8 boundary traffic analysis",
+    )
     args = parser.parse_args()
 
     if len(args.thiek) != 5:
@@ -121,6 +127,54 @@ def our_e2e_fwd_bwd_call(moe, x, dout):
     x.grad = w1.grad = w2.grad = router_w.grad = None
 
 
+def _mib(numel: int, bytes_per_elem: int) -> float:
+    return numel * bytes_per_elem / (1024**2)
+
+
+def _print_fp8_theory_report(
+    *,
+    thiek: Tuple[int, int, int, int, int],
+    fp8_enabled: bool,
+) -> None:
+    T, H, I, E, K = thiek
+    TK = T * K
+    scale_cols_128 = I // 128
+
+    w1_mib = _mib(E * 2 * I * H, 2)
+    w2_mib = _mib(E * I * H, 2)
+    x_mib = _mib(T * H, 2)
+    z_mib = _mib(TK * 2 * I, 2)
+    postact_bf16_mib = _mib(TK * I, 2)
+    postact_fp8_mib = _mib(TK * I, 1)
+    scales_f32_mib = _mib(TK * scale_cols_128, 4)
+    scales_e8m0_mib = _mib(TK * scale_cols_128, 1)
+
+    stable_fp8_boundary_lower_bound_mib = z_mib + postact_fp8_mib + scales_f32_mib + postact_fp8_mib + scales_f32_mib + postact_bf16_mib
+    stable_fp8_saved_payload_mib = postact_bf16_mib - (postact_fp8_mib + scales_f32_mib)
+
+    print0(
+        "[bold yellow]Theoretical memory / compute analysis[/bold yellow] "
+        f"weights_mib(w1={w1_mib:.2f}, w2={w2_mib:.2f}, total={w1_mib + w2_mib:.2f}); "
+        f"activations_mib(x={x_mib:.2f}, z={z_mib:.2f}, postact_bf16={postact_bf16_mib:.2f}, "
+        f"postact_fp8={postact_fp8_mib:.2f}, scales_f32={scales_f32_mib:.2f}, scales_e8m0={scales_e8m0_mib:.2f}); "
+        f"stable_fp8_boundary_lower_bound_mib={stable_fp8_boundary_lower_bound_mib:.2f}; "
+        f"stable_fp8_saved_payload_mib={stable_fp8_saved_payload_mib:.2f}"
+    )
+
+    blockscaled_capacity = os.getenv("SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY")
+    if fp8_enabled and os.getenv("SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ", "").lower() in {"1", "true", "yes", "on"}:
+        if blockscaled_capacity is not None:
+            capacity = int(blockscaled_capacity)
+            grouped_out_mib = _mib(E * capacity * H, 2)
+            grouped_a_fp8_mib = _mib(E * capacity * I, 1)
+            grouped_scale_1x32_mib = _mib(E * capacity * (I // 32), 1)
+            print0(
+                "[bold yellow]Blockscaled static-layout analysis[/bold yellow] "
+                f"capacity={capacity}; grouped_out_bf16_mib={grouped_out_mib:.2f}; "
+                f"grouped_a_fp8_mib={grouped_a_fp8_mib:.2f}; grouped_a_scale_e8m0_mib={grouped_scale_1x32_mib:.2f}"
+            )
+
+
 def run(
     thiek: Tuple[int, int, int, int, int],
     dtype: Type[cutlass.Numeric],
@@ -130,6 +184,7 @@ def run(
     fp8_protocol: Type[str],
     report_fp8_metrics: Type[bool],
     report_stage_memory: Type[bool],
+    report_fp8_analysis: Type[bool],
     **kwargs,
 ):
     torch_dtype = {cutlass.BFloat16: torch.bfloat16, cutlass.Float16: torch.float16}[dtype]
@@ -140,6 +195,8 @@ def run(
     T, H, I, E, K = thiek
     TK = T * K
     print(f"T {T}, I {I}, H {H}, E {E}, K {K}")
+    if report_fp8_analysis:
+        _print_fp8_theory_report(thiek=thiek, fp8_enabled=fp8_protocol_config is not None)
 
     random.seed(1111)
     torch.manual_seed(1111)
@@ -460,5 +517,6 @@ if __name__ == "__main__":
         args.fp8_protocol,
         args.report_fp8_metrics,
         args.report_stage_memory,
+        args.report_fp8_analysis,
     )
     print("PASS")

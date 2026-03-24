@@ -20,6 +20,7 @@ This directory is the live work log for the FP8 upgrade effort. It is not meant 
   - parallel result: `18 passed, 91 skipped in 168.14s`
   - multi-GPU dry-run: `python tools/run_blackwell_test_shards.py --gpus 0,1,2 --dry-run`
   - fp8 metric probe: `USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 1024,512,512,32,4 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_fp8_metrics`
+  - fp8 theory probe: `USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 8192,4096,1024,128,8 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_fp8_metrics --report_fp8_analysis`
   - stagewise memory probe: `USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 4096,4096,1024,128,8 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_stage_memory`
   - latest fused-path validation:
     - `USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py -k 'preact_cutely_fused_path_matches_reference_boundary or boundary_keeps_finite_forward_backward or blackwell_fp8_protocol_runtime_and_reference_quant'`
@@ -74,12 +75,17 @@ This directory is the live work log for the FP8 upgrade effort. It is not meant 
 - 更大真实 shape 已可跑通：
   - shape `8192,4096,1024,128,8`
   - 官方 bf16：peak `7690.63 MiB`，e2e `12.202 ms`
-  - 稳定 `fp8-mainline`：output RMSE `0.01074074`，loss RMSE `0.00000025`，peak `7572.75 MiB`，e2e `12.972 ms`
-  - 结论：大 shape crash 已通过本地 fallback 消掉，但稳定主线性能仍慢 `6.31%`
+  - 稳定 `fp8-mainline`：output RMSE `0.01074074`，loss RMSE `0.00000025`，peak `7572.75 MiB`，e2e `13.096 ms`
+  - 理论账：stable fp8 边界流量下界 `516.00 MiB`，真正节省 payload 仅 `62.00 MiB`
+  - 结论：大 shape crash 已通过本地 fallback / 分块 vec4 路径消掉，但稳定主线性能仍慢，主因是 `quant -> dequant -> bf16` 边界搬运
+- blockscaled 的理论账也已明确：
+  - shape `4096,4096,1024,128,8`，`capacity=1024`
+  - `grouped_out_bf16` 理论大小 `1024.00 MiB`
+  - 结论：这就是当前 blockscaled 很难在显存 / e2e 上赢过 bf16 的核心原因
 - 因此当前下一优先级已经明确：
-  1. 优先优化稳定 `fp8-mainline` 大 row-count preact quant 路径，恢复高性能 vec4 fast path；
-  2. blockscaled 只在能直接吃掉 `grouped_out` / router 聚合过渡层时继续重投入；
-  3. 然后再继续 backward/mainloop 迁移。
+  1. 优先优化稳定 `fp8-mainline`，让量化后激活直接进入 down-proj mainloop，去掉反量化回 bf16；
+  2. 同时把激活 / 权重精度路径逐步做成外部可控开关，朝全流程 FP8 推进；
+  3. blockscaled 只在能直接吃掉 `grouped_out` / router 聚合过渡层时继续重投入。
 - 最新进展补充：
   - blockscaled 已经吃掉 `grouped_a` 物化，改成 `pack+quant` 融合；
   - 中等 shape `4096,4096,1024,128,8`：
