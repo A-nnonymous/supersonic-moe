@@ -5,6 +5,21 @@ This is the minimum context a new agent needs to continue work without replaying
 ## 0. 最新中文结论
 
 - 新结论（这一轮最重要）：
+  - `ue8m0` 运行时 preact-scale 实验已经**完整回读**；
+  - 在加了 capture-safe guard 之后，它是安全的，但 cudagraph capture 下会自动回退；
+  - 当前没有拿到可重复、可归因的确定性能收益，因此**没有落地主线**，只保留在工程记录中。
+- 新结论（这一轮最重要）：
+  - 已经在主线补上“每一步精度由外部开关控制”的第一层骨架：
+    - `SONIC_MOE_FP8_UPPROJ_EPILOGUE_PRECISION={bf16,fp8}`
+    - `SONIC_MOE_FP8_DOWNPROJ_MAINLOOP_PRECISION={bf16,fp8-blockscaled}`
+    - `SONIC_MOE_FP8_DOWNPROJ_WEIGHT_PRECISION={bf16,fp8}`
+  - 旧开关 `SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1` 仍兼容；
+  - 当前唯一明确限制：
+    - `SONIC_MOE_FP8_DOWNPROJ_WEIGHT_PRECISION=fp8` 只允许和 `fp8-blockscaled` mainloop 组合使用。
+- 最新验证：
+  - `USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py`
+  - 结果：`15 passed`
+- 新结论（这一轮最重要）：
   - 已经去掉运行时无用的 scale decode；
   - inference 模式下也不再做 STE 混合；
   - 这两项都是低风险边界缩减，不改训练语义。
@@ -24,6 +39,9 @@ This is the minimum context a new agent needs to continue work without replaying
     - inference 领先 bf16
   - 但 training/e2e 仍慢，根因仍是 `quant -> dequant -> bf16` 回退；
   - 下一步必须打通“量化后激活直喂 down-proj mainloop”。
+- 工程化提醒：
+  - 如果只是想做真实主线优化，请**不要**重新把 `SONIC_MOE_FP8_PREACT_UE8M0_SCALE` 那条实验逻辑加回去；
+  - 除非先证明它在非 capture 路径下有稳定收益，并且不会把 graph capture 再次打坏。
 - 关于 float8 mainloop scout 的结论：
   - `grouped_gemm.py` 的核心 kernel 对 8-bit dtype 有一定支持；
   - 但当前 SonicMoE 直接路径没有现成的“带 scale 的 FP8 grouped mainloop”可无缝复用；

@@ -52,8 +52,63 @@ def _use_cutely_fused_fp8_adapter() -> bool:
     return os.getenv("SONIC_MOE_FP8_CUTELY_FUSED", "").lower() in {"1", "true", "yes", "on"}
 
 
-def _use_blockscaled_fp8_downproj() -> bool:
+def _parse_runtime_precision(name: str, default: str, allowed: set[str]) -> str:
+    value = os.getenv(name, "").strip().lower()
+    if not value:
+        return default
+    if value not in allowed:
+        allowed_list = ", ".join(sorted(allowed))
+        raise RuntimeError(f"{name} must be one of {{{allowed_list}}}, but got {value!r}")
+    return value
+
+
+def _legacy_blockscaled_fp8_downproj_enabled() -> bool:
     return os.getenv("SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _upproj_epilogue_precision() -> str:
+    return _parse_runtime_precision(
+        "SONIC_MOE_FP8_UPPROJ_EPILOGUE_PRECISION",
+        default="fp8",
+        allowed={"bf16", "fp8"},
+    )
+
+
+def _downproj_mainloop_precision() -> str:
+    legacy_default = "fp8-blockscaled" if _legacy_blockscaled_fp8_downproj_enabled() else "bf16"
+    return _parse_runtime_precision(
+        "SONIC_MOE_FP8_DOWNPROJ_MAINLOOP_PRECISION",
+        default=legacy_default,
+        allowed={"bf16", "fp8-blockscaled"},
+    )
+
+
+def _downproj_weight_precision() -> str:
+    default = "fp8" if _downproj_mainloop_precision() == "fp8-blockscaled" else "bf16"
+    return _parse_runtime_precision(
+        "SONIC_MOE_FP8_DOWNPROJ_WEIGHT_PRECISION",
+        default=default,
+        allowed={"bf16", "fp8"},
+    )
+
+
+def _use_blockscaled_fp8_downproj() -> bool:
+    return _downproj_mainloop_precision() == "fp8-blockscaled"
+
+
+def _validate_runtime_precision_switches(fp8_protocol: FP8Protocol | None) -> None:
+    upproj_precision = _upproj_epilogue_precision()
+    downproj_mainloop_precision = _downproj_mainloop_precision()
+    downproj_weight_precision = _downproj_weight_precision()
+
+    if fp8_protocol is None:
+        return
+
+    if downproj_weight_precision == "fp8" and downproj_mainloop_precision != "fp8-blockscaled":
+        raise RuntimeError(
+            "SONIC_MOE_FP8_DOWNPROJ_WEIGHT_PRECISION=fp8 currently requires "
+            "SONIC_MOE_FP8_DOWNPROJ_MAINLOOP_PRECISION=fp8-blockscaled"
+        )
 
 
 def _stage_memory_debug_enabled() -> bool:
@@ -526,6 +581,7 @@ def moe_TC_softmax_topk_layer(
     assert ((b1 is None) and (b2 is None)) or (
         (b1 is not None) and (b2 is not None)
     ), "b1 and b2 has to be None or not None at the same time!"
+    _validate_runtime_precision_switches(fp8_protocol)
     E = router_w.size(0)
     _reset_stage_memory_probe()
     router_logits = F.linear(x, router_w)
@@ -569,7 +625,7 @@ def moe_TC_softmax_topk_layer(
     )
     _log_stage_memory("forward:up-proj")
 
-    if fp8_protocol is not None:
+    if fp8_protocol is not None and _upproj_epilogue_precision() == "fp8":
         _reset_stage_memory_probe()
         if is_using_quack_gemm():
             y1, _ = apply_preact_activation_fp8_protocol_cutely_fused(

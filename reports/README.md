@@ -8,10 +8,10 @@ This directory is the live work log for the FP8 upgrade effort. It is not meant 
 
 - authoritative Python environment: `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer`
 - Blackwell path: QuACK-enabled (`USE_QUACK_GEMM=1`)
-- latest validated fork state: `1c01fc9` on `fork-main-sync`, plus uncommitted stage-memory probe changes in SonicMoE and local fallback changes in `operator-incubator`
+- latest validated fork state: `80271c3` on `fork-main-sync`, plus local vec4 fallback / chunked-launch changes in `operator-incubator`
 - latest targeted validation:
   - stable Blackwell fp8 regression: `USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py`
-  - stable result: `13 passed`
+  - stable result: `15 passed`
   - env-on blockscaled regression: `USE_QUACK_GEMM=1 SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1 SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY=128 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py`
   - env-on blockscaled result: `13 passed`
   - serial: `python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py tests/moe_test.py`
@@ -90,6 +90,14 @@ This directory is the live work log for the FP8 upgrade effort. It is not meant 
   1. 优先优化稳定 `fp8-mainline`，让量化后激活直接进入 down-proj mainloop，去掉反量化回 bf16；
   2. 同时把激活 / 权重精度路径逐步做成外部可控开关，朝全流程 FP8 推进；
   3. blockscaled 只在能直接吃掉 `grouped_out` / router 聚合过渡层时继续重投入。
+- 本轮新增的运行时精度开关：
+  - `SONIC_MOE_FP8_UPPROJ_EPILOGUE_PRECISION={bf16,fp8}`
+  - `SONIC_MOE_FP8_DOWNPROJ_MAINLOOP_PRECISION={bf16,fp8-blockscaled}`
+  - `SONIC_MOE_FP8_DOWNPROJ_WEIGHT_PRECISION={bf16,fp8}`
+  - 默认行为不变；旧开关 `SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1` 仍兼容
+- 本轮明确不落地主线的实验：
+  - `SONIC_MOE_FP8_PREACT_UE8M0_SCALE`
+  - 原因：capture-safe 后虽然安全，但 graph capture 下会自动回退，暂未形成可重复、可归因的确定收益
 - 最新进展补充：
   - blockscaled 已经吃掉 `grouped_a` 物化，改成 `pack+quant` 融合；
   - 中等 shape `4096,4096,1024,128,8`：

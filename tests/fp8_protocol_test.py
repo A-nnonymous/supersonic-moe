@@ -9,6 +9,7 @@ from unittest.mock import patch
 import torch
 import torch.nn.functional as F
 
+import sonicmoe.functional as functional
 from sonicmoe import (
     FP8ActivationDType,
     KernelBackendMoE,
@@ -180,6 +181,80 @@ class FP8ProtocolTest(TestCommons):
         self.assertEqual(tuple(scales.shape), (4, 2))
         self.assertEqual(tuple(restored.shape), (4, 130))
         self.assertFalse(torch.isnan(restored.float()).any().item())
+
+    def test_fp8_runtime_switch_can_disable_upproj_epilogue_quant(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required")
+
+        major, _ = torch.cuda.get_device_capability()
+        if major < 10:
+            self.skipTest("Blackwell-only test requires SM100+")
+
+        self.set_seed(_SEED)
+        protocol = get_default_fp8_protocol()
+        moe = MoE(
+            num_experts=128,
+            num_experts_per_tok=8,
+            hidden_size=768,
+            intermediate_size=256,
+            activation_function=ActivationType.SWIGLU,
+            add_bias=False,
+            std=0.02,
+        ).to(device="cuda", dtype=torch.bfloat16)
+        x = (0.02 * torch.randn(256, 768, device="cuda", dtype=torch.bfloat16)).detach().requires_grad_()
+        dout = 0.02 * torch.randn_like(x)
+
+        with patch.dict(
+            os.environ,
+            {
+                "SONIC_MOE_FP8_UPPROJ_EPILOGUE_PRECISION": "bf16",
+                "SONIC_MOE_FP8_DOWNPROJ_MAINLOOP_PRECISION": "bf16",
+                "SONIC_MOE_FP8_DOWNPROJ_WEIGHT_PRECISION": "bf16",
+            },
+            clear=False,
+        ):
+            with patch.object(functional, "apply_preact_activation_fp8_protocol_cutely_fused", wraps=functional.apply_preact_activation_fp8_protocol_cutely_fused) as patched:
+                with enable_quack_gemm(True):
+                    y, _ = moe(x, kernel_backend_moe=KernelBackendMoE.sonicmoe, fp8_protocol=protocol)
+                    y.backward(dout)
+
+        patched.assert_not_called()
+        self.assertFalse(torch.isnan(y.float()).any().item())
+        self.assertIsNotNone(x.grad)
+        self.assertFalse(torch.isnan(x.grad.float()).any().item())
+
+    def test_fp8_runtime_switch_rejects_fp8_downproj_weights_without_fp8_mainloop(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required")
+
+        major, _ = torch.cuda.get_device_capability()
+        if major < 10:
+            self.skipTest("Blackwell-only test requires SM100+")
+
+        self.set_seed(_SEED)
+        protocol = get_default_fp8_protocol()
+        moe = MoE(
+            num_experts=128,
+            num_experts_per_tok=8,
+            hidden_size=768,
+            intermediate_size=256,
+            activation_function=ActivationType.SWIGLU,
+            add_bias=False,
+            std=0.02,
+        ).to(device="cuda", dtype=torch.bfloat16)
+        x = (0.02 * torch.randn(256, 768, device="cuda", dtype=torch.bfloat16)).detach().requires_grad_()
+
+        with patch.dict(
+            os.environ,
+            {
+                "SONIC_MOE_FP8_DOWNPROJ_MAINLOOP_PRECISION": "bf16",
+                "SONIC_MOE_FP8_DOWNPROJ_WEIGHT_PRECISION": "fp8",
+            },
+            clear=False,
+        ):
+            with enable_quack_gemm(True):
+                with self.assertRaisesRegex(RuntimeError, "SONIC_MOE_FP8_DOWNPROJ_WEIGHT_PRECISION=fp8"):
+                    moe(x, kernel_backend_moe=KernelBackendMoE.sonicmoe, fp8_protocol=protocol)
 
     def test_blockscaled_downproj_rejects_unaligned_static_capacity(self) -> None:
         if not torch.cuda.is_available():

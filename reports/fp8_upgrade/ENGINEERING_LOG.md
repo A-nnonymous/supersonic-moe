@@ -2,6 +2,75 @@
 
 This log records concrete code changes plus their immediate validation and performance numbers.
 
+## 2026-03-24 - 收口 ue8m0 运行时实验，并补上外部精度开关骨架
+
+### 指标注释（先看这个）
+
+- 精度基线：当前稳定 `fp8-mainline` 默认行为。
+- 稳定性基线：上一轮 Blackwell 主回归 `13 passed`。
+- 性能基线：上一轮稳定 `fp8-mainline@8192,4096,1024,128,8`：
+  - inf `3.933 ms`
+  - e2e `12.888 ms`
+  - peak `7572.75 MiB`
+- 收益来源：
+  - 把“每一步精度由外部开关控制”的合同显式化，避免后续全流程 FP8 演进继续依赖隐式 env；
+  - 对 `ue8m0` 运行时实验做真实回读，确认其在 graph capture 下会自动回退，因此本轮不把这条收益不确定的实验路径带进主线。
+
+### 改动
+
+- 在 `sonicmoe/functional/__init__.py` 中新增运行时精度开关解析：
+  - `SONIC_MOE_FP8_UPPROJ_EPILOGUE_PRECISION={bf16,fp8}`
+  - `SONIC_MOE_FP8_DOWNPROJ_MAINLOOP_PRECISION={bf16,fp8-blockscaled}`
+  - `SONIC_MOE_FP8_DOWNPROJ_WEIGHT_PRECISION={bf16,fp8}`
+- 保持与旧环境变量兼容：
+  - 如果未显式设置新开关，仍会继续识别 `SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1`
+- 新增运行时约束：
+  - `SONIC_MOE_FP8_DOWNPROJ_WEIGHT_PRECISION=fp8` 目前只允许与 `SONIC_MOE_FP8_DOWNPROJ_MAINLOOP_PRECISION=fp8-blockscaled` 组合使用
+- 在 `tests/fp8_protocol_test.py` 中新增两条回归：
+  - 可显式关闭 up-proj epilogue FP8 boundary，且前反向保持有限值
+  - 非法组合（fp8 weight + bf16 mainloop）会显式报错
+- 在 `sonicmoe/functional/fp8_cutely_fused.py` 中收回未准备落地主线的 `SONIC_MOE_FP8_PREACT_UE8M0_SCALE` 实验逻辑，避免后续 handoff 误把它当成稳定收益点
+
+### 正确性验证
+
+命令：
+
+```bash
+USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py
+```
+
+结果：
+
+```text
+15 passed
+```
+
+### ue8m0 运行时实验回读（仅记录，不落主线）
+
+命令：
+
+```bash
+USE_QUACK_GEMM=1 SONIC_MOE_FP8_PREACT_UE8M0_SCALE=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py
+CUDA_VISIBLE_DEVICES=6 USE_QUACK_GEMM=1 SONIC_MOE_FP8_PREACT_UE8M0_SCALE=1 python benchmarks/moe-cute.py --thiek 8192,4096,1024,128,8 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_fp8_metrics --report_fp8_analysis
+```
+
+结果：
+
+- 回归：`13 passed`
+- `8192,4096,1024,128,8`：
+  - output RMSE：`0.01074074`
+  - loss RMSE：`0.00000025`
+  - peak：`7571.25 MiB`
+  - inf：`3.908 ms`
+  - e2e：`12.672 ms`
+
+结论：
+
+- 这条实验在 capture-safe guard 下是**安全**的；
+- 但 inference 路径在 cudagraph capture 下本来就会自动回退，不会稳定命中新量化分支；
+- 当前观测到的时间变化仍在共享机器噪声范围内，**没有形成可重复、可归因的确定收益**；
+- 因此本轮选择把它从主线代码中收回，只在工程记录里保留实验结论，避免后续 agent 误把它当成已验证优化点。
+
 ## 2026-03-24 - 去掉无用 scale decode，并在 inference 下跳过 STE 混合
 
 ### 指标注释（先看这个）
