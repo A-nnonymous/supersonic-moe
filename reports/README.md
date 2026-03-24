@@ -75,9 +75,13 @@ This directory is the live work log for the FP8 upgrade effort. It is not meant 
 - 更大真实 shape 已可跑通：
   - shape `8192,4096,1024,128,8`
   - 官方 bf16：peak `7690.63 MiB`，e2e `12.202 ms`
-  - 稳定 `fp8-mainline`：output RMSE `0.01074074`，loss RMSE `0.00000025`，peak `7572.75 MiB`，e2e `13.096 ms`
+  - 稳定 `fp8-mainline`：output RMSE `0.01074074`，loss RMSE `0.00000025`，peak `7572.75 MiB`，inf `3.933 ms`，e2e `12.888 ms`
   - 理论账：stable fp8 边界流量下界 `516.00 MiB`，真正节省 payload 仅 `62.00 MiB`
-  - 结论：大 shape crash 已通过本地 fallback / 分块 vec4 路径消掉，但稳定主线性能仍慢，主因是 `quant -> dequant -> bf16` 边界搬运
+  - 结论：大 shape crash 已通过本地 fallback / 分块 vec4 路径消掉；现在 stable fp8 的 inference 已领先 bf16，但 e2e 仍慢，主因还是 `quant -> dequant -> bf16` 边界搬运
+- 中等真实 shape `4096,4096,1024,128,8`：
+  - 官方 bf16：inf `2.344 ms`，e2e `7.338 ms`
+  - 稳定 `fp8-mainline`：output RMSE `0.01073638`，loss RMSE `0.00000020`，peak `6867.00 MiB`，inf `2.204 ms`，e2e `8.022 ms`
+  - 结论：稳定 fp8 inference 已领先 bf16 `5.97%`
 - blockscaled 的理论账也已明确：
   - shape `4096,4096,1024,128,8`，`capacity=1024`
   - `grouped_out_bf16` 理论大小 `1024.00 MiB`

@@ -49,14 +49,19 @@ def apply_activation_fp8_protocol_cutely_fused(
     x: torch.Tensor,
     protocol: FP8Protocol | None = None,
     quack_enabled: bool | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    return_scales: bool = True,
+    use_ste: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     protocol = validate_fp8_runtime_support(protocol or FP8Protocol(), x.device, quack_enabled=quack_enabled)
     padded_x, original_last_dim = _pad_postact_tensor(x, protocol.group_size)
     data, scales = quantize_activation_blockwise(padded_x, protocol)
     dequantized = dequantize_activation_blockwise(data, scales, protocol, output_dtype=x.dtype)[..., :original_last_dim]
 
-    restored_with_ste = x + (dequantized - x).detach()
-    return restored_with_ste, scales[..., : ((original_last_dim + protocol.group_size - 1) // protocol.group_size)]
+    restored_with_ste = x + (dequantized - x).detach() if use_ste else dequantized
+    return (
+        restored_with_ste,
+        scales[..., : ((original_last_dim + protocol.group_size - 1) // protocol.group_size)] if return_scales else None,
+    )
 
 
 def apply_preact_activation_fp8_protocol_cutely_fused(
@@ -64,10 +69,18 @@ def apply_preact_activation_fp8_protocol_cutely_fused(
     postact: torch.Tensor,
     protocol: FP8Protocol | None = None,
     quack_enabled: bool | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    return_scales: bool = True,
+    use_ste: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     protocol = validate_fp8_runtime_support(protocol or FP8Protocol(), preact.device, quack_enabled=quack_enabled)
     if protocol.group_size != 128:
-        return apply_activation_fp8_protocol_cutely_fused(postact, protocol, quack_enabled=quack_enabled)
+        return apply_activation_fp8_protocol_cutely_fused(
+            postact,
+            protocol,
+            quack_enabled=quack_enabled,
+            return_scales=return_scales,
+            use_ste=use_ste,
+        )
     padded_preact, original_postact_width = _pad_preact_for_group_size(preact, protocol.group_size)
     quantized, packed_scales = fused_weighted_swiglu_act_quant_best(
         padded_preact,
@@ -79,7 +92,10 @@ def apply_preact_activation_fp8_protocol_cutely_fused(
     restored = fused_act_dequant_best(quantized, packed_scales, block_size=protocol.group_size)[..., :original_postact_width]
     restored = restored.to(dtype=postact.dtype)
 
+    restored_with_ste = postact + (restored - postact).detach() if use_ste else restored
+    if not return_scales:
+        return restored_with_ste, None
+
     scale_cols = (original_postact_width + protocol.group_size - 1) // protocol.group_size
     decoded_scales = round_scale_to_e8m0(packed_scales[:, :scale_cols], protocol)
-    restored_with_ste = postact + (restored - postact).detach()
     return restored_with_ste, decoded_scales

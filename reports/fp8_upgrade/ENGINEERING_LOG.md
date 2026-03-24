@@ -2,6 +2,130 @@
 
 This log records concrete code changes plus their immediate validation and performance numbers.
 
+## 2026-03-24 - 去掉无用 scale decode，并在 inference 下跳过 STE 混合
+
+### 指标注释（先看这个）
+
+- 精度基线：官方 `bf16` 路径。
+- 显存基线：官方 `bf16` 路径。
+- 性能基线 1：上一版稳定 `fp8-mainline`（已接入理论分析，但仍会做无用 scale decode，且 inference 仍做 STE 混合）。
+- 性能基线 2：同 shape 官方 `bf16`。
+- 收益来源：
+  - 运行时不再做**没有消费者**的 `round_scale_to_e8m0(...)`；
+  - inference 模式直接返回 `restored`，不再做 `postact + (restored - postact).detach()`；
+  - 这两项都只缩减 FP8 boundary 的无效边界开销，不改变训练语义。
+
+### 改动
+
+- 在 `sonicmoe/functional/fp8_reference.py` 中：
+  - `apply_activation_fp8_protocol(...)` 新增：
+    - `return_scales: bool = True`
+    - `use_ste: bool = True`
+- 在 `sonicmoe/functional/fp8_cutely_fused.py` 中：
+  - `apply_activation_fp8_protocol_cutely_fused(...)`
+  - `apply_preact_activation_fp8_protocol_cutely_fused(...)`
+  - 新增：
+    - `return_scales: bool = True`
+    - `use_ste: bool = True`
+  - 当 `return_scales=False` 时，直接跳过 scale decode；
+  - 当 `use_ste=False` 时，直接返回 dequant 后结果，不再做 STE 混合。
+- 在 `sonicmoe/functional/__init__.py` 中：
+  - SonicMoE 真实运行主线调用 FP8 boundary 时改为：
+    - `return_scales=False`
+    - `use_ste=not is_inference_mode_enabled`
+
+### 正确性验证
+
+命令：
+
+```bash
+USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py
+```
+
+结果：
+
+```text
+13 passed
+```
+
+### 真实 shape 数据
+
+#### shape `4096,4096,1024,128,8`
+
+- 官方 bf16：
+  - peak：`7049.88 MiB`
+  - inf fwd：`2.344 ms`
+  - e2e：`7.338 ms`
+- 上一版稳定 fp8-mainline：
+  - output RMSE：`0.01073638`
+  - loss RMSE：`0.00000020`
+  - peak：`6867.00 MiB`
+  - inf fwd：`2.587 ms`（复测正常值）
+  - train fwd：`2.912 ms`
+  - e2e：`7.903 ms`
+  - bwd：`5.316 ms`
+- 本轮稳定 fp8-mainline：
+  - output RMSE：`0.01073638`
+  - loss RMSE：`0.00000020`
+  - peak：`6867.00 MiB`
+  - inf fwd：`2.204 ms`
+  - train fwd：`2.907 ms`
+  - e2e：`8.022 ms`
+  - bwd：`5.819 ms`
+
+结论：
+
+- 相对 bf16：
+  - inference **领先** `5.97%`
+  - peak memory 仍领先 `182.88 MiB`
+- 相对上一版稳定 fp8-mainline：
+  - inference 提升 `14.82%`
+  - train fwd 基本持平（`0.17%`）
+  - e2e / bwd 噪声较大，本轮不据此下强结论
+
+#### shape `8192,4096,1024,128,8`
+
+- 官方 bf16：
+  - peak：`7690.63 MiB`
+  - inf fwd：`4.147 ms`
+  - e2e：`12.202 ms`
+- 上一版稳定 fp8-mainline（去掉无用 scale decode 后、但 inference 仍做 STE）：
+  - output RMSE：`0.01074074`
+  - loss RMSE：`0.00000025`
+  - peak：`7572.75 MiB`
+  - inf fwd：`4.372 ms`
+  - train fwd：`4.557 ms`
+  - e2e：`12.751 ms`
+  - bwd：`8.379 ms`
+- 本轮稳定 fp8-mainline：
+  - output RMSE：`0.01074074`
+  - loss RMSE：`0.00000025`
+  - peak：`7572.75 MiB`
+  - inf fwd：`3.933 ms`
+  - train fwd：`4.421 ms`
+  - e2e：`12.888 ms`
+  - bwd：`8.955 ms`
+
+结论：
+
+- 相对 bf16：
+  - inference **领先** `5.16%`
+  - peak memory 领先 `117.88 MiB`
+  - e2e 仍慢 `5.62%`
+- 相对上一版稳定 fp8-mainline：
+  - inference 提升 `10.04%`
+  - train fwd 提升 `2.98%`
+  - e2e / bwd 在共享机器上仍有噪声，但 forward 侧收益是确定的
+
+### 当前判断
+
+- 这一步证明：
+  - 稳定 `fp8-mainline` 的 forward 路径里仍有不少“非必要边界工作”可以继续吃掉；
+  - 仅靠削减无用边界工作，已经能让真实大 shape 的 inference 领先 bf16。
+- 但训练/e2e 还没追平 bf16，说明真正剩余的大头仍是：
+  - `quant -> dequant -> bf16` 这层回退本身；
+  - 要继续前进，就必须把量化后的激活直接送入 down-proj mainloop。
+
 ## 2026-03-24 - 用理论显存 / FLOPs 账解释为什么当前 FP8 还会慢
 
 ### 指标注释（先看这个）

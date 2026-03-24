@@ -41,10 +41,12 @@ def apply_activation_fp8_protocol(
     x: torch.Tensor,
     protocol: FP8Protocol | None = None,
     quack_enabled: bool | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    return_scales: bool = True,
+    use_ste: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     fp8_tensor = quantize_activation_reference(x, protocol, quack_enabled=quack_enabled)
     dequantized = dequantize_activation_reference(fp8_tensor, output_dtype=x.dtype)
 
     # Keep the reference FP8 numerics in forward while preserving a usable backward path.
-    restored_with_ste = x + (dequantized - x).detach()
-    return restored_with_ste, fp8_tensor.scales
+    restored_with_ste = x + (dequantized - x).detach() if use_ste else dequantized
+    return restored_with_ste, fp8_tensor.scales if return_scales else None

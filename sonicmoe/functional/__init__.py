@@ -577,10 +577,18 @@ def moe_TC_softmax_topk_layer(
                 y1,
                 fp8_protocol,
                 quack_enabled=True,
+                return_scales=False,
+                use_ste=not is_inference_mode_enabled,
             )
         else:
             fp8_adapter = apply_activation_fp8_protocol_cutely_fused if _use_cutely_fused_fp8_adapter() else apply_activation_fp8_protocol
-            y1, _ = fp8_adapter(y1, fp8_protocol, quack_enabled=False)
+            y1, _ = fp8_adapter(
+                y1,
+                fp8_protocol,
+                quack_enabled=False,
+                return_scales=False,
+                use_ste=not is_inference_mode_enabled,
+            )
         _log_stage_memory("forward:fp8-boundary")
 
     _reset_stage_memory_probe()

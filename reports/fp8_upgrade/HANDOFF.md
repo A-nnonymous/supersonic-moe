@@ -5,6 +5,34 @@ This is the minimum context a new agent needs to continue work without replaying
 ## 0. 最新中文结论
 
 - 新结论（这一轮最重要）：
+  - 已经去掉运行时无用的 scale decode；
+  - inference 模式下也不再做 STE 混合；
+  - 这两项都是低风险边界缩减，不改训练语义。
+- 最新真实结果：
+  - shape `4096,4096,1024,128,8`
+    - bf16：inf `2.344 ms`，e2e `7.338 ms`
+    - 稳定 fp8：output RMSE `0.01073638`，loss RMSE `0.00000020`，peak `6867.00 MiB`，inf `2.204 ms`，e2e `8.022 ms`
+    - 结论：inference 已领先 bf16 `5.97%`
+  - shape `8192,4096,1024,128,8`
+    - bf16：inf `4.147 ms`，e2e `12.202 ms`
+    - 稳定 fp8：output RMSE `0.01074074`，loss RMSE `0.00000025`，peak `7572.75 MiB`，inf `3.933 ms`，e2e `12.888 ms`
+    - 结论：inference 已领先 bf16 `5.16%`，但 e2e 仍慢 `5.62%`
+- 当前最重要的判断：
+  - 现在稳定 `fp8-mainline` 在真实规整 shape 上已经做到了：
+    - 精度稳定
+    - 显存领先
+    - inference 领先 bf16
+  - 但 training/e2e 仍慢，根因仍是 `quant -> dequant -> bf16` 回退；
+  - 下一步必须打通“量化后激活直喂 down-proj mainloop”。
+- 关于 float8 mainloop scout 的结论：
+  - `grouped_gemm.py` 的核心 kernel 对 8-bit dtype 有一定支持；
+  - 但当前 SonicMoE 直接路径没有现成的“带 scale 的 FP8 grouped mainloop”可无缝复用；
+  - 当前真正可用、带 scale 的主线仍是 `blockscaled_fp8_gemm_grouped(...)`；
+  - 所以下一实现应优先考虑：
+    - 复用现有 blockscaled / scaled-fp8 主循环能力；
+    - 同时继续减少 `grouped_out` / dequant 回退边界。
+
+- 新结论（这一轮最重要）：
   - 已经把理论显存 / FLOPs 账接入 benchmark：
     - 新开关：`--report_fp8_analysis`
   - 核心结论：
