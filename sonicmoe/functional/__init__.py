@@ -30,7 +30,12 @@ from .fp8_protocol import (
     validate_fp8_protocol,
     validate_fp8_runtime_support,
 )
-from .fp8_reference import FP8Tensor, dequantize_activation_reference, quantize_activation_reference
+from .fp8_reference import (
+    FP8Tensor,
+    apply_activation_fp8_protocol,
+    dequantize_activation_reference,
+    quantize_activation_reference,
+)
 from .forward import _down_projection_forward, _router_forward, _softmax_topk_fwd, _up_projection_forward
 from .triton_kernels import TC_topk_router_metadata_triton
 from .utils import enable_quack_gemm, is_using_quack_gemm
@@ -448,6 +453,7 @@ def moe_TC_softmax_topk_layer(
     stream_id: int,
     activation_type: ActivationType | str = ActivationType.SWIGLU,
     is_inference_mode_enabled: bool = False,
+    fp8_protocol: FP8Protocol | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert ((b1 is None) and (b2 is None)) or (
         (b1 is not None) and (b2 is not None)
@@ -491,6 +497,9 @@ def moe_TC_softmax_topk_layer(
         activation_type,
         is_inference_mode_enabled,
     )
+
+    if fp8_protocol is not None:
+        y1, _ = apply_activation_fp8_protocol(y1, fp8_protocol, quack_enabled=is_using_quack_gemm())
 
     o = _DownProjection.apply(
         y1,

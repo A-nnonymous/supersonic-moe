@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from rich import print as print0
 from triton.testing import do_bench
 
-from sonicmoe import MoE
+from sonicmoe import MoE, get_default_fp8_protocol
 from sonicmoe.enums import ActivationType, is_glu
 from sonicmoe.functional import moe_TC_softmax_topk_layer
 
@@ -86,6 +86,12 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         default=False,
     )
+    parser.add_argument(
+        "--fp8_protocol",
+        choices=["none", "blackwell"],
+        default="none",
+        help="Enable the Blackwell FP8 protocol path for the up-proj/down-proj activation boundary",
+    )
     args = parser.parse_args()
 
     if len(args.thiek) != 5:
@@ -107,11 +113,13 @@ def run(
     skip_test: Type[bool],
     add_bias: Type[bool],
     activation: Type[str],
+    fp8_protocol: Type[str],
     **kwargs,
 ):
     torch_dtype = {cutlass.BFloat16: torch.bfloat16, cutlass.Float16: torch.float16}[dtype]
 
     activation = ActivationType(activation)
+    fp8_protocol_config = get_default_fp8_protocol() if fp8_protocol == "blackwell" else None
     # Unpack parameters
     T, H, I, E, K = thiek
     TK = T * K
@@ -249,6 +257,7 @@ def run(
         moe.stream_id,
         activation,
         True,
+        fp8_protocol_config,
     )
 
     cuda_graph = torch.cuda.CUDAGraph()
@@ -273,6 +282,7 @@ def run(
                 moe.stream_id,
                 activation,
                 True,
+                fp8_protocol_config,
             )
 
     moe.stream_id = old_stream_id  # restore
@@ -294,6 +304,7 @@ def run(
             moe.stream_id,
             activation,
             False,
+            fp8_protocol_config,
         )
         return o
 
@@ -319,6 +330,7 @@ def run(
             moe.stream_id,
             activation,
             False,
+            fp8_protocol_config,
         )
         o.backward(dout, retain_graph=True)
         x.grad = w1.grad = w2.grad = router_w.grad = None
@@ -339,5 +351,5 @@ def run(
 
 if __name__ == "__main__":
     args = parse_arguments()
-    run(args.thiek, args.dtype, args.skip_test, args.add_bias, args.activation)
+    run(args.thiek, args.dtype, args.skip_test, args.add_bias, args.activation, args.fp8_protocol)
     print("PASS")

@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from .count_cumsum import count_cumsum
 from .enums import ActivationType, KernelBackendMoE, is_glu
-from .functional import moe_TC_softmax_topk_layer
+from .functional import FP8Protocol, moe_TC_softmax_topk_layer
 
 
 try:
@@ -210,6 +210,7 @@ class MoE(nn.Module):
         hidden_states: torch.Tensor,
         kernel_backend_moe: KernelBackendMoE = KernelBackendMoE.sonicmoe,
         is_inference_mode: bool = False,
+        fp8_protocol: FP8Protocol | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         original_shape = hidden_states.shape
 
@@ -228,6 +229,7 @@ class MoE(nn.Module):
                 self.stream_id,
                 self.activation_function,
                 is_inference_mode or not self.training,
+                fp8_protocol,
             )
         else:
             # hidden_states -> (total_q, hidden_size)

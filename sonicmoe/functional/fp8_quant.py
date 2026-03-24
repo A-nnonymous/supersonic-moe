@@ -7,12 +7,21 @@ import torch
 from .fp8_protocol import FP8Protocol, validate_fp8_protocol
 
 
-def _reshape_last_dim_groups(x: torch.Tensor, group_size: int) -> tuple[torch.Tensor, tuple[int, ...]]:
-    if x.size(-1) % group_size != 0:
-        raise ValueError(f"Expected the last dimension to be divisible by {group_size}, got {x.size(-1)}")
+def _pad_last_dim_to_group_size(x: torch.Tensor, group_size: int) -> tuple[torch.Tensor, int]:
+    original_last_dim = x.size(-1)
+    remainder = original_last_dim % group_size
+    if remainder == 0:
+        return x, original_last_dim
 
-    grouped_shape = (*x.shape[:-1], x.size(-1) // group_size, group_size)
-    return x.reshape(grouped_shape), grouped_shape
+    pad = group_size - remainder
+    padding = torch.zeros(*x.shape[:-1], pad, device=x.device, dtype=x.dtype)
+    return torch.cat([x, padding], dim=-1), original_last_dim
+
+
+def _reshape_last_dim_groups(x: torch.Tensor, group_size: int) -> tuple[torch.Tensor, tuple[int, ...], int]:
+    padded_x, original_last_dim = _pad_last_dim_to_group_size(x, group_size)
+    grouped_shape = (*padded_x.shape[:-1], padded_x.size(-1) // group_size, group_size)
+    return padded_x.reshape(grouped_shape), grouped_shape, original_last_dim
 
 
 def _safe_scale_from_amax(amax: torch.Tensor, dtype_max: float) -> torch.Tensor:
@@ -43,7 +52,7 @@ def quantize_activation_blockwise(
     if x.device.type != "cuda":
         raise ValueError("FP8 activation quantization is only supported on CUDA tensors")
 
-    grouped_x, grouped_shape = _reshape_last_dim_groups(x.float(), protocol.group_size)
+    grouped_x, grouped_shape, original_last_dim = _reshape_last_dim_groups(x.float(), protocol.group_size)
     amax = grouped_x.abs().amax(dim=-1)
     raw_scale = _safe_scale_from_amax(amax, torch.finfo(protocol.activation_torch_dtype).max)
     encoded_scale = round_scale_to_e8m0(raw_scale, protocol)
@@ -51,7 +60,8 @@ def quantize_activation_blockwise(
     scale_fp32 = encoded_scale.float()
     scale_fp32 = torch.where(scale_fp32 > 0, scale_fp32, torch.ones_like(scale_fp32))
     scaled = grouped_x / scale_fp32.unsqueeze(-1)
-    quantized = scaled.to(protocol.activation_torch_dtype).reshape(x.shape)
+    quantized = scaled.to(protocol.activation_torch_dtype).reshape(*grouped_shape[:-2], grouped_shape[-2] * grouped_shape[-1])
+    quantized = quantized[..., :original_last_dim]
 
     return quantized, encoded_scale.reshape(grouped_shape[:-1])
 
@@ -63,7 +73,7 @@ def dequantize_activation_blockwise(
 ) -> torch.Tensor:
     protocol = validate_fp8_protocol(protocol or FP8Protocol())
 
-    grouped_x, grouped_shape = _reshape_last_dim_groups(x_fp8, protocol.group_size)
+    grouped_x, grouped_shape, original_last_dim = _reshape_last_dim_groups(x_fp8, protocol.group_size)
     expected_scale_shape = grouped_shape[:-1]
 
     if tuple(scales_e8m0.shape) != expected_scale_shape:
@@ -71,4 +81,7 @@ def dequantize_activation_blockwise(
             f"Expected scales shape {expected_scale_shape} for tensor shape {tuple(x_fp8.shape)}, got {tuple(scales_e8m0.shape)}"
         )
 
-    return (grouped_x.float() * scales_e8m0.float().unsqueeze(-1)).reshape(x_fp8.shape)
+    dequantized = (grouped_x.float() * scales_e8m0.float().unsqueeze(-1)).reshape(
+        *grouped_shape[:-2], grouped_shape[-2] * grouped_shape[-1]
+    )
+    return dequantized[..., :original_last_dim]

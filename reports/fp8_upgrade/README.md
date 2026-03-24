@@ -14,7 +14,14 @@ This file tracks the real state of the SonicMoE FP8 upgrade, not a wish list.
 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py tests/moe_test.py
 ```
 
-- validated result: `17 passed, 91 skipped`
+- validated result: `18 passed, 91 skipped`
+- opt-in faster command:
+
+```bash
+make test-blackwell-parallel PYTEST_WORKERS=2
+```
+
+- observed parallel runtime: `168.14s` vs. `187.28s` for the serial command
 
 ## Completed work
 
@@ -62,13 +69,29 @@ Important behavior:
 
 - scale encoding is rounded **up** to the next power-of-two before storing in `e8m0`
 - this avoids `e4m3` overflow-to-`nan` during activation quantization
+- non-divisible tail blocks are padded internally to preserve `1x128` protocol semantics without rejecting widths like `2880`
+
+## Newly landed functional-boundary wiring
+
+The protocol is now visible at the current SonicMoE functional boundary:
+
+- `MoE.forward(..., fp8_protocol=...)`
+- `moe_TC_softmax_topk_layer(..., fp8_protocol=...)`
+
+Current behavior:
+
+- the boundary path quantizes/dequantizes the activation between `_UpProjection` and `_DownProjection`
+- backward uses a straight-through estimator so the training graph stays usable
+- this is intentionally a correctness-first step; it is not yet the final performance path
+
+See `reports/fp8_upgrade/ENGINEERING_LOG.md` for the benchmark deltas from this change.
 
 ## Immediate next implementation targets
 
-1. Wire the new protocol into `forward.py` / `backward.py` call boundaries
-2. Land the Hopper fused up-projection epilogue
-3. Land the paired backward kernel and cache contract
-4. Reuse the same protocol for Blackwell QuACK activation paths
+1. Replace the torch-side boundary quant/dequant with a fused up-projection epilogue
+2. Land the paired backward kernel and cache contract
+3. Reuse the same protocol for Blackwell QuACK activation paths
+4. Keep the current benchmark command as the mandatory regression gate
 
 ## Source-of-truth inputs
 

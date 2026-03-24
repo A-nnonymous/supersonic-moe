@@ -8,8 +8,11 @@ import torch
 
 from sonicmoe import (
     FP8ActivationDType,
+    KernelBackendMoE,
+    MoE,
     FP8Protocol,
     FP8ScaleEncoding,
+    apply_activation_fp8_protocol,
     dequantize_activation_reference,
     enable_quack_gemm,
     get_default_fp8_protocol,
@@ -17,6 +20,7 @@ from sonicmoe import (
     validate_fp8_protocol,
     validate_fp8_runtime_support,
 )
+from sonicmoe.enums import ActivationType
 
 from .test_commons import TestCommons
 
@@ -74,3 +78,42 @@ class FP8ProtocolTest(TestCommons):
 
         self.assertEqual(restored.dtype, torch.float32)
         self.assertLess((restored - x.float()).abs().max().item(), 0.35)
+
+    def test_blackwell_fp8_protocol_boundary_keeps_finite_forward_backward(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required")
+
+        major, _ = torch.cuda.get_device_capability()
+        if major < 10:
+            self.skipTest("Blackwell-only test requires SM100+")
+
+        self.set_seed(_SEED)
+        protocol = get_default_fp8_protocol()
+
+        moe = MoE(
+            num_experts=128,
+            num_experts_per_tok=8,
+            hidden_size=768,
+            intermediate_size=256,
+            activation_function=ActivationType.SWIGLU,
+            add_bias=False,
+            std=0.02,
+        ).to(device="cuda", dtype=torch.bfloat16)
+
+        x = (0.02 * torch.randn(256, 768, device="cuda", dtype=torch.bfloat16)).detach().requires_grad_()
+        dout = 0.02 * torch.randn_like(x)
+
+        with enable_quack_gemm(True):
+            y, _ = moe(x, kernel_backend_moe=KernelBackendMoE.sonicmoe, fp8_protocol=protocol)
+            y.backward(dout)
+
+        self.assertFalse(torch.isnan(y.float()).any().item())
+        self.assertIsNotNone(x.grad)
+        self.assertFalse(torch.isnan(x.grad.float()).any().item())
+
+        sample = 0.1 * torch.randn(4, 130, device="cuda", dtype=torch.bfloat16)
+        with enable_quack_gemm(True):
+            restored, scales = apply_activation_fp8_protocol(sample, protocol)
+        self.assertEqual(tuple(scales.shape), (4, 2))
+        self.assertEqual(tuple(restored.shape), (4, 130))
+        self.assertFalse(torch.isnan(restored.float()).any().item())
