@@ -3,6 +3,7 @@
 # ********************************************************************************
 
 import argparse
+import math
 import random
 import time
 from typing import Tuple, Type
@@ -92,6 +93,12 @@ def parse_arguments() -> argparse.Namespace:
         default="none",
         help="Enable the Blackwell FP8 protocol path for the up-proj/down-proj activation boundary",
     )
+    parser.add_argument(
+        "--report_fp8_metrics",
+        action="store_true",
+        default=False,
+        help="When fp8 is enabled, report bf16-baseline RMSE and peak memory deltas before timing runs",
+    )
     args = parser.parse_args()
 
     if len(args.thiek) != 5:
@@ -114,6 +121,7 @@ def run(
     add_bias: Type[bool],
     activation: Type[str],
     fp8_protocol: Type[str],
+    report_fp8_metrics: Type[bool],
     **kwargs,
 ):
     torch_dtype = {cutlass.BFloat16: torch.bfloat16, cutlass.Float16: torch.float16}[dtype]
@@ -152,6 +160,53 @@ def run(
         torch.nn.init.normal_(b1, 0, 0.01)
         torch.nn.init.normal_(b2, 0, 0.01)
     dout = 0.2 * torch.randn_like(x, requires_grad=True)
+
+    if report_fp8_metrics and fp8_protocol_config is not None:
+        def run_metrics_case(protocol_config):
+            x_case = x.detach().clone().requires_grad_()
+            dout_case = dout.detach().clone()
+
+            for grad_tensor in [w1, w2, router_w]:
+                grad_tensor.grad = None
+
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+
+            o_case, _, _ = moe_TC_softmax_topk_layer(
+                x_case,
+                router_w,
+                w1.permute(1, 2, 0),
+                b1,
+                w2.permute(1, 2, 0),
+                b2,
+                moe.top_k,
+                moe.stream_id,
+                activation,
+                False,
+                protocol_config,
+            )
+            o_case.backward(dout_case)
+            torch.cuda.synchronize()
+            peak_mib = torch.cuda.max_memory_allocated() / (1024**2)
+            loss_value = (o_case.float() * dout_case.float()).mean().item()
+            output_value = o_case.detach().float()
+
+            for grad_tensor in [x_case, w1, w2, router_w]:
+                grad_tensor.grad = None
+
+            return output_value, loss_value, peak_mib
+
+        bf16_output, bf16_loss, bf16_peak_mib = run_metrics_case(None)
+        fp8_output, fp8_loss, fp8_peak_mib = run_metrics_case(fp8_protocol_config)
+
+        output_rmse = torch.sqrt(torch.mean((fp8_output - bf16_output) ** 2)).item()
+        loss_rmse = math.sqrt((fp8_loss - bf16_loss) ** 2)
+
+        print0(
+            "[bold cyan]FP8 metrics vs bf16 baseline[/bold cyan] "
+            f"output_rmse={output_rmse:.8f}, loss_rmse={loss_rmse:.8f}, "
+            f"bf16_peak_mib={bf16_peak_mib:.2f}, fp8_peak_mib={fp8_peak_mib:.2f}"
+        )
 
     # # Ref check
     if not skip_test:
@@ -351,5 +406,5 @@ def run(
 
 if __name__ == "__main__":
     args = parse_arguments()
-    run(args.thiek, args.dtype, args.skip_test, args.add_bias, args.activation, args.fp8_protocol)
+    run(args.thiek, args.dtype, args.skip_test, args.add_bias, args.activation, args.fp8_protocol, args.report_fp8_metrics)
     print("PASS")

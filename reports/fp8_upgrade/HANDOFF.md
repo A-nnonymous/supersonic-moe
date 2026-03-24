@@ -49,6 +49,19 @@ Observed runtime for the parallel entry:
 18 passed, 91 skipped in 168.14s
 ```
 
+Multi-GPU shard launcher:
+
+```bash
+make test-blackwell-multigpu BLACKWELL_TEST_GPUS=0,1,2
+python tools/run_blackwell_test_shards.py --gpus 0,1,2 --dry-run
+```
+
+Metric-reporting command:
+
+```bash
+USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 32768,2880,2880,64,8 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_fp8_metrics
+```
+
 ## 4. What has already been settled
 
 - the Blackwell smoke path is real and regression-tested
@@ -60,22 +73,28 @@ Observed runtime for the parallel entry:
 - a first memory optimization pass already landed:
   - fp8 boundary peak memory: `15312.85 MiB -> 13017.85 MiB`
   - fp8 boundary Fwd+Bwd: `119.803 ms -> 109.117 ms`
+- a new adapter landing point now exists in `sonicmoe/functional/fp8_cutely_fused.py`
+- the incubator fused quant kernel does **not** match the current SonicMoE boundary 1:1:
+  - incubator input contract: pre-SwiGLU `(T, 2H)`
+  - current SonicMoE boundary: post-SwiGLU `(TK, I)`
+  - so the first safe landing is the adapter shim, not a direct kernel swap
 - the next kernel target is the Hopper FP8 up-projection epilogue, not a standalone gather kernel and not a monolithic full-graph rewrite
 
 ## 5. The next concrete edits
 
-### Stage 1: replace the torch-side boundary path with a fused epilogue
+### Stage 1: wire the adapter and expose the pre-SwiGLU contract
 
 The protocol/reference modules are already wired through:
 
-- `sonicmoe/functional/forward.py`
-- `sonicmoe/functional/backward.py`
+- `sonicmoe/moe.py`
 - `sonicmoe/functional/__init__.py`
+- `sonicmoe/functional/fp8_reference.py`
+- `sonicmoe/functional/fp8_cutely_fused.py`
 
-The next step should remove the current torch-side quant/dequant scaffold for:
+The next step should replace the current torch-side quant/dequant scaffold for:
 
-- grouped-gemm output activation
-- SwiGLU
+- grouped-gemm output activation before the current post-SwiGLU boundary
+- SwiGLU inside the fused epilogue
 - optional router probability weighting
 - blockwise quant/dequant
 - backward cache consumption
@@ -97,12 +116,11 @@ Reuse:
 ## 6. File map for fast navigation
 
 - SonicMoE execution path:
+  - `sonicmoe/moe.py`
+  - `sonicmoe/functional/__init__.py`
   - `sonicmoe/functional/forward.py`
   - `sonicmoe/functional/backward.py`
-  - `sonicmoe/functional/grouped_gemm.py`
-  - `sonicmoe/functional/moe_config.py`
 - Blackwell adapter:
-  - `sonicmoe/quack_utils/gemm_interface.py`
   - `sonicmoe/quack_utils/gemm_gated.py`
   - `sonicmoe/quack_utils/gemm_dgated.py`
 - operator incubator kernels:
@@ -118,4 +136,8 @@ Reuse:
 - current torch already provides both `torch.float8_e4m3fn` and `torch.float8_e8m0fnu`; a nightly upgrade is not currently required
 - the benchmark gate for performance-facing work is now documented in `reports/fp8_upgrade/ENGINEERING_LOG.md`
 - `pytest-xdist` is now installed in `xfer`; keep the worker count conservative (`2`) for the single-GPU Blackwell regression path
+- the reporting policy is fixed:
+  - accuracy baseline: official bf16
+  - memory baseline: official bf16
+  - performance baselines: previous commit and official bf16
 - keep `reports/` up to date whenever the branch, validation command, or next target changes

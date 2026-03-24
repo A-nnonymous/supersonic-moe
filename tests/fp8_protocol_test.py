@@ -10,6 +10,7 @@ from sonicmoe import (
     FP8ActivationDType,
     KernelBackendMoE,
     MoE,
+    apply_activation_fp8_protocol_cutely_fused,
     FP8Protocol,
     FP8ScaleEncoding,
     apply_activation_fp8_protocol,
@@ -117,3 +118,26 @@ class FP8ProtocolTest(TestCommons):
         self.assertEqual(tuple(scales.shape), (4, 2))
         self.assertEqual(tuple(restored.shape), (4, 130))
         self.assertFalse(torch.isnan(restored.float()).any().item())
+
+    def test_cutely_fused_adapter_matches_reference_contract(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required")
+
+        major, _ = torch.cuda.get_device_capability()
+        if major < 10:
+            self.skipTest("Blackwell-only test requires SM100+")
+
+        self.set_seed(_SEED)
+        protocol = get_default_fp8_protocol()
+        sample = 0.1 * torch.randn(8, 256, device="cuda", dtype=torch.bfloat16)
+
+        with enable_quack_gemm(True):
+            restored_ref, scales_ref = apply_activation_fp8_protocol(sample, protocol)
+            restored_adapter, scales_adapter = apply_activation_fp8_protocol_cutely_fused(sample, protocol)
+
+        self.assertEqual(restored_ref.shape, restored_adapter.shape)
+        self.assertEqual(scales_ref.shape, scales_adapter.shape)
+        self.assertEqual(restored_ref.dtype, restored_adapter.dtype)
+        self.assertEqual(scales_ref.dtype, scales_adapter.dtype)
+        torch.testing.assert_close(restored_ref.float(), restored_adapter.float(), atol=0.0, rtol=0.0)
+        torch.testing.assert_close(scales_ref.float(), scales_adapter.float(), atol=0.0, rtol=0.0)
