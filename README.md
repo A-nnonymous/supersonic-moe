@@ -80,121 +80,43 @@ For a Blackwell-only QuACK smoke test, run:
 make test-blackwell
 ```
 
-## Control Plane
+## 📋 Current FP8 Upgrade TODOs
 
-The FP8 multi-agent control plane has been migrated out of this repository into the standalone sibling repository `../warp`.
+Keep this list synchronized with `reports/README.md` and `reports/fp8_upgrade/HANDOFF.md`.
 
-### Control Plane Deployment
+- [x] Bootstrap the Blackwell-capable Python environment at `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer`
+- [x] Merge latest upstream `main` and validate local Blackwell behavior
+- [x] Add a dedicated Blackwell QuACK pytest entry (`make test-blackwell`)
+- [x] Make `tests/moe_test.py` Blackwell-aware so unsupported non-QuACK SonicMoE paths skip instead of hard-failing
+- [ ] Add an explicit FP8 protocol layer in `sonicmoe/functional/`
+- [ ] Build a torch/reference FP8 path before adding Hopper fused kernels
+- [ ] Implement the Hopper up-projection FP8 epilogue: `grouped_gemm -> SwiGLU -> optional prob -> blockwise quant`
+- [ ] Implement the paired FP8 backward path and cache contract
+- [ ] Unify Hopper CuTe and Blackwell QuACK under the same FP8 protocol and test matrix
 
-The default deployment target is a Linux machine with NVIDIA Hopper or Blackwell GPUs already available, with the full SonicMoE runtime environment installed and ready for direct testing.
+## 🧭 FP8 Upgrade Roadmap
 
-- recommended hardware: H100, H200, B200, or GB200
-- recommended runtime state: CUDA, PyTorch, Triton, and SonicMoE dependencies already installed in the active environment
-- recommended workflow: launch the standalone `warp` control plane against this SonicMoE checkout on the same provisioned machine
+The current plan is to treat FP8 as a protocol-and-kernel migration, not a one-shot mega-kernel rewrite.
 
-If you are testing Blackwell kernels directly on B200 or GB200, export `USE_QUACK_GEMM=1` in the worker environment before running Blackwell-specific commands.
+1. **Freeze protocol and reference behavior first**
+   - add `fp8_protocol.py`, `fp8_quant.py`, and `fp8_reference.py`
+   - define `fp8_dtype`, `scale_encoding`, `scale_granularity`, cache tensors, and backend adapter rules
+2. **Ship the first Hopper fused kernel at the up-projection epilogue**
+   - target `grouped_gemm(varlen/gather-A) -> SwiGLU -> optional prob -> 1x128 quant`
+   - keep Blackwell on the QuACK adapter route
+3. **Add the paired backward kernel**
+   - cover the `fused_swiglu_weighted_bwd` semantics and the minimum forward cache contract
+4. **Standardize dequant and blockwise quant**
+   - start as reference/protocol code, then fuse only if profiling shows the need
+5. **Expand regression coverage**
+   - Hopper and Blackwell should share one FP8 protocol and one test story even if their kernels differ
 
-### Control Plane Quickstart
+For the live work log, validated commands, and next-agent handoff, read:
 
-Use the external `warp` checkout as the canonical entrypoint. If you keep it as a sibling repository, these commands cover the normal manager workflow and match the runtime defaults:
+- `reports/README.md`
+- `reports/fp8_upgrade/README.md`
+- `reports/fp8_upgrade/HANDOFF.md`
 
-```bash
-python3 ../warp/runtime/control_plane.py serve
-python3 ../warp/runtime/control_plane.py up
-python3 ../warp/runtime/control_plane.py stop-agents
-python3 ../warp/runtime/control_plane.py silent
-python3 ../warp/runtime/control_plane.py stop-all
-```
-
-Or launch the same commands from this repository through the convenience wrapper:
-
-```bash
-make warp-serve
-make warp-up
-make warp-stop-agents
-make warp-silent
-make warp-stop-all
-```
-
-- `serve` starts the dashboard only
-- `up` starts the dashboard and launches all configured workers immediately
-- `stop-agents` stops workers but keeps the dashboard available
-- `silent` closes only the dashboard listener and leaves workers running
-- `stop-all` stops both the listener and the worker fleet
-
-For the default deployment, these commands already do the reliable thing:
-
-- they use `runtime/local_config.yaml` when it exists
-- they bind the dashboard to `0.0.0.0:8233` unless you override host or port
-- `serve` detaches by default so the control plane keeps running after the shell returns
-
-Before using `up`, fill `../warp/runtime/local_config.yaml` with:
-
-- resource pool API keys
-- provider and model assignments
-- Paddle absolute path
-- shared worker defaults for environment path, sync command, test command, submit strategy, and default git identity
-- per-worker worktree paths and branches
-- only the per-worker overrides that truly differ from the shared defaults
-
-If you want browser auto-open during local debugging, add `--open-browser` to either launch command:
-
-```bash
-python3 ../warp/runtime/control_plane.py serve --open-browser
-python3 ../warp/runtime/control_plane.py up --open-browser
-```
-
-Use additional parameters only when you actually need them:
-
-- `--foreground`: keep `serve` attached to the current shell instead of detaching
-- `--bootstrap`: force template-backed cold-start mode when you want to edit from the default template
-- `--host 127.0.0.1`: do not expose the dashboard on all interfaces
-- `--port 9000`: move the listener to a different port
-- `--config <path>`: load a non-default runtime config file
-- `--log-file <path>`: change the detached log path
-- `--detach`: force detach on a non-`serve` command
-
-For lightweight manager machines that do not carry the full CUDA stack, keep the same command shape and only swap the launcher:
-
-```bash
-uv run --no-project --with 'PyYAML>=6.0.2' python ../warp/runtime/control_plane.py serve
-```
-
-That fallback launcher also supports the same optional parameters, for example:
-
-```bash
-uv run --no-project --with 'PyYAML>=6.0.2' python ../warp/runtime/control_plane.py serve --bootstrap --open-browser
-```
-
-### Control Plane Behavior
-
-- the first screen shows every manager and worker agent as a status card
-- the overview page stays focused on agent dashboards and overall program progress
-- the dashboard now uses a compiled React frontend served from `../warp/runtime/web/static/`
-- the dashboard can save validated form-based config, launch workers, restart workers, enter silent mode, stop agents, stop all, and copy startup commands
-- the Settings page now uses `worker_defaults` plus lean per-worker overrides so common fields are filled once instead of repeated on every worker
-- resource pools are shown in a horizontal strip so provider routing stays visible without a long vertical form
-- the launch bar supports first-run Copilot, explicit provider/model pinning, and elastic provider selection
-- worker launch decisions use static pool priority plus runtime connection-quality and work-quality scoring
-- each worker can still override git identity, test command, environment, and routing when it needs a non-default path, and A0 owns final merge into the integration branch
-- every worker may still declare its own `resource_pool_queue` for fallback ordering when the default queue is not enough
-- provider queue, runtime topology, heartbeats, and validation errors remain available in the dashboard
-
-If you change the frontend source under `../warp/runtime/web/src/`, rebuild it with:
-
-```bash
-cd ../warp/runtime/web
-npm install
-npm run build
-```
-
-### Control Plane Notes
-
-- on a real Hopper or Blackwell deployment host, the direct `python ...` commands above are the default path
-- keep `worker_defaults.test_command` and benchmark commands pointed at the same CUDA-capable environment that will run real validation on the target GPU
-- the control plane source of truth is now `../warp/README.md`
-- use `../warp/README.md` for the full manager workflow, including cold-start, start, pause, and resume guidance
-- stop commands are available separately for agents, listener, or both: `stop-agents`, `stop-listener`, and `stop-all`
 ### Example usage
 - SonicMoE with TC top-K choice routing (SwiGLU activation) on Hopper GPUs
 ```python
