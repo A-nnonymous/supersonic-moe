@@ -74,6 +74,12 @@ Run the test suite to verify correctness:
 make test
 ```
 
+For a Blackwell-only QuACK smoke test, run:
+
+```bash
+make test-blackwell
+```
+
 ## Control Plane
 
 The FP8 multi-agent control plane has been migrated out of this repository into the standalone sibling repository `../warp`.
@@ -189,7 +195,6 @@ npm run build
 - the control plane source of truth is now `../warp/README.md`
 - use `../warp/README.md` for the full manager workflow, including cold-start, start, pause, and resume guidance
 - stop commands are available separately for agents, listener, or both: `stop-agents`, `stop-listener`, and `stop-all`
-
 ### Example usage
 - SonicMoE with TC top-K choice routing (SwiGLU activation) on Hopper GPUs
 ```python
