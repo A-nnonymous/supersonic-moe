@@ -121,3 +121,82 @@ real 168.41
 
 - `xdist` with `2` workers is a real win for the current Blackwell-targeted regression subset on this machine
 - keep the parallel target opt-in rather than default, because these tests are still GPU-heavy and a higher worker count may oversubscribe the device
+
+## 2026-03-24 - Boundary memory optimization
+
+### Change
+
+- removed the full-width float32 activation copy from `quantize_activation_blockwise(...)`
+- dequantization now writes directly to the requested output dtype instead of materializing a full float32 activation first
+- kept the same protocol semantics: `e4m3` activations, `e8m0` scales, `1x128` granularity, tail padding for non-divisible widths
+
+### Correctness validation
+
+Command:
+
+```bash
+python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py tests/moe_test.py
+```
+
+Result:
+
+```text
+18 passed, 91 skipped
+```
+
+### Precision delta
+
+Measured against the no-protocol baseline on the Blackwell training shape:
+
+- max abs diff: `0.0013427734375`
+- mean abs diff: `0.00018952522077597678`
+
+The optimization did not change these error numbers relative to the previous boundary implementation.
+
+### Memory delta
+
+Single-run peak memory on `T=32768, H=2880, I=2880, E=64, K=8`:
+
+Before optimization:
+
+- baseline fwd peak: `9611.98 MiB`
+- baseline e2e peak: `11826.48 MiB`
+- fp8 boundary fwd peak: `15312.85 MiB`
+- fp8 boundary e2e peak: `15312.85 MiB`
+
+After optimization:
+
+- baseline fwd peak: `9611.98 MiB`
+- baseline e2e peak: `11826.48 MiB`
+- fp8 boundary fwd peak: `13017.85 MiB`
+- fp8 boundary e2e peak: `13017.85 MiB`
+
+Interpretation:
+
+- fp8 boundary peak memory dropped by `2295.00 MiB` (~`15.0%`) on both forward and end-to-end peak
+- baseline memory stayed unchanged
+
+### Performance delta
+
+Benchmark command:
+
+```bash
+USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 32768,2880,2880,64,8 --dtype BFloat16 --activation swiglu --skip_test
+USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 32768,2880,2880,64,8 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell
+```
+
+Before optimization, fp8 boundary:
+
+- Fwd inference: `63.715 ms`
+- Fwd+Bwd: `119.803 ms`
+
+After optimization, fp8 boundary:
+
+- Fwd inference: `56.065 ms`
+- Fwd+Bwd: `109.117 ms`
+
+Interpretation:
+
+- fp8 boundary forward improved by `7.650 ms` (~`12.0%`)
+- fp8 boundary end-to-end improved by `10.686 ms` (~`8.9%`)
+- the path is still much slower than the bf16 baseline, so the next real win still depends on a fused up-proj epilogue

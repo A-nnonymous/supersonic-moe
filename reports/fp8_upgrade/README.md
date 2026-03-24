@@ -86,6 +86,13 @@ Current behavior:
 
 See `reports/fp8_upgrade/ENGINEERING_LOG.md` for the benchmark deltas from this change.
 
+The latest optimization pass already improved the current boundary path:
+
+- fp8 boundary peak memory: `15312.85 MiB -> 13017.85 MiB`
+- fp8 boundary Fwd+Bwd time: `119.803 ms -> 109.117 ms`
+
+This is useful progress, but it is still not enough; the torch-side boundary path remains slower than the bf16 baseline.
+
 ## Immediate next implementation targets
 
 1. Replace the torch-side boundary quant/dequant with a fused up-projection epilogue

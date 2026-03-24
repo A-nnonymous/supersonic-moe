@@ -57,6 +57,9 @@ Observed runtime for the parallel entry:
 - the current protocol scope is fixed to `e4m3` activations + `e8m0` scales + `1x128` granularity
 - the protocol is now threaded through `MoE.forward(..., fp8_protocol=...)` and `moe_TC_softmax_topk_layer(..., fp8_protocol=...)`
 - the current functional-boundary implementation is intentionally correctness-first and is still slower than the baseline
+- a first memory optimization pass already landed:
+  - fp8 boundary peak memory: `15312.85 MiB -> 13017.85 MiB`
+  - fp8 boundary Fwd+Bwd: `119.803 ms -> 109.117 ms`
 - the next kernel target is the Hopper FP8 up-projection epilogue, not a standalone gather kernel and not a monolithic full-graph rewrite
 
 ## 5. The next concrete edits
