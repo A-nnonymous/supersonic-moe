@@ -200,3 +200,50 @@ Interpretation:
 - fp8 boundary forward improved by `7.650 ms` (~`12.0%`)
 - fp8 boundary end-to-end improved by `10.686 ms` (~`8.9%`)
 - the path is still much slower than the bf16 baseline, so the next real win still depends on a fused up-proj epilogue
+
+## 2026-03-24 - Metric harness and multi-GPU shard prep
+
+### Change
+
+- added `--report_fp8_metrics` to `benchmarks/moe-cute.py`
+- added `make test-blackwell-multigpu BLACKWELL_TEST_GPUS=...`
+- added `tools/run_blackwell_test_shards.py`
+- added `--dry-run` to the shard launcher so command routing can be validated even when all 8 GPUs are busy
+- added an env-gated adapter landing point in `sonicmoe/functional/fp8_cutely_fused.py`
+- threaded the adapter behind `SONIC_MOE_FP8_CUTELY_FUSED`
+
+### Validation
+
+Dry-run command:
+
+```bash
+python tools/run_blackwell_test_shards.py --gpus 0,1,2 --dry-run
+```
+
+Result:
+
+```text
+[blackwell-shard] gpu=0 tests=tests/fp8_protocol_test.py
+[blackwell-shard] gpu=1 tests=tests/moe_blackwell_test.py
+[blackwell-shard] gpu=2 tests=tests/moe_test.py
+```
+
+Metric probe command:
+
+```bash
+USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 1024,512,512,32,4 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_fp8_metrics
+```
+
+Result:
+
+```text
+FP8 metrics vs bf16 baseline output_rmse=0.00002498, loss_rmse=0.00000000, bf16_peak_mib=380.25, fp8_peak_mib=134.38
+PASS
+```
+
+### Interpretation
+
+- the benchmark harness now emits the bf16-vs-fp8 metrics required by the current reporting policy
+- the shard launcher is safe to invoke on a saturated machine in dry-run mode before selecting idle GPUs
+- the new adapter shim keeps default behavior unchanged while fixing the code landing point for the real fused epilogue
+- fused-op analysis confirmed that the incubator quant kernel consumes pre-SwiGLU `(T, 2H)` activations, so a direct swap at the current post-SwiGLU boundary would be semantically wrong

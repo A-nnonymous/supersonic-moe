@@ -30,6 +30,7 @@ from .fp8_protocol import (
     validate_fp8_protocol,
     validate_fp8_runtime_support,
 )
+from .fp8_cutely_fused import apply_activation_fp8_protocol_cutely_fused
 from .fp8_reference import (
     FP8Tensor,
     apply_activation_fp8_protocol,
@@ -39,6 +40,10 @@ from .fp8_reference import (
 from .forward import _down_projection_forward, _router_forward, _softmax_topk_fwd, _up_projection_forward
 from .triton_kernels import TC_topk_router_metadata_triton
 from .utils import enable_quack_gemm, is_using_quack_gemm
+
+
+def _use_cutely_fused_fp8_adapter() -> bool:
+    return os.getenv("SONIC_MOE_FP8_CUTELY_FUSED", "").lower() in {"1", "true", "yes", "on"}
 
 
 def general_routing_router_metadata(
@@ -499,7 +504,8 @@ def moe_TC_softmax_topk_layer(
     )
 
     if fp8_protocol is not None:
-        y1, _ = apply_activation_fp8_protocol(y1, fp8_protocol, quack_enabled=is_using_quack_gemm())
+        fp8_adapter = apply_activation_fp8_protocol_cutely_fused if _use_cutely_fused_fp8_adapter() else apply_activation_fp8_protocol
+        y1, _ = fp8_adapter(y1, fp8_protocol, quack_enabled=is_using_quack_gemm())
 
     o = _DownProjection.apply(
         y1,

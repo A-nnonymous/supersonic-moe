@@ -22,6 +22,17 @@ make test-blackwell-parallel PYTEST_WORKERS=2
 ```
 
 - observed parallel runtime: `168.14s` vs. `187.28s` for the serial command
+- multi-GPU shard launcher:
+
+```bash
+make test-blackwell-multigpu BLACKWELL_TEST_GPUS=0,1,2
+```
+
+- dry-run validation command for saturated machines:
+
+```bash
+python tools/run_blackwell_test_shards.py --gpus 0,1,2 --dry-run
+```
 
 ## Completed work
 
@@ -93,9 +104,21 @@ The latest optimization pass already improved the current boundary path:
 
 This is useful progress, but it is still not enough; the torch-side boundary path remains slower than the bf16 baseline.
 
+The benchmark harness also now has an explicit bf16-vs-fp8 metric entry:
+
+```bash
+USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 32768,2880,2880,64,8 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_fp8_metrics
+```
+
+This is the command to use when recording:
+
+- output RMSE vs official bf16
+- loss RMSE vs official bf16
+- peak memory vs official bf16
+
 ## Immediate next implementation targets
 
-1. Replace the torch-side boundary quant/dequant with a fused up-projection epilogue
+1. Add the adapter shim for the incubator fused quant contract, then replace the torch-side boundary quant/dequant with a fused up-projection epilogue
 2. Land the paired backward kernel and cache contract
 3. Reuse the same protocol for Blackwell QuACK activation paths
 4. Keep the current benchmark command as the mandatory regression gate
@@ -111,6 +134,9 @@ This is useful progress, but it is still not enough; the torch-side boundary pat
 - end-to-end FP8 reference behavior:
   - `supersonic-moe/tests/reference_layers/standalone_moe_layer/moe_standalone/moe/deep_ep_moe_layer.py`
   - `supersonic-moe/tests/reference_layers/standalone_moe_layer/moe_standalone/token_dispatcher/fp8_utils.py`
+- integration constraint from incubator fused-op analysis:
+  - `operator-incubator/cutify/ops/cute/fused_weighted_swiglu_act_quant.py` consumes pre-SwiGLU `(T, 2H)` activations and emits `(T, H)` fp8 + block scales
+  - SonicMoE's current FP8 boundary sits after `_UpProjection` on post-SwiGLU `(TK, I)` activations, so the first safe landing is an adapter shim rather than a direct swap
 
 ## Maintenance rule
 

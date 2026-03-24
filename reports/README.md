@@ -12,6 +12,8 @@ This directory is the live work log for the FP8 upgrade effort. It is not meant 
   - serial result: `18 passed, 91 skipped`
   - opt-in parallel: `make test-blackwell-parallel PYTEST_WORKERS=2`
   - parallel result: `18 passed, 91 skipped in 168.14s`
+  - multi-GPU dry-run: `python tools/run_blackwell_test_shards.py --gpus 0,1,2 --dry-run`
+  - fp8 metric probe: `USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 1024,512,512,32,4 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_fp8_metrics`
 
 ## What is already done
 
@@ -25,6 +27,7 @@ This directory is the live work log for the FP8 upgrade effort. It is not meant 
   - `sonicmoe/functional/fp8_quant.py`
   - `sonicmoe/functional/fp8_reference.py`
 - the protocol is wired through `MoE.forward(..., fp8_protocol=...)` and `moe_TC_softmax_topk_layer(..., fp8_protocol=...)`
+- a gated adapter landing point now exists in `sonicmoe/functional/fp8_cutely_fused.py`
 - current protocol scope is intentionally constrained to:
   - activation dtype: `torch.float8_e4m3fn`
   - scale encoding: `torch.float8_e8m0fnu`
@@ -37,7 +40,7 @@ This directory is the live work log for the FP8 upgrade effort. It is not meant 
 1. Read `reports/fp8_upgrade/HANDOFF.md`
 2. Confirm the environment with `source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate`
 3. Re-run `python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py tests/moe_test.py`
-4. Start the first fused FP8 kernel work at the up-projection epilogue
+4. Start from the env-gated adapter path in `sonicmoe/functional/fp8_cutely_fused.py`, then expose the pre-SwiGLU contract needed for the real fused epilogue
 
 ## Working rule
 

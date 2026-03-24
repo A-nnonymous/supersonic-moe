@@ -24,6 +24,11 @@ PYTEST_WORKERS ?= 2
 test-blackwell-parallel:
 	USE_QUACK_GEMM=1 python -m pytest -q -n $(PYTEST_WORKERS) --dist loadscope tests/fp8_protocol_test.py tests/moe_blackwell_test.py tests/moe_test.py
 
+BLACKWELL_TEST_GPUS ?= 0,1,2
+
+test-blackwell-multigpu:
+	python tools/run_blackwell_test_shards.py --gpus $(BLACKWELL_TEST_GPUS)
+
 test-debug:
 	DEBUG_CUTOTUNE=1 TRITON_PRINT_AUTOTUNING=1 pytest -s tests
 

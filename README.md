@@ -94,6 +94,32 @@ make test-blackwell-parallel PYTEST_WORKERS=2
 
 This parallel entry is intentionally opt-in. On a single busy GPU it may not speed up the heaviest QuACK/CuTe tests, so keep comparing it against the serial path.
 
+On this machine, a better option is to shard the Blackwell regression files across separate GPUs:
+
+```bash
+make test-blackwell-multigpu BLACKWELL_TEST_GPUS=0,1,2
+```
+
+This avoids multiple workers contending on one GPU.
+
+If the machine is saturated, validate the shard mapping without launching pytest:
+
+```bash
+python tools/run_blackwell_test_shards.py --gpus 0,1,2 --dry-run
+```
+
+For FP8 accuracy and memory reporting against the official bf16 baseline, run:
+
+```bash
+USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 32768,2880,2880,64,8 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_fp8_metrics
+```
+
+The reporting policy for every FP8 step is:
+
+- accuracy baseline: official bf16
+- memory baseline: official bf16
+- performance baselines: previous commit and official bf16
+
 ## 📋 Current FP8 Upgrade TODOs
 
 Keep this list synchronized with `reports/README.md` and `reports/fp8_upgrade/HANDOFF.md`.
@@ -104,6 +130,7 @@ Keep this list synchronized with `reports/README.md` and `reports/fp8_upgrade/HA
 - [x] Make `tests/moe_test.py` Blackwell-aware so unsupported non-QuACK SonicMoE paths skip instead of hard-failing
 - [x] Add a Blackwell-only FP8 protocol layer in `sonicmoe/functional/` for `e4m3` activations and `e8m0` scales
 - [x] Build the first torch/reference FP8 quant/dequant path before adding Hopper fused kernels
+- [x] Add Blackwell multi-GPU regression sharding and bf16-vs-fp8 RMSE/memory reporting entrypoints
 - [ ] Implement the Hopper up-projection FP8 epilogue: `grouped_gemm -> SwiGLU -> optional prob -> blockwise quant`
 - [ ] Implement the paired FP8 backward path and cache contract
 - [ ] Unify Hopper CuTe and Blackwell QuACK under the same FP8 protocol and test matrix
@@ -116,10 +143,11 @@ The current plan is to treat FP8 as a protocol-and-kernel migration, not a one-s
    - add `fp8_protocol.py`, `fp8_quant.py`, and `fp8_reference.py`
    - current scope is intentionally narrow: `e4m3` activations + `e8m0` scales + `1x128` granularity + Blackwell runtime checks
 2. **Ship the first Hopper fused kernel at the up-projection epilogue**
-   - target `grouped_gemm(varlen/gather-A) -> SwiGLU -> optional prob -> 1x128 quant`
-   - keep Blackwell on the QuACK adapter route
+    - target `grouped_gemm(varlen/gather-A) -> SwiGLU -> optional prob -> 1x128 quant`
+    - keep Blackwell on the QuACK adapter route
+   - the current `operator-incubator` fused quant kernel expects a pre-SwiGLU `(T, 2H)` tensor, so the smallest safe integration step is to add an adapter shim first and then replace the current torch-side boundary path once the pre-activation contract is exposed cleanly
 3. **Add the paired backward kernel**
-   - cover the `fused_swiglu_weighted_bwd` semantics and the minimum forward cache contract
+    - cover the `fused_swiglu_weighted_bwd` semantics and the minimum forward cache contract
 4. **Standardize dequant and blockwise quant**
    - start as reference/protocol code, then fuse only if profiling shows the need
 5. **Expand regression coverage**
