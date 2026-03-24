@@ -19,6 +19,18 @@ from .backward import (
     _up_projection_backward_act,
     _up_projection_backward_weight,
 )
+from .fp8_protocol import (
+    FP8ActivationDType,
+    FP8Backend,
+    FP8Protocol,
+    FP8ScaleEncoding,
+    FP8ScaleGranularity,
+    get_default_fp8_protocol,
+    is_blackwell_device,
+    validate_fp8_protocol,
+    validate_fp8_runtime_support,
+)
+from .fp8_reference import FP8Tensor, dequantize_activation_reference, quantize_activation_reference
 from .forward import _down_projection_forward, _router_forward, _softmax_topk_fwd, _up_projection_forward
 from .triton_kernels import TC_topk_router_metadata_triton
 from .utils import enable_quack_gemm, is_using_quack_gemm
