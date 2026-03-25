@@ -115,6 +115,18 @@ def parse_arguments() -> argparse.Namespace:
         default=False,
         help="Print theoretical weight/activation memory and FP8 boundary traffic analysis",
     )
+    parser.add_argument(
+        "--prefetch_fp8_weights",
+        action="store_true",
+        default=False,
+        help="Pre-quantize supported FP8 weights before fp8 timing/metric runs so runtime measures static fp8 weights",
+    )
+    parser.add_argument(
+        "--native_fp8_forward",
+        action="store_true",
+        default=False,
+        help="Enable native FP8 tensor cores for forward up-proj and backward down-proj GEMMs",
+    )
     args = parser.parse_args()
 
     if len(args.thiek) != 5:
@@ -304,6 +316,8 @@ def run(
     report_fp8_metrics: Type[bool],
     report_stage_memory: Type[bool],
     report_fp8_analysis: Type[bool],
+    prefetch_fp8_weights: Type[bool],
+    native_fp8_forward: bool = False,
     **kwargs,
 ):
     torch_dtype = {cutlass.BFloat16: torch.bfloat16, cutlass.Float16: torch.float16}[dtype]
@@ -345,12 +359,61 @@ def run(
         torch.nn.init.normal_(b2, 0, 0.01)
     dout = 0.2 * torch.randn_like(x, requires_grad=True)
 
+    # ── Native FP8 tensor core mode ──
+    if native_fp8_forward:
+        os.environ["SONIC_MOE_OPT_NATIVE_FP8_UPPROJ"] = "1"
+        os.environ["SONIC_MOE_OPT_MIXED_DTYPE_DOWNPROJ_DW2"] = "1"
+        # Pre-quantize x to fp8 before timing so cast overhead is excluded.
+        # The router still needs bf16, so keep original x; store fp8 view
+        # for any internal path that checks the flag.
+        x_fp8 = x.detach().to(torch.float8_e4m3fn)
+        print0(
+            "[bold cyan]Native FP8 forward/backward enabled[/bold cyan] "
+            f"x_fp8_shape={tuple(x_fp8.shape)}, x_fp8_dtype={x_fp8.dtype}, "
+            "SONIC_MOE_OPT_NATIVE_FP8_UPPROJ=1, SONIC_MOE_OPT_MIXED_DTYPE_DOWNPROJ_DW2=1"
+        )
+
+    static_fp8_prefetch_announced = False
+
+    def prime_static_fp8_weights() -> None:
+        nonlocal static_fp8_prefetch_announced
+        prefetched = moe.prefetch_fp8_weights(fp8_protocol_config)
+        torch.cuda.synchronize()
+        if not static_fp8_prefetch_announced:
+            downproj_weight_fp8, downproj_scales = prefetched["downproj"]
+            print0(
+                "[bold yellow]Static FP8 weight prefetch[/bold yellow] "
+                f"downproj_fp8_shape={tuple(downproj_weight_fp8.shape)}, "
+                f"downproj_scale_shape={tuple(downproj_scales.shape)}, "
+                f"downproj_weight_dtype={downproj_weight_fp8.dtype}, "
+                f"downproj_scale_dtype={downproj_scales.dtype}"
+            )
+            static_fp8_prefetch_announced = True
+
+    static_fp8_weights_enabled = prefetch_fp8_weights
+
     if report_fp8_metrics and fp8_protocol_config is not None:
+        def collect_grad_rmses(fp8_grads, bf16_grads):
+            return {
+                name: torch.sqrt(torch.mean((fp8_grads[name] - bf16_grads[name]) ** 2)).item() for name in bf16_grads
+            }
+
         def run_metrics_case(protocol_config):
+            moe.clear_fp8_weight_cache()
+            if protocol_config is not None and static_fp8_weights_enabled:
+                prime_static_fp8_weights()
             x_case = x.detach().clone().requires_grad_()
             dout_case = dout.detach().clone()
+            tracked_grad_tensors = {
+                "dw1": w1,
+                "dw2": w2,
+                "drouter_w": router_w,
+            }
+            if add_bias:
+                tracked_grad_tensors["db1"] = b1
+                tracked_grad_tensors["db2"] = b2
 
-            for grad_tensor in [w1, w2, router_w]:
+            for grad_tensor in tracked_grad_tensors.values():
                 grad_tensor.grad = None
 
             torch.cuda.empty_cache()
@@ -373,27 +436,35 @@ def run(
             torch.cuda.synchronize()
             peak_mib = torch.cuda.max_memory_allocated() / (1024**2)
             loss_value = (o_case.float() * dout_case.float()).mean().item()
-            output_value = o_case.detach().float()
+            output_value = o_case.detach().float().cpu()
+            grad_values = {"dx": x_case.grad.detach().float().cpu()}
+            grad_values.update(
+                {name: grad_tensor.grad.detach().float().cpu() for name, grad_tensor in tracked_grad_tensors.items()}
+            )
 
-            for grad_tensor in [x_case, w1, w2, router_w]:
+            for grad_tensor in [x_case, *tracked_grad_tensors.values()]:
                 grad_tensor.grad = None
 
-            return output_value, loss_value, peak_mib
+            return output_value, loss_value, peak_mib, grad_values
 
-        bf16_output, bf16_loss, bf16_peak_mib = run_metrics_case(None)
-        fp8_output, fp8_loss, fp8_peak_mib = run_metrics_case(fp8_protocol_config)
+        bf16_output, bf16_loss, bf16_peak_mib, bf16_grads = run_metrics_case(None)
+        fp8_output, fp8_loss, fp8_peak_mib, fp8_grads = run_metrics_case(fp8_protocol_config)
 
         output_rmse = torch.sqrt(torch.mean((fp8_output - bf16_output) ** 2)).item()
         loss_rmse = math.sqrt((fp8_loss - bf16_loss) ** 2)
+        grad_rmses = collect_grad_rmses(fp8_grads, bf16_grads)
+        grad_rmse_summary = ", ".join(f"{name}_rmse={rmse:.8f}" for name, rmse in grad_rmses.items())
 
         print0(
             "[bold cyan]FP8 metrics vs bf16 baseline[/bold cyan] "
             f"output_rmse={output_rmse:.8f}, loss_rmse={loss_rmse:.8f}, "
-            f"bf16_peak_mib={bf16_peak_mib:.2f}, fp8_peak_mib={fp8_peak_mib:.2f}"
+            f"bf16_peak_mib={bf16_peak_mib:.2f}, fp8_peak_mib={fp8_peak_mib:.2f}, "
+            + grad_rmse_summary
         )
 
     if report_stage_memory:
         if fp8_protocol_config is None:
+            moe.clear_fp8_weight_cache()
             stages, final_peak_mib = _run_stage_memory_case(
                 moe=moe,
                 x=x,
@@ -415,6 +486,7 @@ def run(
                 + f"; final_peak_mib={final_peak_mib:.2f}"
             )
         else:
+            moe.clear_fp8_weight_cache()
             bf16_stages, bf16_final_peak_mib = _run_stage_memory_case(
                 moe=moe,
                 x=x,
@@ -427,6 +499,9 @@ def run(
                 activation=activation,
                 protocol_config=None,
             )
+            moe.clear_fp8_weight_cache()
+            if static_fp8_weights_enabled:
+                prime_static_fp8_weights()
             fp8_stages, fp8_final_peak_mib = _run_stage_memory_case(
                 moe=moe,
                 x=x,
@@ -537,6 +612,10 @@ def run(
     warmup = 5
 
     time.sleep(0.5)
+
+    moe.clear_fp8_weight_cache()
+    if static_fp8_weights_enabled:
+        prime_static_fp8_weights()
 
     # Warmup — populate all CuTe compile caches and Triton autotune
     moe_TC_softmax_topk_layer(
@@ -654,5 +733,7 @@ if __name__ == "__main__":
         args.report_fp8_metrics,
         args.report_stage_memory,
         args.report_fp8_analysis,
+        args.prefetch_fp8_weights,
+        args.native_fp8_forward,
     )
     print("PASS")

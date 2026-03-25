@@ -96,8 +96,16 @@ def _use_blockscaled_fp8_downproj() -> bool:
     return _downproj_mainloop_precision() == "fp8-blockscaled"
 
 
+def _use_native_fp8_upproj() -> bool:
+    return os.getenv("SONIC_MOE_OPT_NATIVE_FP8_UPPROJ", "").lower() in {"1", "true", "yes", "on"}
+
+
 def _use_dummy_fp8_postact_buffer() -> bool:
     return os.getenv("SONIC_MOE_FP8_DUMMY_POSTACT_BUFFER", "").lower() in {"1", "true", "yes", "on"}
+
+
+def _use_mixed_dtype_downproj_dw2() -> bool:
+    return os.getenv("SONIC_MOE_OPT_MIXED_DTYPE_DOWNPROJ_DW2", "").lower() in {"1", "true", "yes", "on"}
 
 
 def _validate_runtime_precision_switches(fp8_protocol: FP8Protocol | None) -> None:
@@ -237,15 +245,29 @@ class _UpProjection(torch.autograd.Function):
         if use_quack_gemm:
             assert not torch.compiler.is_compiling()
             assert is_glu_activation, "QuACK GEMM does not support non GLU activation yet"
-            z, y1 = gemm_gated(
-                x,
-                w1.permute(2, 1, 0),
-                activation="swiglu",
-                cu_seqlens_m=expert_frequency_offset,
-                A_idx=x_gather_idx,
-                postact_dtype=(torch.float8_e4m3fn if use_low_precision_postact_buffer else None),
-                dynamic_scheduler=False,
-            )
+            if _use_native_fp8_upproj():
+                x_fp8 = x.to(torch.float8_e4m3fn)
+                w1_fp8 = w1.permute(2, 1, 0).to(torch.float8_e4m3fn)
+                z, y1 = gemm_gated(
+                    x_fp8,
+                    w1_fp8,
+                    activation="swiglu",
+                    cu_seqlens_m=expert_frequency_offset,
+                    A_idx=x_gather_idx,
+                    out_dtype=torch.bfloat16,
+                    postact_dtype=torch.float8_e4m3fn,
+                    dynamic_scheduler=False,
+                )
+            else:
+                z, y1 = gemm_gated(
+                    x,
+                    w1.permute(2, 1, 0),
+                    activation="swiglu",
+                    cu_seqlens_m=expert_frequency_offset,
+                    A_idx=x_gather_idx,
+                    postact_dtype=(torch.float8_e4m3fn if use_low_precision_postact_buffer else None),
+                    dynamic_scheduler=False,
+                )
         else:
             z = torch.empty(TK, (2 * I if is_glu_activation else I), dtype=x.dtype, device=x.device)
             y1 = torch.empty(TK, I, dtype=x.dtype, device=x.device)
@@ -508,23 +530,46 @@ class _DownProjection(torch.autograd.Function):
             assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
 
             s = topk_scores[s_scatter_idx]
-            _, y1s, ds = gemm_dgated(
-                dout,
-                w2.permute(2, 0, 1),
-                PreAct=z,
-                activation="swiglu",
-                dx_out=dz,
-                colvec_scale=s,
-                colvec_reduce=True,
-                cu_seqlens_m=expert_frequency_offset,
-                A_idx=x_gather_idx,
-                dynamic_scheduler=False,
-            )
+            if _use_mixed_dtype_downproj_dw2():
+                # FP8 tensor core path: cast A (dout) and B (w2) to fp8
+                # PreAct/Out MUST stay bf16 (epilogue constraint)
+                dout_fp8 = dout.to(torch.float8_e4m3fn)
+                w2_fp8 = w2.permute(2, 0, 1).to(torch.float8_e4m3fn)
+                _, y1s, ds = gemm_dgated(
+                    dout_fp8,
+                    w2_fp8,
+                    PreAct=z,
+                    activation="swiglu",
+                    dx_out=dz,
+                    out_dtype=torch.bfloat16,
+                    postact_dtype=torch.float8_e4m3fn,
+                    colvec_scale=s,
+                    colvec_reduce=True,
+                    cu_seqlens_m=expert_frequency_offset,
+                    A_idx=x_gather_idx,
+                    dynamic_scheduler=False,
+                )
+            else:
+                _, y1s, ds = gemm_dgated(
+                    dout,
+                    w2.permute(2, 0, 1),
+                    PreAct=z,
+                    activation="swiglu",
+                    dx_out=dz,
+                    colvec_scale=s,
+                    colvec_reduce=True,
+                    cu_seqlens_m=expert_frequency_offset,
+                    A_idx=x_gather_idx,
+                    dynamic_scheduler=False,
+                )
             _log_stage_memory("backward:down-proj-dgated")
             _reset_stage_memory_probe()
+
+            # Weight gradient: quack.gemm doesn't support fp8, dequant if needed
+            y1s_wgrad = y1s.to(torch.bfloat16) if y1s.dtype == torch.float8_e4m3fn else y1s
             gemm(
                 dout.T,
-                y1s,
+                y1s_wgrad,
                 out=dw2.permute(2, 0, 1),
                 cu_seqlens_k=expert_frequency_offset,
                 A_idx=x_gather_idx,
@@ -623,36 +668,55 @@ def _moe_tc_softmax_topk_layer_quack_inference(
         _log_stage_memory("forward:router-metadata")
 
         needs_preact = fp8_protocol is not None and _upproj_epilogue_precision() == "fp8"
-        z, y1 = gemm_gated(
-            x,
-            w1.permute(2, 1, 0),
-            activation="swiglu",
-            cu_seqlens_m=expert_frequency_offset,
-            A_idx=x_gather_idx,
-            postact_dtype=(torch.float8_e4m3fn if use_low_precision_postact_buffer else None),
-            store_preact=needs_preact,
-            dynamic_scheduler=False,
-        )
+        if _use_native_fp8_upproj():
+            x_fp8 = x.to(torch.float8_e4m3fn)
+            w1_fp8 = w1.permute(2, 1, 0).to(torch.float8_e4m3fn)
+            z, y1 = gemm_gated(
+                x_fp8,
+                w1_fp8,
+                activation="swiglu",
+                cu_seqlens_m=expert_frequency_offset,
+                A_idx=x_gather_idx,
+                out_dtype=torch.bfloat16,
+                postact_dtype=torch.float8_e4m3fn,
+                store_preact=needs_preact,
+                dynamic_scheduler=False,
+            )
+        else:
+            z, y1 = gemm_gated(
+                x,
+                w1.permute(2, 1, 0),
+                activation="swiglu",
+                cu_seqlens_m=expert_frequency_offset,
+                A_idx=x_gather_idx,
+                postact_dtype=(torch.float8_e4m3fn if use_low_precision_postact_buffer else None),
+                store_preact=needs_preact,
+                dynamic_scheduler=False,
+            )
         _log_stage_memory("forward:up-proj")
 
         if needs_preact:
             _reset_stage_memory_probe()
-            restored_out = None
-            if y1.size(-1) % fp8_protocol.group_size == 0:
-                if use_low_precision_postact_buffer:
-                    restored_out = torch.empty(y1.shape, dtype=x.dtype, device=device)
-                else:
-                    restored_out = y1
-            y1, _ = apply_preact_activation_fp8_protocol_cutely_fused(
-                z,
-                None,
-                fp8_protocol,
-                quack_enabled=True,
-                return_scales=False,
-                use_ste=False,
-                restored_out=restored_out,
-                output_dtype=x.dtype,
-            )
+            if _use_native_fp8_upproj():
+                # y1 is already fp8 from the native up-proj GEMM epilogue.
+                y1 = y1.to(x.dtype)
+            else:
+                restored_out = None
+                if y1.size(-1) % fp8_protocol.group_size == 0:
+                    if use_low_precision_postact_buffer:
+                        restored_out = torch.empty(y1.shape, dtype=x.dtype, device=device)
+                    else:
+                        restored_out = y1
+                y1, _ = apply_preact_activation_fp8_protocol_cutely_fused(
+                    z,
+                    None,
+                    fp8_protocol,
+                    quack_enabled=True,
+                    return_scales=False,
+                    use_ste=False,
+                    restored_out=restored_out,
+                    output_dtype=x.dtype,
+                )
             _log_stage_memory("forward:fp8-boundary")
 
         del z
@@ -777,7 +841,12 @@ def moe_TC_softmax_topk_layer(
 
     if fp8_protocol is not None and _upproj_epilogue_precision() == "fp8":
         _reset_stage_memory_probe()
-        if is_using_quack_gemm():
+        if _use_native_fp8_upproj() and is_using_quack_gemm():
+            # y1 is already fp8 from the native up-proj GEMM epilogue.
+            # Convert to bf16 for downstream compatibility; down-proj will
+            # re-quantize if its own blockscaled path is active.
+            y1 = y1.to(z.dtype)
+        elif is_using_quack_gemm():
             restored_out = None
             if y1.size(-1) % fp8_protocol.group_size == 0:
                 if use_low_precision_postact_buffer:
