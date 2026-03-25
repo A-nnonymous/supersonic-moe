@@ -258,6 +258,10 @@ class _UpProjection(torch.autograd.Function):
                     postact_dtype=torch.float8_e4m3fn,
                     dynamic_scheduler=False,
                 )
+                # FP8 tensor cores were used for the GEMM; convert postact
+                # back to bf16 so downstream (FP8 boundary / down-proj) gets
+                # a consistent dtype regardless of fp8_protocol.
+                y1 = y1.to(x.dtype)
             else:
                 z, y1 = gemm_gated(
                     x,
@@ -698,8 +702,10 @@ def _moe_tc_softmax_topk_layer_quack_inference(
         if needs_preact:
             _reset_stage_memory_probe()
             if _use_native_fp8_upproj():
-                # y1 is already fp8 from the native up-proj GEMM epilogue.
-                y1 = y1.to(x.dtype)
+                # y1 was computed via FP8 tensor cores; convert to bf16 and
+                # skip the quant→dequant round-trip.
+                if y1.dtype != x.dtype:
+                    y1 = y1.to(x.dtype)
             else:
                 restored_out = None
                 if y1.size(-1) % fp8_protocol.group_size == 0:
@@ -842,10 +848,10 @@ def moe_TC_softmax_topk_layer(
     if fp8_protocol is not None and _upproj_epilogue_precision() == "fp8":
         _reset_stage_memory_probe()
         if _use_native_fp8_upproj() and is_using_quack_gemm():
-            # y1 is already fp8 from the native up-proj GEMM epilogue.
-            # Convert to bf16 for downstream compatibility; down-proj will
-            # re-quantize if its own blockscaled path is active.
-            y1 = y1.to(z.dtype)
+            # y1 was computed via FP8 tensor cores and already converted to
+            # bf16 inside _UpProjection.  Skip the quant→dequant round-trip;
+            # the GEMM epilogue already applied the activation at fp8 precision.
+            pass
         elif is_using_quack_gemm():
             restored_out = None
             if y1.size(-1) % fp8_protocol.group_size == 0:
