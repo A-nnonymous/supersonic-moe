@@ -2,6 +2,116 @@
 
 This log records concrete code changes plus their immediate validation and performance numbers.
 
+## 2026-03-25 - 让 fused preact dequant 直接回写 `y1`，把稳定主线前向拉回可竞争区间
+
+### 指标注释（先看这个）
+
+- 精度基线：同一条命令下的 `bf16 baseline` 输出 / loss。
+- 显存基线：同一条命令下的 `bf16 baseline` peak memory。
+- 性能基线 1：同一时间窗、同一张卡上的 `bf16 baseline`。
+- 性能基线 2：本轮改动前的稳定 `fp8-mainline` 实测。
+- 本轮收益来源：
+  - 不再让 fused preact dequant 新建一份额外的 `bf16 y1`；
+  - 直接把 dequant 结果回写到 QuACK `gemm_gated(...)` 已经产出的 `y1` buffer；
+  - 同时把这条 QuACK preact FP8 boundary 包在 `torch.no_grad()` 里，避免继续构建一条主线里根本不会用到的死梯度图。
+
+### 改动
+
+- 在 `sonicmoe/functional/fp8_cutely_fused.py` 中：
+  - `apply_preact_activation_fp8_protocol_cutely_fused(...)` 新增 `restored_out=...`；
+  - 当调用方提供预分配输出时，`fused_act_dequant_best(...)` 会直接把反量化后的 `bf16` 激活写入该 buffer；
+  - 对 `shape / dtype / device` 做了显式校验，并保留非对齐尾部的安全切片逻辑。
+- 在 `sonicmoe/functional/__init__.py` 中：
+  - QuACK 主线现在会在对齐宽度下把 `y1` 直接作为 `restored_out` 传给 fused preact dequant；
+  - 这条 QuACK preact FP8 boundary 现在运行在 `torch.no_grad()` 下；
+  - 主线不再把原始 `postact` 重新传回 adapter，因为这条路径本来就没有真实梯度意义。
+- 在 `tests/fp8_protocol_test.py` 中：
+  - 新增回归：`preact_cutely_fused_path_can_reuse_restored_output_buffer`
+  - 用显式预分配的 `restored_out` 锁住“返回值就是复用后的同一块输出 buffer”。
+
+### 正确性验证
+
+命令：
+
+```bash
+USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py
+```
+
+结果：
+
+```text
+20 passed
+```
+
+### 真实 shape 数据
+
+#### shape `8192,4096,1024,128,8`
+
+- 精度：
+  - output RMSE：`0.01074111`
+  - loss RMSE：`0.00000025`
+- bf16 baseline：
+  - peak：`7690.63 MiB`
+  - inf / train fwd / e2e / bwd：`4.081 / 3.942 / 5.728 / 1.647 ms`
+- 当前稳定 fp8-mainline：
+  - peak：`7700.75 MiB`
+  - inf / train fwd / e2e / bwd：`1.842 / 2.111 / 5.586 / 3.743 ms`
+- 相对 bf16 baseline：
+  - inference：`+121.55%`（`2.22x`）
+  - train fwd：`+86.74%`（`1.87x`）
+  - e2e：`+2.54%`（`1.03x`）
+  - backward：`-55.89%`
+  - peak memory：`+10.12 MiB`
+- 相对改动前 fp8-mainline（同卡近邻复测）：
+  - inference：`+109.56%`
+  - train fwd：`+95.82%`
+  - e2e：`+117.98%`
+  - backward：`+122.22%`
+- stagewise memory：
+  - `forward:router-metadata`：`+0.00 MiB`
+  - `forward:up-proj`：`+0.00 MiB`
+  - `forward:down-proj-router`：`+2.00 MiB`
+  - `backward:down-proj-core`：`+130.00 MiB`
+  - `backward:up-proj-core`：`+130.00 MiB`
+  - `backward:token-reduce`：`+130.00 MiB`
+  - final peak：`7828.75 -> 7958.75 MiB`
+
+#### shape `4096,4096,1024,128,8`
+
+- 精度：
+  - output RMSE：`0.01073675`
+  - loss RMSE：`0.00000021`
+- bf16 baseline：
+  - peak：`7049.88 MiB`
+  - inf / train fwd / e2e / bwd：`1.141 / 1.210 / 3.437 / 2.296 ms`
+- 当前稳定 fp8-mainline：
+  - peak：`6931.00 MiB`
+  - inf / train fwd / e2e / bwd：`1.125 / 1.697 / 3.733 / 2.608 ms`
+- 相对 bf16 baseline：
+  - inference：`+1.42%`
+  - train fwd：`-28.70%`
+  - e2e：`-7.93%`
+  - backward：`-11.42%`
+  - peak memory：`-118.88 MiB`
+- 相对改动前 fp8-mainline（同卡近邻复测）：
+  - inference：`+188.76%`
+  - train fwd：`+104.59%`
+  - e2e：`+185.47%`
+  - backward：`+184.03%`
+
+### 结论
+
+- 这次改动已经把稳定主线的**前向主矛盾明显吃掉**：
+  - `8192` 上 inference / train-fwd 都已经显著领先 bf16；
+  - `8192` 的 e2e 也终于在真实大 shape 上微幅超过 bf16。
+- 但它同时暴露了一个新的硬 blocker：
+  - `8192` 上 backward 仍然多出一段稳定的 `+130 MiB` 峰值；
+  - 量级正好接近一份 `bf16 y1`，说明还有一份额外 postact 级别的驻留没有被彻底吃掉。
+- 因此下一阶段的主线已经更明确：
+  1. 保留这次 `y1` 直回写带来的前向收益；
+  2. 继续追 `8192` backward 段那份 `+130 MiB` 的额外驻留，优先检查 `gemm_gated` 输出 buffer 生命周期与 `_DownProjection.backward(...) / gemm_dgated(...)` 之间的耦合；
+  3. 目标是不丢掉当前前向收益的前提下，把 peak memory 重新拉回到稳定 `fp8 < bf16`。
+
 ## 2026-03-24 - 去掉主线里无效的 STE 依赖，并把低精度 up-proj postact buffer 收口为实验开关
 
 ### 指标注释（先看这个）

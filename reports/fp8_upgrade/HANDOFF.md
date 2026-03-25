@@ -5,6 +5,31 @@ This is the minimum context a new agent needs to continue work without replaying
 ## 0. 最新中文结论
 
 - 新结论（这一轮最重要）：
+  - QuACK 主线里的 fused preact dequant 现在已经支持 `restored_out=...`，并且默认会直接回写 `gemm_gated(...)` 已经分配好的 `y1` buffer；
+  - 同时这条 QuACK preact FP8 boundary 已经切到 `torch.no_grad()`；
+  - 对应回归已更新为：
+    - `USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py`
+    - 结果：`20 passed`
+- 新结论（这一轮最重要）：
+  - 这一步不是小修，而是真实性能里程碑：
+  - `8192,4096,1024,128,8`
+    - bf16：peak `7690.63 MiB`，inf / train fwd / e2e / bwd `4.081 / 3.942 / 5.728 / 1.647 ms`
+    - 稳定 fp8：peak `7700.75 MiB`，output RMSE `0.01074111`，loss RMSE `0.00000025`，inf / train fwd / e2e / bwd `1.842 / 2.111 / 5.586 / 3.743 ms`
+    - 相对 bf16：inference `+121.55%`，train fwd `+86.74%`，e2e `+2.54%`
+  - `4096,4096,1024,128,8`
+    - bf16：peak `7049.88 MiB`，inf / train fwd / e2e / bwd `1.141 / 1.210 / 3.437 / 2.296 ms`
+    - 稳定 fp8：peak `6931.00 MiB`，output RMSE `0.01073675`，loss RMSE `0.00000021`，inf / train fwd / e2e / bwd `1.125 / 1.697 / 3.733 / 2.608 ms`
+    - 相对 bf16：inference `+1.42%`，e2e `-7.93%`，peak `-118.88 MiB`
+- 新结论（这一轮最重要）：
+  - 这一步已经把“稳定主线前向太慢”这个矛盾明显缩小；
+  - 但也把新的 blocker 暴露得更清楚：
+    - `8192` 的 stagewise memory 对排现在稳定显示：
+      - `backward:down-proj-core`：`+130.00 MiB`
+      - `backward:up-proj-core`：`+130.00 MiB`
+      - `backward:token-reduce`：`+130.00 MiB`
+      - final peak：`7828.75 -> 7958.75 MiB`
+  - 这说明下一刀已经不该再打前向，而是要查清楚这份接近一整份 `bf16 y1` 的额外 backward 驻留。
+- 新结论（这一轮最重要）：
   - SonicMoE 主线里 preact fused FP8 boundary 的 `STE` 混合已经确认是**语义冗余**：
     - `_UpProjection.forward(...)` 返回的 `y1` 本来就 `mark_non_differentiable`
     - `_DownProjection.backward(...)` 也不是从前向 `y1` 回梯度，而是重新基于 `z` 做 gated backward
@@ -74,7 +99,7 @@ This is the minimum context a new agent needs to continue work without replaying
     - `SONIC_MOE_FP8_DOWNPROJ_WEIGHT_PRECISION=fp8` 只允许和 `fp8-blockscaled` mainloop 组合使用。
 - 最新验证：
   - `USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py`
-  - 结果：`19 passed`
+  - 结果：`20 passed`
 - 最新已 push 里程碑：
   - `b93211d` — `Add runtime FP8 precision switches`
 - 新结论（这一轮最重要）：
@@ -93,10 +118,12 @@ This is the minimum context a new agent needs to continue work without replaying
 - 当前最重要的判断：
   - 现在稳定 `fp8-mainline` 在真实规整 shape 上已经做到了：
     - 精度稳定
-    - 显存领先
-    - inference 领先 bf16
-  - 但 training/e2e 仍慢，根因仍是 `quant -> dequant -> bf16` 回退；
-  - 下一步必须打通“量化后激活直喂 down-proj mainloop”。
+    - inference 大 shape 已明显领先 bf16
+    - `8192` e2e 已经首次微幅超过 bf16
+  - 但当前还没有同时满足“大 shape 性能领先 + 显存也领先”：
+    - `8192` 这轮 peak 比 bf16 高 `10.12 MiB`
+    - 真正新 blocker 已经收敛为 backward 段的 `+130 MiB` 额外驻留
+  - 下一步必须优先把这份 backward 额外驻留找出来并吃掉。
 - 工程化提醒：
   - `fp8-direct-downproj` grouped 原型已经证伪，且已从工作树撤回；
   - 下一个 agent **不要**再从 grouped/static capacity 这条路继续深挖 stable 主线；

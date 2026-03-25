@@ -517,3 +517,35 @@ class FP8ProtocolTest(TestCommons):
 
         self.assertIs(scales, scale_out)
         torch.testing.assert_close(scales.float(), scales_ref.float(), atol=0.0, rtol=0.0)
+
+    def test_preact_cutely_fused_path_can_reuse_restored_output_buffer(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required")
+
+        major, _ = torch.cuda.get_device_capability()
+        if major < 10:
+            self.skipTest("Blackwell-only test requires SM100+")
+
+        self.set_seed(_SEED)
+        protocol = get_default_fp8_protocol()
+        preact = 0.1 * torch.randn(8, 256, device="cuda", dtype=torch.bfloat16)
+        postact = (preact[..., 1::2] * F.silu(preact[..., ::2].float()).to(dtype=preact.dtype)).contiguous()
+        restored_out = torch.empty_like(postact)
+
+        with enable_quack_gemm(True):
+            restored_ref, _ = apply_preact_activation_fp8_protocol_cutely_fused(
+                preact,
+                postact,
+                protocol,
+                use_ste=False,
+            )
+            restored, _ = apply_preact_activation_fp8_protocol_cutely_fused(
+                preact,
+                postact,
+                protocol,
+                use_ste=False,
+                restored_out=restored_out,
+            )
+
+        self.assertIs(restored, restored_out)
+        torch.testing.assert_close(restored.float(), restored_ref.float(), atol=0.0, rtol=0.0)

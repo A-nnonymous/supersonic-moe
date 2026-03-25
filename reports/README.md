@@ -9,12 +9,17 @@ This directory is the live work log for the FP8 upgrade effort. It is not meant 
 - authoritative Python environment: `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer`
 - Blackwell path: QuACK-enabled (`USE_QUACK_GEMM=1`)
 - latest validated local milestone:
-  - `bf16 vs fp8` stagewise/theory comparison is now in `benchmarks/moe-cute.py`
-  - FP8 quant / dequant / scale encode now support preallocated output buffers for capture-safe reuse
-  - preact fused FP8 mainline now drops redundant STE by default; experimental dummy postact buffer remains opt-in only
+  - fused preact dequant now supports `restored_out=...` and directly reuses the QuACK `y1` output buffer on the aligned stable path
+  - QuACK preact FP8 boundary now runs under `torch.no_grad()` so the mainline no longer builds a dead gradient path there
+  - latest large-shape state:
+    - `8192,4096,1024,128,8`
+    - bf16: peak `7690.63 MiB`, inf / train fwd / e2e / bwd `4.081 / 3.942 / 5.728 / 1.647 ms`
+    - fp8: peak `7700.75 MiB`, output RMSE `0.01074111`, loss RMSE `0.00000025`, inf / train fwd / e2e / bwd `1.842 / 2.111 / 5.586 / 3.743 ms`
+    - relative to bf16: inference `+121.55%`, train fwd `+86.74%`, e2e `+2.54%`
+    - current blocker: backward stages still carry `+130.00 MiB` extra peak, so large-shape peak memory has not yet beaten bf16 again
 - latest targeted validation:
   - stable Blackwell fp8 regression: `USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py`
-  - stable result: `19 passed`
+  - stable result: `20 passed`
   - env-on blockscaled regression: `USE_QUACK_GEMM=1 SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1 SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY=128 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py`
   - env-on blockscaled result: `13 passed`
   - serial: `python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py tests/moe_test.py`
@@ -77,22 +82,24 @@ This directory is the live work log for the FP8 upgrade effort. It is not meant 
   - 结论：blockscaled 当前真正的显存墙已经是 `grouped_out` / `down-proj-router`，不是前半段 `pack+quant`
 - 更大真实 shape 已可跑通：
   - shape `8192,4096,1024,128,8`
-  - 官方 bf16：peak `7690.63 MiB`，e2e `12.202 ms`
-  - 稳定 `fp8-mainline`：output RMSE `0.01074074`，loss RMSE `0.00000025`，peak `7572.75 MiB`，inf `3.933 ms`，e2e `12.888 ms`
+  - 官方 bf16：peak `7690.63 MiB`，inf / train fwd / e2e / bwd `4.081 / 3.942 / 5.728 / 1.647 ms`
+  - 稳定 `fp8-mainline`：output RMSE `0.01074111`，loss RMSE `0.00000025`，peak `7700.75 MiB`，inf / train fwd / e2e / bwd `1.842 / 2.111 / 5.586 / 3.743 ms`
+  - 相对 bf16：inference `+121.55%`，train fwd `+86.74%`，e2e `+2.54%`，但 peak `+10.12 MiB`
   - 理论账：stable fp8 边界流量下界 `516.00 MiB`，真正节省 payload 仅 `62.00 MiB`
-  - 结论：大 shape crash 已通过本地 fallback / 分块 vec4 路径消掉；现在 stable fp8 的 inference 已领先 bf16，但 e2e 仍慢，主因还是 `quant -> dequant -> bf16` 边界搬运
+  - 结论：大 shape crash 已通过本地 fallback / 分块 vec4 路径消掉；现在 stable fp8 的前向与 e2e 已经被拉回可竞争区间，但新 blocker 已收敛为 backward 段那份 `+130 MiB` 的额外驻留
 - 中等真实 shape `4096,4096,1024,128,8`：
-  - 官方 bf16：inf `2.344 ms`，e2e `7.338 ms`
-  - 稳定 `fp8-mainline`：output RMSE `0.01073638`，loss RMSE `0.00000020`，peak `6867.00 MiB`，inf `2.204 ms`，e2e `8.022 ms`
-  - 结论：稳定 fp8 inference 已领先 bf16 `5.97%`
+  - 官方 bf16：peak `7049.88 MiB`，inf / train fwd / e2e / bwd `1.141 / 1.210 / 3.437 / 2.296 ms`
+  - 稳定 `fp8-mainline`：output RMSE `0.01073675`，loss RMSE `0.00000021`，peak `6931.00 MiB`，inf / train fwd / e2e / bwd `1.125 / 1.697 / 3.733 / 2.608 ms`
+  - 相对 bf16：inference `+1.42%`，e2e `-7.93%`，peak `-118.88 MiB`
 - blockscaled 的理论账也已明确：
   - shape `4096,4096,1024,128,8`，`capacity=1024`
   - `grouped_out_bf16` 理论大小 `1024.00 MiB`
   - 结论：这就是当前 blockscaled 很难在显存 / e2e 上赢过 bf16 的核心原因
 - 因此当前下一优先级已经明确：
-  1. 优先优化稳定 `fp8-mainline`，让量化后激活直接进入 down-proj mainloop，去掉反量化回 bf16；
-  2. 同时把激活 / 权重精度路径逐步做成外部可控开关，朝全流程 FP8 推进；
-  3. blockscaled 只在能直接吃掉 `grouped_out` / router 聚合过渡层时继续重投入。
+  1. 优先吃掉 `8192` backward 段那份 `+130 MiB` 额外驻留，恢复“大 shape 性能领先 + 显存也领先”；
+  2. 在不丢失这次前向收益的前提下，继续把量化后激活直喂 down-proj mainloop，减少 `bf16` 回退；
+  3. 同时把激活 / 权重精度路径逐步做成外部可控开关，朝全流程 FP8 推进；
+  4. blockscaled 只在能直接吃掉 `grouped_out` / router 聚合过渡层时继续重投入。
 - 最新账本补充（shape `4096,4096,1024,128,8`）：
   - 当前稳定主线：
     - `stable_fp8_boundary_lower_bound_mib=258.00`

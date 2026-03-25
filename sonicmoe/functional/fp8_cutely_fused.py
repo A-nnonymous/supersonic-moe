@@ -73,6 +73,7 @@ def apply_preact_activation_fp8_protocol_cutely_fused(
     return_scales: bool = True,
     use_ste: bool = True,
     scale_out: torch.Tensor | None = None,
+    restored_out: torch.Tensor | None = None,
     output_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     protocol = validate_fp8_runtime_support(protocol or FP8Protocol(), preact.device, quack_enabled=quack_enabled)
@@ -99,8 +100,23 @@ def apply_preact_activation_fp8_protocol_cutely_fused(
         using_pow2_scaling=True,
         using_ue8m0_scale=False,
     )
-    restored = fused_act_dequant_best(quantized, packed_scales, block_size=protocol.group_size)[..., :original_postact_width]
-    restored = restored.to(dtype=output_dtype)
+    if restored_out is not None:
+        expected_shape = tuple(quantized.shape)
+        if tuple(restored_out.shape) != expected_shape:
+            raise ValueError(f"restored_out must have shape {expected_shape}, got {tuple(restored_out.shape)}")
+        if restored_out.device != preact.device:
+            raise ValueError(f"restored_out must be on device {preact.device}, got {restored_out.device}")
+        if restored_out.dtype != output_dtype:
+            raise ValueError(f"restored_out must have dtype {output_dtype}, got {restored_out.dtype}")
+    restored_full = fused_act_dequant_best(
+        quantized,
+        packed_scales,
+        block_size=protocol.group_size,
+        out=restored_out,
+    )
+    restored = restored_full if restored_full.size(-1) == original_postact_width else restored_full[..., :original_postact_width]
+    if restored.dtype != output_dtype:
+        restored = restored.to(dtype=output_dtype)
 
     if use_ste:
         if postact is None:

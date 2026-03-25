@@ -641,15 +641,18 @@ def moe_TC_softmax_topk_layer(
     if fp8_protocol is not None and _upproj_epilogue_precision() == "fp8":
         _reset_stage_memory_probe()
         if is_using_quack_gemm():
-            y1, _ = apply_preact_activation_fp8_protocol_cutely_fused(
-                z,
-                None if use_low_precision_postact_buffer else y1,
-                fp8_protocol,
-                quack_enabled=True,
-                return_scales=False,
-                use_ste=False,
-                output_dtype=z.dtype,
-            )
+            restored_out = y1 if (not use_low_precision_postact_buffer and y1.size(-1) % fp8_protocol.group_size == 0) else None
+            with torch.no_grad():
+                y1, _ = apply_preact_activation_fp8_protocol_cutely_fused(
+                    z,
+                    None,
+                    fp8_protocol,
+                    quack_enabled=True,
+                    return_scales=False,
+                    use_ste=False,
+                    restored_out=restored_out,
+                    output_dtype=z.dtype,
+                )
         else:
             fp8_adapter = apply_activation_fp8_protocol_cutely_fused if _use_cutely_fused_fp8_adapter() else apply_activation_fp8_protocol
             y1, _ = fp8_adapter(
