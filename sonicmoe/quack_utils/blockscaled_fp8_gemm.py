@@ -32,7 +32,10 @@ _SF_TILE_STORAGE = _SF_TILE_M * (_SF_TILE_K // _SF_VEC_SIZE)
 _FP8_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
 
 _INDEX_CACHE: dict[tuple[int, int, int | None], torch.Tensor] = {}
-_WEIGHT_CACHE: dict[tuple[int, tuple[int, ...], tuple[int, ...], int | None, int], tuple[torch.Tensor, torch.Tensor]] = {}
+_WEIGHT_CACHE: dict[
+    tuple[int, tuple[int, ...], tuple[int, ...], int | None, int, str, str, str, str],
+    tuple[torch.Tensor, torch.Tensor],
+] = {}
 _COMPILE_CACHE: dict[tuple[object, ...], object] = {}
 _TORCH_TO_CUTLASS_DTYPE = {
     torch.float8_e4m3fn: cutlass.Float8E4M3FN,
@@ -171,13 +174,20 @@ def _make_cute_tensor_dynamic(tensor: torch.Tensor, leading_dim: int) -> cute.Te
     return from_dlpack(tensor.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=leading_dim)
 
 
-def _weight_cache_key(weight: torch.Tensor) -> tuple[int, tuple[int, ...], tuple[int, ...], int | None, int]:
+def _weight_cache_key(
+    weight: torch.Tensor,
+    protocol: FP8Protocol,
+) -> tuple[int, tuple[int, ...], tuple[int, ...], int | None, int, str, str, str, str]:
     return (
         weight.untyped_storage().data_ptr(),
         tuple(weight.shape),
         tuple(weight.stride()),
         weight.device.index,
         weight._version,
+        protocol.activation_dtype.value,
+        protocol.scale_encoding.value,
+        protocol.scale_granularity.value,
+        protocol.backend.value,
     )
 
 
@@ -185,7 +195,7 @@ def _quantize_w2_cached(
     w2: torch.Tensor,
     protocol: FP8Protocol,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    key = _weight_cache_key(w2)
+    key = _weight_cache_key(w2, protocol)
     cached = _WEIGHT_CACHE.get(key)
     if cached is not None:
         return cached
@@ -195,6 +205,23 @@ def _quantize_w2_cached(
     packed_scales = pack_blockscaled_1x32_scales(weight_scales, weight_ehi.size(-1))
     _WEIGHT_CACHE[key] = (weight_fp8_ehi, packed_scales)
     return weight_fp8_ehi, packed_scales
+
+
+def clear_blockscaled_fp8_weight_cache() -> None:
+    _WEIGHT_CACHE.clear()
+
+
+def prefetch_blockscaled_w2_fp8(
+    w2: torch.Tensor,
+    protocol: FP8Protocol,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if w2.ndim != 3:
+        raise ValueError(f"expected w2 with shape (H, I, E), got {tuple(w2.shape)}")
+    if w2.device.type != "cuda":
+        raise ValueError("blockscaled FP8 weight prefetch requires CUDA weights")
+
+    blockscaled_protocol = validate_fp8_runtime_support(_blockscaled_protocol(protocol), device=w2.device)
+    return _quantize_w2_cached(w2, blockscaled_protocol)
 
 
 @triton.jit
@@ -581,6 +608,235 @@ def blockscaled_fp8_gemm_grouped(
         b_scale_cute,
     )
     return grouped_out
+
+
+def blockscaled_fp8_gemm_varlen(
+    a: torch.Tensor,
+    w2: torch.Tensor,
+    cu_seqlens_m: torch.Tensor,
+    *,
+    protocol: FP8Protocol,
+    out_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """Blockscaled FP8 GEMM using the varlen scheduler — no grouped packing.
+
+    Unlike ``blockscaled_fp8_gemm_grouped`` this keeps the activation flat
+    (total_M, K) and relies on ``cu_seqlens_m`` to map token-ranges to experts,
+    avoiding the expert-capacity env-var, 3-D padding, and unpack step.
+
+    Parameters
+    ----------
+    a : Tensor (total_M, K) bf16 — activations, contiguous in expert order.
+    w2 : Tensor (H, I, E) bf16 — expert weights.
+    cu_seqlens_m : Tensor (E+1,) int32 — expert token boundaries.
+    protocol : FP8Protocol
+    out_dtype : optional output dtype (defaults to ``a.dtype``).
+
+    Returns
+    -------
+    Tensor (total_M, H) — result of per-expert matmuls.
+
+    Raises
+    ------
+    NotImplementedError
+        The CUTLASS blockscaled kernel (``tile_atom_to_shape_SF``) currently
+        requires 3-D tensor shapes (M, K, L) for the scale-factor layout
+        computation, but the varlen_m path supplies a 2-D activation tensor
+        (total_M, K).  Until the kernel DSL is updated to handle rank-2
+        scale-factor tiling, this combination is not supported.
+
+        Kernel error observed at compile time::
+
+            tile_atom_to_shape_SF → cute.tile_to_shape:
+            "expects target shape and order operands have same rank,
+             but got (?,?) vs (2,1,3)"
+
+        The mismatch is between the 2-D ``mA.shape`` produced by the
+        varlen_m path and the hard-coded 3-element order ``(2,1,3)`` inside
+        ``tile_atom_to_shape_SF``
+        (``cutlass/utils/blockscaled_layout.py:81``).
+
+    Notes
+    -----
+    The implementation below is complete and correct in intent.  Once the
+    upstream CUTLASS DSL adds rank-aware ``tile_atom_to_shape_SF`` (or a
+    separate ``tile_atom_to_shape_SF_2d``), removing the guard at the top
+    should make this function operational.
+    """
+    protocol = validate_fp8_runtime_support(_blockscaled_protocol(protocol), a.device, quack_enabled=True)
+    if get_device_capacity(a.device)[0] != 10:
+        raise RuntimeError("blockscaled_fp8_gemm_varlen currently supports Blackwell only")
+
+    if a.ndim != 2:
+        raise ValueError(f"expected activation to be 2D, got shape {tuple(a.shape)}")
+    if w2.ndim != 3:
+        raise ValueError(f"expected w2 to be 3D (H, I, E), got shape {tuple(w2.shape)}")
+    if cu_seqlens_m.ndim != 1 or cu_seqlens_m.dtype != torch.int32:
+        raise ValueError("cu_seqlens_m must be a 1D int32 tensor")
+    if a.size(1) % _SF_TILE_K != 0:
+        raise RuntimeError(f"blockscaled_fp8_gemm_varlen requires intermediate width multiple of {_SF_TILE_K}")
+    if w2.size(0) % _SF_TILE_M != 0:
+        raise RuntimeError(f"blockscaled_fp8_gemm_varlen requires hidden width multiple of {_SF_TILE_M}")
+
+    total_M, K = a.shape
+    H, I, num_experts = w2.shape
+    assert K == I, f"K dimension mismatch: a has {K}, w2 has I={I}"
+    assert cu_seqlens_m.shape[0] == num_experts + 1, (
+        f"cu_seqlens_m length {cu_seqlens_m.shape[0]} != num_experts+1 ({num_experts + 1})"
+    )
+
+    # --- weight quantization (cached, 3D: E×H×I) ---
+    weight_fp8, weight_scales = _quantize_w2_cached(w2, protocol)
+
+    # --- activation quantization (flat 2D: total_M × K) ---
+    a_fp8, a_scales = quantize_activation_blockwise(a, protocol)
+    packed_a_scales = pack_blockscaled_1x32_scales(a_scales, K)
+
+    # --- output tensor (flat 2D: total_M × H) ---
+    d_dtype = a.dtype if out_dtype is None else out_dtype
+    out = torch.empty(total_M, H, dtype=d_dtype, device=a.device)
+
+    config = default_config(a.device)
+    if config.swap_ab:
+        raise RuntimeError("blockscaled_fp8_gemm_varlen does not support swap_ab configs")
+
+    # --- tensor infos ---
+    # For varlen_m: A is 2D (total_M, K), B is 3D (E, H, I), D is 2D (total_M, H)
+    tensor_infos = {
+        "A": GemmTensorInfo(a_fp8),
+        "B": GemmTensorInfo(weight_fp8),
+        "D": GemmTensorInfo(out),
+        "C": GemmTensorInfo(None),
+    }
+
+    # Permute B from (E, H, I) → (H, I, E)  [the standard (n, k, l) convention]
+    GemmWrapperBase.permute_tensors(tensor_infos, varlen_m=True)
+
+    major_configs = {
+        "A": ("m", "k", "l"),
+        "B": ("n", "k", "l"),
+        "D": ("m", "n", "l"),
+        "C": ("m", "n", "l"),
+    }
+    GemmWrapperBase.determine_major_orders(tensor_infos, major_configs)
+
+    for name, info in tensor_infos.items():
+        if info.tensor is not None:
+            info.dtype = _TORCH_TO_CUTLASS_DTYPE[info.tensor.dtype]
+            if name != "C":
+                info.cute_tensor = _make_cute_tensor_dynamic(
+                    info.tensor,
+                    leading_dim=1 if info.major == major_configs[name][1] else 0,
+                )
+
+    tile_shape_mn = (config.tile_m, config.tile_n)
+    cluster_shape_mnk = (config.cluster_m, config.cluster_n, 1)
+    if not GemmDefaultSm100.is_valid_dtypes(
+        tensor_infos["A"].dtype,
+        tensor_infos["B"].dtype,
+        Float32,
+        tensor_infos["D"].dtype,
+        tensor_infos["A"].major,
+        tensor_infos["B"].major,
+    ):
+        raise TypeError("Unsupported FP8 blockscaled type/major combination for varlen path")
+
+    max_active_clusters = get_max_active_clusters(config.cluster_m * config.cluster_n)
+
+    # --- scheduler (persistent for varlen) ---
+    scheduler_args = GemmWrapperBase.create_scheduler_args(
+        max_active_clusters,
+        tile_count_semaphore=None,
+        batch_idx_permute=None,
+        max_swizzle_size=config.max_swizzle_size,
+    )
+
+    # --- varlen args ---
+    varlen_args = GemmWrapperBase.create_varlen_args(
+        cu_seqlens_m,
+        cu_seqlens_k=None,
+        A_idx=None,
+        max_active_clusters=max_active_clusters,
+        cluster_shape_mnk=cluster_shape_mnk,
+        tensors=tensor_infos,
+        num_epi_tensormaps=GemmDefaultSm100.num_epi_tensormaps,
+        pingpong=config.pingpong,
+    )
+
+    epi_args = GemmDefaultSm100.EpilogueArguments()
+    current_stream = cutlass_torch.current_stream()
+    a_scale_cute = _make_cute_tensor_dynamic(packed_a_scales, leading_dim=1)
+    b_scale_cute = _make_cute_tensor_dynamic(weight_scales, leading_dim=1)
+
+    compile_key = (
+        "varlen",
+        tensor_infos["A"].dtype,
+        tensor_infos["B"].dtype,
+        tensor_infos["D"].dtype,
+        tile_shape_mn,
+        cluster_shape_mnk,
+        tuple(tensor_infos["A"].tensor.shape),
+        tuple(tensor_infos["A"].tensor.stride()),
+        tuple(tensor_infos["B"].tensor.shape),
+        tuple(tensor_infos["B"].tensor.stride()),
+        tuple(tensor_infos["D"].tensor.shape),
+        tuple(tensor_infos["D"].tensor.stride()),
+        tuple(packed_a_scales.shape),
+        tuple(weight_scales.shape),
+        tensor_infos["A"].major,
+        tensor_infos["B"].major,
+        config.pingpong,
+        True,
+        _SF_VEC_SIZE,
+    )
+    compiled = _COMPILE_CACHE.get(compile_key)
+    if compiled is None:
+        gemm_obj = GemmDefaultSm100(
+            Float32,
+            tensor_infos["A"].dtype,
+            tile_shape_mn,
+            cluster_shape_mnk,
+            sf_vec_size=_SF_VEC_SIZE,
+            gather_A=False,
+        )
+        try:
+            compiled = cute.compile(
+                gemm_obj,
+                tensor_infos["A"].cute_tensor,
+                tensor_infos["B"].cute_tensor,
+                tensor_infos["D"].cute_tensor,
+                tensor_infos["C"].cute_tensor,
+                epi_args,
+                scheduler_args,
+                varlen_args,
+                current_stream,
+                a_scale_cute,
+                b_scale_cute,
+            )
+        except (ValueError, Exception) as exc:
+            raise NotImplementedError(
+                "blockscaled FP8 + varlen_m is not yet supported by the CUTLASS kernel. "
+                "The kernel's tile_atom_to_shape_SF (blockscaled_layout.py:81) calls "
+                "cute.tile_to_shape with a hard-coded 3-element order (2,1,3), but the "
+                "varlen_m path provides a 2-D activation tensor (total_M, K). "
+                "Until the upstream CUTLASS DSL adds rank-2 support for blockscaled "
+                "scale-factor tiling, use blockscaled_fp8_gemm_grouped() instead."
+            ) from exc
+        _COMPILE_CACHE[compile_key] = compiled
+
+    compiled(
+        tensor_infos["A"].cute_tensor,
+        tensor_infos["B"].cute_tensor,
+        tensor_infos["D"].cute_tensor,
+        tensor_infos["C"].cute_tensor,
+        epi_args,
+        scheduler_args,
+        varlen_args,
+        current_stream,
+        a_scale_cute,
+        b_scale_cute,
+    )
+    return out
 
 
 def blockscaled_fp8_gemm(
