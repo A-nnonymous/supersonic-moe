@@ -232,7 +232,9 @@ class _UpProjection(torch.autograd.Function):
             I //= 2
         TK = total_expert_freq
 
-        if is_using_quack_gemm():
+        use_quack_gemm = is_using_quack_gemm()
+
+        if use_quack_gemm:
             assert not torch.compiler.is_compiling()
             assert is_glu_activation, "QuACK GEMM does not support non GLU activation yet"
             z, y1 = gemm_gated(
@@ -271,6 +273,7 @@ class _UpProjection(torch.autograd.Function):
         ctx.is_varlen_K = is_varlen_K
         ctx.is_glu_activation = is_glu_activation
         ctx.stream_id = stream_id
+        ctx.use_quack_gemm = use_quack_gemm
 
         ctx.save_for_backward(
             x,
@@ -278,7 +281,7 @@ class _UpProjection(torch.autograd.Function):
             b1,
             expert_frequency_offset,
             x_gather_idx,
-            s_scatter_idx,
+            None if use_quack_gemm else s_scatter_idx,
             s_reverse_scatter_idx,
             num_activated_expert_per_token_offset,
         )
@@ -303,6 +306,7 @@ class _UpProjection(torch.autograd.Function):
         is_glu_activation = ctx.is_glu_activation
         is_varlen_K = ctx.is_varlen_K
         stream_id = ctx.stream_id
+        use_quack_gemm = ctx.use_quack_gemm
 
         (
             x,
@@ -319,7 +323,7 @@ class _UpProjection(torch.autograd.Function):
         db1 = None if b1 is None else torch.empty_like(b1)
         _reset_stage_memory_probe()
 
-        if is_using_quack_gemm():
+        if use_quack_gemm:
             assert not is_compiling
 
             gemm(
@@ -402,7 +406,9 @@ class _DownProjection(torch.autograd.Function):
         TK = y1.size(0)
         H, I, E = w2.shape
 
-        if is_using_quack_gemm():
+        use_quack_gemm = is_using_quack_gemm()
+
+        if use_quack_gemm:
             assert not torch.compiler.is_compiling()
 
             assert b2 is None
@@ -457,13 +463,13 @@ class _DownProjection(torch.autograd.Function):
         ctx.is_varlen_K = is_varlen_K
         ctx.activation_type = activation_type
         ctx.stream_id = stream_id
+        ctx.use_quack_gemm = use_quack_gemm
 
         ctx.save_for_backward(
             z,
             w2,
             b2,
             topk_scores,
-            selected_experts,
             expert_frequency_offset,
             x_gather_idx,
             s_scatter_idx,
@@ -479,13 +485,13 @@ class _DownProjection(torch.autograd.Function):
         stream_id = ctx.stream_id
         is_varlen_K = ctx.is_varlen_K
         activation_type = ctx.activation_type
+        use_quack_gemm = ctx.use_quack_gemm
 
         (
             z,
             w2,
             b2,
             topk_scores,
-            _selected_experts,
             expert_frequency_offset,
             x_gather_idx,
             s_scatter_idx,
@@ -497,7 +503,7 @@ class _DownProjection(torch.autograd.Function):
         dz = torch.empty_like(z)
         _reset_stage_memory_probe()
 
-        if is_using_quack_gemm():
+        if use_quack_gemm:
             assert not torch.compiler.is_compiling()
             assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
 
@@ -514,6 +520,8 @@ class _DownProjection(torch.autograd.Function):
                 A_idx=x_gather_idx,
                 dynamic_scheduler=False,
             )
+            _log_stage_memory("backward:down-proj-dgated")
+            _reset_stage_memory_probe()
             gemm(
                 dout.T,
                 y1s,
@@ -523,6 +531,7 @@ class _DownProjection(torch.autograd.Function):
                 batch_idx_permute=None,
                 dynamic_scheduler=False,
             )
+            _log_stage_memory("backward:down-proj-weight")
 
             ds = ds[s_reverse_scatter_idx]
         else:
@@ -552,6 +561,8 @@ class _DownProjection(torch.autograd.Function):
                 activation_type=activation_type.value,
                 stream_id=stream_id,
             )
+            _log_stage_memory("backward:down-proj-dgated")
+            _reset_stage_memory_probe()
 
             _down_projection_backward_weight(
                 dout=dout,
@@ -562,13 +573,124 @@ class _DownProjection(torch.autograd.Function):
                 x_gather_idx=x_gather_idx,
                 stream_id=stream_id,
             )
+            _log_stage_memory("backward:down-proj-weight")
 
-        _log_stage_memory("backward:down-proj-core")
+        _reset_stage_memory_probe()
+        del y1s
+        _log_stage_memory("backward:down-proj-postact-release")
         # TC top-K routing
         if not is_varlen_K:
             ds = ds.view(T, K)
 
         return None, dz, dw2, db2, ds, None, *[None] * 11
+
+
+def _moe_tc_softmax_topk_layer_quack_inference(
+    x: torch.Tensor,
+    router_w: torch.Tensor,
+    w1: torch.Tensor,
+    b1: torch.Tensor | None,
+    w2: torch.Tensor,
+    b2: torch.Tensor | None,
+    K: int,
+    stream_id: int,
+    activation_type: ActivationType,
+    fp8_protocol: FP8Protocol | None,
+    use_low_precision_postact_buffer: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    E = router_w.size(0)
+    T = x.size(0)
+    H = w2.size(0)
+    TK = T * K
+    device = x.device
+
+    with torch.no_grad():
+        _reset_stage_memory_probe()
+        router_logits = F.linear(x, router_w)
+        topk_scores = torch.empty(T, K, dtype=torch.float32, device=device)
+        topk_indices = torch.empty(T, K, dtype=torch.int32, device=device)
+        _softmax_topk_fwd(router_logits, topk_scores, topk_indices, E, K)
+
+        s_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
+        s_reverse_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
+        expert_frequency = torch.empty(E, dtype=torch.int32, device=device)
+        expert_frequency_offset = torch.empty(E + 1, dtype=torch.int32, device=device)
+        x_gather_idx = torch.empty(TK, dtype=torch.int32, device=device)
+
+        TC_topk_router_metadata_triton(
+            topk_indices, E, expert_frequency, expert_frequency_offset, x_gather_idx, s_scatter_idx, s_reverse_scatter_idx
+        )
+        _log_stage_memory("forward:router-metadata")
+
+        needs_preact = fp8_protocol is not None and _upproj_epilogue_precision() == "fp8"
+        z, y1 = gemm_gated(
+            x,
+            w1.permute(2, 1, 0),
+            activation="swiglu",
+            cu_seqlens_m=expert_frequency_offset,
+            A_idx=x_gather_idx,
+            postact_dtype=(torch.float8_e4m3fn if use_low_precision_postact_buffer else None),
+            store_preact=needs_preact,
+            dynamic_scheduler=False,
+        )
+        _log_stage_memory("forward:up-proj")
+
+        if needs_preact:
+            _reset_stage_memory_probe()
+            restored_out = None
+            if y1.size(-1) % fp8_protocol.group_size == 0:
+                if use_low_precision_postact_buffer:
+                    restored_out = torch.empty(y1.shape, dtype=x.dtype, device=device)
+                else:
+                    restored_out = y1
+            y1, _ = apply_preact_activation_fp8_protocol_cutely_fused(
+                z,
+                None,
+                fp8_protocol,
+                quack_enabled=True,
+                return_scales=False,
+                use_ste=False,
+                restored_out=restored_out,
+                output_dtype=x.dtype,
+            )
+            _log_stage_memory("forward:fp8-boundary")
+
+        del z
+        _reset_stage_memory_probe()
+        if fp8_protocol is not None and _use_blockscaled_fp8_downproj():
+            y2 = blockscaled_fp8_gemm_grouped(
+                y1,
+                w2,
+                expert_frequency_offset,
+                protocol=fp8_protocol,
+            )
+            router_perm = make_blockscaled_grouped_reverse_scatter_idx(
+                s_reverse_scatter_idx,
+                expert_frequency_offset,
+                expert_ids=topk_indices.reshape(-1),
+            )
+            y2_for_router = y2.view(-1, H)
+        else:
+            y2 = gemm(y1, w2.permute(2, 1, 0), cu_seqlens_m=expert_frequency_offset)
+            router_perm = s_reverse_scatter_idx
+            y2_for_router = y2
+
+        del y1
+        o = torch.empty(T, H, device=device, dtype=y2_for_router.dtype)
+        topk_scores = topk_scores.flatten()
+        _router_forward(
+            y2=y2_for_router,
+            o=o,
+            topk_scores=topk_scores,
+            s_reverse_scatter_idx=router_perm,
+            num_activated_expert_per_token_offset=None,
+            varlen_K_max=K,
+            H=H,
+            is_varlen_K=False,
+        )
+        _log_stage_memory("forward:down-proj-router")
+
+    return o, router_logits, expert_frequency
 
 
 def moe_TC_softmax_topk_layer(
@@ -588,6 +710,30 @@ def moe_TC_softmax_topk_layer(
         (b1 is not None) and (b2 is not None)
     ), "b1 and b2 has to be None or not None at the same time!"
     _validate_runtime_precision_switches(fp8_protocol)
+    if type(activation_type) == str:
+        activation_type = ActivationType(activation_type)
+
+    use_low_precision_postact_buffer = (
+        fp8_protocol is not None
+        and _upproj_epilogue_precision() == "fp8"
+        and is_using_quack_gemm()
+        and _use_dummy_fp8_postact_buffer()
+    )
+    if is_inference_mode_enabled and is_using_quack_gemm():
+        return _moe_tc_softmax_topk_layer_quack_inference(
+            x,
+            router_w,
+            w1,
+            b1,
+            w2,
+            b2,
+            K,
+            stream_id,
+            activation_type,
+            fp8_protocol,
+            use_low_precision_postact_buffer,
+        )
+
     E = router_w.size(0)
     _reset_stage_memory_probe()
     router_logits = F.linear(x, router_w)
@@ -610,15 +756,6 @@ def moe_TC_softmax_topk_layer(
 
     T = x.size(0)
 
-    if type(activation_type) == str:
-        activation_type = ActivationType(activation_type)
-
-    use_low_precision_postact_buffer = (
-        fp8_protocol is not None
-        and _upproj_epilogue_precision() == "fp8"
-        and is_using_quack_gemm()
-        and _use_dummy_fp8_postact_buffer()
-    )
     y1, z = _UpProjection.apply(
         x,
         w1,
@@ -748,6 +885,7 @@ def moe_general_routing_inputs(
         True,  # is_varlen_K
         activation_type,
         is_inference_mode_enabled,
+        False,  # use_low_precision_postact_buffer
     )
 
     o = _DownProjection.apply(
