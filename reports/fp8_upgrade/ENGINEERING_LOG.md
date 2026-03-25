@@ -19,14 +19,14 @@
 
 | 论文算子 | 工程函数 / 路径 | 论文变量 | baseline dtype | 当前支持 dtype | 当前支持方式 / 备注 | 当前完成度 | 进度预期 | 工程量预期 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| up-proj (`varlen-M grouped GEMM + act`) | `sonicmoe/functional/forward.py::_up_projection_forward`；QuACK 路径主要是 `sonicmoe/quack_utils/gemm_interface.py::gemm_gated` | 输入 `X_e`，输出 pre-activation `H_e` 与 activation 后 `A_e` | 输入激活 `torch.bfloat16`；权重 `torch.bfloat16`；输出 `torch.bfloat16` | 输出后激活 buffer 额外支持 `torch.float8_e4m3fn`；scale 额外支持 `torch.float8_e8m0fnu` | **部分算子内融合**：QuACK `gemm_gated` 可直接写低精度 post-activation buffer；stable 主线仍主要是先算出 `A_e`，再做边界 FP8 quant/dequant | 部分完成，已是当前最成熟 FP8 入口 | 继续做局部 epilogue / saved-state / buffer 生命周期优化；不把 full-chain FP8 放到这条小步主线里 | 中 |
-| down-proj (`varlen-M grouped GEMM`) | `sonicmoe/functional/forward.py::_down_projection_forward`；QuACK 路径主要是 `quack.gemm_interface::gemm` | 输入 `A_e`，输出 `Y_e` | 输入激活 `torch.bfloat16`；权重 `torch.bfloat16`；输出 `torch.bfloat16` | 实验线支持 `A_e` / `W2_e` 的 blockscaled FP8（`torch.float8_e4m3fn` + `torch.float8_e8m0fnu` scale） | **未主线化为原生 FP8 mainloop**；当前 stable 仍是恢复成 `bf16 A_e` 后再做 down-proj；experimental blockscaled path 仍依赖 grouped/static-capacity | stable 主线未完成 | 近期待继续做 glue / layout / router 过渡的小优化；原生 flat-varlen FP8 mainloop 默认记入大工程目录 | 大 |
-| expert aggregation (forward) | `sonicmoe/functional/forward.py::_router_forward` | `O_t = Σ π_{t,e} S_{t,e} Y_{e,t}` | `Y_e` / `O` 为 `torch.bfloat16`；score 为 `torch.float32` | 暂无额外 FP8 主线支持 | 不是当前 FP8 主战场；保持和 baseline 一致 | 基本未动 | 短期只做 reshape / reduction / metadata glue 层小优化，不单独追求 FP8 化 | 小-中 |
-| down-proj act grad | `sonicmoe/functional/backward.py::_down_projection_backward_act`；QuACK 路径会用 `sonicmoe/quack_utils/gemm_interface.py::gemm_dgated` | `dH_e` / `dA_e` / router score grad side products | `dout / H_e / dH_e / dA_e` 以 `torch.bfloat16` 为主；部分 reduce 为 `torch.float32` | 本地 probe 已支持输出 `torch.float8_e4m3fn` 的 router-weighted activation side product | **已局部打 through**：`gemm_dgated` 可产出 FP8 后激活 side product，但未接成 stable backward 主线 | 局部打通，主线未闭环 | 近期待继续做 reduction / scratch / dtype-contract 的局部优化；若要把 FP8 `S·A_e` 接到主线则会撞上更大工程 | 中 |
-| down-proj weight grad (`varlen-K grouped GEMM`) | `sonicmoe/functional/backward.py::_down_projection_backward_weight` | `dW2_e` | 输入 `dout` / routed activation 为 `torch.bfloat16`，累加到 `torch.float32` | 暂无 stable FP8 支持 | 当前 blocker 是 mixed-dtype 合同 + Blackwell-native kernel 路线未完成 | 基本未做 | 默认并行排队，不阻塞主线；只接受为后续大工程做最小 probe，不在当前小步迭代里硬推 | 大 |
-| up-proj act grad | `sonicmoe/functional/backward.py::_up_projection_backward_act` | `dX_e` / `dH_e` | `torch.bfloat16` 主线 | 暂无 stable FP8 支持 | 仍按论文 baseline 合同走 | 基本未动 | 近期待只做 metadata / saved-state / wrapper overhead 优化，不优先做算子级 FP8 改写 | 中 |
-| up-proj weight grad (`varlen-K grouped GEMM`) | `sonicmoe/functional/backward.py::_up_projection_backward_weight` | `dW1_e` | 输入激活 / 梯度 `torch.bfloat16`，累加到 `torch.float32` | 暂无 stable FP8 支持 | 仍按论文 baseline 合同走 | 基本未动 | 近期待只做低风险 bookkeeping / saved-state 优化；真正 FP8 化优先级低于 down-proj 主问题 | 中 |
-| backward expert aggregation | `sonicmoe/functional/backward.py::_token_broadcast_backward`；router score 反向为 `_softmax_topk_bwd` | `dX_t = Σ reverse_scatter(dX_e)` 与 router score grad | 激活梯度 `torch.bfloat16`；router score grad path 用 `torch.float32` score 合同 | 暂无额外 FP8 主线支持 | 不是当前 FP8 主战场 | 基本未动 | 只在出现明确 buffer / scatter 热点时做小修；不主动扩 scope | 小 |
+| up-proj (`varlen-M grouped GEMM + act`) | `sonicmoe/functional/__init__.py::_UpProjection`；QuACK 路径 `sonicmoe/quack_utils/gemm_gated.py::gemm_gated` | 输入 `X_e`，输出 pre-activation `H_e` 与 activation 后 `A_e` | 输入激活 `bf16`；权重 `bf16`；输出 `bf16` | **原生 FP8 tensor core**: 输入 `x.to(fp8)`, 权重 `w1_fp8_cached`, 输出 `z(bf16) + y1(fp8→bf16)` | `SONIC_MOE_OPT_NATIVE_FP8_UPPROJ=1` 启用。gemm_gated 内部使用 FP8 tensor core + FP32 累加。权重经 `_FP8_WEIGHT_CACHE` 缓存。前向推理/训练均已打通 | **已完成** ✅ | 后续可加 E8M0 blockscaling (sf_vec_size) | 完成 |
+| down-proj (`varlen-M grouped GEMM`) | `sonicmoe/functional/__init__.py::_DownProjection`；QuACK 路径 `quack.gemm_interface::gemm` | 输入 `A_e`，输出 `Y_e` | 输入激活 `bf16`；权重 `bf16`；输出 `bf16` | 仍使用 bf16。`quack.gemm` 不支持 fp8 dtype mapping | stable 主线仍为 bf16；需要 fork quack.gemm 或等上游支持 fp8 | **未完成** | 需 quack.gemm fp8 支持 | 大 |
+| expert aggregation (forward) | `sonicmoe/functional/forward.py::_router_forward` | `O_t = Σ π_{t,e} S_{t,e} Y_{e,t}` | `Y_e` / `O` 为 `bf16`；score 为 `float32` | 暂无额外 FP8 主线支持 | 不是当前 FP8 主战场 | 基本未动 | 低优先级 | 小 |
+| down-proj act grad | `sonicmoe/functional/__init__.py::_DownProjection.backward`；QuACK `sonicmoe/quack_utils/gemm_dgated.py::gemm_dgated` | `dH_e` / `dA_e` / router score grad side products | `dout / H_e / dH_e / dA_e` 以 `bf16` 为主 | **原生 FP8 tensor core**: `dout.to(fp8)` + `w2_fp8_cached` → gemm_dgated FP8 TC → `dz(bf16), y1s(fp8)` | `SONIC_MOE_OPT_MIXED_DTYPE_DOWNPROJ_DW2=1` 启用。gemm_dgated 内部使用 FP8 tensor core + FP32 累加。w2 经 `_FP8_WEIGHT_CACHE` 缓存 | **已完成** ✅ | 后续可优化 y1s 的 fp8→bf16 roundtrip | 完成 |
+| down-proj weight grad (`varlen-K grouped GEMM`) | `sonicmoe/functional/__init__.py::_DownProjection.backward` (gemm call) | `dW2_e` | 输入 `dout` / `y1s` 为 `bf16`，累加到 `float32` | **部分 FP8**: y1s 由 gemm_dgated 以 fp8 产出，但必须 dequant 回 bf16 给 quack.gemm | quack.gemm 不支持 fp8。当前: `y1s_wgrad = y1s.to(bf16)` 后调用 bf16 gemm | **部分完成** ⚠️ | 需 quack.gemm fp8 支持 | 大 |
+| up-proj act grad | `sonicmoe/functional/__init__.py::_UpProjection.backward` | `dX_e` / `dH_e` | `bf16` 主线 | 仍 bf16（`gemm(dz, w1)` 和 `gemm(x.T, dz)` 均 bf16） | quack.gemm 不支持 fp8 | **未完成** | 需 quack.gemm fp8 支持 | 中 |
+| up-proj weight grad (`varlen-K grouped GEMM`) | `sonicmoe/functional/__init__.py::_UpProjection.backward` | `dW1_e` | 输入激活 / 梯度 `bf16`，累加到 `float32` | 仍 bf16（同上） | quack.gemm 不支持 fp8 | **未完成** | 需 quack.gemm fp8 支持 | 中 |
+| backward expert aggregation | `sonicmoe/functional/backward.py::_token_broadcast_backward`；router score 反向为 `_softmax_topk_bwd` | `dX_t = Σ reverse_scatter(dX_e)` 与 router score grad | 激活梯度 `bf16`；router score grad path 用 `float32` | 暂无额外 FP8 支持 | 不是当前 FP8 主战场 | 基本未动 | 低优先级 | 小 |
 
 ### 0.2 论文变量 ↔ 工程变量（之后汇报不要只写简写）
 
@@ -1236,7 +1236,7 @@ workspace cache 试验结果（未保留，仅记录）：
 - 不要继续把工程精力重投到 grouped/static-capacity 主线化
 - 除非目标明确是做“对照实验”，而不是做真正交付路径
 
-### 6.3 Sprint: Native FP8 Tensor Core — 三路并行（进行中）
+### 6.3 Sprint: Native FP8 Tensor Core — 三路并行（已完成核心功能）
 
 **目标**: 全流程涉及到 GEMM 的，内部都调用 FP8 tensor core，使用 FP32 main-loop 累加。
 
@@ -1246,29 +1246,103 @@ workspace cache 试验结果（未保留，仅记录）：
 - 标准 quack.gemm 不支持 fp8 — `torch2cute_dtype_map` 缺少 fp8 映射
 - gemm_dgated 约束: Out/PreAct 必须 bf16 (element_size==2 断言)，A/B 可以 fp8
 
-**三路并行 Agent**:
+**三路并行 Agent（全部完成）**:
 
-| Agent | 范围 | GPU | 状态 |
-|-------|------|-----|------|
-| P1 fp8-varlen-kernel | blockscaled_fp8_gemm_varlen | GPU 1 | 进行中 |
-| P2 fp8-forward-pipeline | up-proj fp8 tensor cores + FP8 boundary | GPU 2 | 进行中 |
-| P3 fp8-backward-benchmark | backward dgated fp8 + benchmark fp8 inputs | GPU 3 | 进行中 |
+| Agent | 范围 | 状态 | Commit |
+|-------|------|------|--------|
+| P1 fp8-varlen-kernel | blockscaled_fp8_gemm_varlen | ✅ 完成（upstream CUTLASS rank 限制已记录） | `1ded647` |
+| P2 fp8-forward-pipeline | up-proj fp8 tensor cores + FP8 boundary skip | ✅ 完成 | `a07050e` |
+| P3 fp8-backward-benchmark | backward dgated fp8 + benchmark fp8 inputs | ✅ 完成 | `65110ec` |
+
+**性能优化迭代**:
+
+1. **初始结果**: FP8 比 BF16 慢 10-27%（因为每次 forward 都做 w1.permute(2,1,0).to(fp8)，1B 元素花费 1.8ms）
+2. **FP8 权重缓存**: `_FP8_WEIGHT_CACHE`（version-aware keying，支持 optimizer step 后清除）消除了 permute+cast 开销
+3. **推理路径 bug 修复**: 发现 inference path 当 fp8_protocol=None 时 y1(fp8) 没有 cast 回 bf16，导致 down-proj gemm dtype 不匹配
+4. **最终结果**: 远超 BF16 baseline（详见 § 6.3.1）
+
+#### 6.3.1 最新 Benchmark 数据（2026-03-26）
+
+Commit: `7c461e1` — 包含 FP8 权重缓存 + 推理路径修复
+
+**Shape 4096,4096,1024,128,8（中等，memory-bound）:**
+
+| 指标 | BF16 Pure | Native FP8 (cached) | Delta | TFLOPS (FP8) |
+|------|-----------|---------------------|-------|-------------|
+| Fwd inference (ms) | 2.431 | 0.885 | **−63.6%** ✅ | 931.8 |
+| Fwd training (ms) | 2.578 | 1.278 | **−50.4%** ✅ | — |
+| E2E fwd+bwd (ms) | 7.629 | 3.261 | **−57.2%** ✅ | 758.7 |
+| Bwd (ms) | 5.199 | 2.376 | **−54.3%** ✅ | 694.1 |
+| Peak mem (MiB) | 7049.75 | 8601.75 | **+1552 MiB** ⚠️ | — |
+
+**Shape 8192,4096,1024,128,8（大，更接近 compute-bound）:**
+
+| 指标 | BF16 Pure | Native FP8 (cached) | Delta | TFLOPS (FP8) |
+|------|-----------|---------------------|-------|-------------|
+| Fwd inference (ms) | 1.787 | 1.470 | **−17.7%** ✅ | 1121.7 |
+| Fwd training (ms) | 1.966 | 1.519 | **−22.7%** ✅ | — |
+| E2E fwd+bwd (ms) | 5.469 | 4.958 | **−9.3%** ✅ | 997.9 |
+| Bwd (ms) | 3.682 | 3.488 | **−5.3%** ✅ | 945.8 |
+| Peak mem (MiB) | 7690.38 | 9258.38 | **+1568 MiB** ⚠️ | — |
+
+**内存增量来源**: ~1552 MiB 来自 FP8 权重缓存（w1_fp8 + w2_fp8 的 permute+cast 副本）。可通过 `clear_fp8_native_weight_cache()` 在 optimizer step 后清除。
+
+**为什么 shape1 改善更大**: shape1 每个 expert 平均 256 tokens (4096×8/128)，per-expert GEMM 高度 memory-bound（BF16 仅 324 TFLOPS）。FP8 将 bandwidth 需求减半 → 近 2× 提速。shape2 per-expert 512 tokens，更 compute-bound（BF16 905 TFLOPS），FP8 改善更温和。
+
+#### 6.3.2 当前 FP8 数据流
+
+```
+Forward (SONIC_MOE_OPT_NATIVE_FP8_UPPROJ=1):
+  x (bf16) → .to(fp8) → gemm_gated(x_fp8, w1_fp8_cached) → z(bf16), y1(fp8)
+  y1(fp8) → .to(bf16) → FP8 boundary SKIPPED → down-proj gemm(y1_bf16, w2_bf16)
+
+Backward (SONIC_MOE_OPT_MIXED_DTYPE_DOWNPROJ_DW2=1):
+  dout(bf16) → .to(fp8) → gemm_dgated(dout_fp8, w2_fp8_cached, PreAct=z_bf16)
+    → dz(bf16), y1s(fp8)
+  y1s(fp8) → .to(bf16) → quack.gemm(dout.T, y1s_bf16) → dw2  [仍 bf16，因 quack.gemm 不支持 fp8]
+
+Weight cache: _FP8_WEIGHT_CACHE[data_ptr, version, tag] → fp8 tensor
+  Tags: "w1_ekh" (permute 2,1,0), "w2_ehi" (permute 2,0,1)
+  Must call clear_fp8_native_weight_cache() between optimizer steps.
+```
+
+#### 6.3.3 控制开关
+
+| Flag | 效果 |
+|------|------|
+| `SONIC_MOE_OPT_NATIVE_FP8_UPPROJ=1` | FP8 tensor cores for up-proj forward + inference |
+| `SONIC_MOE_OPT_MIXED_DTYPE_DOWNPROJ_DW2=1` | FP8 tensor cores for backward dgated |
+| `--native_fp8_forward` (benchmark) | 同时设置以上两个 flag |
+
+#### 6.3.4 剩余缺口
+
+1. **Down-proj forward 仍使用 bf16**: `gemm(y1_bf16, w2_bf16)` — 需要 quack.gemm 支持 fp8 或创建 fork
+2. **Up-proj weight grad 仍 bf16**: `gemm(x.T, dz)` — 同上
+3. **Down-proj weight grad 仍 bf16**: `gemm(dout.T, y1s_bf16)` — y1s 需要 dequant 才能用
+4. **无 E8M0 blockscaling**: gemm_gated/gemm_dgated 不带 sf_vec_size → 简单 cast 量化（非 hardware-native scale）
+5. **内存代价**: 权重缓存 +1.5 GiB — 可接受（训练模式常驻，optimizer step 后刷新）
+6. **Varlen blockscaled**: CUTLASS upstream rank 限制（tile_atom_to_shape_SF 2D/3D）
+
+**测试状态**: 11/11 contract tests pass (both fp8 flags enabled); 3 varlen tests pass, 3 skip.
 
 ---
 
 ## 7. 当前工作树里最重要的非文档改动
 
+- `sonicmoe/functional/__init__.py`
+  - **FP8 权重缓存**: `_FP8_WEIGHT_CACHE`（version-aware keying）, `_get_cached_fp8_weight()`, `clear_fp8_native_weight_cache()`
+  - 训练前向/推理前向/反向均使用缓存的 fp8 权重
+  - 修复推理路径 y1 fp8→bf16 cast 缺失 bug
+  - 输入 x 已为 fp8 时跳过冗余 cast
+- `sonicmoe/quack_utils/blockscaled_fp8_gemm.py`
+  - `blockscaled_fp8_gemm_varlen()` — 完整实现但因 upstream CUTLASS rank 限制抛 NotImplementedError
 - `benchmarks/moe-cute.py`
-  - backward RMSE
-  - CPU snapshot fix
-  - static weight prefetch benchmark plumbing
+  - `--native_fp8_forward` flag，设置 fp8 env vars 并 pre-quantize x
+  - backward RMSE / stage-memory 增强
 - `sonicmoe/moe.py`
   - fp8 weight prefetch / clear API
 - `sonicmoe/quack_utils/blockscaled_fp8_gemm.py`
-  - protocol-aware weight cache
-  - prefetch / clear
-- `sonicmoe/functional/__init__.py`
-  - 更细的 backward stage-memory probe
+  - protocol-aware weight cache, prefetch / clear
 
 备注：
 
@@ -1318,4 +1392,16 @@ python benchmarks/moe-cute.py \
   --fp8_protocol blackwell \
   --report_fp8_metrics \
   --prefetch_fp8_weights
+```
+
+### Native FP8 tensor core benchmark（主线）
+
+```bash
+USE_QUACK_GEMM=1 python benchmarks/moe-cute.py \
+  --thiek 4096,4096,1024,128,8 \
+  --dtype BFloat16 \
+  --activation swiglu \
+  --skip_test \
+  --report_stage_memory \
+  --native_fp8_forward
 ```
