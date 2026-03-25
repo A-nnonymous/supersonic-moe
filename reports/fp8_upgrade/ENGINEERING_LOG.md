@@ -1,2388 +1,1321 @@
 # FP8 Engineering Log
 
-This log records concrete code changes plus their immediate validation and performance numbers.
+本文件不再按“想到哪写到哪”的流水账组织，而是按**主线里程碑 / 实验线 / 经验教训 / 当前缺口**组织。
 
-## 2026-03-25 - 让 fused preact dequant 直接回写 `y1`，把稳定主线前向拉回可竞争区间
+---
 
-### 指标注释（先看这个）
+## 0. 读法
 
-- 精度基线：同一条命令下的 `bf16 baseline` 输出 / loss。
-- 显存基线：同一条命令下的 `bf16 baseline` peak memory。
-- 性能基线 1：同一时间窗、同一张卡上的 `bf16 baseline`。
-- 性能基线 2：本轮改动前的稳定 `fp8-mainline` 实测。
-- 本轮收益来源：
-  - 不再让 fused preact dequant 新建一份额外的 `bf16 y1`；
-  - 直接把 dequant 结果回写到 QuACK `gemm_gated(...)` 已经产出的 `y1` buffer；
-  - 同时把这条 QuACK preact FP8 boundary 包在 `torch.no_grad()` 里，避免继续构建一条主线里根本不会用到的死梯度图。
+如果你只想知道“现在到底到了哪一步”，请只看：
 
-### 改动
+- `## 1. 主线里程碑`
+- `## 3. 当前最可信的数据`
+- `## 5. 经验与教训`
+- `## 6. 当前缺口`
 
-- 在 `sonicmoe/functional/fp8_cutely_fused.py` 中：
-  - `apply_preact_activation_fp8_protocol_cutely_fused(...)` 新增 `restored_out=...`；
-  - 当调用方提供预分配输出时，`fused_act_dequant_best(...)` 会直接把反量化后的 `bf16` 激活写入该 buffer；
-  - 对 `shape / dtype / device` 做了显式校验，并保留非对齐尾部的安全切片逻辑。
-- 在 `sonicmoe/functional/__init__.py` 中：
-  - QuACK 主线现在会在对齐宽度下把 `y1` 直接作为 `restored_out` 传给 fused preact dequant；
-  - 这条 QuACK preact FP8 boundary 现在运行在 `torch.no_grad()` 下；
-  - 主线不再把原始 `postact` 重新传回 adapter，因为这条路径本来就没有真实梯度意义。
-- 在 `tests/fp8_protocol_test.py` 中：
-  - 新增回归：`preact_cutely_fused_path_can_reuse_restored_output_buffer`
-  - 用显式预分配的 `restored_out` 锁住“返回值就是复用后的同一块输出 buffer”。
+### 0.1 论文 8 个算子 ↔ 工程函数 ↔ 当前 dtype / 支持状态
 
-### 正确性验证
+后续所有进展汇报，默认都按这张表对齐；不再只说“forward/backward 某段”，而要明确是论文里的哪一个算子、工程里对应哪一个函数、baseline 是什么 dtype、现在额外支持什么 dtype、以及 FP8 是在算子内还是算子边界上。
 
-命令：
+| 论文算子 | 工程函数 / 路径 | 论文变量 | baseline dtype | 当前支持 dtype | 当前支持方式 / 备注 | 当前完成度 | 进度预期 | 工程量预期 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| up-proj (`varlen-M grouped GEMM + act`) | `sonicmoe/functional/forward.py::_up_projection_forward`；QuACK 路径主要是 `sonicmoe/quack_utils/gemm_interface.py::gemm_gated` | 输入 `X_e`，输出 pre-activation `H_e` 与 activation 后 `A_e` | 输入激活 `torch.bfloat16`；权重 `torch.bfloat16`；输出 `torch.bfloat16` | 输出后激活 buffer 额外支持 `torch.float8_e4m3fn`；scale 额外支持 `torch.float8_e8m0fnu` | **部分算子内融合**：QuACK `gemm_gated` 可直接写低精度 post-activation buffer；stable 主线仍主要是先算出 `A_e`，再做边界 FP8 quant/dequant | 部分完成，已是当前最成熟 FP8 入口 | 继续做局部 epilogue / saved-state / buffer 生命周期优化；不把 full-chain FP8 放到这条小步主线里 | 中 |
+| down-proj (`varlen-M grouped GEMM`) | `sonicmoe/functional/forward.py::_down_projection_forward`；QuACK 路径主要是 `quack.gemm_interface::gemm` | 输入 `A_e`，输出 `Y_e` | 输入激活 `torch.bfloat16`；权重 `torch.bfloat16`；输出 `torch.bfloat16` | 实验线支持 `A_e` / `W2_e` 的 blockscaled FP8（`torch.float8_e4m3fn` + `torch.float8_e8m0fnu` scale） | **未主线化为原生 FP8 mainloop**；当前 stable 仍是恢复成 `bf16 A_e` 后再做 down-proj；experimental blockscaled path 仍依赖 grouped/static-capacity | stable 主线未完成 | 近期待继续做 glue / layout / router 过渡的小优化；原生 flat-varlen FP8 mainloop 默认记入大工程目录 | 大 |
+| expert aggregation (forward) | `sonicmoe/functional/forward.py::_router_forward` | `O_t = Σ π_{t,e} S_{t,e} Y_{e,t}` | `Y_e` / `O` 为 `torch.bfloat16`；score 为 `torch.float32` | 暂无额外 FP8 主线支持 | 不是当前 FP8 主战场；保持和 baseline 一致 | 基本未动 | 短期只做 reshape / reduction / metadata glue 层小优化，不单独追求 FP8 化 | 小-中 |
+| down-proj act grad | `sonicmoe/functional/backward.py::_down_projection_backward_act`；QuACK 路径会用 `sonicmoe/quack_utils/gemm_interface.py::gemm_dgated` | `dH_e` / `dA_e` / router score grad side products | `dout / H_e / dH_e / dA_e` 以 `torch.bfloat16` 为主；部分 reduce 为 `torch.float32` | 本地 probe 已支持输出 `torch.float8_e4m3fn` 的 router-weighted activation side product | **已局部打 through**：`gemm_dgated` 可产出 FP8 后激活 side product，但未接成 stable backward 主线 | 局部打通，主线未闭环 | 近期待继续做 reduction / scratch / dtype-contract 的局部优化；若要把 FP8 `S·A_e` 接到主线则会撞上更大工程 | 中 |
+| down-proj weight grad (`varlen-K grouped GEMM`) | `sonicmoe/functional/backward.py::_down_projection_backward_weight` | `dW2_e` | 输入 `dout` / routed activation 为 `torch.bfloat16`，累加到 `torch.float32` | 暂无 stable FP8 支持 | 当前 blocker 是 mixed-dtype 合同 + Blackwell-native kernel 路线未完成 | 基本未做 | 默认并行排队，不阻塞主线；只接受为后续大工程做最小 probe，不在当前小步迭代里硬推 | 大 |
+| up-proj act grad | `sonicmoe/functional/backward.py::_up_projection_backward_act` | `dX_e` / `dH_e` | `torch.bfloat16` 主线 | 暂无 stable FP8 支持 | 仍按论文 baseline 合同走 | 基本未动 | 近期待只做 metadata / saved-state / wrapper overhead 优化，不优先做算子级 FP8 改写 | 中 |
+| up-proj weight grad (`varlen-K grouped GEMM`) | `sonicmoe/functional/backward.py::_up_projection_backward_weight` | `dW1_e` | 输入激活 / 梯度 `torch.bfloat16`，累加到 `torch.float32` | 暂无 stable FP8 支持 | 仍按论文 baseline 合同走 | 基本未动 | 近期待只做低风险 bookkeeping / saved-state 优化；真正 FP8 化优先级低于 down-proj 主问题 | 中 |
+| backward expert aggregation | `sonicmoe/functional/backward.py::_token_broadcast_backward`；router score 反向为 `_softmax_topk_bwd` | `dX_t = Σ reverse_scatter(dX_e)` 与 router score grad | 激活梯度 `torch.bfloat16`；router score grad path 用 `torch.float32` score 合同 | 暂无额外 FP8 主线支持 | 不是当前 FP8 主战场 | 基本未动 | 只在出现明确 buffer / scatter 热点时做小修；不主动扩 scope | 小 |
 
-```bash
-USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py
-```
+### 0.2 论文变量 ↔ 工程变量（之后汇报不要只写简写）
 
-结果：
+后续汇报中，不应再只写 `z / y1 / y1s / STE` 这类简写，而应写成“论文变量名 + 工程变量名”。最低要求格式：
 
-```text
-20 passed
-```
+- `up-projection pre-activation output H_e（工程变量 z）`
+- `activated expert intermediate A_e（工程变量 y1）`
+- `router-weighted activated expert intermediate S_{t,e}·A_e（工程变量 y1s）`
 
-### 真实 shape 数据
+| 工程变量名 | 论文变量 / 含义 | baseline dtype | 当前支持 dtype | 现在是怎么支持的 |
+| --- | --- | --- | --- | --- |
+| `x` | layer input `X` | `torch.bfloat16` | `torch.bfloat16` | stable 主线输入；未主线化为 FP8 输入 |
+| `router_w` | router weight | `torch.bfloat16` | `torch.bfloat16` | stable 主线 |
+| `router_logits` | routing scores `S`（top-k 之前） | `torch.bfloat16` 输入经 `F.linear` 产出；top-k score 计算时会升到 `torch.float32` | `torch.bfloat16` / `torch.float32` 计算合同 | 默认保持 `score` 路径数值稳定；代码里明确不默认降成 bf16 score |
+| `topk_scores` | selected routing scores `S_{t,e}` | `torch.float32` | `torch.float32` | stable 主线；forward aggregation 与 backward router grad 都依赖这条合同 |
+| `topk_indices` | activated expert ids（对应论文中的 `π` 非零位置） | `torch.int32` | `torch.int32` | metadata 构造与 gather/scatter 索引 |
+| `x_gather_idx` | `Gather(X, π_{:,e})` 的 gather map | `torch.int32` | `torch.int32` | varlen/grouped GEMM metadata |
+| `expert_frequency_offset` | 每个 expert 的 prefix-sum token count（`T_e` 的 packed 边界） | `torch.int32` | `torch.int32` | varlen-M / varlen-K grouped GEMM metadata |
+| `s_scatter_idx` | 从 token-major 到 expert-major 的 scatter map | `torch.int32` | `torch.int32` | metadata |
+| `s_reverse_scatter_idx` | 从 expert-major 回 token-major 的 reverse scatter map | `torch.int32` | `torch.int32` | aggregation / reverse aggregation metadata |
+| `w1` | up-projection weight `W1_e` | `torch.bfloat16` | `torch.bfloat16` | stable 主线；未主线化为 FP8 weight |
+| `z` | up-projection pre-activation output `H_e = X_e W1_e` | `torch.bfloat16` | `torch.bfloat16` | stable 主线；之后可作为 fused FP8 boundary 的输入 |
+| `y1` | activated expert intermediate `A_e = act_func(H_e)` | `torch.bfloat16` | `torch.bfloat16`；局部可临时为 `torch.float8_e4m3fn` buffer | QuACK `gemm_gated` 可直接写低精度 post-activation buffer，但 stable 主线仍恢复为 `bf16 A_e` |
+| `restored_out` | 边界 quant/dequant 后恢复的 `A_e` buffer | `torch.bfloat16` | `torch.bfloat16` | `apply_preact_activation_fp8_protocol_cutely_fused(..., restored_out=...)` |
+| `w2` | down-projection weight `W2_e` | `torch.bfloat16` | stable 主线 `torch.bfloat16`；实验线 `torch.float8_e4m3fn` + `torch.float8_e8m0fnu` scale | experimental blockscaled weight path 只在 grouped/static-capacity 路线上成立 |
+| `y2` | per-expert down-projection output `Y_e = A_e W2_e` | `torch.bfloat16` | `torch.bfloat16` | stable 主线 |
+| `o` | final aggregated output `O` | `torch.bfloat16` | `torch.bfloat16` | stable 主线 |
+| `dout` | output gradient `dO` | `torch.bfloat16` | `torch.bfloat16` | stable backward 输入 |
+| `dz` | gradient of `H_e` / `z` | `torch.bfloat16` | `torch.bfloat16` | stable backward |
+| `dx_expanded` | expert-major expanded input gradient before reverse aggregation | `torch.bfloat16` | `torch.bfloat16` | up-proj act grad 输出 |
+| `dx_reduced` | token-major reduced input gradient after reverse aggregation | `torch.bfloat16` | `torch.bfloat16` | `_token_broadcast_backward` 输出 |
+| `y1s` | router-weighted activated expert intermediate `S_{t,e} · A_e`，用于 `dW2_e` | baseline 主线 `torch.bfloat16` | probe 已支持 `torch.float8_e4m3fn` | 本地 `gemm_dgated` 已能产出 FP8 `y1s`；但后续 `down-proj weight grad` 还不支持稳定消费 |
+| `dw1 / dw2` | `dW1_e / dW2_e` | `torch.float32` accumulation target | `torch.float32` | stable 主线 |
+| `STE` | straight-through estimator（不是论文变量，而是边界训练技巧） | N/A | N/A | 当前 stable 主线默认不依赖它；只在特定边界适配逻辑里作为可选训练技巧存在 |
 
-#### shape `8192,4096,1024,128,8`
+### 0.3 当前“FP8 到底做到哪”统一口径
 
-- 精度：
-  - output RMSE：`0.01074111`
-  - loss RMSE：`0.00000025`
-- bf16 baseline：
-  - peak：`7690.63 MiB`
-  - inf / train fwd / e2e / bwd：`4.081 / 3.942 / 5.728 / 1.647 ms`
-- 当前稳定 fp8-mainline：
-  - peak：`7700.75 MiB`
-  - inf / train fwd / e2e / bwd：`1.842 / 2.111 / 5.586 / 3.743 ms`
-- 相对 bf16 baseline：
-  - inference：`+121.55%`（`2.22x`）
-  - train fwd：`+86.74%`（`1.87x`）
-  - e2e：`+2.54%`（`1.03x`）
-  - backward：`-55.89%`
-  - peak memory：`+10.12 MiB`
-- 相对改动前 fp8-mainline（同卡近邻复测）：
-  - inference：`+109.56%`
-  - train fwd：`+95.82%`
-  - e2e：`+117.98%`
-  - backward：`+122.22%`
-- stagewise memory：
-  - `forward:router-metadata`：`+0.00 MiB`
-  - `forward:up-proj`：`+0.00 MiB`
-  - `forward:down-proj-router`：`+2.00 MiB`
-  - `backward:down-proj-core`：`+130.00 MiB`
-  - `backward:up-proj-core`：`+130.00 MiB`
-  - `backward:token-reduce`：`+130.00 MiB`
-  - final peak：`7828.75 -> 7958.75 MiB`
+如果后续要回答“当前进度主要是在论文 8 个算子外做 FP8 外挂，还是往算子内融合 FP8 quant/dequant”，统一口径如下：
 
-#### shape `4096,4096,1024,128,8`
+- **大多数当前进展仍属于算子边界 / 算子之间的 FP8 contract 优化**
+  - 代表路径：`up-proj -> fused fp8 boundary -> down-proj`
+- **只有少数位置已经进入算子内融合**
+  - 主要是 QuACK `gemm_gated` / `gemm_dgated` 这类带 activation epilogue 的路径
+  - 它们已经能直接处理或产出低精度 `postact`
+- **down-proj forward 与大部分 backward 核心算子，尚未成为原生 FP8 主线**
 
-- 精度：
-  - output RMSE：`0.01073675`
-  - loss RMSE：`0.00000021`
-- bf16 baseline：
-  - peak：`7049.88 MiB`
-  - inf / train fwd / e2e / bwd：`1.141 / 1.210 / 3.437 / 2.296 ms`
-- 当前稳定 fp8-mainline：
-  - peak：`6931.00 MiB`
-  - inf / train fwd / e2e / bwd：`1.125 / 1.697 / 3.733 / 2.608 ms`
-- 相对 bf16 baseline：
-  - inference：`+1.42%`
-  - train fwd：`-28.70%`
-  - e2e：`-7.93%`
-  - backward：`-11.42%`
-  - peak memory：`-118.88 MiB`
-- 相对改动前 fp8-mainline（同卡近邻复测）：
-  - inference：`+188.76%`
-  - train fwd：`+104.59%`
-  - e2e：`+185.47%`
-  - backward：`+184.03%`
+### 0.4 当前 dtype / support 统一口径
 
-### 结论
+- stable 主线权重：
+  - `router_w / w1 / w2`：`torch.bfloat16`
+- stable 主线激活：
+  - `x / z / y1 / y2 / dout / dz / dx`：主要是 `torch.bfloat16`
+- router / top-k：
+  - `topk_scores`：主线按 `torch.float32`
+  - indices / offsets：`torch.int32`
+- stable FP8 activation protocol：
+  - activation data：`torch.float8_e4m3fn`
+  - scales：`torch.float8_e8m0fnu`
+  - stable granularity：`1x128`
+- 实验线 blockscaled down-proj：
+  - `w2` 可量化成 `e4m3 + e8m0(1x32)`
+  - 但这条 grouped/static-capacity 路线仍不是 stable 主线
 
-- 这次改动已经把稳定主线的**前向主矛盾明显吃掉**：
-  - `8192` 上 inference / train-fwd 都已经显著领先 bf16；
-  - `8192` 的 e2e 也终于在真实大 shape 上微幅超过 bf16。
-- 但这轮同时暴露了一个更细的测量口径问题：
-  - `report_fp8_metrics` 的 cold metrics run 在 `8192` 下给出 `bf16_peak / fp8_peak = 7690.63 / 7700.75 MiB`
-  - 单独 `--report_stage_memory` 的原始对排则给出：
-    - `forward:down-proj-router` peak delta `-245.88 MiB`
-    - backward 三段 `delta_alloc=+138.12 MiB`
-    - final peak `7690.63 -> 7572.75 MiB`
-  - 也就是说，**large-shape 下 fp8 最终 peak 仍然可以低于 bf16，但 backward 阶段存在明显的 transient overhead**；后续日志必须继续把两种测量口径分开写，不能混写成单一结论。
-- 因此下一阶段的主线已经更明确：
-  1. 保留这次 `y1` 直回写带来的前向收益；
-  2. 继续缩小 backward 段的 transient overhead，而不是误判成“最终 peak 已经回退”；
-  3. 所有后续结论都必须同时给出：
-     - `report_fp8_metrics` 的同轮 bf16 baseline
-     - `--report_stage_memory` 的 stagewise/final 对排
+### 0.5 大工程目录（默认并行排队，不阻塞当前小步优化）
 
-## 2026-03-25 - 给 dummy-postact 实验路径补上预分配 restored_out，但继续保持默认关闭
+这部分不是“今天顺手补一补”能完成的工作。后续如果某项优化直接落到这些边界上，应默认把它记到这里，单独并行推进，而不是把主线迭代拖进大内核工程。
 
-### 指标注释（先看这个）
+| 大工程名 | 范围 | 当前状态 | 为什么是大工程 | 进度预期 | 工程量预期 |
+| --- | --- | --- | --- | --- | --- |
+| Project 1 umbrella：native FP8 GEMM 能力集（不是单点问题） | umbrella，仅用于统筹 `native fp8 up-proj`、`native fp8 down-proj`、`fp8 weight storage`、`precision validation` 4 个子工程 | 已拆分定义，当前绕过 | 它同时覆盖输入激活、权重存储、输出/累加与验收，不应再被当成一个单点工程 | 后续按 1.1/1.2/1.3/1.4 子工程顺序推进 | 特大 |
+| Blackwell-native mixed-dtype down-proj weight-grad | 让 `down-proj weight grad` 稳定消费 `bf16 dO + fp8 (S·A)` | 已立项，当前绕过 | 需要 mixed-dtype / scaled weight-grad 合同，还要补齐 Blackwell-native kernel 路线 | 维持并行排队；等更核心 forward 主线稳定后再集中攻坚 | 大 |
+| rank-flexible blockscaled varlen down-proj | 让 flat varlen-M activation + blockscaled scale factor 不再依赖 grouped/static-capacity | 已立项，当前绕过 | 当前 blocker 在上游 blockscaled + varlen 的 rank/layout 设计，不是 SonicMoE glue 层小修能解决 | 先持续确认 blocker 边界；若无上游改动，不在当前仓库里强推 | 特大 |
 
-- 精度基线：同一条命令下的 `bf16 baseline` 输出 / loss。
-- 显存基线：同一条命令下的 `bf16 baseline` peak memory。
-- 性能基线：同一时间窗的 `bf16 baseline`。
-- 本轮收益来源：
-  - 不是主线默认路径优化；
-  - 只是把 `SONIC_MOE_FP8_DUMMY_POSTACT_BUFFER=1` 这条实验路径也接上显式 `restored_out` 预分配，避免 fused dequant 在该实验分支里再额外 `torch.empty(...)` 一次。
+### 0.6 大工程输入输出契约冻结（bf16 SonicMoE 作为金标准）
 
-### 改动
+| 大工程名 | 冻结输入契约 | 冻结输出契约 | bf16 金标准来源 | 验收单测 |
+| --- | --- | --- | --- | --- |
+| 1.1 native FP8 up-proj | token-major `x`、routing metadata、`W1_e`；允许未来内部变成 FP8 input/postact，但 token/expert 语义不可变 | 最终 `O`、`expert_frequency` 与 bf16 主线一致 | `enable_quack_gemm(True)` + `moe(..., kernel_backend_moe=KernelBackendMoE.sonicmoe, fp8_protocol=None)` | `tests/fp8_large_project_contract_test.py::test_native_fp8_upproj_bf16_gold_contract` |
+| 1.2 native FP8 down-proj | `A_e` / routing metadata / `W2_e`；允许未来内部 mainloop 改成 FP8 输入消费 | 最终 `O`、`expert_frequency` 与 bf16 主线一致 | 同上 | `tests/fp8_large_project_contract_test.py::test_native_fp8_downproj_bf16_gold_contract` |
+| 1.3 FP8 weight storage | `W1_e / W2_e` 可改成 FP8 存储 + scale，但外部路由和 shape 合同不可变 | 最终 `O`、`expert_frequency` 与 bf16 主线一致 | 同上 | `tests/fp8_large_project_contract_test.py::test_fp8_weight_storage_bf16_gold_contract` |
+| Blackwell-native mixed-dtype down-proj weight-grad | `dO`、router-weighted activated expert intermediate `S_{t,e}·A_e`、routing metadata；未来允许 `S_{t,e}·A_e` 变成 fp8 + scale 合同 | `dW2_e` 的 shape、dtype 语义、有限值、与 bf16 主线的一致性 | `enable_quack_gemm(True)` + bf16 `moe(...).backward(...)` 后的 `moe.c_proj.weight.grad` | `tests/fp8_large_project_contract_test.py::test_mixed_dtype_downproj_weight_grad_bf16_gold_contract` |
+| rank-flexible blockscaled varlen down-proj | flat varlen `A_e`、`expert_frequency_offset`、`expert_indices` / scatter metadata；未来允许 blockscaled scale-factor layout 变化，但输入 token/expert 语义不可变 | token-major `O` 与 `expert_frequency`；未来内部可 blockscaled / rank-lift，但对外输出 contract 不变 | `moe_general_routing_inputs(..., bf16)` | `tests/fp8_large_project_contract_test.py::test_rank_flexible_varlen_downproj_bf16_gold_contract` |
 
-- 在 `sonicmoe/functional/__init__.py` 中：
-  - 当 `SONIC_MOE_FP8_DUMMY_POSTACT_BUFFER=1` 且 postact 宽度对齐时：
-    - 不再让 fused preact dequant 自己分配输出；
-    - 而是显式传入一块 `bf16 restored_out` buffer。
-- 在 `tests/fp8_protocol_test.py` 中：
-  - 扩展 dummy-postact 实验回归；
-  - 现在除了确认 `gemm_gated(... postact_dtype=torch.float8_e4m3fn)` 被请求之外，也确认 boundary 真正拿到了预分配的 `bf16 restored_out`。
+### 0.7 大工程详细规划（冻结后按阶段推进）
 
-### 正确性验证
+#### 0.7.1 Project 1 umbrella：native FP8 GEMM 能力集（必须拆分，不是单点问题）
 
-命令：
+拆分结论：
 
-```bash
-USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py
-```
+- 它至少包含 4 个彼此独立、依赖关系也不同的单点问题：
+  1. `1.1 native fp8 up-proj input/output contract`
+  2. `1.2 fp8 weight storage & quantization contract`
+  3. `1.3 native fp8 down-proj input/output/accumulator contract`
+  4. `1.4 precision / numerics / performance validation`
 
-结果：
+需要触达的论文算子：
 
-```text
-20 passed
-```
+- `up-proj`
+- `down-proj`
+- （可选 side product）`down-proj act grad`
 
-### 真实 shape 数据
+不属于本工程 umbrella 的算子：
 
-#### shape `8192,4096,1024,128,8`
+- `down-proj weight grad`（那是 Project 2）
+- `expert aggregation`
+- `router / top-k`
 
-- output RMSE：`0.01074111`
-- loss RMSE：`0.00000025`
-- bf16 peak / fp8 peak：`7690.63 / 7700.75 MiB`
-- inf / train fwd / e2e / bwd：
-  - `1.724 / 2.136 / 5.703 / 3.978 ms`
-- 相对 bf16 baseline：
-  - inference：`+136.72%`
-  - train fwd：`+84.55%`
-  - e2e：`+0.44%`
-  - backward：`-58.60%`
-  - peak：`+10.12 MiB`
+推荐顺序：
 
-#### shape `4096,4096,1024,128,8`
+1. **1.1 native fp8 up-proj**
+   - 先稳定 `gemm_gated` 的 FP8 input/postact 合同
+   - 工程位置：
+     - `sonicmoe/quack_utils/gemm_interface.py::gemm_gated`
+     - `sonicmoe/quack_utils/gemm_gated.py`
+     - `sonicmoe/functional/__init__.py`
+2. **1.2 fp8 weight storage**
+   - 独立于 1.1，可并行推进
+   - 先解决 `W1_e / W2_e` 的持久化与 scale contract
+   - 工程位置：
+     - `sonicmoe/moe.py`
+     - `sonicmoe/quack_utils/blockscaled_fp8_gemm.py`
+     - `sonicmoe/quack_utils/gemm_interface.py`
+3. **1.3 native fp8 down-proj**
+   - 依赖 1.1 的 activation contract 稳定后再推进
+   - 工程位置：
+     - `quack.gemm_interface::gemm`
+     - `sonicmoe/functional/__init__.py`
+     - `sonicmoe/functional/forward.py::_down_projection_forward`
+4. **1.4 验收与性能收敛**
+   - correctness / bf16-gold / benchmark gate 全部通过后再谈默认接入
 
-- output RMSE：`0.01073675`
-- loss RMSE：`0.00000021`
-- bf16 peak / fp8 peak：`7049.88 / 6931.00 MiB`
-- inf / train fwd / e2e / bwd：
-  - `1.066 / 1.725 / 3.693 / 2.627 ms`
-- 相对 bf16 baseline：
-  - inference：`+7.04%`
-  - train fwd：`-29.86%`
-  - e2e：`-6.93%`
-  - backward：`-12.60%`
-  - peak：`-118.88 MiB`
+明确不做：
 
-### 结论
+- 不再把 umbrella 本身当作“一个点改完就结束”的工程
+- 不把“局部 epilogue 写一个 fp8 buffer”误报成工程 1 完成
 
-- 这一步把 dummy-postact 分支补齐成了更完整的 capture-safe 实验能力；
-- 但它仍然**不是默认主线优化**：
-  - `8192` 上 e2e 只有近似打平；
-  - `4096` 上仍慢于 bf16。
-- 所以当前策略不变：
-  - 继续默认关闭 `SONIC_MOE_FP8_DUMMY_POSTACT_BUFFER`
-  - 只把它当成后续更深层 epilogue/mainloop 实验的基础设施
+#### 0.7.2 Blackwell-native mixed-dtype down-proj weight-grad
 
-## 2026-03-25 - 证伪 backward `y1s` 直接 runtime-fp8 的最短路径
+阶段拆分：
 
-### 指标注释（先看这个）
+需要触达的论文算子：
 
-- 本轮不是主线性能收益，而是一个必要的技术证伪：
-  - 目标是验证 `_DownProjection.backward()` 里能否直接让 `gemm_dgated(... postact_out)` 变成 runtime fp8，并直接喂给后续 weight-grad GEMM。
+- `down-proj act grad`
+- `down-proj weight grad`
 
-### 结论
+推荐顺序：
 
-- 这条最短路径当前**没有打通**，而且 blocker 很明确：
-  1. plain `gemm` 在这条链路上要求 `A` 和 `B` 同 dtype；
-  2. 但 `dout.T` 仍是 `bf16`，而 `y1s` 如果改成 runtime fp8，就会直接触发 dtype mismatch；
-  3. 在 `gather_A` 场景下，普通 `gemm` 还有额外的合法 config 约束（`cluster_n=1`）。
-- 这说明：
-  - backward act / weight 想往 fp8 迁移，不是简单加一个 `postact_dtype=torch.float8_e4m3fn` 就能成；
-  - 它需要的是**混合 dtype / 带 scale 的下游 GEMM 合同**，或者新的本地 wrapper / mainloop 路线；
-  - 因此这条失败实验没有保留在代码树里，只保留为 handoff 结论。
+1. `2.1 helper / wrapper 打通`
+2. `2.2 Blackwell mixed-dtype kernel`
+3. `2.3 _down_projection_backward_weight` 消费 FP8 `S·A_e`
+4. `2.4 主线 backward 接入 + acceptance`
 
-## 2026-03-24 - 去掉主线里无效的 STE 依赖，并把低精度 up-proj postact buffer 收口为实验开关
+明确不做：
 
-### 指标注释（先看这个）
+- 不在 helper 层打补丁后就宣布问题解决；必须以 `dW2_e` 对齐 bf16 gold 为准
 
-- 精度基线：当前稳定 `fp8-mainline` 默认行为。
-- 显存基线：当前稳定 `fp8-mainline` 默认行为。
-- 性能基线：上一轮稳定 `fp8-mainline@4096,4096,1024,128,8` 的真实 benchmark。
-- 本轮收益来源：
-  - 先利用 SonicMoE 的真实 autograd 合同，去掉主线上实际上没有梯度意义的 `STE` 混合；
-  - 再把“up-proj postact 降成 FP8 dummy buffer”收口成**默认关闭**的实验开关，只保留能力，不污染稳定主线。
+#### 0.7.3 rank-flexible blockscaled varlen down-proj
 
-### 改动
+阶段拆分：
 
-- 在 `sonicmoe/functional/__init__.py` 中：
-  - QuACK + preact fused FP8 边界现在默认使用 `use_ste=False`；
-  - 原因是 SonicMoE 主线里：
-    - `_UpProjection.forward(...)` 返回的 `y1` 已被 `mark_non_differentiable(...)`
-    - `_DownProjection.backward(...)` 反向也不是从前向 `y1` 回传，而是重新基于 `z` 做 gated backward
-  - 所以这条边界上的 `STE` 对真实梯度路径没有贡献，只会增加一层无效 tensor 运算。
-- 在 `sonicmoe/functional/fp8_cutely_fused.py` 中：
-  - `apply_preact_activation_fp8_protocol_cutely_fused(...)` 现在支持：
-    - `postact=None`
-    - `output_dtype=...`
-  - 这允许 SonicMoE 在需要时只靠 `z` 重建 `bf16 y1`，不再强依赖额外的 `postact` 读回。
-- 在 `sonicmoe/quack_utils/gemm_gated.py` 中：
-  - 本地 wrapper 现在支持 `postact_dtype=torch.float8_e4m3fn`
-  - 原因是 QuACK 公共 wrapper 的 `torch2cute_dtype_map` 本身没有把 runtime float8 列进去；本地需要单独补 runtime fp8 tensor -> cute tensor 的包装逻辑。
-- 在 `sonicmoe/functional/__init__.py` 中新增实验开关：
-  - `SONIC_MOE_FP8_DUMMY_POSTACT_BUFFER=1`
-  - 打开后，QuACK up-proj 会请求 `float8_e4m3fn` 的 dummy `postact_out`
-  - 但当前它只是**实验开关**，默认关闭
-- 在 `tests/fp8_protocol_test.py` 中新增：
-  - fused preact path 可在 `postact=None` 下仅凭 `z` 重建
-  - 打开实验开关时，主线会显式请求低精度 `postact_dtype`
+需要触达的论文算子：
 
-### 正确性验证
+- `down-proj`
 
-命令：
+推荐顺序：
+
+1. `3.1 reverse-scatter / metadata generalization`
+2. `3.2 rank-flexible scale packing`
+3. `3.3 varlen-aware blockscaled mainloop`
+4. `3.4 runtime toggle / acceptance / benchmark`
+
+明确不做：
+
+- 不把 grouped/static-capacity 的实验路径包装一下就当作 flat varlen 主线完成
+
+### 0.8 baseline / opt 验收入口（开发完成可直接挂载）
+
+bf16 baseline correctness gate：
 
 ```bash
-USE_QUACK_GEMM=1 CUDA_VISIBLE_DEVICES=6 python -m pytest -q tests/fp8_protocol_test.py -k 'preact_cutely_fused_path_can_reconstruct_without_postact_tensor or blackwell_fp8_runtime_path_requests_low_precision_upproj_postact_buffer or preact_cutely_fused_path_matches_reference_boundary'
-
-USE_QUACK_GEMM=1 CUDA_VISIBLE_DEVICES=6 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py
+make test-large-project-baseline
 ```
 
-结果：
-
-```text
-3 passed, 15 deselected
-19 passed
-```
-
-### 真实 shape 数据
-
-#### 默认稳定主线（实验开关关闭）
-
-命令：
+bf16 baseline performance gate：
 
 ```bash
-CUDA_VISIBLE_DEVICES=6 USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 4096,4096,1024,128,8 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_fp8_metrics
+make bench-large-project-baseline FP8_LARGE_PROJECT_BENCH_SHAPE=8192,4096,1024,128,8
 ```
 
-结果：
-
-- output RMSE：`0.01073675`
-- loss RMSE：`0.00000021`
-- bf16 peak / fp8 peak：`7049.88 / 6867.00 MiB`
-- inf / train fwd / e2e / bwd：
-  - `2.430 / 2.824 / 7.272 / 4.842 ms`
-
-#### 实验开关打开（`SONIC_MOE_FP8_DUMMY_POSTACT_BUFFER=1`）
-
-命令：
+未来 operator-opt correctness gate：
 
 ```bash
-CUDA_VISIBLE_DEVICES=6 USE_QUACK_GEMM=1 SONIC_MOE_FP8_DUMMY_POSTACT_BUFFER=1 python benchmarks/moe-cute.py --thiek 4096,4096,1024,128,8 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_fp8_metrics --report_fp8_analysis
+make test-large-project-opt FP8_OPERATOR_OPTS="SONIC_MOE_OPT_NATIVE_FP8_UPPROJ=1"
+make test-large-project-opt FP8_OPERATOR_OPTS="SONIC_MOE_OPT_NATIVE_FP8_DOWNPROJ=1"
+make test-large-project-opt FP8_OPERATOR_OPTS="SONIC_MOE_OPT_FP8_WEIGHT_STORAGE=1"
+make test-large-project-opt FP8_OPERATOR_OPTS="SONIC_MOE_OPT_MIXED_DTYPE_DOWNPROJ_DW2=1"
+make test-large-project-opt FP8_OPERATOR_OPTS="SONIC_MOE_OPT_RANKFLEX_VARLEN_DOWNPROJ=1"
 ```
 
-结果：
-
-- output RMSE：`0.01073675`
-- loss RMSE：`0.00000021`
-- bf16 peak / fp8 peak：`7049.88 / 6867.00 MiB`
-- inf / train fwd / e2e / bwd：
-  - `2.484 / 2.742 / 7.535 / 5.051 ms`
-
-### 结论
-
-- 这轮真正应该留在主线里的结论只有一个：
-  - **主线里的 `STE` 混合是冗余的，可以安全去掉**
-- 与此同时，本轮也明确证伪了一个看上去合理、但真实 benchmark 不赚的想法：
-  - `up-proj postact` 改成 `FP8 dummy buffer` 虽然可跑、也已具备实验能力
-  - 但 `4096` 真实 shape 下并没有带来收益，因此**默认不启用**
-- 这次结果再次说明：
-  - 不能因为某个局部 buffer 看起来更小，就默认认为整条主线会更快；
-  - SonicMoE 主线的真正优化标准仍然是：
-    - 不破坏 `varlen/gather-A` 合同
-    - 不引入额外边界搬运
-    - 用真实大 shape benchmark 判断，而不是只看局部理论
-
-## 2026-03-24 - 补齐 bf16-vs-fp8 理论上限账本，并给 FP8 scale 路径落地可复用输出接口
-
-### 指标注释（先看这个）
-
-- 精度基线：当前稳定 `fp8-mainline` 默认行为。
-- 显存基线 1：同一条 benchmark 命令下的 `bf16 baseline`。
-- 显存基线 2：当前稳定 `fp8-mainline` 的 steady-state peak。
-- 性能基线：同一台卡、同一条 benchmark 命令下的稳定 `fp8-mainline`。
-- 本轮收益来源：
-  - 先把“还能省多少”做成可重复对排的理论账本，避免后续再盲目优化错误方向；
-  - 再把 `e8m0` scale encode / blockwise quant / dequant 的输出接口做成可写入预分配 buffer，为后续 cudagraph-safe FP8 主线铺路。
-
-### 改动
-
-- 在 `benchmarks/moe-cute.py` 中：
-  - `--report_stage_memory` 现在在 `fp8_protocol` 打开时会自动同时跑 `bf16` 和 `fp8`，并输出阶段级对排；
-  - `_print_fp8_theory_report(...)` 新增了“预期最大收益”相关账本：
-    - `direct_fp8_boundary_floor_mib`
-    - `direct_fp8_boundary_saved_mib`
-    - `aggressive_weight_fp8_storage_mib`
-    - `aggressive_weight_saved_mib`
-    - `aggressive_total_saved_mib`
-- 在 `sonicmoe/functional/fp8_quant.py` 中：
-  - `round_scale_to_e8m0(...)` 新增 `out=...`
-  - `quantize_activation_blockwise(...)` 新增：
-    - `out=...`
-    - `scale_out=...`
-  - `dequantize_activation_blockwise(...)` 新增 `out=...`
-  - 这些接口都支持把结果直接写进预分配 tensor，避免每次都新建最终输出张量。
-- 在 `sonicmoe/functional/fp8_cutely_fused.py` 中：
-  - `apply_activation_fp8_protocol_cutely_fused(...)` 新增 `scale_out=...`
-  - `apply_preact_activation_fp8_protocol_cutely_fused(...)` 新增 `scale_out=...`
-  - 这样 fused preact 路径在需要返回 `e8m0` scales 时，也能直接复用上层准备好的 buffer。
-- 在 `tests/fp8_protocol_test.py` 中补了两条新回归：
-  - blockwise quant / dequant 可以复用预分配输出
-  - fused preact path 可以复用预分配的 scale buffer
-- 在 `sonicmoe/functional/__init__.py` 中顺手收口了一个返回值个数错误：
-  - `_UpProjection.backward(...)` 末尾的 `None` 返回数量改为与输入签名一致
-
-### 正确性验证
-
-命令：
+未来 operator-opt performance gate：
 
 ```bash
-USE_QUACK_GEMM=1 CUDA_VISIBLE_DEVICES=6 python -m pytest -q tests/fp8_protocol_test.py -k 'blockwise_quant_can_reuse_preallocated_outputs or preact_cutely_fused_path_can_reuse_scale_buffer or preact_cutely_fused_path_matches_reference_boundary or blockwise_quant_matches_divide_reference_after_e8m0_encoding'
-
-USE_QUACK_GEMM=1 CUDA_VISIBLE_DEVICES=6 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py
+make bench-large-project-opt FP8_OPERATOR_OPTS="SONIC_MOE_OPT_NATIVE_FP8_UPPROJ=1" FP8_LARGE_PROJECT_BENCH_SHAPE=8192,4096,1024,128,8
 ```
 
-结果：
-
-```text
-4 passed, 12 deselected
-17 passed
-```
-
-### 真实账本验证
-
-命令：
-
-```bash
-CUDA_VISIBLE_DEVICES=6 USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 4096,4096,1024,128,8 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_fp8_metrics --report_fp8_analysis --report_stage_memory
-```
-
-结果：
-
-- 理论账：
-  - `stable_fp8_boundary_lower_bound_mib=258.00`
-  - `stable_fp8_saved_payload_mib=31.00`
-  - `direct_fp8_boundary_floor_mib=160.25`
-  - `direct_fp8_boundary_saved_mib=97.75`
-  - `aggressive_weight_fp8_storage_mib=1548.00`
-  - `aggressive_weight_saved_mib=1524.00`
-  - `aggressive_total_saved_mib=1555.75`
-- 稳定主线精度 / steady-state 显存：
-  - output RMSE：`0.01073638`
-  - loss RMSE：`0.00000020`
-  - bf16 peak / fp8 peak：`7049.88 / 6867.00 MiB`
-- 阶段级 eager 对排：
-  - `forward:router-metadata`：`+0.00 MiB`
-  - `forward:up-proj`：`+0.00 MiB`
-  - `forward:down-proj-router`：`+1.00 MiB`
-  - `backward:down-proj-core`：`+1.00 MiB`
-  - `backward:up-proj-core`：`+1.00 MiB`
-  - `backward:token-reduce`：`+1.00 MiB`
-  - final peak：`6931.00 -> 6932.00 MiB`
-
-### 结论
-
-- 这轮最重要的新判断有两个：
-  1. 当前稳定 `fp8-mainline` 相比 `bf16` 真正已经省下来的“边界 payload”只有 `31 MiB`；
-  2. 如果能做到 **varlen-friendly direct FP8 mainloop**，理论上还能再追回约 `97.75 MiB` 的边界流量。
-- 更激进但也更值得追求的上限已经明确：
-  - 如果 `w1/w2` 也改成 FP8 存储，单是权重驻留理论上还能再省 `1524 MiB`；
-  - activation + weight 一起算，`4096,4096,1024,128,8` 这档 shape 的总理论节省上限约为 `1555.75 MiB`。
-- `--report_stage_memory` 的 bf16-vs-fp8 对排也给了一个重要信号：
-  - eager 单次前后向阶段峰值几乎一样；
-  - 这说明当前稳定主线的 steady-state peak 优势并不主要来自单个阶段瞬时峰值降低，而更像是来自长期驻留 / graph-steady-state buffer 形态差异。
-- 因此下一阶段主线仍然不变：
-  - **必须继续守住 SonicMoE 的 `varlen/gather-A` 内存合同**
-  - 优先做可 cudagraph-safe 的 `varlen FP8 epilogue + direct mainloop`
-  - 不再回到 grouped/static-capacity 路线
-
-## 2026-03-24 - 证伪 grouped direct-fp8 downproj，主线切向 varlen/gather-A 友好融合
-
-### 指标注释（先看这个）
-
-- 精度基线：当前稳定 `fp8-mainline` 默认行为。
-- 显存基线：当前稳定 `fp8-mainline` 默认行为。
-- 性能基线：同一台卡、同一条 benchmark 命令下的稳定 `fp8-mainline`。
-- 本轮实验目的：
-  - 验证“只要把量化后激活直接喂进 down-proj mainloop，就一定更快/更省”这个假设是否成立。
-- 本轮实验收益来源：
-  - **不是直接性能收益**，而是把一条高风险错误路线尽早证伪；
-  - 明确 SonicMoE 的主线内存合同必须继续守住 `varlen/gather-A`，不能为了 FP8 重新引入 `grouped_out/static capacity`。
-
-### 实验原型
-
-- 本轮曾短暂实现一个未落地主线的 `fp8-direct-downproj` 原型：
-  - 目标：复用 blockscaled grouped mainloop，让量化后的 post-SwiGLU 激活直接进入 down-proj；
-  - 关键代价：需要重新进入 `grouped/static layout`，也就重新带回 `grouped_out` / static capacity / grouped router 边界。
-- 该原型随后已从代码树中撤回，**没有落地主线**。
-
-### 正确性验证
-
-原型验证期间，Blackwell 回归一度达到：
-
-```bash
-USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py
-```
-
-结果：
-
-```text
-16 passed
-```
-
-原型撤回后，主线重新回到已 push 状态。
-
-### 真实 shape 证伪数据
-
-命令：
-
-```bash
-CUDA_VISIBLE_DEVICES=6 USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 4096,4096,1024,128,8 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_fp8_metrics
-
-CUDA_VISIBLE_DEVICES=6 USE_QUACK_GEMM=1 \
-  SONIC_MOE_FP8_UPPROJ_EPILOGUE_PRECISION=fp8 \
-  SONIC_MOE_FP8_DOWNPROJ_MAINLOOP_PRECISION=fp8-direct \
-  SONIC_MOE_FP8_DOWNPROJ_WEIGHT_PRECISION=fp8 \
-  SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY=1024 \
-  python benchmarks/moe-cute.py --thiek 4096,4096,1024,128,8 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_fp8_metrics
-```
-
-结果：
-
-- 稳定 `fp8-mainline`：
-  - output RMSE：`0.01073638`
-  - loss RMSE：`0.00000020`
-  - peak：`6867.00 MiB`
-  - inf：`2.111 ms`
-  - train fwd：`2.772 ms`
-  - e2e：`7.256 ms`
-  - bwd：`5.145 ms`
-- `fp8-direct-downproj` 原型：
-  - output RMSE：`0.01073366`
-  - loss RMSE：`0.00000019`
-  - peak：`7395.25 MiB`
-  - inf：`2.824 ms`
-  - train fwd：`3.648 ms`
-  - e2e：`8.256 ms`
-  - bwd：`5.432 ms`
-
-结论：
-
-- 精度没有问题，但显存和性能都**显著退化**：
-  - peak 变差 `528.25 MiB`
-  - inference 变慢 `33.78%`
-  - e2e 变慢 `13.78%`
-- 这证明：
-  - “去掉 bf16 回退”本身不是充分条件；
-  - 如果为此重新引入 `grouped_out` / static capacity / grouped layout bridge，仍然会输给 stable varlen 主线。
-
-### 当前工程判断
-
-- SonicMoE 最精髓的省内存设计，不是某一个局部 kernel，而是整条主线对以下合同的坚持：
-  - `varlen/gather-A`
-  - 按真实 expert frequency 工作，而不是静态 capacity
-  - 避免把激活重排成 `grouped/static layout`
-  - 避免物化不必要的中间输出和边界回退
-- 因此 FP8 的下一主线应该是：
-  - **varlen/gather-A 友好的 FP8 epilogue / mainloop**
-  - 而不是 grouped blockscaled down-proj
-- 当前最值得投入的实现方向已经切换为：
-  1. 在 `gemm_gated` / up-proj epilogue 上直接产出 `varlen FP8 postact + scales`
-  2. 后续再让 down-proj mainloop 在 **不破坏 varlen 合同** 的前提下消费这些 FP8 激活
-
-## 2026-03-24 - 收口 ue8m0 运行时实验，并补上外部精度开关骨架
-
-### 指标注释（先看这个）
-
-- 精度基线：当前稳定 `fp8-mainline` 默认行为。
-- 稳定性基线：上一轮 Blackwell 主回归 `13 passed`。
-- 性能基线：上一轮稳定 `fp8-mainline@8192,4096,1024,128,8`：
-  - inf `3.933 ms`
-  - e2e `12.888 ms`
-  - peak `7572.75 MiB`
-- 收益来源：
-  - 把“每一步精度由外部开关控制”的合同显式化，避免后续全流程 FP8 演进继续依赖隐式 env；
-  - 对 `ue8m0` 运行时实验做真实回读，确认其在 graph capture 下会自动回退，因此本轮不把这条收益不确定的实验路径带进主线。
-
-### 改动
-
-- 在 `sonicmoe/functional/__init__.py` 中新增运行时精度开关解析：
-  - `SONIC_MOE_FP8_UPPROJ_EPILOGUE_PRECISION={bf16,fp8}`
-  - `SONIC_MOE_FP8_DOWNPROJ_MAINLOOP_PRECISION={bf16,fp8-blockscaled}`
-  - `SONIC_MOE_FP8_DOWNPROJ_WEIGHT_PRECISION={bf16,fp8}`
-- 保持与旧环境变量兼容：
-  - 如果未显式设置新开关，仍会继续识别 `SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1`
-- 新增运行时约束：
-  - `SONIC_MOE_FP8_DOWNPROJ_WEIGHT_PRECISION=fp8` 目前只允许与 `SONIC_MOE_FP8_DOWNPROJ_MAINLOOP_PRECISION=fp8-blockscaled` 组合使用
-- 在 `tests/fp8_protocol_test.py` 中新增两条回归：
-  - 可显式关闭 up-proj epilogue FP8 boundary，且前反向保持有限值
-  - 非法组合（fp8 weight + bf16 mainloop）会显式报错
-- 在 `sonicmoe/functional/fp8_cutely_fused.py` 中收回未准备落地主线的 `SONIC_MOE_FP8_PREACT_UE8M0_SCALE` 实验逻辑，避免后续 handoff 误把它当成稳定收益点
-
-### 正确性验证
-
-命令：
-
-```bash
-USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py
-```
-
-结果：
-
-```text
-15 passed
-```
-
-### ue8m0 运行时实验回读（仅记录，不落主线）
-
-命令：
-
-```bash
-USE_QUACK_GEMM=1 SONIC_MOE_FP8_PREACT_UE8M0_SCALE=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py
-CUDA_VISIBLE_DEVICES=6 USE_QUACK_GEMM=1 SONIC_MOE_FP8_PREACT_UE8M0_SCALE=1 python benchmarks/moe-cute.py --thiek 8192,4096,1024,128,8 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_fp8_metrics --report_fp8_analysis
-```
-
-结果：
-
-- 回归：`13 passed`
-- `8192,4096,1024,128,8`：
-  - output RMSE：`0.01074074`
-  - loss RMSE：`0.00000025`
-  - peak：`7571.25 MiB`
-  - inf：`3.908 ms`
-  - e2e：`12.672 ms`
-
-结论：
-
-- 这条实验在 capture-safe guard 下是**安全**的；
-- 但 inference 路径在 cudagraph capture 下本来就会自动回退，不会稳定命中新量化分支；
-- 当前观测到的时间变化仍在共享机器噪声范围内，**没有形成可重复、可归因的确定收益**；
-- 因此本轮选择把它从主线代码中收回，只在工程记录里保留实验结论，避免后续 agent 误把它当成已验证优化点。
-
-## 2026-03-24 - 去掉无用 scale decode，并在 inference 下跳过 STE 混合
-
-### 指标注释（先看这个）
-
-- 精度基线：官方 `bf16` 路径。
-- 显存基线：官方 `bf16` 路径。
-- 性能基线 1：上一版稳定 `fp8-mainline`（已接入理论分析，但仍会做无用 scale decode，且 inference 仍做 STE 混合）。
-- 性能基线 2：同 shape 官方 `bf16`。
-- 收益来源：
-  - 运行时不再做**没有消费者**的 `round_scale_to_e8m0(...)`；
-  - inference 模式直接返回 `restored`，不再做 `postact + (restored - postact).detach()`；
-  - 这两项都只缩减 FP8 boundary 的无效边界开销，不改变训练语义。
-
-### 改动
-
-- 在 `sonicmoe/functional/fp8_reference.py` 中：
-  - `apply_activation_fp8_protocol(...)` 新增：
-    - `return_scales: bool = True`
-    - `use_ste: bool = True`
-- 在 `sonicmoe/functional/fp8_cutely_fused.py` 中：
-  - `apply_activation_fp8_protocol_cutely_fused(...)`
-  - `apply_preact_activation_fp8_protocol_cutely_fused(...)`
-  - 新增：
-    - `return_scales: bool = True`
-    - `use_ste: bool = True`
-  - 当 `return_scales=False` 时，直接跳过 scale decode；
-  - 当 `use_ste=False` 时，直接返回 dequant 后结果，不再做 STE 混合。
-- 在 `sonicmoe/functional/__init__.py` 中：
-  - SonicMoE 真实运行主线调用 FP8 boundary 时改为：
-    - `return_scales=False`
-    - `use_ste=not is_inference_mode_enabled`
-
-### 正确性验证
-
-命令：
-
-```bash
-USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py
-```
-
-结果：
-
-```text
-13 passed
-```
-
-### 真实 shape 数据
-
-#### shape `4096,4096,1024,128,8`
-
-- 官方 bf16：
-  - peak：`7049.88 MiB`
-  - inf fwd：`2.344 ms`
-  - e2e：`7.338 ms`
-- 上一版稳定 fp8-mainline：
-  - output RMSE：`0.01073638`
-  - loss RMSE：`0.00000020`
-  - peak：`6867.00 MiB`
-  - inf fwd：`2.587 ms`（复测正常值）
-  - train fwd：`2.912 ms`
-  - e2e：`7.903 ms`
-  - bwd：`5.316 ms`
-- 本轮稳定 fp8-mainline：
-  - output RMSE：`0.01073638`
-  - loss RMSE：`0.00000020`
-  - peak：`6867.00 MiB`
-  - inf fwd：`2.204 ms`
-  - train fwd：`2.907 ms`
-  - e2e：`8.022 ms`
-  - bwd：`5.819 ms`
-
-结论：
-
-- 相对 bf16：
-  - inference **领先** `5.97%`
-  - peak memory 仍领先 `182.88 MiB`
-- 相对上一版稳定 fp8-mainline：
-  - inference 提升 `14.82%`
-  - train fwd 基本持平（`0.17%`）
-  - e2e / bwd 噪声较大，本轮不据此下强结论
-
-#### shape `8192,4096,1024,128,8`
-
-- 官方 bf16：
-  - peak：`7690.63 MiB`
-  - inf fwd：`4.147 ms`
-  - e2e：`12.202 ms`
-- 上一版稳定 fp8-mainline（去掉无用 scale decode 后、但 inference 仍做 STE）：
-  - output RMSE：`0.01074074`
-  - loss RMSE：`0.00000025`
-  - peak：`7572.75 MiB`
-  - inf fwd：`4.372 ms`
-  - train fwd：`4.557 ms`
-  - e2e：`12.751 ms`
-  - bwd：`8.379 ms`
-- 本轮稳定 fp8-mainline：
-  - output RMSE：`0.01074074`
-  - loss RMSE：`0.00000025`
-  - peak：`7572.75 MiB`
-  - inf fwd：`3.933 ms`
-  - train fwd：`4.421 ms`
-  - e2e：`12.888 ms`
-  - bwd：`8.955 ms`
-
-结论：
-
-- 相对 bf16：
-  - inference **领先** `5.16%`
-  - peak memory 领先 `117.88 MiB`
-  - e2e 仍慢 `5.62%`
-- 相对上一版稳定 fp8-mainline：
-  - inference 提升 `10.04%`
-  - train fwd 提升 `2.98%`
-  - e2e / bwd 在共享机器上仍有噪声，但 forward 侧收益是确定的
-
-### 当前判断
-
-- 这一步证明：
-  - 稳定 `fp8-mainline` 的 forward 路径里仍有不少“非必要边界工作”可以继续吃掉；
-  - 仅靠削减无用边界工作，已经能让真实大 shape 的 inference 领先 bf16。
-- 但训练/e2e 还没追平 bf16，说明真正剩余的大头仍是：
-  - `quant -> dequant -> bf16` 这层回退本身；
-  - 要继续前进，就必须把量化后的激活直接送入 down-proj mainloop。
-
-## 2026-03-24 - 用理论显存 / FLOPs 账解释为什么当前 FP8 还会慢
-
-### 指标注释（先看这个）
-
-- 精度基线：官方 `bf16` 路径。
-- 显存基线：官方 `bf16` 路径。
-- 性能基线：同 shape 官方 `bf16` 与当前稳定 `fp8-mainline` / env-on `blockscaled`。
-- 本轮收益来源：
-  - 不是直接性能提升；
-  - 而是把“FP8 为什么还没赢”从猜测变成可重复打印的理论账 + 实测账。
-- 重要说明：
-  - 新增 benchmark 开关：`--report_fp8_analysis`
-  - 它会打印：
-    - 权重大小
-    - 关键中间结果大小
-    - 稳定 `fp8-mainline` 边界流量的理论下界
-    - blockscaled 静态布局 buffer 的理论大小
-
-### 改动
-
-- 在 `benchmarks/moe-cute.py` 中新增：
-  - `--report_fp8_analysis`
-  - 输出内容包括：
-    - `w1/w2` 理论显存
-    - `x / z / postact_bf16 / postact_fp8 / scales_f32 / scales_e8m0`
-    - `stable_fp8_boundary_lower_bound_mib`
-    - `stable_fp8_saved_payload_mib`
-    - 如果 env-on `blockscaled`：
-      - `grouped_out_bf16_mib`
-      - `grouped_a_fp8_mib`
-      - `grouped_a_scale_e8m0_mib`
-
-### 为什么稳定 `fp8-mainline` 还没赢
-
-#### shape `8192,4096,1024,128,8`
-
-- 理论账：
-  - `w1/w2` 权重总大小：`3072.00 MiB`
-  - `x`：`64.00 MiB`
-  - `z`（pre-SwiGLU）：`256.00 MiB`
-  - `postact_bf16`：`128.00 MiB`
-  - `postact_fp8`：`64.00 MiB`
-  - `scales_f32`：`2.00 MiB`
-  - `scales_e8m0`：`0.50 MiB`
-  - 稳定 `fp8` 边界理论流量下界：`516.00 MiB`
-  - 真正节省下来的 payload：`62.00 MiB`
-- 实测账：
-  - bf16：peak `7690.63 MiB`，inf `4.147 ms`，e2e `12.202 ms`
-  - 稳定 `fp8-mainline`：peak `7572.75 MiB`，inf `4.404 ms`，e2e `13.096 ms`
-  - output RMSE：`0.01074074`
-  - loss RMSE：`0.00000025`
-
-结论：
-
-- 当前稳定 `fp8-mainline` 的问题，不是权重太大：
-  - `w1/w2` 在 bf16 和当前 fp8 路径里都还是 bf16，理论上没有变小；
-- 也不是 FP8 计算本身慢：
-  - benchmark 打出来的 GEMM TFLOPS 仍然很高；
-- 真正的问题是：
-  - 现在路径是 `z -> fused quant -> fused dequant -> bf16 y1 -> down-proj`
-  - 这条边界引入了大量额外搬运；
-  - 但真正省下来的只是 `postact_bf16` 到 `postact_fp8+scale` 这一点点 payload
-  - 因此 **“节省量 < 额外边界流量”**，性能自然很难超过 bf16
-- 这说明稳定主线下一步真正应该做的是：
-  - 不是继续优化 quant/dequant 小细节；
-  - 而是让量化后的激活 **直接进入 down-proj mainloop**，去掉 `dequant -> bf16` 这层回退
-
-### 为什么当前 blockscaled 还没赢
-
-#### shape `4096,4096,1024,128,8`，`capacity=1024`
-
-- 理论账：
-  - `grouped_out_bf16`：`1024.00 MiB`
-  - `grouped_a_fp8`：`128.00 MiB`
-  - `grouped_a_scale_e8m0`：`4.00 MiB`
-  - 同 shape 稳定 `fp8` 边界理论流量下界：`258.00 MiB`
-  - 同 shape 稳定 `fp8` 真正节省下来的 payload：`31.00 MiB`
-- 实测账：
-  - env-on `blockscaled`：peak `7396.25 MiB`，inf `3.776 ms`，e2e `11.211 ms`
-  - 同 shape bf16：peak `7049.88 MiB`，e2e `7.338 ms`
-  - 同 shape 稳定 `fp8-mainline`：final peak `7050.88 MiB`（stagewise），e2e `7.562~7.693 ms`
-
-结论：
-
-- blockscaled 当前输，不是前半段 pack+quant 还不够好；
-- 而是 `grouped_out` 这种静态对齐输出 buffer 本身太大；
-- 只要 `grouped_out` 还在，显存和 e2e 都很难赢；
-- 所以后续 blockscaled 方向只有一个值得继续投入的点：
-  - 让 GEMM 直接写 router 可消费布局
-  - 或者让 router 原生消费当前 grouped 布局
-
-### 当前最高优先级（已根据理论账更新）
-
-1. 稳定 `fp8-mainline`：
-   - 目标是量化后激活直接进入 down-proj mainloop
-   - 同时引入外部开关，逐步控制激活 / 权重的精度路径
-2. env-on `blockscaled`：
-   - 只有在能直接吃掉 `grouped_out` / router 边界时才继续重投入
-3. 长期目标：
-   - 最激进情况下实现前后向 GEMM 全流程 FP8
-   - 但短期必须先把“量化后立刻反量化”的浪费拿掉
-
-## 2026-03-24 - 用阶段显存 probe 锁定热点，并修掉 `8192` preact fused quant crash
-
-### 指标注释（先看这个）
-
-- 精度基线：官方 `bf16` 路径。
-- 显存基线：官方 `bf16` 路径。
-- 性能基线 1：同 shape 官方 `bf16`。
-- 性能基线 2：同 shape 的稳定 `fp8-mainline` / env-on `blockscaled` 旧结果。
-- 本轮收益来源分两类：
-  - 工程收益：把真实路径的阶段显存观测补齐，后续可以有的放矢优化；
-  - 稳定性收益：给大 row-count 的 vec4 preact fused quant 加保底 fallback，先让真实大 shape 跑通。
-- 重要说明：
-  - `stage-memory` 是默认关闭的，只在 `SONIC_MOE_STAGEWISE_MEMORY=1` 或 benchmark `--report_stage_memory` 时启用；
-  - `8192` crash 修复当前落在本地 `operator-incubator` workspace，不在 SonicMoE git 仓库里。
-
-### 改动
-
-- 在 `sonicmoe/functional/__init__.py` 中新增阶段显存 probe：
-  - 开关：`SONIC_MOE_STAGEWISE_MEMORY=1`
-  - 使用的 torch 观测接口：
-    - `torch.cuda.memory_allocated()`
-    - `torch.cuda.memory_reserved()`
-    - `torch.cuda.max_memory_allocated()`
-    - `torch.cuda.max_memory_reserved()`
-    - `torch.cuda.reset_peak_memory_stats()`
-  - 当前 forward / backward 打点位置：
-    - `forward:router-metadata`
-    - `forward:up-proj`
-    - `forward:fp8-boundary`
-    - `forward:down-proj-router`
-    - `backward:down-proj-core`
-    - `backward:up-proj-core`
-    - `backward:token-reduce`
-- 在 `benchmarks/moe-cute.py` 中新增：
-  - `--report_stage_memory`
-  - 会在正式计时前先跑一遍独立的 training-mode fwd+bwd，并打印阶段显存
-  - debug pass 改成使用独立 clone，避免污染后续计时图
-- 在本地 `operator-incubator/cutify/ops/cute/fused_weighted_swiglu_act_quant.py` 中：
-  - 给 vec4 fast path 增加 row-count guard
-  - 当 `x.shape[0] >= 4096` 时，回退到已验证可用的 generic path
-  - 目的不是极致性能，而是先消掉 `8192,4096,1024,128,8` 的 runtime crash
-
-### 阶段显存结论
-
-统一 shape：`4096,4096,1024,128,8`
-
-- 稳定 `fp8-mainline`：
-  - `forward:down-proj-router` peak alloc：`4012.00 MiB`
-  - `backward:token-reduce` final peak：`7050.88 MiB`
-  - e2e：`7.562 ms`
-- env-on `blockscaled`：
-  - `forward:down-proj-router` peak alloc：`5309.38 MiB`
-  - `backward:token-reduce` final peak：`7580.13 MiB`
-  - e2e：`10.390 ms`
-
-收益 / 诊断：
-
-- `router-metadata` / `up-proj` / `fp8-boundary` 三段两条路径几乎重合；
-- 真正拉开差距的是：
-  - `forward:down-proj-router`：blockscaled 比稳定主线多出 `1297.38 MiB`
-  - `final peak`：blockscaled 比稳定主线多出 `529.25 MiB`
-- 这说明：
-  - blockscaled 当前主矛盾已经不是前半段 pack+quant；
-  - 而是 `grouped_out` 本体及其下游 router 聚合边界；
-  - 后续如果继续抠 blockscaled，必须直接对准 `down-proj/router` 合同，而不是继续磨前半段。
-
-### 大一点真实 shape 结果
-
-#### shape `6144,4096,1024,128,8`
-
-- 官方 bf16：
-  - peak memory：`7370.25 MiB`
-  - Fwd inference：`3.254 ms`
-  - Fwd training：`3.214 ms`
-  - Fwd+Bwd：`9.550 ms`
-  - Bwd：`6.297 ms`
-- 稳定 `fp8-mainline`：
-  - output RMSE：`0.01074142`
-  - loss RMSE：`0.00000034`
-  - peak memory：`7220.63 MiB`
-  - Fwd inference：`3.189 ms`
-  - Fwd training：`3.606 ms`
-  - Fwd+Bwd：`9.954 ms`
-  - Bwd：`6.764 ms`
-- env-on `blockscaled`：
-  - output RMSE：`0.01073865`
-  - loss RMSE：`0.00000035`
-  - peak memory：`7749.88 MiB`
-  - Fwd inference：`4.163 ms`
-  - Fwd training：`6.729 ms`
-  - Fwd+Bwd：`12.207 ms`
-  - Bwd：`8.044 ms`
-
-结论：
-
-- 稳定 `fp8-mainline` 继续保持显存领先：
-  - 相对 bf16 节省 `149.62 MiB`
-- 但性能仍未超过 bf16：
-  - e2e 慢 `4.23%`
-  - bwd 慢 `7.42%`
-- env-on `blockscaled` 仍不是当前可交付主线：
-  - 显存反而比 bf16 多 `379.63 MiB`
-  - e2e 慢 `27.82%`
-
-#### shape `8192,4096,1024,128,8`
-
-- 官方 bf16：
-  - peak memory：`7690.63 MiB`
-  - Fwd inference：`4.147 ms`
-  - Fwd training：`4.174 ms`
-  - Fwd+Bwd：`12.202 ms`
-  - Bwd：`8.054 ms`
-- 稳定 `fp8-mainline`（本地 vec4 fallback 生效后）：
-  - output RMSE：`0.01074074`
-  - loss RMSE：`0.00000025`
-  - peak memory：`7572.75 MiB`
-  - Fwd inference：`4.360 ms`
-  - Fwd training：`4.464 ms`
-  - Fwd+Bwd：`12.972 ms`
-  - Bwd：`8.612 ms`
-
-结论：
-
-- 之前的 `CUresult 9` runtime crash 已经被保底 fallback 消掉；
-- 稳定 `fp8-mainline` 继续保有显存优势：
-  - 相对 bf16 节省 `117.88 MiB`
-- 但性能仍落后：
-  - inference 慢 `5.14%`
-  - e2e 慢 `6.31%`
-  - bwd 慢 `6.93%`
-- 这说明当前稳定主线已经具备继续放大 shape 的可测性；
-- 下一步性能攻关方向应优先考虑：
-  - 恢复/重建大 row-count 下的高性能 vec4 path，而不是长期依赖 generic fallback。
-
-### 验证命令
-
-```bash
-USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py
-CUDA_VISIBLE_DEVICES=2 USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 1024,512,512,32,4 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_stage_memory
-CUDA_VISIBLE_DEVICES=3 USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 4096,4096,1024,128,8 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_stage_memory
-CUDA_VISIBLE_DEVICES=4 USE_QUACK_GEMM=1 SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1 SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY=1024 python benchmarks/moe-cute.py --thiek 4096,4096,1024,128,8 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_stage_memory
-CUDA_VISIBLE_DEVICES=5 USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 8192,4096,1024,128,8 --dtype BFloat16 --activation swiglu --skip_test
-CUDA_VISIBLE_DEVICES=6 USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 8192,4096,1024,128,8 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_fp8_metrics
-```
-
-### 下一步
-
-- SonicMoE 仓库内：
-  - 继续把阶段显存 probe 用到真实热点迭代中；
-  - 优先研究稳定 `fp8-mainline` 大 row-count vec4 path 的恢复方案；
-  - blockscaled 方向只保留为长期路径，除非能直接吃掉 `grouped_out` / router 边界。
-- 本地 `operator-incubator`：
-  - 需要把当前“大 row-count fallback”升级为真正高性能的大 shape vec4/分块方案；
-  - 否则稳定主线虽然能跑，但长期仍会慢于 bf16。
-
-## 2026-03-24 - grouped `y2` 直接喂 router 聚合，去掉 blockscaled flat unpack
-
-### 指标注释（先看这个）
-
-- 精度基线：官方 `bf16` 路径。
-- 显存基线：官方 `bf16` 路径。
-- 性能基线 1：上一版 env-on blockscaled（已经做完 `pack+quant` 融合，但仍会 `grouped_out -> flat y2 -> router`）。
-- 性能基线 2：同 shape 的稳定 `fp8-mainline`。
-- 重要说明：
-  - 本轮不是去掉 `grouped_out` 本体，而是先去掉 **`flat unpack` 这层中间表示**。
-  - 新路径：
-    - down-proj blockscaled GEMM 直接产出 `grouped_out`
-    - router gather 直接消费 grouped/static layout
-    - 不再物化 `TK x H` 的 flat `y2`
-  - 这一步如果有效，主要收益应该来自：
-    - inference/e2e
-    - 少一次大张量 unpack
-  - 但 peak memory 不一定立刻下降，因为 `grouped_out` 本体仍在。
-
-### 改动
-
-- 在 `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` 中：
-  - 新增 `blockscaled_fp8_gemm_grouped(...)`
-  - 让 blockscaled 主路径可以直接返回 grouped/static-capacity 布局输出
-  - 保留 `blockscaled_fp8_gemm(...)` 作为兼容包装：需要 flat 输出时仍可走 unpack
-- 新增 grouped 索引辅助：
-  - `make_blockscaled_grouped_reverse_scatter_idx(...)`
-  - 当前快路径直接复用已知 `selected_experts`，不再靠 `searchsorted` 反推 expert id
-- 在 `sonicmoe/functional/__init__.py` 中：
-  - blockscaled 下行前向不再调用 flat `blockscaled_fp8_gemm(...)`
-  - 改成：
-    - `blockscaled_fp8_gemm_grouped(...)`
-    - `router_perm = make_blockscaled_grouped_reverse_scatter_idx(..., expert_ids=selected_experts.reshape(-1))`
-    - `_router_forward(y2=grouped_out.view(-1, H), ...)`
-  - 同时把 `selected_experts` 直接穿过 `_DownProjection.apply(...)`
-- 在 `tests/fp8_protocol_test.py` 中新增：
-  - `test_blockscaled_grouped_reverse_scatter_idx_matches_static_capacity_layout`
-
-### 收益来源说明
-
-- 本轮 forward/e2e 收益来源：
-  - 删掉 `grouped_out -> flat y2` 的 unpack；
-  - router 聚合直接从 grouped/static layout 读取；
-  - grouped index 不再靠 `searchsorted` 反推，而是直接复用路由阶段已有 expert id。
-- 为什么 peak memory 还没掉：
-  - `grouped_out` 本体仍然存在；
-  - benchmark 的峰值点目前仍被 grouped/static-capacity output buffer 主导。
-- 这说明下一步应该继续去掉的是：
-  - `grouped_out` 本体
-  - 或者让 GEMM 直接写 router 可聚合布局
-
-### 正确性验证
-
-命令：
-
-```bash
-USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py -k 'grouped_reverse_scatter_idx or blockscaled_downproj'
-USE_QUACK_GEMM=1 SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1 SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY=256 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py
-```
-
-结果：
-
-```text
-4 passed, 8 deselected
-13 passed
-```
-
-解释：
-
-- grouped reverse scatter 的静态合同测试通过；
-- env-on blockscaled 回归从之前 `12 passed` 增长到 `13 passed`；
-- 说明 grouped router 直连本身已经被正式回归覆盖。
-
-### 中等真实 shape 精度 / 显存 / 性能数据
-
-统一 shape：`4096,4096,1024,128,8`
-
-- 官方 bf16：
-  - peak memory：`7049.88 MiB`
-  - Fwd inference：`2.344 ms`
-  - Fwd training：`2.236 ms`
-  - Fwd+Bwd：`7.338 ms`
-  - Bwd：`4.994 ms`
-- 稳定 fp8-mainline：
-  - output RMSE：`0.01073638`
-  - loss RMSE：`0.00000020`
-  - peak memory：`6867.00 MiB`
-  - Fwd inference：`2.390 ms`
-  - Fwd training：`2.890 ms`
-  - Fwd+Bwd：`7.693 ms`
-  - Bwd：`5.303 ms`
-- 上一版 env-on blockscaled（`pack+quant` 融合后）：
-  - output RMSE：`0.01073363`
-  - loss RMSE：`0.00000019`
-  - peak memory：`7396.13 MiB`
-  - Fwd inference：`3.095 ms`
-  - Fwd training：`3.791 ms`
-  - Fwd+Bwd：`8.414 ms`
-  - Bwd：`5.319 ms`
-- 本轮 grouped router 直连后 env-on blockscaled：
-  - output RMSE：`0.01073363`
-  - loss RMSE：`0.00000019`
-  - peak memory：`7396.13 MiB`
-  - Fwd inference：`2.918 ms`
-  - Fwd training：`3.818 ms`
-  - Fwd+Bwd：`8.196 ms`
-  - Bwd：`5.279 ms`
-
-收益 / 损失：
-
-- 相对上一版 env-on blockscaled：
-  - Fwd inference 提升：`5.72%`
-  - Fwd training 退化：`0.71%`
-  - Fwd+Bwd 提升：`2.59%`
-  - Bwd 提升：`0.75%`
-  - peak memory：`持平`
-- 相对稳定 `fp8-mainline`：
-  - output RMSE 基本持平
-  - peak memory 仍多：`529.13 MiB`
-  - Fwd inference 仍慢：`22.09%`
-  - Fwd training 仍慢：`32.11%`
-  - Fwd+Bwd 仍慢：`6.54%`
-  - Bwd 反而快：`0.45%`
-- 相对官方 bf16：
-  - peak memory 仍多：`346.25 MiB`
-  - Fwd inference 仍慢：`24.49%`
-  - Fwd training 仍慢：`70.75%`
-  - Fwd+Bwd 仍慢：`11.69%`
-  - Bwd 仍慢：`5.71%`
-
-解释：
-
-- 这一步已经证明：
-  - `flat unpack` 不是必须存在的；
-  - blockscaled 可以直接与 SonicMoE 的 router 聚合合同对接；
-  - e2e 继续下降，且 backward 已经略优于稳定 `fp8-mainline`。
-- 但显存没动，说明真正的下一堵墙已经更收敛了：
-  - `grouped_out` 本体
-  - 而不是它后面的 flat unpack
-
-### 当前结论
-
-- grouped router 直连是一个**值得提交**的小里程碑：
-  - 不改精度；
-  - 不破坏 Blackwell 回归；
-  - 继续压低 blockscaled e2e / bwd。
-- 下一步第一优先级：
-  1. 继续处理 `grouped_out` 本体；
-  2. 尝试让 GEMM 直接写 router 可聚合布局，或让 router 聚合原生接受 grouped output contract；
-  3. 并行修 `8192,4096,1024,128,8` 的 fused preact quant crash。
-
-## 2026-03-24 - blockscaled `pack+quant` 融合，去掉 `grouped_a` 物化
-
-### 指标注释（先看这个）
-
-- 精度基线：官方 `bf16` 路径。
-- 显存基线：官方 `bf16` 路径。
-- 性能基线 1：上一版 env-on blockscaled（专用段拷贝桥，但仍是 `pack -> grouped_a -> quantize` 两段式）。
-- 性能基线 2：同 shape 的稳定 `fp8-mainline`。
-- 重要说明：
-  - 本轮只吃掉了 blockscaled 前半段的大 buffer：
-    - 不再 materialize `grouped_a`
-    - 直接 `flat sorted activation -> grouped fp8 activation + grouped scale`
-  - `grouped_out` 还在，所以峰值显存主矛盾并没有彻底解决。
-  - 这一步的收益应该主要体现在：
-    - inference/training forward
-    - e2e
-    - 而不是最终 peak memory
-
-### 改动
-
-- 在 `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` 中新增：
-  - `_pack_quantize_expert_segments_kernel`
-  - `_pack_quantize_grouped_rows(...)`
-- 新路径直接完成：
-  - 从平铺 expert-sorted `a`
-  - 按 `expert_frequency_offset` 写入 grouped/static-capacity 布局
-  - 同时完成 `1x32` blockwise FP8 quant
-  - 直接产出：
-    - `a_fp8`
-    - grouped `dequant_scale_fp32`
-  - 然后只保留一个很小的 `round_scale_to_e8m0(...) + pack_blockscaled_1x32_scales(...)`
-- 旧的：
-  - `_pack_grouped_rows(...)`
-  - `quantize_activation_blockwise(grouped_a, ...)`
-  的串行前半段已经不再走主路径。
-
-### 收益来源说明
-
-- 本轮 forward/e2e 收益来源非常明确：
-  - 去掉了 `grouped_a` 这个大 bf16 中间张量；
-  - 去掉了 “先 pack 再 quantize” 的两次大张量往返；
-  - 直接把 sorted activation 一步落到 grouped fp8 contract。
-- 本轮为什么显存没同步改善：
-  - 现在最大的额外峰值已经不是 `grouped_a`，而是 `grouped_out`；
-  - 所以下一步必须继续处理输出布局/聚合直连，而不是停在前半段。
-
-### 正确性验证
-
-命令：
-
-```bash
-USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py -k 'blockscaled_downproj or blockwise_quant_matches_divide_reference_after_e8m0_encoding'
-USE_QUACK_GEMM=1 SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1 SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY=256 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py
-```
-
-结果：
-
-```text
-4 passed, 7 deselected
-12 passed
-```
-
-解释：
-
-- blockscaled 合同测试继续通过；
-- env-on Blackwell 回归继续通过；
-- 说明 `pack+quant` 融合没有破坏现有静态合同和数值边界。
-
-### 中等真实 shape 精度 / 显存 / 性能数据
-
-统一 shape：`4096,4096,1024,128,8`
-
-- 官方 bf16：
-  - peak memory：`7049.88 MiB`
-  - Fwd inference：`2.344 ms`
-  - Fwd training：`2.236 ms`
-  - Fwd+Bwd：`7.338 ms`
-  - Bwd：`4.994 ms`
-- 稳定 fp8-mainline（当前同机对照）：
-  - output RMSE：`0.01073638`
-  - loss RMSE：`0.00000020`
-  - peak memory：`6867.00 MiB`
-  - Fwd inference：`2.390 ms`
-  - Fwd training：`2.890 ms`
-  - Fwd+Bwd：`7.693 ms`
-  - Bwd：`5.303 ms`
-- 上一版 env-on blockscaled：
-  - output RMSE：`0.01073363`
-  - loss RMSE：`0.00000019`
-  - peak memory：`7396.13 MiB`
-  - Fwd inference：`4.362 ms`
-  - Fwd training：`6.715 ms`
-  - Fwd+Bwd：`11.668 ms`
-  - Bwd：`7.307 ms`
-- 本轮 `pack+quant` 融合后 env-on blockscaled：
-  - output RMSE：`0.01073363`
-  - loss RMSE：`0.00000019`
-  - peak memory：`7396.13 MiB`
-  - Fwd inference：`3.095 ms`
-  - Fwd training：`3.791 ms`
-  - Fwd+Bwd：`8.414 ms`
-  - Bwd：`5.319 ms`
-
-收益 / 损失：
-
-- 相对上一版 env-on blockscaled：
-  - Fwd inference 提升：`29.05%`
-  - Fwd training 提升：`43.54%`
-  - Fwd+Bwd 提升：`27.89%`
-  - Bwd 提升：`27.21%`
-  - peak memory：`持平`
-- 相对稳定 `fp8-mainline`：
-  - output RMSE 基本持平
-  - peak memory 仍多：`529.13 MiB`
-  - Fwd inference 仍慢：`29.50%`
-  - Fwd training 仍慢：`31.17%`
-  - Fwd+Bwd 仍慢：`9.37%`
-  - Bwd 基本持平：`0.30%`
-- 相对官方 bf16：
-  - peak memory 仍多：`346.25 MiB`
-  - Fwd inference 仍慢：`32.04%`
-  - Fwd training 仍慢：`69.54%`
-  - Fwd+Bwd 仍慢：`14.66%`
-  - Bwd 仍慢：`6.51%`
-
-解释：
-
-- 这一步已经把 blockscaled 从“明显不可用”拉回到“接近稳定 fp8-mainline 的 e2e 区间”；
-- 最亮眼的是：
-  - `Bwd` 已经几乎追平稳定 `fp8-mainline`
-  - `E2E` 差距已经从非常大缩到个位数百分比量级（相对稳定 fp8-mainline）
-- 但显存完全没动，说明当前下一堵墙已经非常明确：
-  - 不是前半段 pack/quant
-  - 而是 `grouped_out` + flat unpack + router 聚合边界
-
-### 当前结论
-
-- `pack+quant` 融合是一个**确定可提交**的新里程碑：
-  - Blackwell 回归继续通过；
-  - 精度保持；
-  - 中等真实 shape 的 blockscaled e2e 提升接近 `28%`。
-- 下一步第一优先级现在进一步收敛为：
-  1. 去掉 `grouped_out -> flat out` 这层过渡；
-  2. 让 router 聚合直接消费 grouped/static layout，或者让 down-proj 直接写可聚合布局；
-  3. 只有做完这一层，blockscaled 才有机会同时赢下性能和显存。
-
-## 2026-03-24 - `e8m0` reciprocal 优化落地，并完成中等真实 shape 对照
-
-### 指标注释（先看这个）
-
-- 精度基线：官方 `bf16` 路径。
-- 显存基线：官方 `bf16` 路径。
-- 性能基线 1：同 shape、改动前的稳定 `fp8-mainline`。
-- 性能基线 2：同 shape、当前 env-on blockscaled 路径。
-- 重要说明：
-  - 这一步不是主循环迁移，而是**先把已经在线上的量化热点除法替换成 reciprocal**：
-    - SonicMoE 自己的 `fp8_quant.py`
-    - SonicMoE 当前真实在用的 preact fused quant kernel
-  - 由于 `e8m0` 最终编码为 2 的幂，这一步在 `using_pow2_scaling=True` 合同下可以做到**bitwise 等价**。
-  - 本轮首次补上了中等真实规整 shape：`4096,4096,1024,128,8`。
-  - 更大的 `8192,4096,1024,128,8` 目前会在 preact fused quant kernel 里触发 CUTLASS runtime crash；这是现有 fused boundary 的规模稳定性问题，不是本轮 reciprocal 改动引入的。
-
-### 改动
-
-- 在 `sonicmoe/functional/fp8_quant.py` 中：
-  - 将 e8m0 编码后的逐元素缩放从
-    - `grouped_x / scale`
-    - 改成 `grouped_x * reciprocal(scale)`
-- 在 `tests/fp8_protocol_test.py` 中新增：
-  - `test_blockwise_quant_matches_divide_reference_after_e8m0_encoding`
-  - 用显式 divide reference 验证 reciprocal 路径与旧合同完全一致。
-- 在 `operator-incubator/cutify/ops/cute/fused_weighted_swiglu_act_quant.py` 中：
-  - 将 4 组 scale 路径从普通除法改成 `cute.arch.rcp_approx(...)`
-  - 覆盖：
-    - single-op prob
-    - vec4 prob
-    - vec4 no-prob
-    - single-op no-prob
-  - 注意：
-    - `operator-incubator` 在当前机器上不是独立 git repo；
-    - 这部分改动目前只存在于本地 workspace，尚不能随 SonicMoE 仓库一起 push。
-
-### 收益来源说明
-
-- SonicMoE 侧收益来源：
-  - 去掉 blockwise quant 的逐元素除法；
-  - 改为 reciprocal 预计算后乘法；
-  - 这一步直接命中 blockscaled path 的激活量化热点。
-- fused quant kernel 侧收益来源：
-  - 去掉每个 quant block 的 `FP8_E4M3_MAX / block_amax`
-  - 去掉每个 quant block 的 `1 / quant_scale`
-  - 在 `pow2/e8m0` 合同下，`rcp_approx` 不会引入额外量化误差。
-- 本轮没有去动 sigmoid 本身的数值路径，只碰 scale 路径，因此精度风险是可控且可验证的。
-
-### 正确性验证
-
-命令：
-
-```bash
-USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py -k 'runtime_and_reference_quant or blockwise_quant_matches_divide_reference_after_e8m0_encoding or preact_cutely_fused_path_matches_reference_boundary'
-USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py
-USE_QUACK_GEMM=1 SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1 SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY=256 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py
-```
-
-结果：
-
-```text
-3 passed, 8 deselected
-12 passed
-12 passed
-```
-
-此外，本轮还对 fused quant kernel 做了单独 bitwise 验证：
-
-```text
-q_rmse=0.0, q_max=0.0
-s_rmse=0.0, s_max=0.0
-```
-
-解释：
-
-- reciprocal 路径没有改变 `e8m0` 编码后的量化结果；
-- SonicMoE 默认 Blackwell 路径和 env-on blockscaled 路径都继续通过。
-
-### 独立量化微基准
-
-命令：
-
-```bash
-python - <<'PY'
-# shape=(128, 512, 1024)
-# old_fn: divide
-# new_fn: reciprocal * multiply
-PY
-```
-
-结果：
-
-- shape：`(128, 512, 1024)`
-- old：`0.510781 ms`
-- new：`0.481161 ms`
-- 量化热点提速：`5.80%`
-- RMSE：`0.00000000`
-- max abs：`0.00000000`
-
-解释：
-
-- 这说明 reciprocal 改动在局部热点上**确实有真实收益**，而不是纯粹代码风格改写。
-- 但它的量级还不够大，不能单独解决端到端主矛盾。
-
-### 中等真实 shape 精度 / 显存 / 性能数据
-
-统一 shape：`4096,4096,1024,128,8`
-
-- 官方 bf16：
-  - peak memory：`7049.88 MiB`
-  - Fwd inference：`2.344 ms`
-  - Fwd training：`2.236 ms`
-  - Fwd+Bwd：`7.338 ms`
-  - Bwd：`4.994 ms`
-- 稳定 fp8-mainline（本轮 reciprocal 后）：
-  - output RMSE vs bf16：`0.01073638`
-  - loss RMSE vs bf16：`0.00000020`
-  - peak memory：`6867.00 MiB`
-  - Fwd inference：`2.390 ms`
-  - Fwd training：`2.890 ms`
-  - Fwd+Bwd：`7.693 ms`
-  - Bwd：`5.303 ms`
-- 同 shape、改动前稳定 fp8-mainline：
-  - Fwd inference：`2.382 ms`
-  - Fwd training：`2.894 ms`
-  - Fwd+Bwd：`7.808 ms`
-  - Bwd：`5.426 ms`
-- 当前 env-on blockscaled：
-  - output RMSE vs bf16：`0.01073363`
-  - loss RMSE vs bf16：`0.00000019`
-  - peak memory：`7396.13 MiB`
-  - Fwd inference：`4.362 ms`
-  - Fwd training：`6.715 ms`
-  - Fwd+Bwd：`11.668 ms`
-  - Bwd：`7.307 ms`
-
-收益 / 损失：
-
-- 稳定 fp8-mainline 相对改动前：
-  - Fwd inference 变化：`-0.34%`（共享机噪声范围内，可视为持平）
-  - Fwd training 提升：`0.14%`
-  - Fwd+Bwd 提升：`1.47%`
-  - Bwd 提升：`2.27%`
-- 稳定 fp8-mainline 相对 bf16：
-  - 显存领先：`182.88 MiB`
-  - Fwd inference 仍慢：`1.96%`
-  - Fwd training 仍慢：`29.25%`
-  - Fwd+Bwd 仍慢：`4.84%`
-  - Bwd 仍慢：`6.19%`
-- 当前 env-on blockscaled 相对 bf16：
-  - 显存反而多：`346.25 MiB`
-  - Fwd inference 仍慢：`86.09%`
-  - Fwd training 仍慢：`200.31%`
-  - Fwd+Bwd 仍慢：`58.99%`
-  - Bwd 仍慢：`46.31%`
-- 当前 env-on blockscaled 相对稳定 fp8-mainline（本轮后）：
-  - peak memory 多：`529.13 MiB`
-  - Fwd inference 仍慢：`82.51%`
-  - Fwd training 仍慢：`132.35%`
-  - Fwd+Bwd 仍慢：`51.67%`
-  - Bwd 仍慢：`37.79%`
-
-解释：
-
-- 这一步已经确认：
-  - reciprocal 是有效优化；
-  - 稳定 `fp8-mainline` 已经在中等真实 shape 上拿到显存优势，并把性能差距压到很小；
-  - 但当前还**没有**超过官方 `bf16`。
-- 同时也确认：
-  - env-on blockscaled 目前仍然不是可交付主线；
-  - 主因不是量化除法，而是：
-    - static capacity 额外 buffer
-    - grouped bridge / pack-unpack
-    - 输出布局不能直接直连现有路由聚合
-
-### 当前结论
-
-- 这次 reciprocal 优化可以作为一个**可保留、可提交**的小里程碑：
-  - 精度不变；
-  - 局部热点确定提速；
-  - 稳定 `fp8-mainline` 的 e2e / bwd 在真实规整 shape 上出现可测改善。
-- 但它不是主矛盾终点。
-- 下一步第一优先级已经进一步收敛为：
-  1. 把 blockscaled 路径的 `pack + quant + grouped_out` 过渡层继续消掉，至少先把 `pack+quant` 合并；
-  2. 让 routing metadata / 下游聚合直接接受静态 expert layout，避免 env-on blockscaled 额外峰值显存；
-  3. 修掉大 shape（`8192,4096,1024,128,8`）下 preact fused quant kernel 的 runtime crash。
-
-## 2026-03-24 - Blackwell blockscaled down-proj 专用段拷贝桥与容量安全合同
-
-### 指标注释（先看这个）
-
-- 精度基线：官方 `bf16` 路径。
-- 显存基线：官方 `bf16` 路径。
-- 性能基线 1：稳定 `fp8-mainline`。
-- 性能基线 2：上一版静态合同 blockscaled（GPU `searchsorted + index_copy_/index_select` bridge）。
-- 重要说明：
-  - 本轮**还没有完全消掉 GPU bridge**，但已经把通用张量操作换成了两段专用 Triton 段拷贝 kernel。
-  - 这一步的真实收益主要体现在 **forward/cudagraph 路径**，因为 down-proj 当前只有 forward 进入了新 blockscaled mainloop；backward 还没跟上，所以 `e2e/bwd` 不能简单按同一比例解读。
-  - 本轮还补上了一个关键安全合同：`capacity` 不足时必须报错，不能静默截断。
-
-### 改动
-
-- 在 `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` 中：
-  - 删除了上一版通用 GPU bridge 的核心路径：
-    - `searchsorted(cu_seqlens_m[1:])`
-    - `index_copy_`
-    - `index_select`
-  - 新增两个专用 Triton kernel：
-    - `_pack_expert_segments_kernel`
-    - `_unpack_expert_segments_kernel`
-  - 它们直接利用 `expert_frequency_offset` 所表达的“按 expert 连续段”语义做静态 capacity 布局转换。
-  - 增加了 blockscaled 静态合同检查：
-    - `SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY` 必须是 `128` 的整数倍
-    - `capacity` 必须大于等于当前 batch 的最大 expert load
-    - `intermediate_size` 必须是 `128` 的整数倍
-    - `hidden_size` 必须是 `128` 的整数倍
-- 在 `tests/fp8_protocol_test.py` 中新增：
-  - `test_blockscaled_downproj_rejects_insufficient_capacity`
-  - 覆盖“capacity 不足必须明确报错”
-
-### 收益来源说明
-
-- 本轮 forward 收益来源：
-  - 不再做通用 `searchsorted + index_copy_/index_select`
-  - 改为基于 `expert_frequency_offset` 的专用段拷贝 kernel
-  - 它更接近最终想要的“routing metadata 直接产出静态布局”方向
-- 本轮正确性收益来源：
-  - 以前 `capacity` 不足会静默截断，极其危险
-  - 现在已经变成显式失败合同，后续 agent 不会再被假性能/假精度误导
-
-### 正确性验证
-
-命令：
-
-```bash
-USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py -k 'blockscaled_downproj'
-USE_QUACK_GEMM=1 SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1 SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY=256 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py
-```
-
-结果：
-
-```text
-3 passed, 7 deselected
-11 passed
-```
-
-解释：
-
-- 第一条说明 blockscaled 静态合同相关测试已经覆盖：
-  - 未对齐 capacity 拒绝
-  - capacity 不足拒绝
-  - 给定静态 capacity 时 finite forward/backward
-- 第二条说明 env-on blockscaled 完整 Blackwell 回归继续通过。
-
-### 精度数据
-
-命令：
-
-```bash
-USE_QUACK_GEMM=1 SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1 SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY=256 python benchmarks/moe-cute.py --thiek 1024,512,512,32,4 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_fp8_metrics
-```
-
-结果（本轮专用段拷贝桥）：
-
-- output RMSE vs bf16：`0.00131902`
-- loss RMSE vs bf16：`0.00000013`
-
-解释：
-
-- 与上一版 blockscaled、稳定 `fp8-mainline` 基本持平。
-- 说明这次桥接替换没有引入新的数值退化。
-
-### 显存数据
-
-同一条命令输出：
-
-- bf16 peak memory：`380.25 MiB`
-- 本轮 blockscaled fp8 peak memory：`142.78 MiB`
-
-对照：
-
-- 上一版 blockscaled：`142.81 MiB`
-- 稳定 `fp8-mainline`：`134.44 MiB`
-
-解释：
-
-- 相对上一版 blockscaled 几乎不变（`-0.03 MiB`）。
-- 相对稳定 `fp8-mainline` 仍多 `8.34 MiB`，说明主要剩余问题已经不是 metadata 算法，而是**bridge 仍然存在本身**。
-
-### 性能数据
-
-同机、同 shape（`1024,512,512,32,4`）对照：
-
-- 官方 bf16：
-  - Fwd inference：`0.187 ms`
-  - Fwd training：`1.186 ms`
-  - Fwd+Bwd：`3.292 ms`
-  - Bwd：`3.105 ms`
-- 稳定 `fp8-mainline`：
-  - Fwd inference：`0.229 ms`
-  - Fwd training：`1.561 ms`
-  - Fwd+Bwd：`3.534 ms`
-  - Bwd：`3.305 ms`
-- 上一版静态合同 blockscaled：
-  - Fwd inference：`0.476 ms`
-  - Fwd training：`2.046 ms`
-  - Fwd+Bwd：`4.004 ms`
-  - Bwd：`3.528 ms`
-- 本轮专用段拷贝桥 blockscaled：
-  - Fwd inference：`0.250 ms`
-  - Fwd training：`1.998 ms`
-  - Fwd+Bwd：`4.259 ms`
-  - Bwd：`4.009 ms`
-
-收益 / 损失：
-
-- 相对上一版静态合同 blockscaled：
-  - Fwd inference 提升 `47.48%`
-  - Fwd training 提升 `2.35%`
-  - Fwd+Bwd 退化 `6.37%`
-  - Bwd 退化 `13.63%`
-- 相对稳定 `fp8-mainline`：
-  - Fwd inference 仍慢 `9.17%`
-  - Fwd training 仍慢 `27.99%`
-  - Fwd+Bwd 仍慢 `20.51%`
-  - Bwd 仍慢 `21.30%`
-- 相对官方 bf16：
-  - Fwd inference 仍慢 `33.69%`
-  - Fwd training 仍慢 `68.47%`
-  - Fwd+Bwd 仍慢 `29.37%`
-  - Bwd 仍慢 `29.11%`
-
-解释：
-
-- 这组数据说明专用段拷贝桥**确实解决了 forward 方向最重的 bridge 开销**。
-- 但 `e2e/bwd` 还没有跟上，原因非常明确：
-  - 当前真正进入 FP8 blockscaled mainloop 的只有 down-proj forward
-  - backward 相关 GEMM 仍沿用旧路径
-  - 因此下一步不能继续只盯 down-proj forward，而要开始把剩余 GEMM 主循环一起迁过去
-
-### 当前结论
-
-- 当前 blockscaled 路径已经从“通用 GPU bridge”进一步收敛为“专用段拷贝桥 + 明确静态合同”。
-- 这是一条更接近最终交付版的过渡路径，但仍然**不是终点**。
-- 下一步最值得做的两件事：
-  1. 继续去掉剩余 bridge，让 routing metadata 直接产出静态布局
-  2. 把 up-proj / backward GEMM 一起迁到同一类 FP8 mainloop 合同
-
-## 2026-03-24 - Blackwell `1x32 ue8m0` blockscaled down-proj 静态对齐合同版
-
-### 指标注释（先看这个）
-
-- 精度基线：官方 `bf16` 路径。
-- 显存基线：官方 `bf16` 路径。
-- 性能基线 1：上一轮稳定 `fp8-mainline`（pre-SwiGLU fused boundary，down-proj 仍是普通 QuACK GEMM）。
-- 性能基线 2：上一版 blockscaled 过渡桥（host-side grouped metadata + 非 capture-safe）。
-- 性能基线 3：官方 `bf16` 小 shape 路径。
-- 重要说明：
-  - 本轮 blockscaled path 的合同已经切换为：**内核层只接受静态对齐后的 expert capacity**。
-  - padding/容量规划不再在 blockscaled kernel 内动态决定，而是上移为显式运行合同：
-    - `SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY`
-    - 必须是 `128` 的整数倍
-  - 当前实现仍保留 GPU 侧 pack/unpack，因此还不是最终极致版本；但 host-side metadata 已经去掉，**cudagraph capture 已恢复**。
-
-### 改动
-
-- 在 `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` 中去掉了上一版的 CPU 侧 grouped bridge：
-  - 删除 `cu_seqlens_m.detach().cpu().tolist()` 相关路径。
-  - 新增静态合同：
-    - `SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY`
-    - blockscaled path 只接受对齐后的静态 expert capacity。
-  - 新增 GPU 侧 padded position 构造：
-    - 用 `torch.searchsorted(cu_seqlens_m[1:])` 直接在设备上恢复 `expert_id / within_expert_rank`
-    - 生成固定 shape 的 `padded_positions`
-  - 新增 GPU 侧 pack/unpack：
-    - `index_copy_` 将平铺 `TK x I` 激活写入 `(E, capacity, I)`
-    - `index_select` 将 `(E, capacity, H)` 输出还原回平铺 `TK x H`
-- 在 `tests/fp8_protocol_test.py` 中增加了静态合同测试：
-  - 未对齐 capacity 必须报错
-  - 给定 `capacity=128` 时 env-on blockscaled 路径 forward/backward 必须保持有限
-- 在 `benchmarks/moe-cute.py` 中恢复了 blockscaled 路径的 cudagraph inference benchmark。
-
-### 收益来源说明
-
-- 相对上一版 blockscaled 过渡桥，本轮收益来源非常明确：
-  - 去掉 host-side grouped metadata；
-  - 恢复固定 shape capture；
-  - 把“动态桥”收敛为“静态容量合同 + GPU pack/unpack”。
+规则：
+
+1. baseline bf16 路径始终是金标准，不允许被 opt 默认覆盖
+2. 每个新算子必须先挂 operator-opt env，再接 correctness gate
+3. correctness 过关后，才允许进入 performance gate
+
+---
+
+## 1. 主线里程碑
+
+### 1.1 Blackwell FP8 protocol 骨架已落地
+
+关键文件：
+
+- `sonicmoe/functional/fp8_protocol.py`
+- `sonicmoe/functional/fp8_quant.py`
+- `sonicmoe/functional/fp8_reference.py`
+
+当前协议范围：
+
+- activation dtype：`e4m3`
+- scale encoding：`e8m0`
+- stable granularity：`1x128`
+- runtime target：Blackwell + QuACK
+
+意义：
+
+- FP8 工作已经从“概念讨论”进入“协议明确、接口固定、可持续演化”的阶段
+
+### 1.2 preact fused FP8 boundary 已落地
+
+关键文件：
+
+- `sonicmoe/functional/fp8_cutely_fused.py`
+
+关键路径：
+
+- `z -> fused_weighted_swiglu_act_quant_best -> fused_act_dequant_best`
+
+意义：
+
+- 当前 stable 主线已经不是简单 reference quant/dequant 拼装
+- 已有真实 fused boundary
+
+### 1.3 stable 主线已复用 `y1`，去掉语义冗余路径
+
+关键文件：
+
+- `sonicmoe/functional/__init__.py`
+
+已落地优化：
+
+- fused preact dequant 支持 `restored_out=...`
+- stable path 直接复用 QuACK `gemm_gated(...)` 产出的 `y1`
+- preact boundary 包在 `torch.no_grad()` 下
+- 默认去掉 `STE`
+
+为什么这是对的：
+
+- `_UpProjection.forward(...)` 返回的 `y1` 已 `mark_non_differentiable`
+- `_DownProjection.backward(...)` 也不是沿前向 `y1` 回梯度
+- 所以这条 `STE` 在主线里是语义冗余，而不是“训练必要组件”
+
+### 1.4 benchmark 指标基础设施已补齐
+
+关键文件：
+
+- `benchmarks/moe-cute.py`
+
+已落地能力：
+
+- `--report_fp8_metrics`
+- `--report_stage_memory`
+- `--report_fp8_analysis`
+- backward RMSE：
+  - `dx_rmse`
+  - `dw1_rmse`
+  - `dw2_rmse`
+  - `drouter_w_rmse`
+- GPU peak 污染修复：
+  - metrics snapshot 改为 CPU 保存
+
+意义：
+
+- 之后所有“fp8 比 bf16 快还是慢”的判断终于有了较可靠的数据面
+
+### 1.5 预分配输出 buffer 合同已铺开
+
+关键文件：
+
+- `sonicmoe/functional/fp8_quant.py`
+- `sonicmoe/functional/fp8_cutely_fused.py`
+
+已落地接口：
+
+- `round_scale_to_e8m0(..., out=...)`
+- `quantize_activation_blockwise(..., out=..., scale_out=...)`
+- `dequantize_activation_blockwise(..., out=...)`
+- `apply_*_fp8_protocol_cutely_fused(..., scale_out=...)`
+
+意义：
+
+- 这是后续完全 cudagraph-compatible FP8 路线的接口基础
+
+### 1.6 2026-03-25：QuACK inference fastpath 第 1 轮落地
+
+关键文件：
+
+- `sonicmoe/functional/__init__.py`
+- `sonicmoe/quack_utils/gemm_interface.py`
+- `tests/fp8_protocol_test.py`
+
+本轮实际改动：
+
+- 给 `moe_TC_softmax_topk_layer(...)` 增加了 QuACK inference fastpath：
+  - `is_inference_mode_enabled=True` 且走 QuACK 时，不再复用训练态的 `_UpProjection.apply -> _DownProjection.apply` autograd 包装
+  - 改成 forward-only 直接调用：
+    - router/topk metadata
+    - `gemm_gated(...)`
+    - 可选 `apply_preact_activation_fp8_protocol_cutely_fused(...)`
+    - `gemm(...)`
+    - `_router_forward(...)`
+- inference fastpath 现在在 forward-only 路径里显式 `torch.no_grad()`，并在 down-proj 前尽早释放 `z/y1`
+- `gather_A` 场景下给 `gemm_gated` autotune 增加了更严格的 invalid-config 剪枝，避免 `cluster_n != 1` 的错误配置被拿来试
+- `_DownProjection.forward()` 不再为 backward 保存实际上没有被用到的 `selected_experts`
+
+本轮原本想做、但被代码现实挡住的点：
+
+- 原计划是让 inference fastpath 在 **不需要 fp8 boundary** 时直接 `store_preact=False`，从而连 `z` 都不落地
+- 但实测发现当前 QuACK `gather_A` up-proj 合同仍要求 `preact_out/D` 存在；否则会在 scheduler / kernel 路径上直接断言失败
 - 这意味着：
-  - 当前 blockscaled 路径已经从“可运行实验实现”升级为“可回归、可 benchmark、可交付的静态合同版本”；
-  - 但最终性能仍被 GPU pack/unpack 吃掉一部分，下一步重点已经收敛为**继续消掉 pack/unpack**，而不是再回头啃 runtime wrapping。
+  - **今天这轮不能把 inference 的 `z` 彻底删掉**
+  - 但我们已经把这个 blocker 明确定位成 **现有 QuACK gather-A 合同限制**，不是 SonicMoE 上层逻辑问题
 
-### 正确性验证
+为什么这轮仍然值得保留：
 
-命令：
+- 当前高频 inference 路径以前虽然不 backward，但仍沿用了训练态自定义 autograd Function 包装
+- 这会把不必要的 graph / ctx / saved-tensor 生命周期带进来
+- 新 fastpath 至少做到了两件正确的事：
+  - inference 不再走训练态 autograd 包装
+  - `z` 不再跨到 down-proj / router 之后才自然释放，而是 forward 中段就能尽早释放
+
+精度结果：
+
+- bf16 inference fastpath vs. 旧路径：
+  - `max_abs_o = 0.0`
+  - `max_abs_logits = 0.0`
+  - `expert_frequency` 完全一致
+- fp8 inference fastpath vs. 旧路径：
+  - `max_abs_o = 0.0`
+  - `max_abs_logits = 0.0`
+  - `expert_frequency` 完全一致
+
+也就是说：
+
+- **本轮没有引入任何可见数值回退**
+- 至少在当前验证 shape 上，forward 结果是逐元素一致的
+
+性能 / 显存结果（注意：共享机 8 卡持续高占用，以下 timing 噪声较大；更可信的是同窗口前后对比与显存趋势）：
+
+- 测量环境：
+  - `CUDA_VISIBLE_DEVICES=1`
+  - shared GPU 高占用背景
+  - shape：`4096,4096,1024,128,8`
+  - mode：`is_inference_mode=True`
+
+- 改前：
+  - bf16：`mean 3.422 ms`, `min 2.748 ms`, `peak 3594.75 MiB`
+  - fp8：`mean 3.442 ms`, `min 1.945 ms`, `peak 3595.75 MiB`
+
+- 改后：
+  - bf16：`mean 3.486 ms`, `min 3.347 ms`, `peak 3440.80 MiB`
+  - fp8：`mean 3.346 ms`, `min 2.458 ms`, `peak 3595.75 MiB`
+
+正确解释：
+
+- **最稳定的收益是 bf16 inference peak memory 下降了约 `153.95 MiB`**
+- fp8 inference mean time 在这组噪声环境里有小幅改善（`3.442 -> 3.346 ms`），但幅度还不够大，不能夸大
+- bf16 inference mean time 没有拿到稳定优势，说明：
+  - “去 autograd 包装 + 提前释放临时张量”是对的
+  - 但如果不能把 `z` 真正从 up-proj inference 合同里拿掉，收益仍然有限
+
+验证结果：
+
+- `python -m py_compile sonicmoe/functional/__init__.py sonicmoe/quack_utils/gemm_interface.py tests/fp8_protocol_test.py`
+- `CUDA_VISIBLE_DEVICES=1 USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py`
+- 结果：`23 passed`
+
+下一步规划：
+
+1. 继续沿着 **真正去掉 inference `z`** 的方向推进，但目标应该转为：
+   - 改 QuACK gather-A up-proj 合同
+   - 或者给它补一个允许 `preact_out=None` 的合法 scheduler / kernel 路径
+2. 如果 QuACK 侧今天还动不了，就把主精力重新拉回更值钱的方向：
+   - `varlen fp8 postact + scales`
+   - varlen-preserving fp8 down-proj mainloop
+3. 保持当前结论清晰：
+   - 本轮不是 endgame
+   - 但它把 inference 路径里一层不必要的训练态包装拿掉了，并且把下一个真正 blocker 定位清楚了
+
+### 1.7 2026-03-25：QuACK gather-A inference 允许 `D=None`，真正去掉非-FP8 边界场景下的 `z`
+
+关键文件：
+
+- `sonicmoe/quack_utils/gemm_gated.py`
+- `sonicmoe/functional/__init__.py`
+- `tests/fp8_protocol_test.py`
+
+本轮实际改动：
+
+- 在本地 `GemmGatedMixin` 里覆写了 scheduler 参数构造逻辑：
+  - 对 `varlen_m + gather_A + mD is None` 的场景，不再沿用上游 `assert mD is not None or not self.gather_A`
+  - 改为直接使用 `VarlenMTileSchedulerArguments(total_m=varlen_args.mAIdx.shape[0])`
+- 基于这个本地调度修复，把 QuACK inference fastpath 恢复成：
+  - `store_preact=False` when `fp8_protocol is None` or `upproj_epilogue_precision != fp8`
+- 新增测试显式锁住：
+  - 非 FP8 boundary 的 QuACK inference fastpath 必须 `store_preact=False`
+  - fastpath 输出仍然 `requires_grad=False`
+  - 全量 `tests/fp8_protocol_test.py` 继续通过
+
+为什么这轮值得做：
+
+- 第 1 轮已经证明：
+  - inference fastpath 本身是对的
+  - 但没有真正去掉 `z` 时，收益有限
+- 这轮把真正的本地 blocker 拆掉了：
+  - 不是算法不允许
+  - 而是上游 scheduler 对 `gather_A + D=None` 做了保守限制
+- 现在至少对 **不需要 fp8 boundary 的 inference**，`z` 已经可以不落地
+
+精度结果：
+
+- bf16 inference fastpath vs. 标准路径：
+  - `max_abs_o = 0.0`
+  - `max_abs_logits = 0.0`
+  - `expert_frequency` 完全一致
+- fp8 inference fastpath vs. 标准路径：
+  - `max_abs_o = 0.0`
+  - `max_abs_logits = 0.0`
+  - `expert_frequency` 完全一致
+
+结论：
+
+- **本轮仍然没有引入任何数值回退**
+- gather-A `D=None` 只是把不必要的 preact materialization 删掉，不改变最终算子语义
+
+性能 / 显存结果（同样处于共享满卡环境，主要看趋势，不夸大 timing）：
+
+- 对比基线：上一轮 fastpath 已落地、但 `store_preact` 仍被迫开启
+- 测量环境：
+  - `CUDA_VISIBLE_DEVICES=1`
+  - shared GPU 高占用背景
+  - shape：`4096,4096,1024,128,8`
+  - mode：`is_inference_mode=True`
+
+- 本轮改后：
+  - bf16：`mean 3.335 ms`, `min 3.259 ms`, `peak 3440.80 MiB`
+  - fp8：`mean 3.292 ms`, `min 2.438 ms`, `peak 3595.75 MiB`
+
+正确解释：
+
+- bf16 inference mean 有小幅改善（相对上一轮 `3.486 -> 3.335 ms`），说明去掉 `z` 对高频路径确实有帮助
+- 但 bf16 inference peak 没有继续下降，说明：
+  - 当前测量口径下的峰值已经不完全由 `z` 决定
+  - 或者共享机噪声把这一层收益淹掉了
+- fp8 inference peak 没变也符合预期：
+  - 当 fp8 boundary 仍存在时，`z` 仍然是必须输入
+
+验证结果：
+
+- `python -m py_compile sonicmoe/functional/__init__.py sonicmoe/quack_utils/gemm_gated.py sonicmoe/quack_utils/gemm_interface.py tests/fp8_protocol_test.py`
+- `CUDA_VISIBLE_DEVICES=1 USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py`
+- 结果：`23 passed`
+
+本轮顺手完成的高 ROI 探针：
+
+- 尝试直接把现有 `blockscaled_fp8_gemm` 从 grouped/static-capacity 改成 **flat varlen-M**
+- 结果没有直接打通，但 blocker 非常清楚：
+  - `GemmDefaultSm100(sf_vec_size=32)` 当前 blockscaled A 路径要求 scale-factor layout 按 rank-3 形态构造
+  - flat varlen-M 的 rank-2 activation 在 `tile_atom_to_shape_SF(...)` 处直接因 rank 假设失败
+  - 这说明当前真正的下一步不是继续优化 grouped，而是优先评估 **rank-lifted A/SF layout 包装** 是否能把 flat varlen-M 接进来
+
+下一步规划：
+
+1. 继续追 `flat varlen-M blockscaled fp8 down-proj`
+   - 先尝试 rank-lift / layout-promotion
+   - 目标是复用现有 `GemmDefaultSm100(sf_vec_size=32)`，而不是回到 grouped/static-capacity
+2. 如果 rank-lift 证伪，再决定是否：
+   - 在本仓库本地派生一个更贴近 SonicMoE 合同的 blockscaled wrapper
+   - 或把这部分视为 `quack/cutlass` 外部依赖层 blocker
+3. 保持优先级判断不变：
+   - inference 小修不是 endgame
+   - **真正的 ROI 仍在 direct / varlen-preserving fp8 down-proj mainloop**
+
+### 1.8 2026-03-25：本地 `gemm_dgated` 已打通 FP8 `y1s/postact_out`，backward blocker 前移到更外层
+
+关键文件：
+
+- `sonicmoe/quack_utils/gemm_dgated.py`
+- `tests/fp8_protocol_test.py`
+
+本轮实际改动：
+
+- 给本地 `gemm_dgated` 包装层补上了 runtime FP8 dtype 处理：
+  - 补齐 `torch.float8_e4m3fn -> cutlass.Float8E4M3FN`
+  - 对 runtime FP8 tensor 改成按底层 `uint8` storage 走 `from_dlpack(...)`，再显式回填 `cute` element type
+  - 不再依赖上游 `quack.gemm_wrapper_utils` 里尚未覆盖 float8 的 dtype 提取路径
+- 新增 Blackwell-only 回归测试，锁住：
+  - `gemm_dgated(..., postact_dtype=torch.float8_e4m3fn)` 可以真实运行
+  - 输出合同为：
+    - `dx.dtype == torch.bfloat16`
+    - `y1s.dtype == torch.float8_e4m3fn`
+    - `ds.dtype == torch.float32`
+
+为什么这轮值得做：
+
+- 之前只知道“想把 backward 的 `y1s` 压成 FP8 时会失败”，但失败边界并不清楚
+- 这轮把问题拆清楚了：
+  - **`gemm_dgated` wrapper / kernel 本身不是 blocker**
+  - 现在前半段已经能在 Blackwell 上真实产出 FP8 `y1s`
+  - 真正的后续阻塞点已经前移到：
+    - `convert_torch_tensor_to_cute_tensor(...)` 对 float8 的 DLPack 支持
+    - 以及现有 down-proj weight-grad kernel 的更外层架构边界
+
+精度结果：
+
+- 新增回归测试里，`y1s.float()` 全 finite，无 NaN
+- 本轮没有修改主线训练 / 推理语义，只是把 wrapper 能力边界打开并用测试锁住
+
+性能 / 显存结果：
+
+- 本轮属于 backward 边界打通，不是主线端到端优化落地
+- **没有宣称新的端到端加速或显存下降**
+- 但它的重要意义是：
+  - backward transient 压缩路线前半段已证实可行
+  - 后续优化可以更集中，不再误判 `gemm_dgated` 自身为根因
+
+验证结果：
+
+- `python -m py_compile sonicmoe/quack_utils/gemm_dgated.py tests/fp8_protocol_test.py`
+- `CUDA_VISIBLE_DEVICES=1 python -m pytest -q tests/fp8_protocol_test.py -k dgated_can_emit_fp8_postact_buffer`
+- 最小实跑 probe：
+  - `gemm_dgated(..., postact_dtype=torch.float8_e4m3fn)` => 成功，输出 `y1s.dtype == torch.float8_e4m3fn`
+
+下一步规划：
+
+1. 评估是否值得把 `convert_torch_tensor_to_cute_tensor(...)` 扩成 runtime FP8-friendly，让 down-proj weight-grad 至少能真正接到 FP8 `y1s`
+2. 同步确认现有 `HopperWgmma_MoE_Down_proj_WeightGrad_Bwd` 是否本质上仍是 Hopper-only；如果是，不在这条内核上做过量 patch
+3. 保持 ROI 判断不变：
+   - 这轮是把 backward FP8 `y1s` 从“猜测可行”推进到“前半段已证实可行”
+   - 但真正决定大 shape 30%+ 收益的，仍更可能是 varlen-preserving forward/down-proj 主线收敛
+
+### 1.9 2026-03-25：通用 runtime-FP8 `cute` conversion 已打通，down-proj weight-grad blocker 收敛为“大工程级”边界
+
+关键文件：
+
+- `sonicmoe/utils.py`
+- `tests/fp8_protocol_test.py`
+
+本轮实际改动：
+
+- 扩展 `convert_torch_tensor_to_cute_tensor(...)`，让它支持 runtime `torch.float8_e4m3fn`
+  - FP8 tensor 先按底层 `uint8` storage 走 `from_dlpack(...)`
+  - 再显式回填 `cute` element type 为 `Float8E4M3FN`
+  - 保持原有 `stream` 包装和 compact-shape 标注逻辑不变
+- 新增回归测试，锁住通用 conversion 现在能接受 runtime FP8 tensor
+
+为什么这轮值得做：
+
+- 上一轮已经证明 `gemm_dgated` 能真实产出 FP8 `y1s`
+- 这轮把更外层的 tensor-conversion blocker 也拆掉了
+- 这样再去探 down-proj weight-grad，报错就更“干净”，不会再把 helper 层和 kernel 层混在一起
+
+精度结果：
+
+- 本轮没有改动主线数值路径，只扩展了 tensor conversion 能力
+- 新增 conversion 回归仅验证合同正确，不引入新的数值近似
+
+性能 / 显存结果：
+
+- 本轮仍属于协议 / kernel 边界收敛
+- **没有新的端到端性能或显存收益可宣称**
+
+本轮确认后的真实 blocker：
+
+- 当 `_down_projection_backward_weight(...)` 直接接收 FP8 `y1s` 时：
+  - float8 的 tensor conversion 已不再是问题
+  - 真实报错变成：`Type mismatch: BFloat16 != Float8E4M3FN`
+- 同时，独立 bf16 probe 仍暴露：
+  - 现有 `HopperWgmma_MoE_Down_proj_WeightGrad_Bwd` 带有 `sm_90a` 假设
+  - 在当前 Blackwell 环境下会报 `expects arch to be Arch.sm_90a, but got Arch.sm_100a`
+
+结论：
+
+- 这说明当前 down-proj weight-grad 的剩余问题已经不是“小补丁级”：
+  1. 需要 mixed-dtype / scaled weight-grad 合同，能消费 `bf16 dout + fp8 y1s`
+  2. 同时还需要更 Blackwell-friendly 的 weight-grad kernel 路线
+- 这已经符合“如果必须做、绕不过去，可以单列项目”的标准
+- 我会把它视为一个 **大型工程候选**：
+  - `Blackwell-native mixed-dtype down-proj weight-grad`
+
+验证结果：
+
+- `python -m py_compile sonicmoe/utils.py tests/fp8_protocol_test.py`
+- conversion probe：
+  - `convert_torch_tensor_to_cute_tensor(fp8_tensor, ...)` => 成功，element type 为 `Float8E4M3FN`
+- weight-grad probe：
+  - bf16 `y1s` => 暴露 `sm_90a` 架构边界
+  - fp8 `y1s` => 暴露 `BFloat16 != Float8E4M3FN` mixed-dtype 边界
+
+下一步规划：
+
+1. 将 `Blackwell-native mixed-dtype down-proj weight-grad` 作为日志中的大型工程候选保留
+2. 日常自主迭代继续优先做 ROI 更高、可小步验证的项：
+   - varlen-preserving fp8 down-proj 主线
+   - 以及能在不重写 weight-grad 大内核的前提下减少 backward transient 的局部优化
+3. 如果后续必须触及这块，就按单独项目方式推进，而不是在当前主线上零碎打补丁
+
+### 1.10 2026-03-25：`flat varlen-M blockscaled` 本地猴补丁 prototype 再次证实是上游 rank/layout 边界，不适合在主线里碎修
+
+本轮动作：
+
+- 没有直接改仓库主代码
+- 用一次性 Python prototype 临时猴补丁了两处上游边界，想验证是否存在“低成本本地 wrapper”空间：
+  - `cutlass.utils.blockscaled_layout.tile_atom_to_shape_SF`
+  - `quack.varlen_utils.VarlenManager.offset_batch_A`
+- 目标是让：
+  - flat 2D varlen-M activation
+  - flat 2D packed scales
+  - 直接走 `GemmDefaultSm100(sf_vec_size=32)` + `varlen_m`
+  - 不再先 pack 成 grouped/static-capacity
+
+prototype 结果：
+
+- 没有打通
+- 而且报错非常集中，继续指向同一类根因：
+  - `tile_atom_to_shape_SF(...)` 仍要求 target shape rank 与 order `(2, 1, 3)` 对齐
+  - 即使临时 rank-lift，后续 `gSFA_mkl = cute.local_tile(...)` 仍会因 coordinate/profile 不匹配失败
+  - `offset_batch_A(...)` 这类按 rank-2 `(m, k)` 写死的 varlen 偏移逻辑也仍然是局部障碍
+
+为什么这轮重要：
+
+- 这不是再一次“猜测可能不行”
+- 而是已经用更接近最终目标的猴补丁 prototype 证明：
+  - **问题不在 SonicMoE 上层 glue**
+  - **问题也不只是一个 helper 函数签名**
+  - 真正卡点在上游 blockscaled + varlen 的 rank/layout 设计本身
+
+精度结果：
+
+- 本轮没有落地主线算子，因此无新的精度变化
+
+性能 / 显存结果：
+
+- 本轮仍属于 feasibility probe
+- **没有新的端到端性能或显存收益**
+
+结论：
+
+- 继续在当前主线里零碎 patch 这条 `flat varlen-M blockscaled` 路线，ROI 已明显下降
+- 这条线如果必须推进，也已经符合单列项目的标准
+- 我把它记录成第二个 **大型工程候选**：
+  - `rank-flexible blockscaled varlen down-proj`
+
+验证记录：
+
+- 一次性 prototype 在当前 Blackwell 环境下编译阶段失败，典型报错包括：
+  - `expects target shape and order operands have same rank`
+  - `unable to compute crd2idx`
+  - `failed to construct a valid coordinate`
+
+下一步规划：
+
+1. 不在主线里继续硬凿这条上游 rank/layout 边界
+2. 继续优先做不依赖大型内核工程的高 ROI 项
+3. 如后续必须做：
+   - 将 `rank-flexible blockscaled varlen down-proj` 作为单独项目推进
+   - 目标应是上游级别的 blockscaled+varlen rank contract 设计，而不是 SonicMoE 侧零碎猴补丁
+
+### 1.11 2026-03-25：QuACK inference fastpath 进一步去掉 router/top-k 的训练态 wrapper；workspace cache 试验未保留
+
+关键文件：
+
+- `sonicmoe/functional/__init__.py`
+- `tests/fp8_protocol_test.py`
+
+本轮实际改动：
+
+- 在 QuACK inference fastpath 中，不再通过 `TC_Softmax_Topk_Router_Function.apply(...)` 走训练态 autograd 包装来拿 `topk_scores/topk_indices`
+- 改成 inference-only 直接预分配：
+  - `topk_scores`
+  - `topk_indices`
+  - 然后直接调用 `_softmax_topk_fwd(...)`
+- 新增回归测试锁住：
+  - inference fastpath 必须直接走 `_softmax_topk_fwd(...)`
+  - 不再调用 `TC_Softmax_Topk_Router_Function.apply(...)`
+
+本轮同时做过、但**没有保留**的试验：
+
+- 我尝试过给 inference fastpath 增加内部 workspace cache，想复用：
+  - router metadata buffer
+  - upproj preact / postact 临时 buffer
+  - downproj 输出临时 buffer
+- 但在当前 shared-GPU steady-state probe 下，没有拿到稳定正收益，因此**撤回了这部分缓存逻辑**，不让主线带着一个无证据收益的复杂度点继续前进
+
+为什么这轮值得保留：
+
+- 这轮虽然不是大性能突破，但它让 inference fastpath 的语义更一致：
+  - up-proj / down-proj 已经不走训练态 autograd wrapper
+  - router/top-k 现在也不再走训练态 wrapper
+- 这使得当前 QuACK inference fastpath 更接近“真正的 forward-only 路径”，后续再做更细的 inference 优化时，边界会更清晰
+
+精度结果：
+
+- `tests/fp8_protocol_test.py` 中：
+  - inference no-boundary fastpath 与标准路径仍数值一致
+  - inference fp8-boundary fastpath 与标准路径仍数值一致
+- 本轮没有引入新的数值回退
+
+性能 / 显存结果（shared GPU，高噪声；只做保守解读）：
+
+- 用临时“旧版 apply-topk inference path”脚本对比当前 landed direct-topk cleanup：
+  - old apply-topk：`mean 3.347 ms`, `min 3.314 ms`, `peak 3434.77 MiB`
+  - new direct-topk：`mean 3.370 ms`, `min 3.009 ms`, `peak 3434.77 MiB`
+- 结论：
+  - **没有观察到稳定、可宣称的端到端性能收益**
+  - peak memory 也没有变化
+  - 因此这轮应被视为 **语义/合同清理**，而不是性能里程碑
+
+workspace cache 试验结果（未保留，仅记录）：
+
+- cache off：`mean 3.314 ms`, `min 2.721 ms`, `peak 3498.75 MiB`
+- cache on：`mean 3.383 ms`, `min 3.306 ms`, `peak 3498.75 MiB`
+- 结论：
+  - 当前实现下 cache 路线没有拿到稳定收益
+  - 不值得把它留在主线里增加复杂度
+
+验证结果：
+
+- `python -m py_compile sonicmoe/functional/__init__.py tests/fp8_protocol_test.py`
+- `CUDA_VISIBLE_DEVICES=1 USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py`
+- 结果：`25 passed`
+
+下一步规划：
+
+1. 把本轮结论定性为“清理完成”，不要误判成性能突破
+2. 继续寻找真正有 ROI 的局部优化，优先级仍然应避开两类大型工程候选：
+   - `Blackwell-native mixed-dtype down-proj weight-grad`
+   - `rank-flexible blockscaled varlen down-proj`
+3. 后续若做 inference 优化，优先考虑：
+   - 能减少真实大 buffer 生命周期
+   - 或能减少 kernel/contract 层的冗余 materialization
+   - 而不是单纯为了减少 `torch.empty(...)` 次数而引入缓存复杂度
+
+### 1.12 2026-03-25：16 机队列空闲资源扫描 / 远端 launch 流程已工程化
+
+关键文件：
+
+- `tools/cluster_idle_launch.py`
+- `Makefile`
+- `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/env.md`
+
+本轮实际改动：
+
+- 新增 `tools/cluster_idle_launch.py`
+  - `scan`：从当前队列环境变量 `PADDLE_TRAINERS / TRAINER_INSTANCES` 解析 16 个 node
+  - 通过 `mpirun + nvidia-smi` 扫描每个 node 的 8 张 GPU 空闲情况
+  - 按 `idle_gpus` 排序输出
+  - 同时保留：
+    - `host`：人类可读主机名
+    - `launch_host`：实际用于 `mpirun --host` 的 IP
+- 新增 Makefile 入口：
+  - `make cluster-scan`
+  - `make cluster-launch CLUSTER_COMMAND="..."`
+- 已把完整使用说明追加到 `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/env.md`
+
+为什么这轮值得做：
+
+- 当前本机 8 卡经常全部高占用，继续只盯本机做 benchmark 会显著放慢迭代
+- 这个队列本身就是 16 机、gpfs 共享存储可复用代码和结果
+- 因此“先扫空闲 node，再在空闲 node 上 launch 实验”应该成为默认工作流，而不是临时手工操作
+
+当前验证结果：
+
+- 本机 local GPU probe 仍显示 8/8 busy
+- 16 机全量 scan 时，当前时间窗发现至少 2 台全空闲：
+  - `tjzj-inf-sci-k8s-bzz2-0275`
+  - `tjzj-inf-sci-k8s-bzz2-0342`
+- 脚本验证通过：
+  - `python tools/cluster_idle_launch.py scan`
+  - `python tools/cluster_idle_launch.py launch --gpu-count 1 --command 'echo hello-from-cluster-launch' --dry-run`
+  - `make cluster-scan`
+
+注意事项：
+
+- launch 当前按 `launch_host(IP)` 走 `mpirun --host`，避免部分 hostname 解析失败
+- 如果当前 16 机里没有满足条件的空闲 GPU，脚本会直接失败退出，不会去争抢忙卡
+- 这轮是实验调度工具化，不是内核性能优化；它的价值在于让后续 benchmark / ablation 能更稳定地落到空闲机器上执行
+
+下一步规划：
+
+1. 后续所有 benchmark / regression / ablation，优先走这套 `scan -> launch` 流程
+2. 如果需要，可以继续扩展：
+   - 指定 host 白名单
+   - 指定结果日志目录
+   - 自动把 stdout/stderr 重定向到 `reports/` 或 `output/`
+3. 保持当前主线优化与“大工程目录”并行推进，不再被本机 8 卡高占用卡住
+
+### 1.13 2026-03-25：QuACK 训练路径 `_UpProjection` 不再保存无用 `s_scatter_idx`，并把 0 段表格升级为“现状 + 进度预期 + 工程量预期”
+
+关键文件：
+
+- `sonicmoe/functional/__init__.py`
+- `reports/fp8_upgrade/ENGINEERING_LOG.md`
+
+这轮改动对应论文算子：
+
+- `up-proj` 反向相关路径（主要是 `up-proj act grad / up-proj weight grad` 的工程 glue 层）
+- 类型：**算子内工程化优化**，不是新的 FP8 数学路径
+
+本轮实际改动：
+
+- `_UpProjection.forward()` 现在会把 forward 时实际采用的 backend（`use_quack_gemm`）写入 `ctx`
+- `_UpProjection.backward()` 改为严格沿用 forward 时记录下来的 backend，而不是再次查询运行时全局开关
+- 当 forward 走 QuACK 路径时，不再把 `_up_projection_backward_act()` 才需要的 `s_scatter_idx` 保存进 autograd `saved_tensors`
+  - 因为 QuACK backward 路径根本不会消费这份 index map
+  - 之前这份张量只是被无条件保存，但在 QuACK backward 分支里是死数据
+- 工程日志第 0 段的算子表 / 大工程表新增：
+  - `当前完成度`
+  - `进度预期`
+  - `工程量预期`
+  之后可以直接从第 0 段看出哪些工作没做、近期是否应该推进、属于小步优化还是大工程
+
+为什么这轮值得做：
+
+- 这是一个低风险、确定正确的训练侧内存 / 工程稳定性修正：
+  - **内存侧**：少保存一份 `TK` 长度的 `torch.int32` metadata
+  - **稳定性侧**：backward 不再依赖“执行 backward 时全局开关是否还和 forward 一致”这种隐式假设
+- 对于大 shape，单层理论 saved-state 减少量约为：
+  - `4 * T * K` bytes
+  - 例如 `T=32768, K=8` 时约节省 `1.0 MiB / layer`
+
+精度 / 性能 / 显存影响：
+
+- 精度变化：**无**
+  - 没改算子数学，只改 autograd 保存面与 backward 分支选择方式
+- 理论显存变化：**训练态小幅下降**
+  - 下降来源是 QuACK up-proj backward 不再保留无用 `s_scatter_idx`
+- 理论性能变化：**预计中性到轻微正向**
+  - 这轮主要收益不是 kernel 算力，而是减小 autograd 保存面和降低上下文错配风险
+
+验证：
+
+- `python -m py_compile sonicmoe/functional/__init__.py`
+- `python tools/cluster_idle_launch.py launch --gpu-count 1 --command "source .../envs/xfer/bin/activate && python -m pytest -q tests/fp8_protocol_test.py"`
+  - 空闲 node 远端回归已通过（`exit code 0`）
+
+下一步规划：
+
+1. 若远端回归通过，把这轮优化标记为稳定 landed
+2. 继续沿着 backward-side 的局部 ROI 做：
+   - `down-proj act grad` 的 `ds_partial` reduction / scratch 优化
+   - 或其他不跨入“大工程目录”的 metadata / buffer 生命周期优化
+3. 继续避免把主线拖入：
+   - full-chain FP8 GEMM
+   - Blackwell-native mixed-dtype `down-proj weight grad`
+   - rank-flexible blockscaled varlen down-proj
+
+### 1.14 2026-03-25：收掉剩余一批非大工程高 ROI 小改动，并冻结 3 个大工程的契约 / 验收入口
+
+关键文件：
+
+- `sonicmoe/functional/backward.py`
+- `sonicmoe/functional/triton_kernels/__init__.py`
+- `tests/fp8_large_project_contract_test.py`
+- `reports/fp8_upgrade/ENGINEERING_LOG.md`
+
+这轮对应的论文算子：
+
+- `down-proj act grad`
+- `expert aggregation (forward)` 的 metadata 统计 glue 层
+- 以及 3 个大工程的**输入输出契约冻结**（不是实现完成）
+
+本轮实际改动：
+
+- `down-proj act grad`
+  - 把 `ds_partial.sum(...)+copy_` 改成直接 `torch.sum(..., out=ds)`
+  - 把 `new_ds_partial.sum(...)+copy_` 改成直接 `torch.sum(..., out=ds)`
+  - 对 `N==1` 的分支，去掉了无意义的 `.to(dtype=ds.dtype)` 临时张量
+- `router metadata`
+  - 把 `expert_frequency.copy_(col_partial_sum_trans.sum(...))` 改成直接 `torch.sum(..., out=expert_frequency)`
+- 大工程侧：
+  - 新增 `tests/fp8_large_project_contract_test.py`
+  - 把以下 3 个大工程的 bf16-gold acceptance 入口固定下来：
+    - `full-chain FP8 GEMM`
+    - `Blackwell-native mixed-dtype down-proj weight-grad`
+    - `rank-flexible blockscaled varlen down-proj`
+  - 在第 0 段新增：
+    - `0.6 大工程输入输出契约冻结`
+    - `0.7 大工程详细规划`
+
+为什么这轮值得做：
+
+- 这些改动都在**高频训练路径**里：
+  - `down-proj act grad` 的 `ds` reduction
+  - router metadata 的 expert histogram 汇总
+- 收益不来自大 kernel 改写，而是来自：
+  - 减少中间临时张量
+  - 缩短 scratch 生命周期
+  - 固定未来大工程不会漂移的 contract / acceptance 入口
+
+精度 / 性能 / 显存变化：
+
+- 精度变化：**无**
+  - 归约数学未改，仍以 bf16 SonicMoE 路径为金标准
+- 理论性能变化：**小幅正向**
+  - 主要来自少一次 `sum -> 临时向量 -> copy_` 的中间写回
+- 理论显存变化：**小幅下降**
+  - 主要来自少一份 reduction 临时输出和更短的 scratch 生命周期
+
+验证：
+
+- `python -m py_compile sonicmoe/functional/__init__.py sonicmoe/functional/backward.py sonicmoe/functional/triton_kernels/__init__.py tests/fp8_protocol_test.py tests/fp8_large_project_contract_test.py`
+- `python tools/cluster_idle_launch.py launch --gpu-count 1 --command "source .../envs/xfer/bin/activate && python -m pytest -q tests/fp8_protocol_test.py tests/fp8_large_project_contract_test.py"`
+  - 空闲 node 远端回归已通过（`exit code 0`）
+
+结论：
+
+- 截至本轮，**大工程之外、明确高 ROI 且低风险的局部 buffer / saved-state / reduction 优化，已经基本收尾**
+- 后续如果继续出现 ROI 明显的小改动，应满足至少一条：
+  - 不跨入 `0.5` 大工程目录
+  - 不破坏 bf16 baseline 合同
+  - 能明确减少 buffer / scratch / wrapper 开销
+- 否则默认转入大工程并行推进，不再以“小改动”名义混入主线
+
+---
+
+## 2. 实验线与结论
+
+### 2.1 blockscaled down-proj：做到了哪里
+
+关键文件：
+
+- `sonicmoe/quack_utils/blockscaled_fp8_gemm.py`
+
+已做过的优化：
+
+- 融合 `pack+quant`
+- 不再物化完整 `grouped_a`
+- 不再把 grouped output 再 unpack 成 flat `y2`
+- grouped reverse scatter index 直接复用 `selected_experts`
+
+结论：
+
+- 前半段已经不是主矛盾
+- 当前真正的墙是：
+  - `grouped_out`
+  - static capacity
+  - grouped layout 到 router 聚合的过渡层
+
+### 2.2 dummy postact buffer：能跑，但不是主线
+
+开关：
+
+- `SONIC_MOE_FP8_DUMMY_POSTACT_BUFFER=1`
+
+想法：
+
+- 让 up-proj 先给出 fp8 dummy postact
+- 再只靠 `z` 重建 `bf16 y1`
+
+结论：
+
+- 已验证可跑
+- 但真实性能更差
+- 默认关闭
+
+### 2.3 backward runtime-fp8 `y1s`：前半段已打通，真正 blocker 已收敛到更外层
+
+尝试位置：
+
+- `_DownProjection.backward()`
+
+当前更准确的结论：
+
+- 本地 `gemm_dgated(..., postact_dtype=torch.float8_e4m3fn)` 已可真实运行
+- 也就是说：
+  - backward 的 `y1s` 压成 FP8 并不是在 `gemm_dgated` 这里就被证伪
+  - 前半段现在已经是可行路线
+
+当前真实 blocker：
+
+- 现有 `_down_projection_backward_weight(...)` 若直接喂 FP8 `y1s`，首先会卡在：
+  - `convert_torch_tensor_to_cute_tensor(...)` 对 float8 直接走 `from_dlpack(...)`
+  - 当前 helper 路径会报：`float8 types are not supported by dlpack`
+- 独立最小 probe 还显示：
+  - `HopperWgmma_MoE_Down_proj_WeightGrad_Bwd` 仍带有 `sm_90a` 假设
+  - 说明 weight-grad 这条线和 Blackwell / QuACK 主线的边界还没有完全对齐
+
+结论：
+
+- backward fp8 `y1s` 不再是“已证伪”
+- 但它也绝不是只补一个 dtype 参数就能端到端打通
+- 现在更准确的说法应该是：
+  - **前半段可行**
+  - **后半段还需要 FP8-friendly tensor conversion + 更 Blackwell-native 的 weight-grad 合同**
+
+### 2.4 static fp8 weight benchmark 合同：已做对
+
+关键文件：
+
+- `sonicmoe/quack_utils/blockscaled_fp8_gemm.py`
+- `sonicmoe/moe.py`
+- `benchmarks/moe-cute.py`
+
+已落地能力：
+
+- protocol-aware `w2` cache key
+- `prefetch_blockscaled_w2_fp8(...)`
+- `clear_blockscaled_fp8_weight_cache()`
+- `MoE.prefetch_fp8_weights(...)`
+- `MoE.clear_fp8_weight_cache()`
+
+结论：
+
+- benchmark 已经做到：
+  - bf16 权重由 seed 决定
+  - fp8 weight 在计时前静态量化
+  - 首轮在线量化不再污染 timing
+- 但 blockscaled 路线仍明显慢于 bf16
+
+这意味着：
+
+- 主矛盾不是在线 weight quant
+- 主矛盾仍是 grouped/static-capacity 过渡层
+
+---
+
+## 3. 当前最可信的数据
+
+### 3.1 stable 主线，shape `8192,4096,1024,128,8`（2026-03-25 同机空闲卡复测）
+
+复测环境：
+
+- host `10.51.203.82`（空闲卡）
+- `USE_QUACK_GEMM=1`
+- bf16 与 fp8 在**同一台空闲机器**上重测，避免共享卡噪声
+
+当前最可信结果：
+
+- bf16：
+  - inf / train fwd / e2e / bwd `1.930 / 1.944 / 5.676 / 3.746 ms`
+- stable fp8：
+  - output RMSE `0.01074111`
+  - loss RMSE `0.00000025`
+  - metrics probe：`bf16_peak_mib=7690.38`, `fp8_peak_mib=7572.50`
+  - stagewise final peak：`7572.50 -> 7702.50 MiB`
+  - inf / train fwd / e2e / bwd `1.947 / 2.144 / 5.871 / 3.924 ms`
+
+相对 bf16 baseline：
+
+- inference：`-0.88%`
+- train fwd：`-10.29%`
+- e2e：`-3.43%`
+- backward：`-4.75%`
+
+当前正确解释：
+
+- **这版 stable fp8 在干净复测下没有性能收益**
+- 理论上它仍可能靠更小的 activation payload 获益，但前提是：
+  - `saved_traffic + overlap > quant/dequant + scales + extra_buffer + sync`
+- 当前这条主线属于：
+  - `up-proj -> fp8 boundary -> bf16 restored A_e -> down-proj`
+  - 即**算子边界 fp8**，不是原生 full-chain fp8 算子
+- 因此当前没有赢的根因是：
+  1. 核心算子主体并没有变成原生 fp8 mainloop
+  2. 额外引入了 quant / dequant / scale 处理
+  3. 还会物化压缩态与恢复后的 `bf16 A_e`
+  4. backward 侧仍有明显 transient overhead（stagewise `+130 MiB`）
+
+收益来源若未来出现，应该主要来自：
+
+- 更小的 `A_e` 边界 payload 带来的 HBM/L2 traffic 下降
+- 更小 working-set 带来的 cache / residency 改善
+- 若后续打通原生 fp8 算子，还可能出现 kernel 内部融合收益
+
+但**当前这版收益没有出现**，因此不能再把“加了 quant/dequant 仍可能赢”当作已被当前主线实证支持的结论。
+
+### 3.1.1 stable 主线，shape `32768,4096,1024,128,8`（并发复测状态）
+
+- 已按并行规则把 bf16 / fp8 分别发到两台空闲 host：
+  - bf16：`10.51.203.76`
+  - fp8：`10.51.203.82`
+- 两边都被 `SIGKILL (exit code 137)` 打断，未拿到可用 timing
+
+当前解释：
+
+- 这不是“fp8 比 bf16 快/慢”的证据
+- 只说明当前这组超大 shape 在本轮空闲节点条件下没有稳定完成
+- 后续如果还要复测 `32768`，应单独走：
+  - 更轻量的 timing 口径
+  - 或先确认该 host 的可用显存 / 作业限制
+
+### 3.2 stable 主线，shape `4096,4096,1024,128,8`
+
+- bf16：
+  - peak `7049.88 MiB`
+  - inf / train fwd / e2e / bwd `1.141 / 1.210 / 3.437 / 2.296 ms`
+- stable fp8：
+  - peak `6931.00 MiB`
+  - output RMSE `0.01073675`
+  - loss RMSE `0.00000021`
+  - inf / train fwd / e2e / bwd `1.125 / 1.697 / 3.733 / 2.608 ms`
+
+正确解释：
+
+- 显存优势稳定存在
+- 训练前向 / e2e 还没有彻底超过 bf16
+
+### 3.3 blockscaled static weight benchmark，shape `1024,512,512,32,4`
+
+- bf16：
+  - peak `380.25 MiB`
+  - inf / train fwd / e2e / bwd `0.184 / 1.187 / 3.184 / 3.000 ms`
+- static fp8 `w2`：
+  - peak `144.78 MiB`
+  - output RMSE `0.00131902`
+  - loss RMSE `0.00000013`
+  - inf / train fwd / e2e / bwd `0.275 / 2.683 / 5.066 / 4.790 ms`
+
+正确解释：
+
+- 省显存很大
+- 但变慢也非常明显
+- 这不是因为在线量化，而是因为路径本身不对
+
+---
+
+## 4. 理论账本
+
+### 4.1 `4096,4096,1024,128,8`
+
+- 当前稳定主线：
+  - `stable_fp8_saved_payload_mib=31.00`
+- 若打通 varlen-friendly direct FP8 mainloop：
+  - `direct_fp8_boundary_saved_mib=97.75`
+- 若进一步把 `w1/w2` 做成 FP8 存储：
+  - `aggressive_weight_saved_mib=1524.00`
+- 合并理论上限：
+  - `aggressive_total_saved_mib=1555.75`
+
+### 4.2 结论
+
+- 现在最值得追的大头非常明确：
+  1. 去掉 `bf16` 回退边界
+  2. 做真正的 weight fp8 存储与消费
+- 小于这个量级的收益，不值得为之破坏 SonicMoE 的核心内存合同
+
+---
+
+## 5. 经验与教训
+
+### 5.1 一定要继续坚持的做法
+
+1. **先问“是否符合 SonicMoE 的内存合同”**
+   - 再问“是不是更激进的 fp8”
+
+2. **所有性能结论都必须带 bf16 baseline**
+
+3. **所有大 shape 结论都尽量同时给出：**
+   - metrics cold run
+   - stagewise raw probe
+   - 理论账本
+
+4. **先修 benchmark 合同，再讨论性能输赢**
+
+5. **把“为什么不是主线”写清楚**
+   - 比“这条路可以跑”更重要
+
+### 5.2 明确的反模式
+
+1. 把 grouped/static-capacity 当作默认演进方向
+2. 把 toy case 提升误判成真实主线进展
+3. 忽略 SonicMoE 的复用与调度，只盯 dtype
+4. 把一份 raw peak 当成最终唯一真相
+5. 因为某条实验数值正确，就误判它接近 endgame
+
+---
+
+## 6. 当前缺口
+
+### 6.1 真正缺的算子 / 合同
+
+1. `varlen FP8 postact + scales`
+2. `gather-A preserving down-proj fp8 mainloop`
+3. `backward mixed-dtype / scaled GEMM`
+4. `persistent static FP8 weight storage`
+5. `fully cudagraph-compatible FP8 path`
+
+### 6.2 当前最需要避免的错误
+
+- 不要继续把工程精力重投到 grouped/static-capacity 主线化
+- 除非目标明确是做“对照实验”，而不是做真正交付路径
+
+### 6.3 Sprint: Native FP8 Tensor Core — 三路并行（进行中）
+
+**目标**: 全流程涉及到 GEMM 的，内部都调用 FP8 tensor core，使用 FP32 main-loop 累加。
+
+**关键技术决策**:
+- Blackwell tcgen05.mma 原生支持 1×32 UE8M0 scale — 不需要在 matmul 内部 descale
+- gemm_gated / gemm_dgated (sonicmoe fork) 已支持 fp8 A/B 输入
+- 标准 quack.gemm 不支持 fp8 — `torch2cute_dtype_map` 缺少 fp8 映射
+- gemm_dgated 约束: Out/PreAct 必须 bf16 (element_size==2 断言)，A/B 可以 fp8
+
+**三路并行 Agent**:
+
+| Agent | 范围 | GPU | 状态 |
+|-------|------|-----|------|
+| P1 fp8-varlen-kernel | blockscaled_fp8_gemm_varlen | GPU 1 | 进行中 |
+| P2 fp8-forward-pipeline | up-proj fp8 tensor cores + FP8 boundary | GPU 2 | 进行中 |
+| P3 fp8-backward-benchmark | backward dgated fp8 + benchmark fp8 inputs | GPU 3 | 进行中 |
+
+---
+
+## 7. 当前工作树里最重要的非文档改动
+
+- `benchmarks/moe-cute.py`
+  - backward RMSE
+  - CPU snapshot fix
+  - static weight prefetch benchmark plumbing
+- `sonicmoe/moe.py`
+  - fp8 weight prefetch / clear API
+- `sonicmoe/quack_utils/blockscaled_fp8_gemm.py`
+  - protocol-aware weight cache
+  - prefetch / clear
+- `sonicmoe/functional/__init__.py`
+  - 更细的 backward stage-memory probe
+
+备注：
+
+- 我尝试过把 benchmark 进一步改成“只暴露一个 `--precision` 参数”
+- 但那一版没有完成
+- 我已把 benchmark 恢复到**可编译状态**
+- 下一个 agent 不要从那份坏 patch 继续改
+
+---
+
+## 8. 当前推荐命令
+
+### 快速回归
 
 ```bash
-USE_QUACK_GEMM=1 SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1 SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY=128 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py
+source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate
+cd /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe
 USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py
 ```
 
-结果：
-
-```text
-10 passed
-10 passed
-```
-
-解释：
-
-- 第一条说明 env-on blockscaled 静态合同版已经通过完整 Blackwell 回归。
-- 第二条说明默认主线继续保持稳定。
-
-### 精度数据
-
-命令：
+### 稳定主线 metrics / theory / stage memory
 
 ```bash
-USE_QUACK_GEMM=1 SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1 SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY=256 python benchmarks/moe-cute.py --thiek 1024,512,512,32,4 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_fp8_metrics
+USE_QUACK_GEMM=1 python benchmarks/moe-cute.py \
+  --thiek 4096,4096,1024,128,8 \
+  --dtype BFloat16 \
+  --activation swiglu \
+  --skip_test \
+  --fp8_protocol blackwell \
+  --report_fp8_metrics \
+  --report_fp8_analysis \
+  --report_stage_memory
 ```
 
-结果（本轮静态合同版 blockscaled）：
-
-- output RMSE vs bf16：`0.00131902`
-- loss RMSE vs bf16：`0.00000013`
-
-对照（上一轮稳定 `fp8-mainline`）：
-
-- output RMSE vs bf16：`0.00131936`
-- loss RMSE vs bf16：`0.00000015`
-
-解释：
-
-- 精度没有恶化，甚至略优于上一轮稳定 mainline。
-- 说明本轮合同收敛主要影响的是调度/搬运开销，而不是数值路径。
-
-### 显存数据
-
-同一条命令输出：
-
-- bf16 peak memory：`380.25 MiB`
-- blockscaled fp8 peak memory：`142.81 MiB`
-
-对照：
-
-- 上一轮稳定 `fp8-mainline`：`134.44 MiB`
-- 上一版 blockscaled 过渡桥：`142.77 MiB`
-
-解释：
-
-- 相对官方 bf16，当前 blockscaled 路径仍少用 `237.44 MiB`，约 `62.44%`。
-- 相对稳定 `fp8-mainline`，当前多用了 `8.37 MiB`，来源是静态 capacity 下的 GPU pack/unpack 中间缓冲。
-- 相对上一版 blockscaled 过渡桥，显存基本持平，说明本轮主要收益来自调度与 capture 恢复，而不是缓存量级变化。
-
-### 性能数据
-
-同机、同 shape（`1024,512,512,32,4`）对照：
-
-- 官方 bf16：
-  - Fwd inference：`0.187 ms`
-  - Fwd training：`1.186 ms`
-  - Fwd+Bwd：`3.292 ms`
-  - Bwd：`3.105 ms`
-- 稳定 `fp8-mainline`：
-  - Fwd inference：`0.229 ms`
-  - Fwd training：`1.561 ms`
-  - Fwd+Bwd：`3.534 ms`
-  - Bwd：`3.305 ms`
-- 上一版 blockscaled 过渡桥：
-  - Fwd training：`2.953 ms`
-  - Fwd+Bwd：`5.537 ms`
-- 本轮静态合同版 `fp8-blockscaled`：
-  - Fwd inference：`0.476 ms`
-  - Fwd training：`2.046 ms`
-  - Fwd+Bwd：`4.004 ms`
-  - Bwd：`3.528 ms`
-
-收益 / 损失：
-
-- 相对上一版 blockscaled 过渡桥：
-  - Fwd training 提升 `30.71%`
-  - Fwd+Bwd 提升 `27.69%`
-  - inference cudagraph 从“不可测”恢复为 `0.476 ms`
-- 相对稳定 `fp8-mainline`：
-  - Fwd inference 仍慢 `107.86%`
-  - Fwd training 仍慢 `31.07%`
-  - Fwd+Bwd 仍慢 `13.30%`
-  - Bwd 仍慢 `6.75%`
-- 相对官方 bf16：
-  - Fwd inference 仍慢 `154.55%`
-  - Fwd training 仍慢 `72.51%`
-  - Fwd+Bwd 仍慢 `21.63%`
-  - Bwd 仍慢 `13.62%`
-
-解释：
-
-- 这组数据说明：
-  - “静态 capacity + GPU pack/unpack” 这一步是对的，已经显著回收了上一版桥接开销；
-  - 但仅靠当前合同还不够，真正的极致性能下一步必须继续去掉 GPU pack/unpack，或者把 routing metadata 直接生成为 blockscaled mainloop 需要的静态布局。
-
-### 下一步
-
-- 第一优先级：继续消掉 GPU pack/unpack，把 down-proj 改成真正的静态对齐直连布局。
-- 第二优先级：把同样的“静态对齐 + fp8 mainloop”合同扩展到其余 GEMM 相关路径：
-  - up-proj forward
-  - down-proj backward act
-  - down-proj backward weight
-- 第三优先级：在 operator 数量上继续向 baseline 对齐，把剩余 boundary 融合吃掉。
-
-## 2026-03-24 - Blackwell `1x32 ue8m0` blockscaled down-proj 主循环打通（3D grouped 试运行）
-
-### 指标注释（先看这个）
-
-- 精度基线：官方 `bf16` 路径。
-- 显存基线：官方 `bf16` 路径。
-- 性能基线 1：上一轮稳定主线 `fp8-mainline`（pre-SwiGLU fused boundary，未启用 blockscaled down-proj）。
-- 性能基线 2：官方 `bf16` 小 shape 路径。
-- 重要说明：
-  - 本轮 `blockscaled down-proj` 已经真实进入 SM100 blockscaled mainloop，并通过 Blackwell 回归。
-  - 但当前实现为了绕开 `varlen_m + blockscaled` 的外层契约冲突，采用了 **SonicMoE 侧 3D grouped pad/unpad** 的过渡方案。
-  - 因此当前数据的收益/损失来源必须区分清楚：**主循环接通** 是收益，**pad/unpad 与 host-side metadata** 是当前主要性能损失来源。
-  - 由于 grouped metadata 还依赖 host 侧读取，当前实验路径**暂不支持 inference cudagraph capture**；因此本轮只采信 `training fwd / e2e / 非-cg 估算 bwd`。
-
-### 改动
-
-- 在 `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` 中完成了可运行的 Blackwell blockscaled down-proj 路径：
-  - 通过 `uint8 storage view + element_type override` 方式绕开 `float8 -> DLPack` 限制。
-  - 不再走先前失败的 rank-2 `varlen_m` 直连方案。
-  - 改为先把 `y1` 按 expert offsets 打包成 `3D grouped` 形式，再喂给 `GemmDefaultSm100(sf_vec_size=32)`。
-  - kernel 输出后再 unpad 回原始 `TK x H` 平铺布局。
-- 在 `benchmarks/moe-cute.py` 中补充了实验路径的 benchmark 兼容：
-  - 当显式开启 `SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1` 时，benchmark 不再强行做 cudagraph capture。
-  - 会明确打印“当前实验路径暂不支持 inference capture”，并继续输出 `training fwd / e2e / 非-cg 估算 bwd`。
-
-### 收益来源说明
-
-- 本轮真正的工程收益：
-  - `1x32 ue8m0` scale pack 已经不只是协议脚手架，而是进入了真实 down-proj 主循环。
-  - `float8 runtime wrapping` 已经被压到可运行状态，下一任 agent 不需要再从 `DLPack 不支持 float8` 这个原点重新排查。
-  - `SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1` 现在是**真实可回归、可 benchmark、可 handoff** 的实验入口，而不是只会报错的占位开关。
-- 本轮性能损失来源：
-  - `grouped pad/unpad` 额外引入了张量搬运和零填充。
-  - grouped metadata 仍有 host 参与，因此 inference cudagraph 被迫关闭。
-  - 这说明当前结果**不能**代表 blockscaled mainloop 的最终绝对性能，只能说明主循环接线已打通。
-
-### 正确性验证
-
-命令：
+### static fp8 weight benchmark（仅做实验，不要误判为主线）
 
 ```bash
-USE_QUACK_GEMM=1 SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py
-USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py
+USE_QUACK_GEMM=1 \
+SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1 \
+SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY=256 \
+SONIC_MOE_FP8_DOWNPROJ_WEIGHT_PRECISION=fp8 \
+python benchmarks/moe-cute.py \
+  --thiek 1024,512,512,32,4 \
+  --dtype BFloat16 \
+  --activation swiglu \
+  --skip_test \
+  --fp8_protocol blackwell \
+  --report_fp8_metrics \
+  --prefetch_fp8_weights
 ```
-
-结果：
-
-```text
-8 passed
-8 passed
-```
-
-解释：
-
-- 第一条说明 env-on 的 blockscaled 实验路径已经可运行且通过 Blackwell 回归。
-- 第二条说明默认主线没有被这轮实验改坏。
-
-### 精度数据
-
-命令：
-
-```bash
-USE_QUACK_GEMM=1 SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1 python benchmarks/moe-cute.py --thiek 1024,512,512,32,4 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_fp8_metrics
-```
-
-结果（blockscaled 实验路径）：
-
-- output RMSE vs bf16：`0.00131902`
-- loss RMSE vs bf16：`0.00000013`
-
-对照（上一轮稳定 `fp8-mainline`）：
-
-- output RMSE vs bf16：`0.00131936`
-- loss RMSE vs bf16：`0.00000015`
-
-解释：
-
-- 精度没有进一步恶化，`output RMSE` 和 `loss RMSE` 都与上一轮稳定主线基本持平。
-- 这说明本轮性能问题主要来自数据搬运/调度层，而不是 blockscaled 主循环本身已经把数值打坏。
-
-### 显存数据
-
-同一条命令输出：
-
-- bf16 peak memory：`380.25 MiB`
-- blockscaled fp8 peak memory：`142.77 MiB`
-
-对照（上一轮稳定 `fp8-mainline`）：
-
-- 旧 fp8 peak memory：`134.44 MiB`
-
-解释：
-
-- 相对官方 bf16，当前 blockscaled 实验路径仍少用 `237.48 MiB`，约 `62.45%`。
-- 但相对上一轮稳定 fp8，显存增加了 `8.33 MiB`，收益损失来源非常明确：`3D grouped pad/unpad` 的中间缓冲。
-
-### 性能数据
-
-同机、同 shape（`1024,512,512,32,4`）对照：
-
-- 官方 bf16：
-  - Fwd training：`1.151 ms`
-  - Fwd+Bwd：`3.158 ms`
-- 上一轮稳定 `fp8-mainline`：
-  - Fwd training：`1.552 ms`
-  - Fwd+Bwd：`3.486 ms`
-- 本轮 `fp8-blockscaled`（实验路径）：
-  - Fwd training：`2.953 ms`
-  - Fwd+Bwd：`5.537 ms`
-  - Bwd（由非-cg fwd 估算）：`2.584 ms`
-
-收益 / 损失：
-
-- 相对上一轮稳定 `fp8-mainline`：
-  - Fwd training 变慢 `90.27%`
-  - Fwd+Bwd 变慢 `58.84%`
-- 相对官方 bf16：
-  - Fwd training 变慢 `156.56%`
-  - Fwd+Bwd 变慢 `75.33%`
-
-解释：
-
-- 这组数字**不是**在否定 blockscaled mainloop，而是在暴露当前过渡接法的问题：
-  - blockscaled kernel 已经跑起来；
-  - 但 kernel 外围的 grouped pad/unpad 与 capture 不兼容 metadata 把收益基本吃掉了。
-- 换言之，下一步不能再优先做新的量化协议，而应该优先做：
-  - 去掉 host-side grouped metadata；
-  - 去掉 `3D grouped pad/unpad`；
-  - 把 `varlen_m` 直连 blockscaled mainloop 或等价的纯 GPU pack/unpack 契约补齐。
-
-### 当前 blocker
-
-- 当前 blocker 已经从“float8 runtime 根本跑不起来”变成：
-  1. `grouped pad/unpad` 还不是最终形态，额外消耗明显。
-  2. host-side grouped metadata 让实验路径无法进入 inference cudagraph。
-  3. 因为无法走 capture，当前 `fwd inference` 还不能和既有基线做同口径绝对对比。
-
-### 下一步
-
-- 第一优先级：把 grouped metadata 完整搬到 GPU 侧，至少先恢复 cudagraph-safe。
-- 第二优先级：继续消掉 `3D grouped pad/unpad`，把 blockscaled down-proj 改回真正的 `varlen_m` 直连。
-- 第三优先级：在上述两点完成后，重跑三条基线：
-  - 官方 `bf16`
-  - 上一轮稳定 `fp8-mainline`
-  - 新 `fp8-blockscaled`
-  并重新验收 `fwd inference / e2e / bwd / RMSE / peak memory`。
-
-## 2026-03-24 - Blackwell `1x32 ue8m0` blockscaled mainloop 试接与稳定性封边
-
-### 指标注释（先看这个）
-
-- 精度基线：官方 `bf16` 路径。
-- 显存基线：官方 `bf16` 路径。
-- 性能基线 1：上一提交 `0a7361b` 的已落地主线。
-- 性能基线 2：官方 `bf16` 路径。
-- 本轮结果说明：
-  - 本轮**没有新增可采信的性能/精度/显存对比数据**，因为 `1x32` blockscaled down-proj 还没有稳定到可以作为默认主线去跑 benchmark。
-  - 本轮唯一有效验收指标是：默认主线回归必须继续保持通过，且新 blockscaled 代码必须以**显式开关**方式留在仓内，供下一轮继续推进。
-
-### 改动
-
-- 在 `sonicmoe/functional/fp8_protocol.py` 中补充了 `1x32` 粒度支持：
-  - `FP8ScaleGranularity.BLOCK_1X32`
-  - 现阶段协议层允许 `1x32` 和 `1x128` 两种粒度并存
-- 在 `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` 中新增了 Blackwell blockscaled 主循环试接脚手架：
-  - `pack_blockscaled_1x32_scales(...)`
-  - `blockscaled_fp8_gemm(...)`
-  - `w2` 的 `fp8 + ue8m0` weight cache
-- 在 `tests/fp8_protocol_test.py` 中新增了 `1x32` blockscaled scale pack 的基础测试。
-- 在 `sonicmoe/functional/__init__.py` 中增加了显式环境开关：
-  - `SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1`
-  - 默认关闭，避免不稳定 runtime 路径污染当前可用主线。
-
-### 收益来源说明
-
-- 本轮收益不是直接性能收益，而是**主循环改造前置条件**的落地：
-  - 已经把 `1x32 ue8m0` 的 scale 物理打包逻辑写进仓内。
-  - 已经把 `w2` 的 `fp8` cache 结构写进仓内。
-  - 已经把 down-proj 的 blockscaled 主循环接线点固定在 `sonicmoe/functional/__init__.py::_DownProjection.forward`。
-- 这意味着下一轮不需要再重新推导：
-  - `1x32` tile 级 scale 的物理存储大小；
-  - `M/K` 按 `128x128` tile 铺开的 pack 公式；
-  - `w2` 从 `(H, I, E)` 到 `(E, H, I)` 的量化缓存位置。
-
-### 正确性验证
-
-命令：
-
-```bash
-USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py
-```
-
-结果：
-
-```text
-8 passed
-```
-
-### 本轮 blocker
-
-- 目标路径是：
-
-```text
-y1_fp8(1x32) + w2_fp8-cache(1x32) -> SM100 blockscaled mainloop -> bf16 output
-```
-
-- 但当前运行时仍有两个关键阻塞：
-  1. `PyTorch -> DLPack` 对 `float8` 仍不支持，导致不能复用 QuACK 现有 `from_dlpack(fp8_tensor)` 包装方式。
-  2. 直接在 SonicMoE 侧用 `cute.make_ptr/cute.make_tensor` 为 `float8` 动态张量造 runtime 参数时，CUTLASS Python DSL 在当前环境里会触发 abort。
-
-- 因此本轮策略调整为：
-  - **保留代码脚手架**
-  - **默认关闭 blockscaled 主循环**
-  - **先保证稳定主线继续全绿**
-
-### 下一步
-
-- 在隔离脚本里最小化复现并解决：
-  - `cute.make_ptr/cute.make_tensor` 对 `float8` runtime 参数的构造契约
-  - 或寻找 QuACK/CUTLASS 内部已有的 `float8` runtime tensor 包装入口
-- 一旦 runtime 契约打通，第一时间打开：
-
-```bash
-SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1
-```
-
-并用当前小 shape benchmark 做首轮对比。
-
-## 2026-03-24 - Blackwell pre-SwiGLU 融合量化前向接线
-
-### 指标注释（先看这个）
-
-- 精度基线：官方 `bf16` 路径。
-- 显存基线：官方 `bf16` 路径。
-- 性能基线 1：本轮改动前的旧 `fp8_protocol blackwell` 小 shape 路径（同机、同命令、同共享环境）。
-- 性能基线 2：官方 `bf16` 小 shape 路径（同机、同命令、同共享环境）。
-- 重要说明：当前 8 张 Blackwell 卡几乎全部 `99%~100%` 利用率，因此本条目的性能数据只用于**同噪声环境下的前后对照**，不作为最终绝对性能验收。绝对性能仍需等待空闲卡后用主 shape 复测。
-
-### 改动
-
-- 在 `sonicmoe/functional/fp8_cutely_fused.py` 中新增真正的 pre-SwiGLU 高性能路径：
-  - 输入直接消费 `_UpProjection` 返回的 `z`（pre-SwiGLU）。
-  - 前向量化改为 `cutify.fused_weighted_swiglu_act_quant_best(...)`。
-  - 反量化改为 `cutify.fused_act_dequant_best(...)`。
-- 在 `sonicmoe/functional/__init__.py` 中将 Blackwell + QuACK 的 `fp8_protocol` 默认前向路径切到：
-
-```text
-z(pre-SwiGLU) -> fused_weighted_swiglu_act_quant_best -> fused_act_dequant_best -> y1
-```
-
-- 对 `I % 128 != 0` 的尾块进行了 pre-SwiGLU 对齐填充，保证像 `2880` 这样的宽度也能走融合路径。
-- 为了恢复 CUDA graph capture 可用性，没有直接在融合 kernel 内走 `ue8m0` 打包返回；而是先保留 kernel 产出的 float32 dequant scale，再在 SonicMoE 侧编码为 `e8m0`。
-
-### 收益来源说明
-
-- 前向收益来源：
-  - 不再走旧的 post-SwiGLU torch reference `quantize + dequantize`。
-  - 改为直接复用现有 Cute/CUDA 储备，把 `SwiGLU + blockwise quant` 合到一个 pre-SwiGLU kernel 里。
-- 端到端收益来源：
-  - 主要来自前向边界开销下降。
-  - 本轮**没有**改 backward 主 kernel，因此 bwd 改善只是前向边界更轻带来的连带收益，不应误判为 backward kernel 已优化。
-- 显存收益来源：
-  - 这一轮的主要目标是吞吐而不是进一步降显存，所以显存几乎不变。
-
-### 正确性验证
-
-命令：
-
-```bash
-USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py -k 'preact_cutely_fused_path_matches_reference_boundary or boundary_keeps_finite_forward_backward or blackwell_fp8_protocol_runtime_and_reference_quant'
-USE_QUACK_GEMM=1 python -m pytest -q tests/moe_blackwell_test.py
-```
-
-结果：
-
-```text
-3 passed, 3 deselected
-1 passed
-```
-
-### 精度数据
-
-命令：
-
-```bash
-USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 1024,512,512,32,4 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_fp8_metrics
-```
-
-结果（新路径）：
-
-- output RMSE vs bf16：`0.00131936`
-- loss RMSE vs bf16：`0.00000015`
-
-对照（旧路径）：
-
-- output RMSE vs bf16：`0.00002498`
-- loss RMSE vs bf16：`0.00000000`
-
-解释：
-
-- 精度有可见回退，来源是 pre-SwiGLU fused path 与旧 post-SwiGLU reference path 在量化前激活舍入位置不同。
-- 目前 loss RMSE 仍非常小，说明训练目标量级没有发散。
-- 后续如果要继续压低 RMSE，需要继续对齐：
-  - pre-SwiGLU 激活布局与 reference 的数值路径；
-  - `pow2/e8m0` scale 的编码细节；
-  - optional prob 融合后的真实语义位置。
-
-### 显存数据
-
-同一条命令输出：
-
-- bf16 peak memory：`380.25 MiB`
-- 新 fp8 peak memory：`134.44 MiB`
-
-对照（旧路径）：
-
-- 旧 fp8 peak memory：`134.38 MiB`
-
-解释：
-
-- 相对官方 bf16，当前 fp8 仍少用 `245.81 MiB`，约 `64.64%`。
-- 相对旧 fp8 路径，本轮显存几乎不变（`+0.06 MiB`），这符合预期，因为本轮主要替换的是量化/反量化算子实现，而不是缓存结构。
-
-### 性能数据
-
-同机、同 shape（`1024,512,512,32,4`）对照：
-
-- 官方 bf16：
-  - Fwd inference：`0.176 ms`
-  - Fwd+Bwd：`3.162 ms`
-  - Bwd：`2.987 ms`
-- 旧 fp8 路径（改动前）：
-  - Fwd inference：`0.392 ms`
-  - Fwd+Bwd：`3.972 ms`
-  - Bwd：`3.580 ms`
-- 新 fp8 路径（本轮）：
-  - Fwd inference：`0.229 ms`
-  - Fwd+Bwd：`3.697 ms`
-  - Bwd：`3.468 ms`
-
-收益：
-
-- 相对旧 fp8：
-  - Fwd inference 提升 `41.58%`
-  - Fwd+Bwd 提升 `6.92%`
-  - Bwd 提升 `3.13%`
-- 相对官方 bf16：
-  - Fwd inference 仍慢 `30.11%`
-  - Fwd+Bwd 仍慢 `16.92%`
-
-解释：
-
-- 这说明“先把 torch-side boundary 换成已有的 Cute/CUDA 融合算子”这一步是有效的，尤其是前向收益很直接。
-- 但它也说明仅靠替换量化/反量化实现还不够；要继续逼近甚至超过 bf16，下一步必须继续往前推进，把：
-  - `prob/topk_scores`
-  - 更少的中间张量
-  - 真正的 backward 融合
-  继续吃进主线。
-
-### 兼容性修复
-
-- 初始版本在 benchmark 的 CUDA graph capture 中失败，根因是 `cutify` 的 `ue8m0` 打包辅助逻辑在 capture 期间触发了不允许的操作。
-- 已修复为：
-  - kernel 内先输出 float32 dequant scale；
-  - SonicMoE 侧再编码成 `e8m0`；
-  - benchmark 现已恢复可运行。
-
-### 下一步
-
-- 把 `topk_scores/prob` 的语义真正前移到融合 epilogue，而不是继续留在 router 后处理。
-- 结合 Paddle 的：
-  - `fp8_quant_blockwise_kernel.cu`
-  - `fused_stack_transpose_quant_kernel.cu`
-  - `fused_transpose_split_quant_kernel.cu`
-  评估是否需要在 `operator-incubator` 再孵化一个更贴近 SonicMoE 合同的新 Cute quant kernel。
-- 开始准备 paired backward kernel，把当前“前向已融合、反向未融合”的状态继续推进。
-
-## 2026-03-24 - Blackwell FP8 functional boundary wiring
-
-### Change
-
-- added a functional-boundary `fp8_protocol` argument to:
-  - `sonicmoe/moe.py::MoE.forward`
-  - `sonicmoe/functional/__init__.py::moe_TC_softmax_topk_layer`
-- added `apply_activation_fp8_protocol(...)` in `sonicmoe/functional/fp8_reference.py`
-- the current boundary implementation quantizes/dequantizes the up-projection activation between `_UpProjection` and `_DownProjection`
-- backward uses a straight-through estimator so the training path stays usable while the fused kernel does not exist yet
-- `1x128` tail blocks are now padded internally and sliced back to original width, so shapes like `2880` are legal
-
-### Correctness validation
-
-Command:
-
-```bash
-python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py tests/moe_test.py
-```
-
-Result:
-
-```text
-18 passed, 91 skipped
-```
-
-### Performance regression
-
-Benchmark command:
-
-```bash
-USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 32768,2880,2880,64,8 --dtype BFloat16 --activation swiglu --skip_test
-```
-
-Baseline before boundary wiring:
-
-- Fwd inference: `24.164 ms`, `539.9 TFLOPS`
-- Fwd training: `23.549 ms`
-- Fwd+Bwd: `72.987 ms`, `536.2 TFLOPS`
-- Bwd: `48.823 ms`, `534.4 TFLOPS`
-
-Baseline after boundary wiring, protocol disabled:
-
-- Fwd inference: `23.026 ms`, `566.6 TFLOPS`
-- Fwd training: `23.478 ms`
-- Fwd+Bwd: `75.443 ms`, `518.8 TFLOPS`
-- Bwd: `52.417 ms`, `497.8 TFLOPS`
-
-Interpretation:
-
-- the default path did not regress in forward
-- the end-to-end training path is a little slower than the earlier baseline, so future changes must keep checking this command
-
-### Protocol-enabled performance
-
-Benchmark command:
-
-```bash
-USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 32768,2880,2880,64,8 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell
-```
-
-Current numbers:
-
-- Fwd inference: `63.715 ms`, `204.8 TFLOPS`
-- Fwd training: `64.160 ms`
-- Fwd+Bwd: `119.803 ms`, `326.7 TFLOPS`
-- Bwd: `56.087 ms`, `465.2 TFLOPS`
-
-Interpretation:
-
-- the current FP8 boundary path is **correctness scaffolding**, not a performance win
-- the large forward slowdown is expected because quant/dequant is still implemented as separate torch-side reference ops
-- the next fused-kernel milestone must eliminate this overhead by folding quantization into the up-projection epilogue
-
-### Next action
-
-- replace the torch-side `apply_activation_fp8_protocol(...)` boundary path with a fused up-projection epilogue implementation
-- keep using the same benchmark command above before and after every important performance-facing change
-
-## 2026-03-24 - Parallel Blackwell regression entry
-
-### Change
-
-- installed `pytest-xdist` into `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer`
-- added:
-  - `make test-blackwell-full`
-  - `make test-blackwell-parallel PYTEST_WORKERS=2`
-
-### Measurement
-
-Serial command:
-
-```bash
-python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py tests/moe_test.py
-```
-
-Serial runtime:
-
-```text
-18 passed, 91 skipped in 187.28s
-```
-
-Parallel command:
-
-```bash
-make test-blackwell-parallel PYTEST_WORKERS=2
-```
-
-Parallel runtime:
-
-```text
-18 passed, 91 skipped in 168.14s
-real 168.41
-```
-
-### Conclusion
-
-- `xdist` with `2` workers is a real win for the current Blackwell-targeted regression subset on this machine
-- keep the parallel target opt-in rather than default, because these tests are still GPU-heavy and a higher worker count may oversubscribe the device
-
-## 2026-03-24 - Boundary memory optimization
-
-### Change
-
-- removed the full-width float32 activation copy from `quantize_activation_blockwise(...)`
-- dequantization now writes directly to the requested output dtype instead of materializing a full float32 activation first
-- kept the same protocol semantics: `e4m3` activations, `e8m0` scales, `1x128` granularity, tail padding for non-divisible widths
-
-### Correctness validation
-
-Command:
-
-```bash
-python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py tests/moe_test.py
-```
-
-Result:
-
-```text
-18 passed, 91 skipped
-```
-
-### Precision delta
-
-Measured against the no-protocol baseline on the Blackwell training shape:
-
-- max abs diff: `0.0013427734375`
-- mean abs diff: `0.00018952522077597678`
-
-The optimization did not change these error numbers relative to the previous boundary implementation.
-
-### Memory delta
-
-Single-run peak memory on `T=32768, H=2880, I=2880, E=64, K=8`:
-
-Before optimization:
-
-- baseline fwd peak: `9611.98 MiB`
-- baseline e2e peak: `11826.48 MiB`
-- fp8 boundary fwd peak: `15312.85 MiB`
-- fp8 boundary e2e peak: `15312.85 MiB`
-
-After optimization:
-
-- baseline fwd peak: `9611.98 MiB`
-- baseline e2e peak: `11826.48 MiB`
-- fp8 boundary fwd peak: `13017.85 MiB`
-- fp8 boundary e2e peak: `13017.85 MiB`
-
-Interpretation:
-
-- fp8 boundary peak memory dropped by `2295.00 MiB` (~`15.0%`) on both forward and end-to-end peak
-- baseline memory stayed unchanged
-
-### Performance delta
-
-Benchmark command:
-
-```bash
-USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 32768,2880,2880,64,8 --dtype BFloat16 --activation swiglu --skip_test
-USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 32768,2880,2880,64,8 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell
-```
-
-Before optimization, fp8 boundary:
-
-- Fwd inference: `63.715 ms`
-- Fwd+Bwd: `119.803 ms`
-
-After optimization, fp8 boundary:
-
-- Fwd inference: `56.065 ms`
-- Fwd+Bwd: `109.117 ms`
-
-Interpretation:
-
-- fp8 boundary forward improved by `7.650 ms` (~`12.0%`)
-- fp8 boundary end-to-end improved by `10.686 ms` (~`8.9%`)
-- the path is still much slower than the bf16 baseline, so the next real win still depends on a fused up-proj epilogue
-
-## 2026-03-24 - Metric harness and multi-GPU shard prep
-
-### Change
-
-- added `--report_fp8_metrics` to `benchmarks/moe-cute.py`
-- added `make test-blackwell-multigpu BLACKWELL_TEST_GPUS=...`
-- added `tools/run_blackwell_test_shards.py`
-- added `--dry-run` to the shard launcher so command routing can be validated even when all 8 GPUs are busy
-- added an env-gated adapter landing point in `sonicmoe/functional/fp8_cutely_fused.py`
-- threaded the adapter behind `SONIC_MOE_FP8_CUTELY_FUSED`
-
-### Validation
-
-Dry-run command:
-
-```bash
-python tools/run_blackwell_test_shards.py --gpus 0,1,2 --dry-run
-```
-
-Result:
-
-```text
-[blackwell-shard] gpu=0 tests=tests/fp8_protocol_test.py
-[blackwell-shard] gpu=1 tests=tests/moe_blackwell_test.py
-[blackwell-shard] gpu=2 tests=tests/moe_test.py
-```
-
-Metric probe command:
-
-```bash
-USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 1024,512,512,32,4 --dtype BFloat16 --activation swiglu --skip_test --fp8_protocol blackwell --report_fp8_metrics
-```
-
-Result:
-
-```text
-FP8 metrics vs bf16 baseline output_rmse=0.00002498, loss_rmse=0.00000000, bf16_peak_mib=380.25, fp8_peak_mib=134.38
-PASS
-```
-
-### Interpretation
-
-- the benchmark harness now emits the bf16-vs-fp8 metrics required by the current reporting policy
-- the shard launcher is safe to invoke on a saturated machine in dry-run mode before selecting idle GPUs
-- the new adapter shim keeps default behavior unchanged while fixing the code landing point for the real fused epilogue
-- fused-op analysis confirmed that the incubator quant kernel consumes pre-SwiGLU `(T, 2H)` activations, so a direct swap at the current post-SwiGLU boundary would be semantically wrong
