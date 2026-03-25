@@ -108,6 +108,34 @@ def _use_mixed_dtype_downproj_dw2() -> bool:
     return os.getenv("SONIC_MOE_OPT_MIXED_DTYPE_DOWNPROJ_DW2", "").lower() in {"1", "true", "yes", "on"}
 
 
+# ---------------------------------------------------------------------------
+# FP8 weight cache: avoids repeated permute+cast on every forward/backward.
+# Keyed by (data_ptr, version) so stale entries are never reused.
+# ---------------------------------------------------------------------------
+_FP8_WEIGHT_CACHE: dict[tuple[int, int, str], torch.Tensor] = {}
+
+
+def _get_cached_fp8_weight(w: torch.Tensor, tag: str) -> torch.Tensor:
+    """Return a cached fp8 copy of *w*, keyed by storage identity + version."""
+    key = (w.untyped_storage().data_ptr(), w._version, tag)
+    cached = _FP8_WEIGHT_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if tag == "w1_ekh":
+        fp8_w = w.permute(2, 1, 0).contiguous().to(torch.float8_e4m3fn)
+    elif tag == "w2_ehi":
+        fp8_w = w.permute(2, 0, 1).contiguous().to(torch.float8_e4m3fn)
+    else:
+        fp8_w = w.contiguous().to(torch.float8_e4m3fn)
+    _FP8_WEIGHT_CACHE[key] = fp8_w
+    return fp8_w
+
+
+def clear_fp8_native_weight_cache() -> None:
+    """Call between steps if weights change (e.g. optimizer step)."""
+    _FP8_WEIGHT_CACHE.clear()
+
+
 def _validate_runtime_precision_switches(fp8_protocol: FP8Protocol | None) -> None:
     upproj_precision = _upproj_epilogue_precision()
     downproj_mainloop_precision = _downproj_mainloop_precision()
@@ -246,8 +274,8 @@ class _UpProjection(torch.autograd.Function):
             assert not torch.compiler.is_compiling()
             assert is_glu_activation, "QuACK GEMM does not support non GLU activation yet"
             if _use_native_fp8_upproj():
-                x_fp8 = x.to(torch.float8_e4m3fn)
-                w1_fp8 = w1.permute(2, 1, 0).to(torch.float8_e4m3fn)
+                x_fp8 = x if x.dtype == torch.float8_e4m3fn else x.to(torch.float8_e4m3fn)
+                w1_fp8 = _get_cached_fp8_weight(w1, "w1_ekh")
                 z, y1 = gemm_gated(
                     x_fp8,
                     w1_fp8,
@@ -258,9 +286,7 @@ class _UpProjection(torch.autograd.Function):
                     postact_dtype=torch.float8_e4m3fn,
                     dynamic_scheduler=False,
                 )
-                # FP8 tensor cores were used for the GEMM; convert postact
-                # back to bf16 so downstream (FP8 boundary / down-proj) gets
-                # a consistent dtype regardless of fp8_protocol.
+                # Convert fp8 postact back to bf16 for downstream compatibility.
                 y1 = y1.to(x.dtype)
             else:
                 z, y1 = gemm_gated(
@@ -535,10 +561,9 @@ class _DownProjection(torch.autograd.Function):
 
             s = topk_scores[s_scatter_idx]
             if _use_mixed_dtype_downproj_dw2():
-                # FP8 tensor core path: cast A (dout) and B (w2) to fp8
-                # PreAct/Out MUST stay bf16 (epilogue constraint)
+                # FP8 tensor core path: use cached fp8 weights
                 dout_fp8 = dout.to(torch.float8_e4m3fn)
-                w2_fp8 = w2.permute(2, 0, 1).to(torch.float8_e4m3fn)
+                w2_fp8 = _get_cached_fp8_weight(w2, "w2_ehi")
                 _, y1s, ds = gemm_dgated(
                     dout_fp8,
                     w2_fp8,
@@ -673,8 +698,8 @@ def _moe_tc_softmax_topk_layer_quack_inference(
 
         needs_preact = fp8_protocol is not None and _upproj_epilogue_precision() == "fp8"
         if _use_native_fp8_upproj():
-            x_fp8 = x.to(torch.float8_e4m3fn)
-            w1_fp8 = w1.permute(2, 1, 0).to(torch.float8_e4m3fn)
+            x_fp8 = x if x.dtype == torch.float8_e4m3fn else x.to(torch.float8_e4m3fn)
+            w1_fp8 = _get_cached_fp8_weight(w1, "w1_ekh")
             z, y1 = gemm_gated(
                 x_fp8,
                 w1_fp8,
@@ -698,6 +723,10 @@ def _moe_tc_softmax_topk_layer_quack_inference(
                 dynamic_scheduler=False,
             )
         _log_stage_memory("forward:up-proj")
+
+        # Ensure y1 is bf16 for downstream compatibility (down-proj gemm).
+        if _use_native_fp8_upproj() and y1.dtype != x.dtype:
+            y1 = y1.to(x.dtype)
 
         if needs_preact:
             _reset_stage_memory_probe()
