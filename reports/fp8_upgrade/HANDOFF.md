@@ -21,14 +21,16 @@ This is the minimum context a new agent needs to continue work without replaying
     - 稳定 fp8：peak `6931.00 MiB`，output RMSE `0.01073675`，loss RMSE `0.00000021`，inf / train fwd / e2e / bwd `1.125 / 1.697 / 3.733 / 2.608 ms`
     - 相对 bf16：inference `+1.42%`，e2e `-7.93%`，peak `-118.88 MiB`
 - 新结论（这一轮最重要）：
-  - 这一步已经把“稳定主线前向太慢”这个矛盾明显缩小；
-  - 但也把新的 blocker 暴露得更清楚：
-    - `8192` 的 stagewise memory 对排现在稳定显示：
-      - `backward:down-proj-core`：`+130.00 MiB`
-      - `backward:up-proj-core`：`+130.00 MiB`
-      - `backward:token-reduce`：`+130.00 MiB`
-      - final peak：`7828.75 -> 7958.75 MiB`
-  - 这说明下一刀已经不该再打前向，而是要查清楚这份接近一整份 `bf16 y1` 的额外 backward 驻留。
+  - `8192` 的 memory 结论必须区分两种口径：
+    - `report_fp8_metrics` cold run：`7690.63 / 7700.75 MiB`
+    - 单独 `--report_stage_memory` 原始对排：final peak `7690.63 -> 7572.75 MiB`
+  - 同一个 stagewise 对排里：
+    - `forward:down-proj-router` peak delta `-245.88 MiB`
+    - backward 三段 `delta_alloc=+138.12 MiB`
+  - 也就是说，large-shape 下真正成立的结论是：
+    - 最终 peak 仍可低于 bf16
+    - 但 backward 段存在明显 transient overhead
+  - 下一个 agent 不要再把这件事误写成“主线最终 peak 已经整体回退”
 - 新结论（这一轮最重要）：
   - SonicMoE 主线里 preact fused FP8 boundary 的 `STE` 混合已经确认是**语义冗余**：
     - `_UpProjection.forward(...)` 返回的 `y1` 本来就 `mark_non_differentiable`
@@ -120,10 +122,25 @@ This is the minimum context a new agent needs to continue work without replaying
     - 精度稳定
     - inference 大 shape 已明显领先 bf16
     - `8192` e2e 已经首次微幅超过 bf16
-  - 但当前还没有同时满足“大 shape 性能领先 + 显存也领先”：
-    - `8192` 这轮 peak 比 bf16 高 `10.12 MiB`
-    - 真正新 blocker 已经收敛为 backward 段的 `+130 MiB` 额外驻留
-  - 下一步必须优先把这份 backward 额外驻留找出来并吃掉。
+  - 但当前日志口径仍有分歧：
+    - cold metrics run 下，`8192` peak 可能略高 `+10.12 MiB`
+    - stagewise raw probe 下，`8192` final peak 仍低 `-117.88 MiB`
+  - 因此下一步必须同时守住：
+    - large-shape e2e 领先
+    - raw stagewise final peak 继续低于 bf16
+    - 并继续缩小 backward transient overhead
+- 新结论（这一轮最重要）：
+  - `SONIC_MOE_FP8_DUMMY_POSTACT_BUFFER=1` 这条实验路径现在也有了显式 `restored_out` 预分配；
+  - 但它依然只是实验，不是默认主线：
+    - `8192`：inference `+136.72%`，e2e 仅 `+0.44%`，peak `+10.12 MiB`
+    - `4096`：inference `+7.04%`，e2e `-6.93%`，peak `-118.88 MiB`
+  - 结论仍是：默认关闭，只保留能力
+- 新结论（这一轮最重要）：
+  - 已经证伪 `_DownProjection.backward()` 最短路径上的 runtime-fp8 `y1s` 实验：
+    - plain `gemm` 要求 `A/B` 同 dtype
+    - `dout.T` 是 `bf16`，`y1s` 改成 runtime fp8 后直接触发 dtype mismatch
+    - `gather_A` 还要求更保守的合法 config
+  - 所以下一步想做 backward act / weight fp8，不是补一个 `postact_dtype` 就够，而是要补**混合 dtype / 带 scale 的 GEMM 合同**
 - 工程化提醒：
   - `fp8-direct-downproj` grouped 原型已经证伪，且已从工作树撤回；
   - 下一个 agent **不要**再从 grouped/static capacity 这条路继续深挖 stable 主线；

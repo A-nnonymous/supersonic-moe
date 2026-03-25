@@ -489,13 +489,22 @@ class FP8ProtocolTest(TestCommons):
 
         with patch.dict(os.environ, {"SONIC_MOE_FP8_DUMMY_POSTACT_BUFFER": "1"}, clear=False):
             with patch.object(functional, "gemm_gated", wraps=functional.gemm_gated) as patched_gemm_gated:
-                with enable_quack_gemm(True):
-                    y, _ = moe(x, kernel_backend_moe=KernelBackendMoE.sonicmoe, fp8_protocol=protocol)
-                    y.backward(dout)
+                with patch.object(
+                    functional,
+                    "apply_preact_activation_fp8_protocol_cutely_fused",
+                    wraps=functional.apply_preact_activation_fp8_protocol_cutely_fused,
+                ) as patched_fp8_boundary:
+                    with enable_quack_gemm(True):
+                        y, _ = moe(x, kernel_backend_moe=KernelBackendMoE.sonicmoe, fp8_protocol=protocol)
+                        y.backward(dout)
 
         self.assertTrue(patched_gemm_gated.called)
         postact_dtypes = [call.kwargs.get("postact_dtype") for call in patched_gemm_gated.call_args_list]
         self.assertIn(torch.float8_e4m3fn, postact_dtypes)
+        restored_out_buffers = [call.kwargs.get("restored_out") for call in patched_fp8_boundary.call_args_list]
+        restored_out_buffers = [buffer for buffer in restored_out_buffers if buffer is not None]
+        self.assertTrue(restored_out_buffers)
+        self.assertTrue(all(buffer.dtype == torch.bfloat16 for buffer in restored_out_buffers))
 
     def test_preact_cutely_fused_path_can_reuse_scale_buffer(self) -> None:
         if not torch.cuda.is_available():

@@ -16,7 +16,7 @@ This directory is the live work log for the FP8 upgrade effort. It is not meant 
     - bf16: peak `7690.63 MiB`, inf / train fwd / e2e / bwd `4.081 / 3.942 / 5.728 / 1.647 ms`
     - fp8: peak `7700.75 MiB`, output RMSE `0.01074111`, loss RMSE `0.00000025`, inf / train fwd / e2e / bwd `1.842 / 2.111 / 5.586 / 3.743 ms`
     - relative to bf16: inference `+121.55%`, train fwd `+86.74%`, e2e `+2.54%`
-    - current blocker: backward stages still carry `+130.00 MiB` extra peak, so large-shape peak memory has not yet beaten bf16 again
+    - stagewise raw probe on the same shape still reports final peak `7690.63 -> 7572.75 MiB`, so the real blocker is backward transient overhead rather than a settled final-peak regression
 - latest targeted validation:
   - stable Blackwell fp8 regression: `USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py`
   - stable result: `20 passed`
@@ -85,8 +85,12 @@ This directory is the live work log for the FP8 upgrade effort. It is not meant 
   - 官方 bf16：peak `7690.63 MiB`，inf / train fwd / e2e / bwd `4.081 / 3.942 / 5.728 / 1.647 ms`
   - 稳定 `fp8-mainline`：output RMSE `0.01074111`，loss RMSE `0.00000025`，peak `7700.75 MiB`，inf / train fwd / e2e / bwd `1.842 / 2.111 / 5.586 / 3.743 ms`
   - 相对 bf16：inference `+121.55%`，train fwd `+86.74%`，e2e `+2.54%`，但 peak `+10.12 MiB`
+  - 单独 `--report_stage_memory` 原始对排：
+    - `forward:down-proj-router` peak delta `-245.88 MiB`
+    - backward 三段 `delta_alloc=+138.12 MiB`
+    - final peak `7690.63 -> 7572.75 MiB`
   - 理论账：stable fp8 边界流量下界 `516.00 MiB`，真正节省 payload 仅 `62.00 MiB`
-  - 结论：大 shape crash 已通过本地 fallback / 分块 vec4 路径消掉；现在 stable fp8 的前向与 e2e 已经被拉回可竞争区间，但新 blocker 已收敛为 backward 段那份 `+130 MiB` 的额外驻留
+  - 结论：大 shape crash 已通过本地 fallback / 分块 vec4 路径消掉；现在 stable fp8 的前向与 e2e 已经被拉回可竞争区间，但 backward transient overhead 仍是下一步主要矛盾
 - 中等真实 shape `4096,4096,1024,128,8`：
   - 官方 bf16：peak `7049.88 MiB`，inf / train fwd / e2e / bwd `1.141 / 1.210 / 3.437 / 2.296 ms`
   - 稳定 `fp8-mainline`：output RMSE `0.01073675`，loss RMSE `0.00000021`，peak `6931.00 MiB`，inf / train fwd / e2e / bwd `1.125 / 1.697 / 3.733 / 2.608 ms`
@@ -96,7 +100,7 @@ This directory is the live work log for the FP8 upgrade effort. It is not meant 
   - `grouped_out_bf16` 理论大小 `1024.00 MiB`
   - 结论：这就是当前 blockscaled 很难在显存 / e2e 上赢过 bf16 的核心原因
 - 因此当前下一优先级已经明确：
-  1. 优先吃掉 `8192` backward 段那份 `+130 MiB` 额外驻留，恢复“大 shape 性能领先 + 显存也领先”；
+  1. 优先继续压缩 `8192` backward transient overhead，保持 large-shape e2e 领先同时把最终 peak 稳定压在 bf16 下；
   2. 在不丢失这次前向收益的前提下，继续把量化后激活直喂 down-proj mainloop，减少 `bf16` 回退；
   3. 同时把激活 / 权重精度路径逐步做成外部可控开关，朝全流程 FP8 推进；
   4. blockscaled 只在能直接吃掉 `grouped_out` / router 聚合过渡层时继续重投入。

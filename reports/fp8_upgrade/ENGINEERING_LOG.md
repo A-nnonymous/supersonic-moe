@@ -104,13 +104,112 @@ USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackw
 - 这次改动已经把稳定主线的**前向主矛盾明显吃掉**：
   - `8192` 上 inference / train-fwd 都已经显著领先 bf16；
   - `8192` 的 e2e 也终于在真实大 shape 上微幅超过 bf16。
-- 但它同时暴露了一个新的硬 blocker：
-  - `8192` 上 backward 仍然多出一段稳定的 `+130 MiB` 峰值；
-  - 量级正好接近一份 `bf16 y1`，说明还有一份额外 postact 级别的驻留没有被彻底吃掉。
+- 但这轮同时暴露了一个更细的测量口径问题：
+  - `report_fp8_metrics` 的 cold metrics run 在 `8192` 下给出 `bf16_peak / fp8_peak = 7690.63 / 7700.75 MiB`
+  - 单独 `--report_stage_memory` 的原始对排则给出：
+    - `forward:down-proj-router` peak delta `-245.88 MiB`
+    - backward 三段 `delta_alloc=+138.12 MiB`
+    - final peak `7690.63 -> 7572.75 MiB`
+  - 也就是说，**large-shape 下 fp8 最终 peak 仍然可以低于 bf16，但 backward 阶段存在明显的 transient overhead**；后续日志必须继续把两种测量口径分开写，不能混写成单一结论。
 - 因此下一阶段的主线已经更明确：
   1. 保留这次 `y1` 直回写带来的前向收益；
-  2. 继续追 `8192` backward 段那份 `+130 MiB` 的额外驻留，优先检查 `gemm_gated` 输出 buffer 生命周期与 `_DownProjection.backward(...) / gemm_dgated(...)` 之间的耦合；
-  3. 目标是不丢掉当前前向收益的前提下，把 peak memory 重新拉回到稳定 `fp8 < bf16`。
+  2. 继续缩小 backward 段的 transient overhead，而不是误判成“最终 peak 已经回退”；
+  3. 所有后续结论都必须同时给出：
+     - `report_fp8_metrics` 的同轮 bf16 baseline
+     - `--report_stage_memory` 的 stagewise/final 对排
+
+## 2026-03-25 - 给 dummy-postact 实验路径补上预分配 restored_out，但继续保持默认关闭
+
+### 指标注释（先看这个）
+
+- 精度基线：同一条命令下的 `bf16 baseline` 输出 / loss。
+- 显存基线：同一条命令下的 `bf16 baseline` peak memory。
+- 性能基线：同一时间窗的 `bf16 baseline`。
+- 本轮收益来源：
+  - 不是主线默认路径优化；
+  - 只是把 `SONIC_MOE_FP8_DUMMY_POSTACT_BUFFER=1` 这条实验路径也接上显式 `restored_out` 预分配，避免 fused dequant 在该实验分支里再额外 `torch.empty(...)` 一次。
+
+### 改动
+
+- 在 `sonicmoe/functional/__init__.py` 中：
+  - 当 `SONIC_MOE_FP8_DUMMY_POSTACT_BUFFER=1` 且 postact 宽度对齐时：
+    - 不再让 fused preact dequant 自己分配输出；
+    - 而是显式传入一块 `bf16 restored_out` buffer。
+- 在 `tests/fp8_protocol_test.py` 中：
+  - 扩展 dummy-postact 实验回归；
+  - 现在除了确认 `gemm_gated(... postact_dtype=torch.float8_e4m3fn)` 被请求之外，也确认 boundary 真正拿到了预分配的 `bf16 restored_out`。
+
+### 正确性验证
+
+命令：
+
+```bash
+USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py
+```
+
+结果：
+
+```text
+20 passed
+```
+
+### 真实 shape 数据
+
+#### shape `8192,4096,1024,128,8`
+
+- output RMSE：`0.01074111`
+- loss RMSE：`0.00000025`
+- bf16 peak / fp8 peak：`7690.63 / 7700.75 MiB`
+- inf / train fwd / e2e / bwd：
+  - `1.724 / 2.136 / 5.703 / 3.978 ms`
+- 相对 bf16 baseline：
+  - inference：`+136.72%`
+  - train fwd：`+84.55%`
+  - e2e：`+0.44%`
+  - backward：`-58.60%`
+  - peak：`+10.12 MiB`
+
+#### shape `4096,4096,1024,128,8`
+
+- output RMSE：`0.01073675`
+- loss RMSE：`0.00000021`
+- bf16 peak / fp8 peak：`7049.88 / 6931.00 MiB`
+- inf / train fwd / e2e / bwd：
+  - `1.066 / 1.725 / 3.693 / 2.627 ms`
+- 相对 bf16 baseline：
+  - inference：`+7.04%`
+  - train fwd：`-29.86%`
+  - e2e：`-6.93%`
+  - backward：`-12.60%`
+  - peak：`-118.88 MiB`
+
+### 结论
+
+- 这一步把 dummy-postact 分支补齐成了更完整的 capture-safe 实验能力；
+- 但它仍然**不是默认主线优化**：
+  - `8192` 上 e2e 只有近似打平；
+  - `4096` 上仍慢于 bf16。
+- 所以当前策略不变：
+  - 继续默认关闭 `SONIC_MOE_FP8_DUMMY_POSTACT_BUFFER`
+  - 只把它当成后续更深层 epilogue/mainloop 实验的基础设施
+
+## 2026-03-25 - 证伪 backward `y1s` 直接 runtime-fp8 的最短路径
+
+### 指标注释（先看这个）
+
+- 本轮不是主线性能收益，而是一个必要的技术证伪：
+  - 目标是验证 `_DownProjection.backward()` 里能否直接让 `gemm_dgated(... postact_out)` 变成 runtime fp8，并直接喂给后续 weight-grad GEMM。
+
+### 结论
+
+- 这条最短路径当前**没有打通**，而且 blocker 很明确：
+  1. plain `gemm` 在这条链路上要求 `A` 和 `B` 同 dtype；
+  2. 但 `dout.T` 仍是 `bf16`，而 `y1s` 如果改成 runtime fp8，就会直接触发 dtype mismatch；
+  3. 在 `gather_A` 场景下，普通 `gemm` 还有额外的合法 config 约束（`cluster_n=1`）。
+- 这说明：
+  - backward act / weight 想往 fp8 迁移，不是简单加一个 `postact_dtype=torch.float8_e4m3fn` 就能成；
+  - 它需要的是**混合 dtype / 带 scale 的下游 GEMM 合同**，或者新的本地 wrapper / mainloop 路线；
+  - 因此这条失败实验没有保留在代码树里，只保留为 handoff 结论。
 
 ## 2026-03-24 - 去掉主线里无效的 STE 依赖，并把低精度 up-proj postact buffer 收口为实验开关
 
