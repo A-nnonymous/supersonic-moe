@@ -11,6 +11,7 @@ from ..enums import ActivationType, is_glu
 from ..quack_utils import (
     blockscaled_fp8_gemm,
     blockscaled_fp8_gemm_grouped,
+    blockscaled_fp8_gemm_varlen,
     gemm_dgated,
     gemm_gated,
     make_blockscaled_grouped_reverse_scatter_idx,
@@ -125,6 +126,11 @@ def _fp8_mode() -> str:
 
 def _fp8_enabled() -> bool:
     return _fp8_mode() != "off"
+
+
+def _get_blockscaled_protocol() -> FP8Protocol:
+    """Return FP8Protocol with 1×32 blockscaling for Blackwell hardware-native descaling."""
+    return FP8Protocol(scale_granularity=FP8ScaleGranularity.BLOCK_1X32)
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +339,6 @@ class _UpProjection(torch.autograd.Function):
                     postact_dtype=torch.float8_e4m3fn,
                     dynamic_scheduler=False,
                 )
-                # y1 stays fp8 — downstream (down-proj) now accepts fp8 directly
             else:
                 z, y1 = gemm_gated(
                     x,
@@ -439,7 +444,6 @@ class _UpProjection(torch.autograd.Function):
                 )
                 del x_fp8
                 # FP8 dx: dz_fp8 × w1_fp8 → dx (bf16)
-                # Cast in original layout then permute → stride(0)=1 matching bf16
                 w1_fp8_dx = _get_fp8_weight_orig(w1)
                 dx_expanded = gemm(dz_fp8, w1_fp8_dx.permute(2, 0, 1),
                                    cu_seqlens_m=expert_frequency_offset,
@@ -546,16 +550,34 @@ class _DownProjection(torch.autograd.Function):
                     expert_ids=selected_experts.reshape(-1),
                 )
                 y2_for_router = y2.view(-1, H)
-            else:
-                if _fp8_enabled():
-                    # Full-pipeline FP8: y1 arrives as fp8, w2 cast on-the-fly
+            elif fp8_protocol is not None and _fp8_enabled():
+                # Blockscaled FP8 varlen down-proj (only with explicit protocol)
+                _bs_protocol = _get_blockscaled_protocol()
+                _seg_lens = expert_frequency_offset[1:] - expert_frequency_offset[:-1]
+                _min_seg = int(_seg_lens[_seg_lens > 0].min().item()) if (_seg_lens > 0).any() else 0
+                if _min_seg >= 32:
+                    y2 = blockscaled_fp8_gemm_varlen(
+                        y1 if y1.dtype == torch.bfloat16 else y1.to(torch.bfloat16),
+                        w2,
+                        expert_frequency_offset,
+                        protocol=_bs_protocol,
+                    )
+                else:
+                    # Fallback: raw fp8 GEMM for small expert segments
                     y1_fp8 = y1 if y1.dtype == torch.float8_e4m3fn else y1.to(torch.float8_e4m3fn)
                     w2_fp8 = _get_fp8_weight_orig(w2)
-                    y2 = gemm(y1_fp8, w2_fp8.permute(2, 1, 0),
-                              cu_seqlens_m=expert_frequency_offset,
-                              out_dtype=torch.bfloat16)
-                else:
-                    y2 = gemm(y1, w2.permute(2, 1, 0), cu_seqlens_m=expert_frequency_offset)
+                    y2 = gemm(y1_fp8, w2_fp8.permute(2, 1, 0), cu_seqlens_m=expert_frequency_offset)
+                router_perm = s_reverse_scatter_idx
+                y2_for_router = y2
+            elif _fp8_enabled():
+                # Legacy raw fp8 path (no protocol)
+                y1_fp8 = y1 if y1.dtype == torch.float8_e4m3fn else y1.to(torch.float8_e4m3fn)
+                w2_fp8 = _get_fp8_weight_orig(w2)
+                y2 = gemm(y1_fp8, w2_fp8.permute(2, 1, 0), cu_seqlens_m=expert_frequency_offset)
+                router_perm = s_reverse_scatter_idx
+                y2_for_router = y2
+            else:
+                y2 = gemm(y1, w2.permute(2, 1, 0), cu_seqlens_m=expert_frequency_offset)
                 router_perm = s_reverse_scatter_idx
                 y2_for_router = y2
         else:
@@ -616,6 +638,10 @@ class _DownProjection(torch.autograd.Function):
         activation_type = ctx.activation_type
         use_quack_gemm = ctx.use_quack_gemm
 
+        # Ensure dout is contiguous (expanded tensors from e.g. sum().backward()
+        # have stride (0,0) which violates GEMM k-major assertions)
+        dout = dout.contiguous()
+
         (
             z,
             w2,
@@ -638,7 +664,7 @@ class _DownProjection(torch.autograd.Function):
 
             s = topk_scores[s_scatter_idx]
             if _fp8_enabled():
-                # FP8 tensor core path for dgated
+                # FP8 tensor core dgated: fp8 inputs, bf16 outputs (no postact fp8 underflow)
                 dout_fp8 = dout.to(torch.float8_e4m3fn)
                 w2_fp8 = _get_cached_fp8_weight(w2, "w2_ehi")
                 _, y1s, ds = gemm_dgated(

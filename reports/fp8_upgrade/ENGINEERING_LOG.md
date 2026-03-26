@@ -9,24 +9,32 @@
 如果你只想知道“现在到底到了哪一步”，请只看：
 
 - `## 1. 主线里程碑`
-- `## 3. 当前最可信的数据`
+- `## 3. 当前最可信的数据
+
+> **2026-03-26 注意**：本节 3.1/3.2 数据来自早期"算子边界 FP8"（非全链条）。
+> 全链条 FP8 最新数据请看 § 6.3.1（forward -40~50%, E2E -33~39%, 但显存 +3 GiB, 精度不合格）。
+> 下方旧数据仅保留作为历史参考。
+
+---
+
+### ⚠️ 旧版 3. 当前最可信的数据（历史，已被 § 6.3.1 取代）`
 - `## 5. 经验与教训`
 - `## 6. 当前缺口`
 
 ### 0.1 论文 8 个算子 ↔ 工程函数 ↔ 当前 dtype / 支持状态
 
-后续所有进展汇报，默认都按这张表对齐；不再只说“forward/backward 某段”，而要明确是论文里的哪一个算子、工程里对应哪一个函数、baseline 是什么 dtype、现在额外支持什么 dtype、以及 FP8 是在算子内还是算子边界上。
+**重要更新 (2026-03-26)**：下表所有标记「per-tensor cast」的 FP8 路径使用 `.to(fp8)` 无 scale factor 量化。在训练典型小幅值激活下精度不可接受 (RelRMSE ~100%)。已有 `blockscaled_fp8_gemm_varlen` 原型验证 1×32 UE8M0 blockscaling 精度 3.74% RelRMSE，但尚未集成为默认路径。下一步必须全面替换为 blockscaled 量化。
 
-| 论文算子 | 工程函数 / 路径 | 论文变量 | baseline dtype | 当前支持 dtype | 当前支持方式 / 备注 | 当前完成度 |
-| --- | --- | --- | --- | --- | --- | --- |
-| up-proj (`varlen-M grouped GEMM + act`) | `_UpProjection.forward`; `gemm_gated` | `X_e → H_e, A_e` | bf16 in/out | **FP8 TC**: `x.to(fp8)` + `w1_fp8_cached(w1_ekh)` → `z(bf16) + y1(fp8)` | `SONIC_MOE_FP8_MODE=perf\|mem`. gemm_gated 原生 FP8 TC + FP32 累加。权重缓存 `_FP8_WEIGHT_CACHE` | **✅ 完成** |
-| down-proj (`varlen-M grouped GEMM`) | `_DownProjection.forward`; `quack.gemm` (patched) | `A_e → Y_e` | bf16 in/out | **FP8 TC**: `y1_fp8` + `w2_fp8_cached(orig).permute(2,1,0)` → `y2(bf16)` | 通过 `fp8_quack_patch.py` monkey-patch quack.gemm 支持 fp8 dtype mapping。权重缓存 `_FP8_ORIG_CACHE` (perf) / on-the-fly (mem) | **✅ 完成** |
-| expert aggregation (forward) | `_router_forward` | `O_t = Σ S_{t,e} Y_{e,t}` | bf16 / f32 score | 不变 | 非 GEMM 算子，不在 FP8 TC 范畴 | N/A |
-| down-proj act grad | `_DownProjection.backward`; `gemm_dgated` | `dH_e, dA_e` | bf16 in/out | **FP8 TC**: `dout.to(fp8)` + `w2_fp8_cached(w2_ehi)` → `dz(bf16), y1s(fp8)` | gemm_dgated 原生 FP8 TC + FP32 累加。w2 缓存 | **✅ 完成** |
-| down-proj weight grad (`varlen-K`) | `_DownProjection.backward`; `quack.gemm` (patched) | `dW2_e` | bf16 in, f32 accum | **FP8 TC**: `dout.to(fp8).T` × `y1s(fp8)` → `dw2(bf16)` | y1s 直接由 gemm_dgated 产出为 fp8，无需 dequant roundtrip | **✅ 完成** |
-| up-proj act grad | `_UpProjection.backward`; `quack.gemm` (patched) | `dX_e` | bf16 in/out | **FP8 TC**: `dz.to(fp8)` × `w1_fp8_cached(orig).permute(2,0,1)` → `dx(bf16)` | 权重缓存 `_FP8_ORIG_CACHE` (perf) / on-the-fly (mem) | **✅ 完成** |
-| up-proj weight grad (`varlen-K`) | `_UpProjection.backward`; `quack.gemm` (patched) | `dW1_e` | bf16 in, f32 accum | **FP8 TC**: `x.to(fp8).T` × `dz.to(fp8)` → `dw1(bf16)` | 激活 on-the-fly 量化 | **✅ 完成** |
-| backward expert aggregation | `_token_broadcast_backward`; `_softmax_topk_bwd` | `dX_t` / router grad | bf16 / f32 | 不变 | 非 GEMM 算子 | N/A |
+| 论文算子 | 工程路径 | FP8 方式 | 量化方式 | 精度状态 | 完成度 |
+| --- | --- | --- | --- | --- | --- |
+| up-proj fwd | `gemm_gated(x_fp8, w1_fp8)` | FP8 TC + FP32 accum | per-tensor cast ⚠️ | 需 blockscaled | 🔧 量化待替换 |
+| down-proj fwd | `gemm(y1_fp8, w2_fp8)` / `blockscaled_fp8_gemm_varlen` | FP8 TC | per-tensor (default) ⚠️ / blockscaled (opt-in) ✅ | blockscaled 可用 | 🔧 需设 blockscaled 为 default |
+| expert aggregation | `_router_forward` | 不变 (非 GEMM) | N/A | N/A | ✅ |
+| down-proj act grad | `gemm_dgated(dout_fp8, w2_fp8)` | FP8 TC + FP32 accum | per-tensor cast ⚠️ | 需 blockscaled | 🔧 量化待替换 |
+| down-proj wt grad | `gemm(dout_fp8.T, y1s_fp8)` | FP8 TC | per-tensor cast ⚠️ | 需 blockscaled | 🔧 量化待替换 |
+| up-proj act grad | `gemm(dz_fp8, w1_fp8.permute)` | FP8 TC | per-tensor cast ⚠️ | 需 blockscaled | 🔧 量化待替换 |
+| up-proj wt grad | `gemm(x_fp8.T, dz_fp8)` | FP8 TC | per-tensor cast ⚠️ | 需 blockscaled | 🔧 量化待替换 |
+| backward aggregation | `_token_broadcast_backward` | 不变 (非 GEMM) | N/A | N/A | ✅ |
 
 ### 0.2 论文变量 ↔ 工程变量（之后汇报不要只写简写）
 
@@ -73,22 +81,24 @@
   - 它们已经能直接处理或产出低精度 `postact`
 - **down-proj forward 与大部分 backward 核心算子，尚未成为原生 FP8 主线**
 
-### 0.4 当前 dtype / support 统一口径
+### 0.4 当前 dtype / support 统一口径（2026-03-26 更新）
 
-- stable 主线权重：
+- **权重存储**（master weight，供 optimizer 使用）：
   - `router_w / w1 / w2`：`torch.bfloat16`
-- stable 主线激活：
-  - `x / z / y1 / y2 / dout / dz / dx`：主要是 `torch.bfloat16`
+- **FP8 权重缓存**（SONIC_MOE_FP8_MODE=perf 时）：
+  - `_FP8_WEIGHT_CACHE`: w1_ekh(E,H,2I) + w2_ehi(E,H,I) — `torch.float8_e4m3fn`
+  - `_FP8_ORIG_CACHE`: w1(2I,H,E) + w2(H,I,E) — `torch.float8_e4m3fn`
+- **FP8 激活**（GEMM 边界）：
+  - x, dout, dz 等通过 `.to(torch.float8_e4m3fn)` on-the-fly 量化
+  - y1, y1s 由 gemm_gated/gemm_dgated 直接产出为 `torch.float8_e4m3fn`
+  - **当前量化方式**：per-tensor cast（无 scale factor）⚠️
+  - **目标量化方式**：1x32 blockscaled UE8M0 scale factor
 - router / top-k：
-  - `topk_scores`：主线按 `torch.float32`
+  - `topk_scores`：`torch.float32`
   - indices / offsets：`torch.int32`
-- stable FP8 activation protocol：
-  - activation data：`torch.float8_e4m3fn`
-  - scales：`torch.float8_e8m0fnu`
-  - stable granularity：`1x128`
-- 实验线 blockscaled down-proj：
-  - `w2` 可量化成 `e4m3 + e8m0(1x32)`
-  - 但这条 grouped/static-capacity 路线仍不是 stable 主线
+- **Blockscaled varlen 原型**：
+  - `blockscaled_fp8_gemm_varlen` 使用 `e4m3 + e8m0(1x32)` — 精度验证通过
+  - 待集成为默认路径
 
 ### 0.5 大工程目录（默认并行排队，不阻塞当前小步优化）
 
@@ -1072,6 +1082,14 @@ workspace cache 试验结果（未保留，仅记录）：
 
 ## 3. 当前最可信的数据
 
+> **2026-03-26 注意**：本节 3.1/3.2 数据来自早期"算子边界 FP8"（非全链条）。
+> 全链条 FP8 最新数据请看 § 6.3.1（forward -40~50%, E2E -33~39%, 但显存 +3 GiB, 精度不合格）。
+> 下方旧数据仅保留作为历史参考。
+
+---
+
+### ⚠️ 旧版 3. 当前最可信的数据（历史，已被 § 6.3.1 取代）
+
 ### 3.1 stable 主线，shape `8192,4096,1024,128,8`（2026-03-25 同机空闲卡复测）
 
 复测环境：
@@ -1287,17 +1305,18 @@ workspace cache 试验结果（未保留，仅记录）：
 | Bwd (ms) | 8.627 | 5.263 | **−39.0%** ✅ |
 | Peak mem (MiB) | 7,690 | 10,762 | **+39.9%** ⚠️ |
 
-**精度 (Shape 4096, FP8-perf vs BF16 reference):**
+**精度 — 严重警告 (2026-03-26 更新):**
 
-| 变量 | max abs ref | max abs diff | max relative |
-|------|------------|-------------|-------------|
-| output `O` | 0.0405 | 0.0031 | 7.6% |
-| dx | 0.0586 | 0.0082 | 14.0% |
-| dw1 | 0.1050 | 0.0133 | 12.7% |
-| dw2 | 0.1025 | 0.0129 | 12.6% |
-| drouter_w | 0.5273 | 0.0381 | 7.2% |
+上述精度数据使用 `1.0 * randn` 输入测得。当使用训练常态输入 (`0.02 * randn`) 时：
 
-精度符合 FP8 E4M3 (3-bit mantissa, ~12.5% per-op) 预期，多级运算后最大相对误差 ≤15%。
+| 输入规模 | Output RelRMSE | Output cosine | 评估 |
+|---------|---------------|---------------|------|
+| `0.02 * randn` (训练常态) | ~100% | ~0.003 | ❌ 完全不可接受 |
+| `1.0 * randn` (大幅值) | 7.9% | 0.997 | ⚠️ 勉强 |
+
+**根因**：per-tensor `.to(fp8)` cast 无 scale factor，E4M3 range [-448, 448] 将小值 flush。
+**解决方案**：已有 `blockscaled_fp8_gemm_varlen` 验证 3.74% RelRMSE（1x32 UE8M0 blockscaling）。
+**下一步**：必须将 blockscaled 量化替换为所有 GEMM 的默认路径。
 
 **内存增量来源分析**:
 - `_FP8_WEIGHT_CACHE` (essential): w1_ekh(1 GiB) + w2_ehi(512 MiB) = **1.5 GiB**

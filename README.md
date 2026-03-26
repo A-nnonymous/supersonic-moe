@@ -120,50 +120,58 @@ The reporting policy for every FP8 step is:
 - memory baseline: official bf16
 - performance baselines: previous commit and official bf16
 
-## 📋 Current FP8 Upgrade TODOs
+## 🔥 FP8 Upgrade Status (2026-03-26)
 
-Keep this list synchronized with `reports/README.md` and `reports/fp8_upgrade/HANDOFF.md`.
+**Current state**: All 6 GEMM operators use FP8 tensor cores (per-tensor cast). Forward 30-50% faster than BF16, E2E 33-39% faster. **Two critical issues remain**: (1) precision — per-tensor cast unacceptable for training inputs, needs 1x32 blockscaled UE8M0; (2) memory — +3 GiB from FP8 weight caches.
 
-- [x] Bootstrap the Blackwell-capable Python environment at `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer`
-- [x] Merge latest upstream `main` and validate local Blackwell behavior
-- [x] Add a dedicated Blackwell QuACK pytest entry (`make test-blackwell`)
-- [x] Make `tests/moe_test.py` Blackwell-aware so unsupported non-QuACK SonicMoE paths skip instead of hard-failing
-- [x] Add a Blackwell-only FP8 protocol layer in `sonicmoe/functional/` for `e4m3` activations and `e8m0` scales
-- [x] Build the first torch/reference FP8 quant/dequant path before adding Hopper fused kernels
-- [x] Add Blackwell multi-GPU regression sharding and bf16-vs-fp8 RMSE/memory reporting entrypoints
-- [ ] Implement the Hopper up-projection FP8 epilogue: `grouped_gemm -> SwiGLU -> optional prob -> blockwise quant`
-- [ ] Implement the paired FP8 backward path and cache contract
-- [ ] Unify Hopper CuTe and Blackwell QuACK under the same FP8 protocol and test matrix
+Blockscaled varlen GEMM prototype validates 3.74% RelRMSE — the solution exists, needs full integration.
 
-## 🧭 FP8 Upgrade Roadmap
+| Resource | Path |
+|----------|------|
+| **Handoff** (start here) | `reports/fp8_upgrade/HANDOFF.md` |
+| Engineering log | `reports/fp8_upgrade/ENGINEERING_LOG.md` |
+| Contract tests (11/11 pass) | `tests/fp8_large_project_contract_test.py` |
+| Benchmark | `benchmarks/moe-cute.py --fp8_mode perf\|mem` |
 
-The current plan is to treat FP8 as a protocol-and-kernel migration, not a one-shot mega-kernel rewrite.
-
-1. **Freeze protocol and reference behavior first**
-   - add `fp8_protocol.py`, `fp8_quant.py`, and `fp8_reference.py`
-   - current scope is intentionally narrow: `e4m3` activations + `e8m0` scales + `1x128` granularity + Blackwell runtime checks
-2. **Ship the first Hopper fused kernel at the up-projection epilogue**
-    - target `grouped_gemm(varlen/gather-A) -> SwiGLU -> optional prob -> 1x128 quant`
-    - keep Blackwell on the QuACK adapter route
-   - the current `operator-incubator` fused quant kernel expects a pre-SwiGLU `(T, 2H)` tensor, so the smallest safe integration step is to add an adapter shim first and then replace the current torch-side boundary path once the pre-activation contract is exposed cleanly
-3. **Add the paired backward kernel**
-    - cover the `fused_swiglu_weighted_bwd` semantics and the minimum forward cache contract
-4. **Standardize dequant and blockwise quant**
-   - start as reference/protocol code, then fuse only if profiling shows the need
-5. **Expand regression coverage**
-   - Hopper and Blackwell should share one FP8 protocol and one test story even if their kernels differ
-
-For the live work log, validated commands, and next-agent handoff, read:
-
-- `reports/README.md`
-- `reports/fp8_upgrade/README.md`
-- `reports/fp8_upgrade/HANDOFF.md`
-
-The current validated Blackwell-only command is:
+### Quick start
 
 ```bash
-python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py tests/moe_test.py
+source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate
+cd /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe
+
+# Run contract tests
+CUDA_VISIBLE_DEVICES=4 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
+  python -m pytest tests/fp8_large_project_contract_test.py -v
+
+# BF16 baseline benchmark
+CUDA_VISIBLE_DEVICES=4 USE_QUACK_GEMM=1 python benchmarks/moe-cute.py \
+  --thiek 8192,4096,1024,128,8 --dtype BFloat16 --activation swiglu --skip_test
+
+# FP8 perf benchmark
+CUDA_VISIBLE_DEVICES=4 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf python benchmarks/moe-cute.py \
+  --thiek 8192,4096,1024,128,8 --dtype BFloat16 --activation swiglu --skip_test
 ```
+
+### Next steps (priority order)
+
+1. **P0**: Replace per-tensor `.to(fp8)` with 1x32 blockscaled UE8M0 quantization (precision fix)
+2. **P1**: Eliminate redundant FP8 weight caches (memory fix)
+3. **P2**: Add blockscaling support to `gemm_gated`/`gemm_dgated` fused kernels
+
+## 📋 FP8 Upgrade TODOs
+
+- [x] Bootstrap the Blackwell-capable Python environment
+- [x] Merge latest upstream `main` and validate local Blackwell behavior
+- [x] Add Blackwell QuACK pytest entry (`make test-blackwell`)
+- [x] FP8 protocol layer (`fp8_protocol.py`, `fp8_quant.py`, `fp8_reference.py`)
+- [x] All 6 GEMM operators: FP8 tensor core forward + backward
+- [x] FP8 weight cache with version-aware invalidation
+- [x] `blockscaled_fp8_gemm_varlen` prototype with rank-aware CUTLASS monkey-patch
+- [x] 11 contract tests covering forward, backward, gradients, small+large shapes
+- [ ] **Replace per-tensor cast with 1x32 blockscaled UE8M0** (precision critical)
+- [ ] **Unify FP8 weight cache layout** (eliminate +3 GiB overhead)
+- [ ] **Add `sf_vec_size` to gemm_gated/gemm_dgated** or split into GEMM + activation
+- [ ] FP8 optimizer for master weight elimination (long-term)
 
 ### Example usage
 - SonicMoE with TC top-K choice routing (SwiGLU activation) on Hopper GPUs

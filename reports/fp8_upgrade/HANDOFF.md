@@ -1,387 +1,312 @@
 # FP8 Next-Agent Handoff
 
-本文件的目标只有一个：**让下一个 agent 在最短时间内接住主线，不重复踩坑。**
+本文件的目标：**让下一个 agent 在最短时间内接住主线，不重复踩坑。**
+
+> 最后更新：2026-03-26，commit 后的代码状态
 
 ---
 
-## 0. 先说一句人话
+## 0. 一句话现状
 
-当前最接近正确方向的，不是 blockscaled 实验线，而是：
-
-- 保住 SonicMoE 的 `varlen/gather-A` 合同
-- 让 up-proj epilogue 直接产出 `varlen FP8 postact + scales`
-- 让 down-proj mainloop 在**不引入 grouped/static capacity** 的前提下直接消费这些 FP8 激活
-
-换句话说：
-
-- **不要把 grouped/static-capacity 当成最终方案**
-- **不要把“已经能跑”误当成“已经接近最优”**
+**全部 6 个 GEMM 算子已使用 FP8 tensor core（per-tensor `.to(fp8)` cast），性能大幅领先 BF16（forward -40~50%, E2E -33~39%）。但有两个严重未解问题：(1) 精度不足——per-tensor cast 无 scale factor，小幅值输入下 RelRMSE 退化到 ~100%；(2) 显存开销——FP8 weight 缓存导致 +3 GiB 额外占用。解决路径明确：替换为 1x32 blockscaled UE8M0 量化（已有 varlen 算子原型验证精度 3.74%）+ 消除冗余 weight 缓存。**
 
 ---
 
-## 1. 用户偏好与工作方式
+## 1. 用户偏好（硬约束）
 
-这些不是建议，是本 session 已经被反复强调的硬约束：
-
-### 1.1 目标
-
-- 目标是**极致性能 + 极致显存收益**
-- 不接受“跑通就行”
-- 也不接受“只做一个能工作的实验原型就交差”
-
-### 1.2 设计哲学
-
-用户希望我们真正学习 SonicMoE 的精髓，而不是机械把 tensor 换成 FP8：
-
-- 少中间结果
-- 少长驻留 buffer
-- 少额外调度
-- 守住 `varlen/gather-A`
-- 尽量避免 grouped/static-capacity 这类破坏 SonicMoE 内存合同的设计
-
-### 1.3 benchmark / debug 方法
-
-用户反复要求：
-
-- 用真实大 shape，不要只看 toy case
-- 同时做：
-  - bf16 baseline 对排
-  - 理论账本
-  - stagewise memory
-  - backward precision / RMSE
-- 如果 fp8 变慢，必须分析：
-  - 是算子本身慢
-  - 还是边界搬运慢
-  - 还是中间结果驻留太大
-  - 还是组网/复用方式偏离 SonicMoE
-
-### 1.4 benchmark 合同
-
-用户明确要求：
-
-- 用 seed 控制 bf16 权重初始化
-- 如果要测 fp8 weight，必须在**运行前静态量化**
-- 不能把首轮在线量化混进 timing
-- 最终用户视角下，bf16 / fp8 的使用逻辑应该尽量一致，最好只差一个参数
-
-### 1.5 工程记录要求
-
-- 每次工程日志都要带相对 bf16 baseline 的性能/精度关系
-- 所有结论都要尽量避免误导
-- report 是给人和 agent 看的，不是流水账
+- 全链条 FP8：所有 GEMM 内部使用 FP8 tensor core + FP32 主循环累加
+- 量化方案：1x32 blockscaled UE8M0 scale factor（Blackwell 硬件原生 descale）
+- 精度是生命线：RelRMSE < 10%，cosine > 0.99
+- 性能 + 显存双指标必须优于 BF16 baseline
+- 守住 SonicMoE 的 `varlen/gather-A` 内存合同
+- 用真实大 shape 对排，不要只看 toy case
+- 不接受 hack：所有代码必须可 git commit，不做 site-packages patch
 
 ---
 
-## 2. 当前代码树的真实状态
+## 2. 当前代码真实状态
 
-### 2.1 已落地且应视为稳定主线的部分
+### 2.1 已稳定落地（可直接使用）
 
-#### A. preact fused FP8 boundary
+#### A. 全 6 GEMM FP8 tensor core（per-tensor cast，无 blockscaling）
 
-- 文件：
-  - `sonicmoe/functional/fp8_cutely_fused.py`
-- 已落地能力：
-  - preact fused quant/dequant
-  - `restored_out=...`
-- 关键意义：
-  - dequant 可以直接回写到调用方提供的 `y1` buffer
+| 论文算子 | 工程路径 | 量化方式 | 状态 |
+|---------|---------|---------|------|
+| up-proj forward | `gemm_gated(x_fp8, w1_fp8)` | `x.to(fp8)` + 缓存 `w1_ekh` | done |
+| down-proj forward | `gemm(y1_fp8, w2_fp8.permute)` | `y1.to(fp8)` + 缓存 `w2_orig` | done |
+| down-proj act grad | `gemm_dgated(dout_fp8, w2_fp8)` | `dout.to(fp8)` + 缓存 `w2_ehi` | done |
+| down-proj weight grad | `gemm(dout_fp8.T, y1s_fp8)` | 均为 `fp8` | done |
+| up-proj act grad | `gemm(dz_fp8, w1_fp8.permute)` | `dz.to(fp8)` + 缓存 `w1_orig` | done |
+| up-proj weight grad | `gemm(x_fp8.T, dz_fp8)` | 均 on-the-fly `.to(fp8)` | done |
 
-#### B. stable QuACK mainline 复用 `y1`
+控制开关：`SONIC_MOE_FP8_MODE=perf`（权重缓存）或 `mem`（on-the-fly 量化）
 
-- 文件：
-  - `sonicmoe/functional/__init__.py`
-- 已落地能力：
-  - stable path 直接复用 `gemm_gated(...)` 产出的 `y1`
-  - preact FP8 boundary 包在 `torch.no_grad()` 下
-  - 默认去掉语义冗余的 `STE`
+#### B. Varlen blockscaled FP8 GEMM（已验证，待集成为默认路径）
 
-#### C. benchmark 指标面
+- **文件**：`sonicmoe/quack_utils/blockscaled_fp8_gemm.py`
+- **能力**：`blockscaled_fp8_gemm_varlen(A_bf16, B_bf16, cu_seqlens, protocol)` — 内部做 1x32 blockscaled 量化 + CUTLASS SM100 GEMM
+- **精度**：3.74% RelRMSE（全生产 shape 验证：E=4-128, tpe=128, I=1024, H=4096）
+- **关键修复**：rank-aware `tile_atom_to_shape_SF` monkey-patch，解决 CUTLASS DSL rank-2 张量不兼容
+- **限制**：每个 expert segment 必须大于等于 32 tokens（blockscaled tile atom 大小）
+- **快速量化**：`quantize_activation_blockscaled_fast()` — Triton 融合单 pass 内核，5.8x 快于 Python 参考
 
-- 文件：
-  - `benchmarks/moe-cute.py`
-- 已落地能力：
-  - `--report_fp8_metrics`
-  - `--report_stage_memory`
-  - `--report_fp8_analysis`
-  - backward RMSE
-  - CPU snapshot 防止污染后续 GPU peak
+#### C. Down-proj forward 已有 blockscaled varlen 路径（gated on fp8_protocol）
 
-#### D. 预分配 / cudagraph-safe 基础设施
+- 当 `fp8_protocol is not None` 且 `_fp8_enabled()` 且 min segment >= 32 时，使用 `blockscaled_fp8_gemm_varlen`
+- 否则 fallback 到 per-tensor fp8 path 或 bf16
+- **当前默认路径**：仍是 per-tensor fp8（因为 `fp8_protocol=None` 是常见调用方式）
 
-- 文件：
-  - `sonicmoe/functional/fp8_quant.py`
-  - `sonicmoe/functional/fp8_cutely_fused.py`
-- 已落地能力：
-  - `round_scale_to_e8m0(..., out=...)`
-  - `quantize_activation_blockwise(..., out=..., scale_out=...)`
-  - `dequantize_activation_blockwise(..., out=...)`
-  - `apply_*_fp8_protocol_cutely_fused(..., scale_out=...)`
+#### D. 合同测试
 
-### 2.2 已存在但仍是实验线的部分
+- `tests/fp8_large_project_contract_test.py`：11 个测试全部通过
+- 测试验证 FP8 路径 vs BF16 gold 的 forward/backward 正确性
+- 包含小 shape (T=256) 和大 shape (T=1024, H=4096, I=1024, E=128, K=8)
 
-#### A. blockscaled down-proj
+### 2.2 已知问题（下一个 agent 必须解决）
 
-- 文件：
-  - `sonicmoe/quack_utils/blockscaled_fp8_gemm.py`
-- 已做过的优化：
-  - 吃掉了 `grouped_a` 的完整物化
-  - pack+quant 融合
-  - 不再把 grouped output 再 unpack 成 flat `y2`
-  - grouped reverse scatter index 直接复用 `selected_experts`
-- 但仍不是主线，因为：
-  - 需要 `static capacity`
-  - 需要 grouped layout
-  - `grouped_out` 本身过大
-  - router 聚合过渡层成本太高
+#### 问题一：精度 — per-tensor cast 无 scale factor
 
-#### B. dummy postact buffer
+**严重程度**：Critical
 
-- 开关：
-  - `SONIC_MOE_FP8_DUMMY_POSTACT_BUFFER=1`
-- 状态：
-  - 默认关闭
-  - 仅实验价值
+当输入幅值较小（如 `0.02 * randn`，这是训练常态）时：
+- FP8 vs BF16 RelRMSE 约 **100%**，cosine 约 **0.003**
+- 原因：E4M3 动态范围 [-448, 448]，小值直接被 flush 到最近表示
 
-#### C. static fp8 weight benchmark plumbing
+当输入幅值较大（如 `1.0 * randn`）时：
+- RelRMSE 约 **7.9%**，cosine 约 **0.997**
 
-- 文件：
-  - `sonicmoe/quack_utils/blockscaled_fp8_gemm.py`
-  - `sonicmoe/moe.py`
-  - `benchmarks/moe-cute.py`
-- 已落地能力：
-  - `prefetch_blockscaled_w2_fp8(...)`
-  - `clear_blockscaled_fp8_weight_cache()`
-  - `MoE.prefetch_fp8_weights(...)`
-  - `MoE.clear_fp8_weight_cache()`
-- 结论：
-  - benchmark 合同是对的
-  - 但它只证明了“在线 weight quant 不是主矛盾”
-  - 没有证明 blockscaled 是正确主线
+**解决方案**（已验证原型）：1x32 blockscaled UE8M0 量化
+- `blockscaled_fp8_gemm_varlen` 已在算子级别验证 3.74% RelRMSE
+- 需要将其替换为所有 GEMM 的默认量化方式
 
-### 2.3 已证伪 / 不要重复的方向
+#### 问题二：显存 — FP8 权重缓存 +3 GiB
 
-#### A. grouped `fp8-direct-downproj`
+**严重程度**：Major
 
-- 结论：
-  - 已用真实 shape 证伪
-  - 仅仅去掉 bf16 回退，不足以抵消 grouped/static-layout 的开销
+| 缓存 | 大小 | 用途 |
+|------|------|------|
+| `_FP8_WEIGHT_CACHE` (w1_ekh, w2_ehi) | 1536 MiB | gemm_gated/gemm_dgated 的 permuted fp8 权重 |
+| `_FP8_ORIG_CACHE` (w1, w2) | 1536 MiB | quack.gemm 的 original-layout fp8 权重 |
+| **总额外占用** | **3072 MiB** | 在 BF16 参数 3073 MiB 基础上翻倍 |
 
-#### B. `_DownProjection.backward()` 上的 runtime-fp8 `y1s` 最短路径
+**解决方案**：
+- 短期：`mem` 模式不缓存，每次 on-the-fly 量化（牺牲性能）
+- 中期：统一权重 layout，消除双缓存（permuted + original）
+- 长期：FP8 optimizer + FP8 master weight，完全消除 BF16 参数副本
 
-- 结论：
-  - 已证伪
-- blocker：
-  - plain `gemm` 要求 `A/B` 同 dtype
-  - `dout.T` 是 bf16
-  - `gather_A` 合法 config 更苛刻
+### 2.3 已证伪方向（不要重复）
 
-#### C. 把 stagewise 与 cold metrics peak 混写
-
-- 结论：
-  - 这是错误的
-- 后续任何 agent 都不要再这样写结论
+1. **Grouped/static-capacity blockscaled down-proj**：违背 SonicMoE varlen 合同，内存开销大
+2. **Backward runtime-fp8 y1s 最短路径**：`quack.gemm` 要求 A/B 同 dtype，`gather_A` 约束苛刻
+3. **将 cold metrics peak 和 stagewise probe 混写成单一结论**
 
 ---
 
-## 3. 最可信的数据结论（2026-03-27 全链条 FP8）
+## 3. 最新性能数据（2026-03-26 实测，GPU 4）
 
-### 3.1 Shape 4096,4096,1024,128,8（中等 shape）
+### 3.1 Shape 4096,4096,1024,128,8（中等）
 
 | 指标 | BF16 | FP8-perf | Delta |
 |------|------|----------|-------|
-| Fwd inference (ms) | 2.501 | 1.541 | **-38.4%** |
-| Fwd training (ms) | 2.566 | 1.686 | **-34.3%** |
-| E2E fwd+bwd (ms) | 6.352 | 5.416 | **-14.7%** |
-| Backward (ms) | 3.851 | 3.875 | +0.6% |
-| Peak mem (MiB) | 7,050 | 10,122 | +43.6% |
+| Fwd inference (ms) | 2.264 | 1.349 | **-40.4%** |
+| Fwd training (ms) | 2.264 | 1.218 | **-46.2%** |
+| E2E fwd+bwd (ms) | 7.357 | 4.915 | **-33.2%** |
+| Bwd (ms) | 5.093 | 3.566 | **-30.0%** |
+| TFLOPS (fwd) | 364.3 | 611.3 | **+67.8%** |
+| TFLOPS (e2e) | 336.3 | 503.4 | **+49.7%** |
+| Peak mem (MiB) | 6,924 | ~12,853 | +85.6% |
 
-### 3.2 Shape 8192,4096,1024,128,8（大 shape）
+### 3.2 Shape 8192,4096,1024,128,8（大）
 
 | 指标 | BF16 | FP8-perf | Delta |
 |------|------|----------|-------|
-| Fwd inference (ms) | 4.152 | 2.404 | **-42.1%** |
-| Fwd training (ms) | 4.499 | 2.178 | **-51.6%** |
-| E2E fwd+bwd (ms) | 12.780 | 7.666 | **-40.0%** |
-| Backward (ms) | 8.627 | 5.263 | **-39.0%** |
-| Peak mem (MiB) | 7,690 | 10,762 | +39.9% |
+| Fwd inference (ms) | 3.924 | 1.995 | **-49.2%** |
+| Fwd training (ms) | 4.399 | 2.086 | **-52.6%** |
+| E2E fwd+bwd (ms) | 11.962 | 7.351 | **-38.6%** |
+| Bwd (ms) | 8.038 | 5.355 | **-33.4%** |
+| TFLOPS (fwd) | 420.3 | 826.6 | **+96.7%** |
+| TFLOPS (e2e) | 413.6 | 673.1 | **+62.7%** |
 
-### 3.3 内存分析
+### 3.3 精度（per-tensor cast，当前默认）
 
-+3 GiB 来自 FP8 权重缓存（4 个 cache 条目）。这是 **结构性开销**，无法在当前架构下消除：
-- BF16 参数必须保留（optimizer Adam m/v 需要 fp32 master weight → bf16 param）
-- FP8 缓存是额外的 permuted 副本，用于 CUTLASS kernel 的特定 layout 需求
-- 推理场景或 FP8 optimizer 可以消除此开销（未来方向）
+| 输入规模 | Output RelRMSE | Output cosine | Grad RelRMSE | Grad cosine |
+|----------|---------------|---------------|-------------|-------------|
+| `0.02 * randn` (训练常态) | ~100% | ~0.003 | ~100% | ~0.008 |
+| `1.0 * randn` | 7.90% | 0.997 | 7.68% | 0.997 |
 
-### 3.4 精度
+**结论**：per-tensor cast 精度在训练常态下完全不可接受，必须换 blockscaled。
 
-output max abs diff: 0.003, grad max abs diff: 0.013-0.038。符合 FP8 E4M3 理论精度。
----
+### 3.4 精度（blockscaled varlen，算子级验证）
 
-## 4. SonicMoE 设计精髓 vs 当前 FP8 偏差
+| 验证方式 | RelRMSE | 备注 |
+|---------|---------|------|
+| `blockscaled_fp8_gemm_varlen` 单算子 | **3.74%** | E=4-128, tpe=128, 全 shape |
+| `quantize_activation_blockscaled_fast` 量化精度 | **100% bit-exact** | vs Python 参考实现 |
 
-这是最重要的一节。
+### 3.5 显存分析
 
-### 4.1 SonicMoE 的精髓
-
-SonicMoE 真正宝贵的不是“有一个 MoE kernel”，而是：
-
-- `varlen/gather-A`
-- 避免为每个 expert 构造巨大静态中间 buffer
-- 尽量把工作保持在原有调度/路由形态里
-
-### 4.2 当前 stable 主线为什么比 blockscaled 更像正确方向
-
-因为 stable 主线虽然还会：
-
-- `z -> quant -> dequant -> bf16 y1`
-
-但它至少仍然保住了：
-
-- varlen routing
-- gather-A 风格
-- 没有回到 grouped/static-capacity 这类大中间结果设计
-
-### 4.3 当前 blockscaled 为什么偏离 SonicMoE 精髓
-
-因为它重新引入了：
-
-- grouped layout
-- static expert capacity
-- `grouped_out`
-
-它虽然在“fp8 weight / fp8 mainloop”这个局部更激进，但在整体内存合同上更不 SonicMoE。
+```
+BF16 参数:           3,073 MiB (w1: 2I*H*E bf16, w2: H*I*E bf16)
+FP8 weight cache:   +3,072 MiB (4 个缓存条目: w1_ekh, w2_ehi, w1_orig, w2_orig)
+FP8 激活中间量:      约等于 BF16 (per-tensor cast 不增加，blockscaled 增加 ~3% scale 存储)
+------
+总额外占用:          ~3,072 MiB (100% 来自权重缓存)
+```
 
 ---
 
-## 5. 剩余缺口
+## 4. 高价值技术知识
 
-### 5.1 ~~缺口一：varlen FP8 postact + scales~~ → **已关闭**
-gemm_gated 直接产出 fp8 postact，下游 quack.gemm 直接消费。
+### 4.1 CUTLASS Blockscaled Varlen 的 Rank-2 修复
 
-### 5.2 ~~缺口二：gather-A preserving fp8 down-proj~~ → **已关闭**
-通过 monkey-patch quack.gemm 支持 fp8，保持 varlen/gather-A 合同。
+- `cutlass.utils.blockscaled_layout.tile_atom_to_shape_SF` 硬编码 `(2, 1, 3)` 排列
+- Varlen 路径产出 rank-2 `(total_M, K)` 张量导致编译期 rank mismatch
+- 修复：`blockscaled_fp8_gemm.py` 中的 `_tile_atom_to_shape_SF_rank_aware` monkey-patch
+- 使用 `cute.rank(Shape)` + `const_expr` 在 trace time 分派 `(2, 1)` / `(2, 1, 3)`
+- 安装到 `cutlass.utils.blockscaled_layout` 模块命名空间
 
-### 5.3 ~~缺口三：backward mixed-dtype / scaled GEMM~~ → **已关闭**
-gemm_dgated 产出 fp8 y1s，直接消费于 weight grad；dz/dx 全链条 fp8。
+### 4.2 Blockscaled 最小 Segment 约束
 
-### 5.4 缺口四：E8M0 blockscaling（未关闭）
-当前量化为简单 `.to(fp8)` cast（per-tensor），无 scale factor。
-Blackwell 原生支持 1x32 UE8M0 blockscaling，需要 gemm_gated/gemm_dgated 传入 sf_vec_size + CUTLASS upstream rank 修复。
+- Scale factor tile atom = 32 elements in M direction
+- Expert segment < 32 tokens 导致 `CUDA_ERROR_ILLEGAL_INSTRUCTION`
+- 生产 shape (T>=512, K=8, E=128, 即 >=32 tpe) 安全
+- 测试 shape (T=256, K=8, E=128, 即 16 tpe) 需要 fallback
+- 代码已有 `_SF_VEC_SIZE` 检查和 bf16 fallback
 
-### 5.5 缺口五：FP8 optimizer / weight storage（未关闭）
-当前 BF16 参数 + FP8 缓存 = 双倍权重存储。
-需要 FP8 optimizer 或 FP8 parameter storage 才能消除 3 GiB 开销。
----
+### 4.3 FP8 权重缓存架构
 
-## 6. 经验与教训
+```
+w1: (2I, H, E) bf16 -> _FP8_WEIGHT_CACHE["w1_ekh"]: (E, H, 2I) fp8  [for gemm_gated]
+w2: (H, I, E) bf16  -> _FP8_WEIGHT_CACHE["w2_ehi"]: (E, H, I)  fp8  [for gemm_dgated]
+w1: (2I, H, E) bf16 -> _FP8_ORIG_CACHE[w1]:         (2I, H, E) fp8  [for quack.gemm backward]
+w2: (H, I, E) bf16  -> _FP8_ORIG_CACHE[w2]:         (H, I, E)  fp8  [for quack.gemm forward]
+```
 
-### 6.1 有效经验
+- 缓存 key 包含 `data_ptr` 和 `_version`，optimizer step 后自动失效
+- `perf` 模式始终缓存；`mem` 模式 on-the-fly
 
-1. **优先对排真实大 shape**
-   - toy case 容易误导
+### 4.4 gemm_gated/gemm_dgated FP8 限制
 
-2. **先看理论账本，再做工程选择**
-   - 没有理论上限约束，很容易在小收益点上反复打磨
+- 这两个 fused kernel 接受 `A(fp8) * B(fp8)` 但**不支持 blockscaled scale factor**
+- `postact_dtype=torch.float8_e4m3fn` 产出 fp8 post-activation（per-tensor，无 scale）
+- 要支持 blockscaled，需要修改 fused kernel 或拆分为 GEMM + activation kernel
 
-3. **用 stagewise memory 找主矛盾**
-   - 它能迅速区分是 kernel 问题还是边界问题
+### 4.5 GPU 兼容性
 
-4. **显式记录“为什么某条路不是主线”**
-   - 这比记录“某条路能跑通”更重要
-
-5. **先把 benchmark 合同做正确**
-   - 不然所有结论都会有污染
-
-### 6.2 反模式
-
-1. 把 grouped/static-capacity 当成“更接近 fp8 endgame”
-2. 因为某条路数值正确，就误判它接近最优
-3. 把 cold metrics 与 stagewise raw probe 混成单一结论
-4. 因为局部 microbench 提速，就误判主线主矛盾已解决
-5. 忽略 SonicMoE 的调度与复用设计，只从 dtype 角度看问题
+- GPU 2, 3 有间歇性 Triton `CUDA_ERROR_ILLEGAL_INSTRUCTION`（autotune 时）
+- GPU 0, 1, 4, 5 稳定
+- 这是硬件/驱动问题，非代码问题
+- 测试建议使用 GPU 0 或 4
 
 ---
 
-## 7. 当前工作树的关键信息
+## 5. 经验与教训
 
-### 7.1 当前有价值的本地改动
+### 踩过的坑
 
-- `benchmarks/moe-cute.py`
-  - backward RMSE 指标
-  - CPU snapshot 修复
-  - static fp8 weight prefetch benchmark plumbing
-- `sonicmoe/moe.py`
-  - fp8 weight prefetch / clear API
-- `sonicmoe/quack_utils/blockscaled_fp8_gemm.py`
-  - protocol-aware weight cache
-  - prefetch / clear
-- `sonicmoe/functional/__init__.py`
-  - 更细的 backward stage-memory probe
+1. **`postact_dtype=None` 导致 dtype 级联错误**：当 A 是 fp8 时，`None` 默认取 `A.dtype`，产出 fp8 post-activation，下游 bf16 GEMM 收到 fp8 输入报错。显式设置 `postact_dtype=torch.float8_e4m3fn` 或 `torch.bfloat16`。
 
-### 7.2 当前不要继续推进的半成品
+2. **`_fp8_enabled()` 检查 env var，不检查 `fp8_protocol` 参数**：gold path (protocol=None) + env var SONIC_MOE_FP8_MODE=perf 导致 FP8 code path 仍激活。测试时必须理解这个区别。
 
-- 刚刚尝试过的“benchmark 对外只暴露一个 `--precision` 参数”改造**没有落地**
-- 我已把 `benchmarks/moe-cute.py` 恢复到可编译状态
-- 这件事应在后续单独、完整地做，不要从坏 patch 继续接着改
+3. **`dout` 非 contiguous 导致 GEMM crash**：`sum().backward()` 产出 stride=(0,0) 的 expanded tensor，需要 `.contiguous()` 后再传入 GEMM。
+
+4. **Weight layout 多次 permute 开销**：SonicMoE 存储 `(H, I, E)`，quack 需要 `(E, K, N)` 或 `(E, H, I)`。预缓存 permuted 副本是正确选择（不是 `.permute()` view）。
+
+5. **Triton kernel 在不同 GPU 上的 autotune crash**：某些 GPU 的 Triton autotuner `load_binary` 报 illegal instruction。解决：固定 GPU、清除 `~/.triton/cache/`。
+
+### 有效方法论
+
+1. 先用 `git stash` 确认回退到上一个 commit 是否通过，快速定位是否是新代码引入
+2. 每次修改后先跑小 shape 合同测试，再跑大 shape，最后 benchmark
+3. 在 subprocess 中逐个运行测试避免 GPU state 污染
+4. 精度测试必须用 `x_gold.detach().clone().requires_grad_()` 而非共享输入
 
 ---
 
-## 8. 推荐的首个动作
+## 6. 下一步规划（优先级排序）
 
-下一个 agent 接手后，建议顺序如下：
+### P0: 替换 per-tensor cast 为 blockscaled 1x32 UE8M0（精度修复）
 
-1. 先读：
-   - `reports/README.md`
-   - 本文件
-   - `reports/fp8_upgrade/ENGINEERING_LOG.md`
+**目标**：所有 6 个 GEMM 使用 blockscaled 量化，RelRMSE < 5%
 
-2. 再看代码：
-   - `sonicmoe/functional/__init__.py`
-   - `sonicmoe/functional/fp8_cutely_fused.py`
-   - `sonicmoe/quack_utils/blockscaled_fp8_gemm.py`
-   - `benchmarks/moe-cute.py`
+具体步骤：
+1. 将 `blockscaled_fp8_gemm_varlen` 设为 down-proj forward 默认路径（当 segment >= 32）
+2. 将 backward dx 也切换到 blockscaled varlen
+3. 为 `gemm_gated`/`gemm_dgated` 添加 blockscaling 支持，或拆分为 blockscaled GEMM + activation kernel
+4. Weight grad 路径也切到 blockscaled
 
-3. 然后做一次快速回归：
+### P1: 消除 FP8 权重缓存冗余（显存修复）
+
+**目标**：FP8 总显存 <= BF16
+
+具体步骤：
+1. 统一 `_FP8_WEIGHT_CACHE` 和 `_FP8_ORIG_CACHE` 为单一缓存
+2. 让 gemm_gated/gemm_dgated 接受与 quack.gemm 相同 layout 的权重
+3. 长期：FP8 master weight + FP8 optimizer 消除 BF16 参数
+
+### P2: gemm_gated/gemm_dgated blockscaled kernel
+
+**目标**：fused kernel 原生支持 1x32 scale factor
+
+选项：
+- A: 修改 `gemm_gated.py`/`gemm_dgated.py` 添加 `sf_vec_size` 参数
+- B: 拆分为 `blockscaled_gemm_varlen` + 独立 `swiglu_activation` kernel
+- C: 参考 CUTLASS example 81 (Blackwell blockwise GEMM) 重写
+
+### Not recommended
+
+- 继续投入 grouped/static-capacity blockscaled 路径
+- 在 site-packages 做 runtime patch（必须本地代码）
+
+---
+
+## 7. 环境与命令速查
+
+### 环境激活
 
 ```bash
 source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate
 cd /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe
-USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py
 ```
 
-4. 接着先跑稳定主线，而不是 blockscaled：
+### 合同测试（11 个，全部必须通过）
 
 ```bash
-USE_QUACK_GEMM=1 python benchmarks/moe-cute.py \
-  --thiek 4096,4096,1024,128,8 \
-  --dtype BFloat16 \
-  --activation swiglu \
-  --skip_test \
-  --fp8_protocol blackwell \
-  --report_fp8_metrics \
-  --report_fp8_analysis \
-  --report_stage_memory
+CUDA_VISIBLE_DEVICES=4 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
+  python -m pytest tests/fp8_large_project_contract_test.py -v
 ```
 
----
+### BF16 baseline benchmark
 
-## 9. 下一阶段真正值得做的事
+```bash
+CUDA_VISIBLE_DEVICES=4 USE_QUACK_GEMM=1 python benchmarks/moe-cute.py \
+  --thiek 4096,4096,1024,128,8 --dtype BFloat16 --activation swiglu --skip_test
+```
 
-### P0
+### FP8 benchmark
 
-- 做 `varlen-friendly FP8 epilogue/mainloop`
-- 保住 SonicMoE 内存合同
+```bash
+CUDA_VISIBLE_DEVICES=4 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf python benchmarks/moe-cute.py \
+  --thiek 4096,4096,1024,128,8 --dtype BFloat16 --activation swiglu --skip_test
+```
 
-### P1
+### 精度对比测试
 
-- 继续拆 backward transient overhead
-- 让 large-shape peak 和 e2e 同时稳定优于 bf16
+```python
+# 见 tests/fp8_large_project_contract_test.py 中的 _run_sonicmoe_path()
+# 注意：gold 和 candidate 都在 SONIC_MOE_FP8_MODE=perf 下运行
+# 真正的 BF16 gold 需要 unset SONIC_MOE_FP8_MODE
+```
 
-### P2
+### 关键文件
 
-- 把 static fp8 weight 从 benchmark 合同推进到真实训练合同
-
-### 明确不建议优先做
-
-- 继续把 grouped/static-capacity blockscaled 往默认主线硬推
-
+| 文件 | 作用 |
+|------|------|
+| `sonicmoe/functional/__init__.py` | 核心：所有 MoE forward/backward + FP8 控制 |
+| `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` | Blockscaled FP8 GEMM 基础设施（varlen + grouped） |
+| `sonicmoe/quack_utils/__init__.py` | 导出 blockscaled_fp8_gemm_varlen |
+| `sonicmoe/functional/fp8_protocol.py` | FP8Protocol, FP8ScaleGranularity 定义 |
+| `sonicmoe/functional/fp8_quant.py` | quantize/dequant/round_scale_to_e8m0 |
+| `sonicmoe/functional/fp8_cutely_fused.py` | preact fused quant/dequant |
+| `tests/fp8_large_project_contract_test.py` | 11 个合同测试 |
+| `benchmarks/moe-cute.py` | 性能 benchmark |

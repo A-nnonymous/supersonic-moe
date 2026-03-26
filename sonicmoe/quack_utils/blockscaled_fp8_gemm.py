@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import replace
 from typing import Optional
@@ -11,11 +12,14 @@ from typing import Optional
 import cutlass
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
+import cutlass.utils.blockscaled_layout as _upstream_blockscaled_utils
 import torch
 import triton
 import triton.language as tl
-from cutlass import Float32
+from cutlass import Float32, const_expr
+from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.cute.runtime import from_dlpack
+from cutlass.utils.blockscaled_layout import BlockScaledBasicChunk
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
 from quack.gemm_default_epi import GemmDefaultSm100
 from quack.gemm_interface import default_config
@@ -23,6 +27,51 @@ from quack.gemm_wrapper_utils import GemmTensorInfo, GemmWrapperBase
 
 from ..functional.fp8_protocol import FP8Protocol, FP8ScaleGranularity, validate_fp8_runtime_support
 from ..functional.fp8_quant import quantize_activation_blockwise, round_scale_to_e8m0
+
+
+# ---------------------------------------------------------------------------
+# Rank-aware tile_atom_to_shape_SF
+# ---------------------------------------------------------------------------
+# The upstream CUTLASS DSL function ``tile_atom_to_shape_SF`` hardcodes a
+# 3-element order ``(2, 1, 3)`` which assumes rank-3 tensor shapes.  The
+# varlen_m scheduler produces rank-2 activation tensors ``(total_M, K)``,
+# causing a compile-time rank mismatch.
+#
+# We provide a rank-aware replacement that uses ``(2, 1)`` for rank-2 and
+# ``(2, 1, 3)`` for rank-3 tensors.  This replacement is installed into the
+# upstream module namespace so that ``GemmDefaultSm100.__call__`` (which
+# references ``blockscaled_utils.tile_atom_to_shape_SF``) picks it up at
+# kernel-tracing time.
+# ---------------------------------------------------------------------------
+
+@dsl_user_op
+def _tile_atom_to_shape_SF_rank_aware(
+    Shape: cute.Shape,
+    sf_vec_size: int,
+    *,
+    loc=None,
+    ip=None,
+) -> cute.Layout:
+    """Rank-aware version of ``tile_atom_to_shape_SF``.
+
+    Handles both rank-2 (varlen flat) and rank-3 (grouped/batched) shapes.
+    """
+    rank = cute.rank(Shape)
+    if const_expr(rank == 2):
+        # varlen: (total_M, K) → ((Atom_MN, Rest_MN), (Atom_K, Rest_K))
+        sf_layout = cute.tile_to_shape(
+            BlockScaledBasicChunk(sf_vec_size).layout, Shape, (2, 1)
+        )
+    else:
+        # grouped/batched: (M, K, L) → ((Atom_MN, Rest_MN), (Atom_K, Rest_K), RestL)
+        sf_layout = cute.tile_to_shape(
+            BlockScaledBasicChunk(sf_vec_size).layout, Shape, (2, 1, 3)
+        )
+    return sf_layout
+
+
+# Install into upstream module so GemmDefaultSm100 uses it at trace time.
+_upstream_blockscaled_utils.tile_atom_to_shape_SF = _tile_atom_to_shape_SF_rank_aware
 
 
 _SF_VEC_SIZE = 32
@@ -222,6 +271,96 @@ def prefetch_blockscaled_w2_fp8(
 
     blockscaled_protocol = validate_fp8_runtime_support(_blockscaled_protocol(protocol), device=w2.device)
     return _quantize_w2_cached(w2, blockscaled_protocol)
+
+
+# ---------------------------------------------------------------------------
+# Fast fused blockscaled quantization kernel for flat 2D activations
+# ---------------------------------------------------------------------------
+# Single-pass: read bf16 → compute per-32 amax → E8M0 scale → quantize → write fp8 + scales
+# Replaces the Python quantize_activation_blockwise which does ~8 separate kernel launches.
+
+@triton.jit
+def _quantize_flat_blockscaled_kernel(
+    src_ptr,
+    dst_fp8_ptr,
+    dst_scale_ptr,
+    rows,
+    cols,
+    src_stride_row,
+    src_stride_col,
+    dst_stride_row,
+    dst_stride_col,
+    scale_stride_row,
+    scale_stride_col,
+    fp8_max: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+):
+    """Quantize a flat (M, K) bf16 tensor to blockscaled FP8 with 1×GROUP_SIZE scales."""
+    row_id = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    group_id = tl.program_id(1)
+    col_offsets = group_id * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+
+    row_mask = row_id[:, None] < rows
+    col_mask = col_offsets[None, :] < cols
+    mask = row_mask & col_mask
+
+    src_ptrs = src_ptr + row_id[:, None] * src_stride_row + col_offsets[None, :] * src_stride_col
+    values = tl.load(src_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    block_amax = tl.max(tl.abs(values), axis=1)
+    raw_scale = block_amax / fp8_max
+    positive = raw_scale > 0
+    exponent = tl.where(positive, tl.ceil(tl.log2(tl.where(positive, raw_scale, 1.0))), 0.0)
+    dequant_scale = tl.exp2(exponent)
+    quant_scale = tl.exp2(-exponent)
+
+    quantized = (values * quant_scale[:, None]).to(tl.float8e4nv)
+    dst_ptrs = dst_fp8_ptr + row_id[:, None] * dst_stride_row + col_offsets[None, :] * dst_stride_col
+    tl.store(dst_ptrs, quantized, mask=mask)
+
+    scale_ptrs = dst_scale_ptr + row_id * scale_stride_row + group_id * scale_stride_col
+    # Extract E8M0 exponent: float32 → int32 bitcast → shift right 23 → mask 8 bits
+    scale_i32 = dequant_scale.to(tl.float32).to(tl.int32, bitcast=True)
+    e8m0_byte = ((scale_i32 >> 23) & 0xFF).to(tl.uint8)
+    tl.store(scale_ptrs, e8m0_byte, mask=row_id < rows)
+
+
+def quantize_activation_blockscaled_fast(
+    x: torch.Tensor,
+    group_size: int = 32,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fast fused 1×group_size blockscaled quantization using a single Triton kernel.
+
+    Returns (fp8_data, e8m0_scales).
+    """
+    assert x.is_contiguous(), "Input must be contiguous"
+    M, K = x.shape
+    num_groups = _div_up(K, group_size)
+
+    fp8_out = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=x.device)
+    # Scale stored as uint8 (E8M0 exponent). Will be view-cast to float8_e8m0fnu for CUTLASS.
+    scale_out = torch.empty(M, num_groups, dtype=torch.uint8, device=x.device)
+
+    BLOCK_ROWS = 4
+    grid = (_div_up(M, BLOCK_ROWS), num_groups)
+    _quantize_flat_blockscaled_kernel[grid](
+        x,
+        fp8_out,
+        scale_out,
+        M,
+        K,
+        x.stride(0),
+        x.stride(1),
+        fp8_out.stride(0),
+        fp8_out.stride(1),
+        scale_out.stride(0),
+        scale_out.stride(1),
+        fp8_max=float(torch.finfo(torch.float8_e4m3fn).max),
+        GROUP_SIZE=group_size,
+        BLOCK_ROWS=BLOCK_ROWS,
+    )
+    return fp8_out, scale_out.view(torch.float8_e8m0fnu)
 
 
 @triton.jit
@@ -467,6 +606,7 @@ def blockscaled_fp8_gemm_grouped(
     *,
     protocol: FP8Protocol,
     out_dtype: Optional[torch.dtype] = None,
+    capacity: Optional[int] = None,
 ) -> torch.Tensor:
     protocol = validate_fp8_runtime_support(_blockscaled_protocol(protocol), a.device, quack_enabled=True)
     if get_device_capacity(a.device)[0] != 10:
@@ -483,7 +623,10 @@ def blockscaled_fp8_gemm_grouped(
     if w2.size(0) % _SF_TILE_M != 0:
         raise RuntimeError(f"blockscaled_fp8_gemm requires aligned hidden width multiple of {_SF_TILE_M}")
 
-    expert_capacity = _get_blockscaled_expert_capacity()
+    if capacity is not None:
+        expert_capacity = capacity
+    else:
+        expert_capacity = _get_blockscaled_expert_capacity()
     _validate_blockscaled_capacity(cu_seqlens_m, expert_capacity)
     num_experts = w2.size(2)
     weight_fp8, weight_scales = _quantize_w2_cached(w2, protocol)
@@ -636,32 +779,11 @@ def blockscaled_fp8_gemm_varlen(
     -------
     Tensor (total_M, H) — result of per-expert matmuls.
 
-    Raises
-    ------
-    NotImplementedError
-        The CUTLASS blockscaled kernel (``tile_atom_to_shape_SF``) currently
-        requires 3-D tensor shapes (M, K, L) for the scale-factor layout
-        computation, but the varlen_m path supplies a 2-D activation tensor
-        (total_M, K).  Until the kernel DSL is updated to handle rank-2
-        scale-factor tiling, this combination is not supported.
-
-        Kernel error observed at compile time::
-
-            tile_atom_to_shape_SF → cute.tile_to_shape:
-            "expects target shape and order operands have same rank,
-             but got (?,?) vs (2,1,3)"
-
-        The mismatch is between the 2-D ``mA.shape`` produced by the
-        varlen_m path and the hard-coded 3-element order ``(2,1,3)`` inside
-        ``tile_atom_to_shape_SF``
-        (``cutlass/utils/blockscaled_layout.py:81``).
-
     Notes
     -----
-    The implementation below is complete and correct in intent.  Once the
-    upstream CUTLASS DSL adds rank-aware ``tile_atom_to_shape_SF`` (or a
-    separate ``tile_atom_to_shape_SF_2d``), removing the guard at the top
-    should make this function operational.
+    Uses the rank-aware ``_tile_atom_to_shape_SF_rank_aware`` installed at
+    module load time to handle the 2-D activation tensors produced by the
+    varlen_m scheduler.
     """
     protocol = validate_fp8_runtime_support(_blockscaled_protocol(protocol), a.device, quack_enabled=True)
     if get_device_capacity(a.device)[0] != 10:
@@ -685,12 +807,26 @@ def blockscaled_fp8_gemm_varlen(
         f"cu_seqlens_m length {cu_seqlens_m.shape[0]} != num_experts+1 ({num_experts + 1})"
     )
 
+    # Blockscaled GEMM requires each expert segment ≥ _SF_VEC_SIZE tokens.
+    # Smaller segments corrupt the blockscaled scale-factor tile layout.
+    if not torch.cuda.is_current_stream_capturing():
+        seg_lens = cu_seqlens_m[1:] - cu_seqlens_m[:-1]
+        active = seg_lens > 0
+        if active.any():
+            min_active = int(seg_lens[active].min().item())
+            if min_active < _SF_VEC_SIZE:
+                raise ValueError(
+                    f"blockscaled_fp8_gemm_varlen requires all active expert segments "
+                    f"≥ {_SF_VEC_SIZE} tokens, but min active segment has {min_active}. "
+                    f"Use the bf16 fallback for small per-expert token counts."
+                )
+
     # --- weight quantization (cached, 3D: E×H×I) ---
     weight_fp8, weight_scales = _quantize_w2_cached(w2, protocol)
 
     # --- activation quantization (flat 2D: total_M × K) ---
-    a_fp8, a_scales = quantize_activation_blockwise(a, protocol)
-    packed_a_scales = pack_blockscaled_1x32_scales(a_scales, K)
+    a_fp8, a_scales_raw = quantize_activation_blockscaled_fast(a.contiguous(), group_size=_SF_VEC_SIZE)
+    packed_a_scales = pack_blockscaled_1x32_scales(a_scales_raw, K)
 
     # --- output tensor (flat 2D: total_M × H) ---
     d_dtype = a.dtype if out_dtype is None else out_dtype
@@ -799,29 +935,19 @@ def blockscaled_fp8_gemm_varlen(
             sf_vec_size=_SF_VEC_SIZE,
             gather_A=False,
         )
-        try:
-            compiled = cute.compile(
-                gemm_obj,
-                tensor_infos["A"].cute_tensor,
-                tensor_infos["B"].cute_tensor,
-                tensor_infos["D"].cute_tensor,
-                tensor_infos["C"].cute_tensor,
-                epi_args,
-                scheduler_args,
-                varlen_args,
-                current_stream,
-                a_scale_cute,
-                b_scale_cute,
-            )
-        except (ValueError, Exception) as exc:
-            raise NotImplementedError(
-                "blockscaled FP8 + varlen_m is not yet supported by the CUTLASS kernel. "
-                "The kernel's tile_atom_to_shape_SF (blockscaled_layout.py:81) calls "
-                "cute.tile_to_shape with a hard-coded 3-element order (2,1,3), but the "
-                "varlen_m path provides a 2-D activation tensor (total_M, K). "
-                "Until the upstream CUTLASS DSL adds rank-2 support for blockscaled "
-                "scale-factor tiling, use blockscaled_fp8_gemm_grouped() instead."
-            ) from exc
+        compiled = cute.compile(
+            gemm_obj,
+            tensor_infos["A"].cute_tensor,
+            tensor_infos["B"].cute_tensor,
+            tensor_infos["D"].cute_tensor,
+            tensor_infos["C"].cute_tensor,
+            epi_args,
+            scheduler_args,
+            varlen_args,
+            current_stream,
+            a_scale_cute,
+            b_scale_cute,
+        )
         _COMPILE_CACHE[compile_key] = compiled
 
     compiled(
@@ -839,6 +965,12 @@ def blockscaled_fp8_gemm_varlen(
     return out
 
 
+def _auto_capacity(cu_seqlens_m: torch.Tensor) -> int:
+    """Compute minimum expert capacity aligned to tile boundary from cu_seqlens_m."""
+    max_tokens = int((cu_seqlens_m[1:] - cu_seqlens_m[:-1]).max().item())
+    return int(math.ceil(max_tokens / _SF_TILE_M) * _SF_TILE_M)
+
+
 def blockscaled_fp8_gemm(
     a: torch.Tensor,
     w2: torch.Tensor,
@@ -847,11 +979,13 @@ def blockscaled_fp8_gemm(
     protocol: FP8Protocol,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    capacity = _auto_capacity(cu_seqlens_m)
     grouped_out = blockscaled_fp8_gemm_grouped(
         a,
         w2,
         cu_seqlens_m,
         protocol=protocol,
         out_dtype=(a.dtype if out is None else out.dtype),
+        capacity=capacity,
     )
     return _unpack_grouped_rows(grouped_out, cu_seqlens_m, out=out)
