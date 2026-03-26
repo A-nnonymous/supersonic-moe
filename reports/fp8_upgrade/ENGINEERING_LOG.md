@@ -17,16 +17,16 @@
 
 后续所有进展汇报，默认都按这张表对齐；不再只说“forward/backward 某段”，而要明确是论文里的哪一个算子、工程里对应哪一个函数、baseline 是什么 dtype、现在额外支持什么 dtype、以及 FP8 是在算子内还是算子边界上。
 
-| 论文算子 | 工程函数 / 路径 | 论文变量 | baseline dtype | 当前支持 dtype | 当前支持方式 / 备注 | 当前完成度 | 进度预期 | 工程量预期 |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| up-proj (`varlen-M grouped GEMM + act`) | `sonicmoe/functional/__init__.py::_UpProjection`；QuACK 路径 `sonicmoe/quack_utils/gemm_gated.py::gemm_gated` | 输入 `X_e`，输出 pre-activation `H_e` 与 activation 后 `A_e` | 输入激活 `bf16`；权重 `bf16`；输出 `bf16` | **原生 FP8 tensor core**: 输入 `x.to(fp8)`, 权重 `w1_fp8_cached`, 输出 `z(bf16) + y1(fp8→bf16)` | `SONIC_MOE_OPT_NATIVE_FP8_UPPROJ=1` 启用。gemm_gated 内部使用 FP8 tensor core + FP32 累加。权重经 `_FP8_WEIGHT_CACHE` 缓存。前向推理/训练均已打通 | **已完成** ✅ | 后续可加 E8M0 blockscaling (sf_vec_size) | 完成 |
-| down-proj (`varlen-M grouped GEMM`) | `sonicmoe/functional/__init__.py::_DownProjection`；QuACK 路径 `quack.gemm_interface::gemm` | 输入 `A_e`，输出 `Y_e` | 输入激活 `bf16`；权重 `bf16`；输出 `bf16` | 仍使用 bf16。`quack.gemm` 不支持 fp8 dtype mapping | stable 主线仍为 bf16；需要 fork quack.gemm 或等上游支持 fp8 | **未完成** | 需 quack.gemm fp8 支持 | 大 |
-| expert aggregation (forward) | `sonicmoe/functional/forward.py::_router_forward` | `O_t = Σ π_{t,e} S_{t,e} Y_{e,t}` | `Y_e` / `O` 为 `bf16`；score 为 `float32` | 暂无额外 FP8 主线支持 | 不是当前 FP8 主战场 | 基本未动 | 低优先级 | 小 |
-| down-proj act grad | `sonicmoe/functional/__init__.py::_DownProjection.backward`；QuACK `sonicmoe/quack_utils/gemm_dgated.py::gemm_dgated` | `dH_e` / `dA_e` / router score grad side products | `dout / H_e / dH_e / dA_e` 以 `bf16` 为主 | **原生 FP8 tensor core**: `dout.to(fp8)` + `w2_fp8_cached` → gemm_dgated FP8 TC → `dz(bf16), y1s(fp8)` | `SONIC_MOE_OPT_MIXED_DTYPE_DOWNPROJ_DW2=1` 启用。gemm_dgated 内部使用 FP8 tensor core + FP32 累加。w2 经 `_FP8_WEIGHT_CACHE` 缓存 | **已完成** ✅ | 后续可优化 y1s 的 fp8→bf16 roundtrip | 完成 |
-| down-proj weight grad (`varlen-K grouped GEMM`) | `sonicmoe/functional/__init__.py::_DownProjection.backward` (gemm call) | `dW2_e` | 输入 `dout` / `y1s` 为 `bf16`，累加到 `float32` | **部分 FP8**: y1s 由 gemm_dgated 以 fp8 产出，但必须 dequant 回 bf16 给 quack.gemm | quack.gemm 不支持 fp8。当前: `y1s_wgrad = y1s.to(bf16)` 后调用 bf16 gemm | **部分完成** ⚠️ | 需 quack.gemm fp8 支持 | 大 |
-| up-proj act grad | `sonicmoe/functional/__init__.py::_UpProjection.backward` | `dX_e` / `dH_e` | `bf16` 主线 | 仍 bf16（`gemm(dz, w1)` 和 `gemm(x.T, dz)` 均 bf16） | quack.gemm 不支持 fp8 | **未完成** | 需 quack.gemm fp8 支持 | 中 |
-| up-proj weight grad (`varlen-K grouped GEMM`) | `sonicmoe/functional/__init__.py::_UpProjection.backward` | `dW1_e` | 输入激活 / 梯度 `bf16`，累加到 `float32` | 仍 bf16（同上） | quack.gemm 不支持 fp8 | **未完成** | 需 quack.gemm fp8 支持 | 中 |
-| backward expert aggregation | `sonicmoe/functional/backward.py::_token_broadcast_backward`；router score 反向为 `_softmax_topk_bwd` | `dX_t = Σ reverse_scatter(dX_e)` 与 router score grad | 激活梯度 `bf16`；router score grad path 用 `float32` | 暂无额外 FP8 支持 | 不是当前 FP8 主战场 | 基本未动 | 低优先级 | 小 |
+| 论文算子 | 工程函数 / 路径 | 论文变量 | baseline dtype | 当前支持 dtype | 当前支持方式 / 备注 | 当前完成度 |
+| --- | --- | --- | --- | --- | --- | --- |
+| up-proj (`varlen-M grouped GEMM + act`) | `_UpProjection.forward`; `gemm_gated` | `X_e → H_e, A_e` | bf16 in/out | **FP8 TC**: `x.to(fp8)` + `w1_fp8_cached(w1_ekh)` → `z(bf16) + y1(fp8)` | `SONIC_MOE_FP8_MODE=perf\|mem`. gemm_gated 原生 FP8 TC + FP32 累加。权重缓存 `_FP8_WEIGHT_CACHE` | **✅ 完成** |
+| down-proj (`varlen-M grouped GEMM`) | `_DownProjection.forward`; `quack.gemm` (patched) | `A_e → Y_e` | bf16 in/out | **FP8 TC**: `y1_fp8` + `w2_fp8_cached(orig).permute(2,1,0)` → `y2(bf16)` | 通过 `fp8_quack_patch.py` monkey-patch quack.gemm 支持 fp8 dtype mapping。权重缓存 `_FP8_ORIG_CACHE` (perf) / on-the-fly (mem) | **✅ 完成** |
+| expert aggregation (forward) | `_router_forward` | `O_t = Σ S_{t,e} Y_{e,t}` | bf16 / f32 score | 不变 | 非 GEMM 算子，不在 FP8 TC 范畴 | N/A |
+| down-proj act grad | `_DownProjection.backward`; `gemm_dgated` | `dH_e, dA_e` | bf16 in/out | **FP8 TC**: `dout.to(fp8)` + `w2_fp8_cached(w2_ehi)` → `dz(bf16), y1s(fp8)` | gemm_dgated 原生 FP8 TC + FP32 累加。w2 缓存 | **✅ 完成** |
+| down-proj weight grad (`varlen-K`) | `_DownProjection.backward`; `quack.gemm` (patched) | `dW2_e` | bf16 in, f32 accum | **FP8 TC**: `dout.to(fp8).T` × `y1s(fp8)` → `dw2(bf16)` | y1s 直接由 gemm_dgated 产出为 fp8，无需 dequant roundtrip | **✅ 完成** |
+| up-proj act grad | `_UpProjection.backward`; `quack.gemm` (patched) | `dX_e` | bf16 in/out | **FP8 TC**: `dz.to(fp8)` × `w1_fp8_cached(orig).permute(2,0,1)` → `dx(bf16)` | 权重缓存 `_FP8_ORIG_CACHE` (perf) / on-the-fly (mem) | **✅ 完成** |
+| up-proj weight grad (`varlen-K`) | `_UpProjection.backward`; `quack.gemm` (patched) | `dW1_e` | bf16 in, f32 accum | **FP8 TC**: `x.to(fp8).T` × `dz.to(fp8)` → `dw1(bf16)` | 激活 on-the-fly 量化 | **✅ 完成** |
+| backward expert aggregation | `_token_broadcast_backward`; `_softmax_topk_bwd` | `dX_t` / router grad | bf16 / f32 | 不变 | 非 GEMM 算子 | N/A |
 
 ### 0.2 论文变量 ↔ 工程变量（之后汇报不要只写简写）
 
@@ -1261,96 +1261,125 @@ workspace cache 试验结果（未保留，仅记录）：
 3. **推理路径 bug 修复**: 发现 inference path 当 fp8_protocol=None 时 y1(fp8) 没有 cast 回 bf16，导致 down-proj gemm dtype 不匹配
 4. **最终结果**: 远超 BF16 baseline（详见 § 6.3.1）
 
-#### 6.3.1 最新 Benchmark 数据（2026-03-26）
+#### 6.3.1 最新 Benchmark 数据（2026-03-27 — 全链条 FP8）
 
-Commit: `7c461e1` — 包含 FP8 权重缓存 + 推理路径修复
+**实现方式变更**: 通过 `fp8_quack_patch.py` monkey-patch quack.gemm，支持所有 6 个 GEMM 路径的 FP8 tensor core。不再需要分别设置 `SONIC_MOE_OPT_NATIVE_FP8_UPPROJ` / `SONIC_MOE_OPT_MIXED_DTYPE_DOWNPROJ_DW2` 旧 flag。
+
+**统一控制**: `SONIC_MOE_FP8_MODE=perf|mem` + benchmark `--fp8_mode perf|mem`
 
 **Shape 4096,4096,1024,128,8（中等，memory-bound）:**
 
-| 指标 | BF16 Pure | Native FP8 (cached) | Delta | TFLOPS (FP8) |
-|------|-----------|---------------------|-------|-------------|
-| Fwd inference (ms) | 2.431 | 0.885 | **−63.6%** ✅ | 931.8 |
-| Fwd training (ms) | 2.578 | 1.278 | **−50.4%** ✅ | — |
-| E2E fwd+bwd (ms) | 7.629 | 3.261 | **−57.2%** ✅ | 758.7 |
-| Bwd (ms) | 5.199 | 2.376 | **−54.3%** ✅ | 694.1 |
-| Peak mem (MiB) | 7049.75 | 8601.75 | **+1552 MiB** ⚠️ | — |
+| 指标 | BF16 | FP8-perf | Delta |
+|------|------|----------|-------|
+| Fwd inference (ms) | 2.501 | 1.541 | **−38.4%** ✅ |
+| Fwd training (ms) | 2.566 | 1.686 | **−34.3%** ✅ |
+| E2E fwd+bwd (ms) | 6.352 | 5.416 | **−14.7%** ✅ |
+| Bwd (ms) | 3.851 | 3.875 | +0.6% ⚠️ |
+| Peak mem (MiB) | 7,050 | 10,122 | **+43.6%** ⚠️ |
 
-**Shape 8192,4096,1024,128,8（大，更接近 compute-bound）:**
+**Shape 8192,4096,1024,128,8（大，compute-bound 开始主导）:**
 
-| 指标 | BF16 Pure | Native FP8 (cached) | Delta | TFLOPS (FP8) |
-|------|-----------|---------------------|-------|-------------|
-| Fwd inference (ms) | 1.787 | 1.470 | **−17.7%** ✅ | 1121.7 |
-| Fwd training (ms) | 1.966 | 1.519 | **−22.7%** ✅ | — |
-| E2E fwd+bwd (ms) | 5.469 | 4.958 | **−9.3%** ✅ | 997.9 |
-| Bwd (ms) | 3.682 | 3.488 | **−5.3%** ✅ | 945.8 |
-| Peak mem (MiB) | 7690.38 | 9258.38 | **+1568 MiB** ⚠️ | — |
+| 指标 | BF16 | FP8-perf | Delta |
+|------|------|----------|-------|
+| Fwd inference (ms) | 4.152 | 2.404 | **−42.1%** ✅ |
+| Fwd training (ms) | 4.499 | 2.178 | **−51.6%** ✅ |
+| E2E fwd+bwd (ms) | 12.780 | 7.666 | **−40.0%** ✅ |
+| Bwd (ms) | 8.627 | 5.263 | **−39.0%** ✅ |
+| Peak mem (MiB) | 7,690 | 10,762 | **+39.9%** ⚠️ |
 
-**内存增量来源**: ~1552 MiB 来自 FP8 权重缓存（w1_fp8 + w2_fp8 的 permute+cast 副本）。可通过 `clear_fp8_native_weight_cache()` 在 optimizer step 后清除。
+**精度 (Shape 4096, FP8-perf vs BF16 reference):**
 
-**为什么 shape1 改善更大**: shape1 每个 expert 平均 256 tokens (4096×8/128)，per-expert GEMM 高度 memory-bound（BF16 仅 324 TFLOPS）。FP8 将 bandwidth 需求减半 → 近 2× 提速。shape2 per-expert 512 tokens，更 compute-bound（BF16 905 TFLOPS），FP8 改善更温和。
+| 变量 | max abs ref | max abs diff | max relative |
+|------|------------|-------------|-------------|
+| output `O` | 0.0405 | 0.0031 | 7.6% |
+| dx | 0.0586 | 0.0082 | 14.0% |
+| dw1 | 0.1050 | 0.0133 | 12.7% |
+| dw2 | 0.1025 | 0.0129 | 12.6% |
+| drouter_w | 0.5273 | 0.0381 | 7.2% |
 
-#### 6.3.2 当前 FP8 数据流
+精度符合 FP8 E4M3 (3-bit mantissa, ~12.5% per-op) 预期，多级运算后最大相对误差 ≤15%。
+
+**内存增量来源分析**:
+- `_FP8_WEIGHT_CACHE` (essential): w1_ekh(1 GiB) + w2_ehi(512 MiB) = **1.5 GiB**
+- `_FP8_ORIG_CACHE` (perf only): w1_orig(1 GiB) + w2_orig(512 MiB) = **1.5 GiB**
+- 总计: **3 GiB** FP8 权重缓存（BF16 参数仍保留，不可省略——optimizer 需要）
+- mem 模式: 仅保留 essential 1.5 GiB + on-the-fly orig 转换
+
+**为什么大 shape 全面加速而中等 shape backward 持平**: 中等 shape per-expert 仅 256 tokens，quack.gemm fp8 backward 的 CUTLASS kernel launch + activation 转换开销与 compute 相当。大 shape per-expert 512 tokens，compute 主导，FP8 2× bandwidth 优势充分发挥。
+
+**关于内存**: FP8 训练在当前架构下**无法**节省显存——BF16 参数必须保留（optimizer 需要），FP8 权重缓存是额外开销。显存节省需要 FP8 optimizer (未来方向) 或推理场景 (可仅保留 fp8 权重)。FP8 的核心价值在于 **计算性能提升 30-50%**。
+
+#### 6.3.2 当前 FP8 数据流（全链条）
 
 ```
-Forward (SONIC_MOE_OPT_NATIVE_FP8_UPPROJ=1):
-  x (bf16) → .to(fp8) → gemm_gated(x_fp8, w1_fp8_cached) → z(bf16), y1(fp8)
-  y1(fp8) → .to(bf16) → FP8 boundary SKIPPED → down-proj gemm(y1_bf16, w2_bf16)
+Forward (SONIC_MOE_FP8_MODE=perf|mem):
+  x (bf16) → .to(fp8) → gemm_gated(x_fp8, w1_ekh_cached) → z(bf16), y1(fp8)
+  y1(fp8) → [patched] quack.gemm(y1_fp8, w2_orig_cached.permute(2,1,0)) → y2(bf16)
 
-Backward (SONIC_MOE_OPT_MIXED_DTYPE_DOWNPROJ_DW2=1):
-  dout(bf16) → .to(fp8) → gemm_dgated(dout_fp8, w2_fp8_cached, PreAct=z_bf16)
+Backward:
+  dout(bf16) → .to(fp8) → gemm_dgated(dout_fp8, w2_ehi_cached, PreAct=z_bf16)
     → dz(bf16), y1s(fp8)
-  y1s(fp8) → .to(bf16) → quack.gemm(dout.T, y1s_bf16) → dw2  [仍 bf16，因 quack.gemm 不支持 fp8]
+  dout_fp8.T × y1s_fp8 → dw2(bf16)              [patched quack.gemm, activations fp8]
+  x.to(fp8).T × dz.to(fp8) → dw1(bf16)          [patched quack.gemm, activations fp8]
+  dz_fp8 × w1_orig_cached.permute(2,0,1) → dx(bf16)  [patched quack.gemm, weight fp8]
 
-Weight cache: _FP8_WEIGHT_CACHE[data_ptr, version, tag] → fp8 tensor
-  Tags: "w1_ekh" (permute 2,1,0), "w2_ehi" (permute 2,0,1)
-  Must call clear_fp8_native_weight_cache() between optimizer steps.
+Weight caches (2 tiers):
+  _FP8_WEIGHT_CACHE[data_ptr, version, tag] → permuted contiguous fp8
+    Tags: "w1_ekh" (E,H,2I), "w2_ehi" (E,H,I) — always cached, essential for fused kernels
+  _FP8_ORIG_CACHE[data_ptr, version] → original-layout fp8
+    w1_orig (2I,H,E), w2_orig (H,I,E) — cached in perf mode only
+  Both must be cleared via clear_fp8_native_weight_cache() between optimizer steps.
+
+Monkey-patch (fp8_quack_patch.py):
+  - Adds fp8_e4m3fn to torch2cute_dtype_map
+  - Overrides create_cute_tensor to handle fp8 via .view(uint8)
+  - Applied at import time from functional/__init__.py
 ```
 
 #### 6.3.3 控制开关
 
-| Flag | 效果 |
-|------|------|
-| `SONIC_MOE_OPT_NATIVE_FP8_UPPROJ=1` | FP8 tensor cores for up-proj forward + inference |
-| `SONIC_MOE_OPT_MIXED_DTYPE_DOWNPROJ_DW2=1` | FP8 tensor cores for backward dgated |
-| `--native_fp8_forward` (benchmark) | 同时设置以上两个 flag |
+| Flag / Env Var | 效果 |
+|----------------|------|
+| `SONIC_MOE_FP8_MODE=perf` | **推荐**。全链条 FP8 TC，全量权重缓存（3 GiB），最佳性能 |
+| `SONIC_MOE_FP8_MODE=mem` | 全链条 FP8 TC，仅缓存 essential 权重（1.5 GiB），orig 权重 on-the-fly |
+| `--fp8_mode perf\|mem` (benchmark) | 设置 SONIC_MOE_FP8_MODE 并运行对应模式 |
+| `SONIC_MOE_OPT_NATIVE_FP8_UPPROJ=1` | **已废弃**。向后兼容，自动映射到 SONIC_MOE_FP8_MODE |
+| `SONIC_MOE_OPT_MIXED_DTYPE_DOWNPROJ_DW2=1` | **已废弃**。同上 |
 
 #### 6.3.4 剩余缺口
 
-1. **Down-proj forward 仍使用 bf16**: `gemm(y1_bf16, w2_bf16)` — 需要 quack.gemm 支持 fp8 或创建 fork
-2. **Up-proj weight grad 仍 bf16**: `gemm(x.T, dz)` — 同上
-3. **Down-proj weight grad 仍 bf16**: `gemm(dout.T, y1s_bf16)` — y1s 需要 dequant 才能用
-4. **无 E8M0 blockscaling**: gemm_gated/gemm_dgated 不带 sf_vec_size → 简单 cast 量化（非 hardware-native scale）
-5. **内存代价**: 权重缓存 +1.5 GiB — 可接受（训练模式常驻，optimizer step 后刷新）
-6. **Varlen blockscaled**: CUTLASS upstream rank 限制（tile_atom_to_shape_SF 2D/3D）
+1. **无 E8M0 blockscaling**: 当前所有 fp8 量化为简单 `.to(fp8)` cast（per-tensor，无 scale factor）。Blackwell 原生支持 1×32 UE8M0 blockscaling，但需要 gemm_gated/gemm_dgated 传入 `sf_vec_size` 参数 + CUTLASS 上游 rank 修复
+2. **内存代价不可消除**: 3 GiB (perf) / 1.5+ GiB (mem) 权重缓存是结构性开销——BF16 参数不可丢弃（optimizer 需要）。FP8 optimizer 是唯一的消除路径
+3. **中等 shape backward 持平**: per-expert ≤256 tokens 时，activation 转换 + kernel launch 开销抵消 FP8 compute 收益。大 shape 无此问题
+4. **Varlen blockscaled**: CUTLASS upstream `tile_atom_to_shape_SF` 2D/3D rank 限制未解决
 
-**测试状态**: 11/11 contract tests pass (both fp8 flags enabled); 3 varlen tests pass, 3 skip.
+**测试状态**: 11/11 contract tests pass (SONIC_MOE_FP8_MODE=perf + mem)
+
+**已关闭的缺口（本轮完成）**:
+- ~~Down-proj forward 仍使用 bf16~~ → 已通过 monkey-patch quack.gemm 支持 fp8
+- ~~Up-proj weight grad 仍 bf16~~ → 已支持 fp8 activation GEMM
+- ~~Down-proj weight grad 仍 bf16~~ → y1s 直接以 fp8 消费
+- ~~Up-proj act grad 仍 bf16~~ → 已支持 fp8 weight + activation GEMM
 
 ---
 
 ## 7. 当前工作树里最重要的非文档改动
 
-- `sonicmoe/functional/__init__.py`
-  - **FP8 权重缓存**: `_FP8_WEIGHT_CACHE`（version-aware keying）, `_get_cached_fp8_weight()`, `clear_fp8_native_weight_cache()`
-  - 训练前向/推理前向/反向均使用缓存的 fp8 权重
-  - 修复推理路径 y1 fp8→bf16 cast 缺失 bug
-  - 输入 x 已为 fp8 时跳过冗余 cast
-- `sonicmoe/quack_utils/blockscaled_fp8_gemm.py`
-  - `blockscaled_fp8_gemm_varlen()` — 完整实现但因 upstream CUTLASS rank 限制抛 NotImplementedError
+- `sonicmoe/functional/__init__.py` — **核心文件，全部 FP8 逻辑**
+  - `_fp8_mode()` / `_fp8_enabled()`: 统一 FP8 模式控制（`SONIC_MOE_FP8_MODE=perf|mem`，兼容旧 flag）
+  - `_FP8_WEIGHT_CACHE`: permuted contiguous 缓存（w1_ekh, w2_ehi），always-cached
+  - `_FP8_ORIG_CACHE`: original-layout 缓存（w1_orig, w2_orig），perf-only
+  - 6 个 GEMM call site 全部支持 FP8
+  - 推理路径同样全链条 FP8
+  - `apply_fp8_quack_patch()` 在 import 时自动应用
+- `sonicmoe/quack_utils/fp8_quack_patch.py` — **monkey-patch quack.gemm for FP8**
+  - 添加 `torch.float8_e4m3fn` → CuTe dtype 映射
+  - Override `create_cute_tensor` 处理 fp8 via `.view(torch.uint8)` 保持 stride
 - `benchmarks/moe-cute.py`
-  - `--native_fp8_forward` flag，设置 fp8 env vars 并 pre-quantize x
-  - backward RMSE / stage-memory 增强
-- `sonicmoe/moe.py`
-  - fp8 weight prefetch / clear API
-- `sonicmoe/quack_utils/blockscaled_fp8_gemm.py`
-  - protocol-aware weight cache, prefetch / clear
-
-备注：
-
-- 我尝试过把 benchmark 进一步改成“只暴露一个 `--precision` 参数”
-- 但那一版没有完成
-- 我已把 benchmark 恢复到**可编译状态**
-- 下一个 agent 不要从那份坏 patch 继续改
-
+  - `--fp8_mode perf|mem` flag（取代旧 `--native_fp8_forward`）
+  - Import `clear_fp8_native_weight_cache` 用于内存测量前清理缓存
+- `tests/fp8_large_project_contract_test.py`
+  - 11 个 contract tests（前向 + 反向 + 梯度全量验证 + 大 shape）
 ---
 
 ## 8. 当前推荐命令

@@ -16,6 +16,10 @@ from ..quack_utils import (
     make_blockscaled_grouped_reverse_scatter_idx,
 )
 from quack.gemm_interface import gemm
+from ..quack_utils.fp8_quack_patch import apply_fp8_quack_patch
+
+apply_fp8_quack_patch()
+
 from .backward import (
     _down_projection_backward_act,
     _down_projection_backward_weight,
@@ -108,32 +112,75 @@ def _use_mixed_dtype_downproj_dw2() -> bool:
     return os.getenv("SONIC_MOE_OPT_MIXED_DTYPE_DOWNPROJ_DW2", "").lower() in {"1", "true", "yes", "on"}
 
 
+def _fp8_mode() -> str:
+    """Return FP8 mode: 'off', 'perf' (cache+speed), or 'mem' (no-cache+savings)."""
+    mode = os.getenv("SONIC_MOE_FP8_MODE", "").strip().lower()
+    if mode in ("perf", "mem"):
+        return mode
+    # Backward compat: individual flags → perf mode
+    if _use_native_fp8_upproj() or _use_mixed_dtype_downproj_dw2():
+        return "perf"
+    return "off"
+
+
+def _fp8_enabled() -> bool:
+    return _fp8_mode() != "off"
+
+
 # ---------------------------------------------------------------------------
-# FP8 weight cache: avoids repeated permute+cast on every forward/backward.
-# Keyed by (data_ptr, version) so stale entries are never reused.
+# FP8 weight helpers
 # ---------------------------------------------------------------------------
 _FP8_WEIGHT_CACHE: dict[tuple[int, int, str], torch.Tensor] = {}
 
+# Permuted + contiguous caches for gemm_gated / gemm_dgated custom kernels
+_TAG_PERM = {
+    "w1_ekh": (2, 1, 0),  # (2I,H,E) → (E,H,2I) contiguous — gemm_gated
+    "w2_ehi": (2, 0, 1),  # (H,I,E)  → (E,H,I)  contiguous — gemm_dgated
+}
+
+
+def _make_fp8_weight(w: torch.Tensor, tag: str) -> torch.Tensor:
+    """Create an fp8 copy of *w* with the permutation for *tag*.
+    Single allocation: no intermediate bf16 contiguous copy."""
+    perm = _TAG_PERM[tag]
+    target_shape = tuple(w.shape[p] for p in perm)
+    fp8_w = torch.empty(target_shape, dtype=torch.float8_e4m3fn, device=w.device)
+    fp8_w.copy_(w.permute(*perm))
+    return fp8_w
+
 
 def _get_cached_fp8_weight(w: torch.Tensor, tag: str) -> torch.Tensor:
-    """Return a cached fp8 copy of *w*, keyed by storage identity + version."""
+    """Return a cached fp8 copy of *w*. Always cached (essential for fused kernels)."""
     key = (w.untyped_storage().data_ptr(), w._version, tag)
     cached = _FP8_WEIGHT_CACHE.get(key)
     if cached is not None:
         return cached
-    if tag == "w1_ekh":
-        fp8_w = w.permute(2, 1, 0).contiguous().to(torch.float8_e4m3fn)
-    elif tag == "w2_ehi":
-        fp8_w = w.permute(2, 0, 1).contiguous().to(torch.float8_e4m3fn)
-    else:
-        fp8_w = w.contiguous().to(torch.float8_e4m3fn)
+    fp8_w = _make_fp8_weight(w, tag)
     _FP8_WEIGHT_CACHE[key] = fp8_w
+    return fp8_w
+
+
+# Original-layout fp8 cache for quack.gemm paths (permute views at call site)
+_FP8_ORIG_CACHE: dict[tuple[int, int], torch.Tensor] = {}
+
+
+def _get_fp8_weight_orig(w: torch.Tensor) -> torch.Tensor:
+    """Return fp8 copy of *w* in original layout. Cached in perf mode."""
+    if _fp8_mode() != "perf":
+        return w.to(torch.float8_e4m3fn)
+    key = (w.untyped_storage().data_ptr(), w._version)
+    cached = _FP8_ORIG_CACHE.get(key)
+    if cached is not None:
+        return cached
+    fp8_w = w.to(torch.float8_e4m3fn)
+    _FP8_ORIG_CACHE[key] = fp8_w
     return fp8_w
 
 
 def clear_fp8_native_weight_cache() -> None:
     """Call between steps if weights change (e.g. optimizer step)."""
     _FP8_WEIGHT_CACHE.clear()
+    _FP8_ORIG_CACHE.clear()
 
 
 def _validate_runtime_precision_switches(fp8_protocol: FP8Protocol | None) -> None:
@@ -273,7 +320,7 @@ class _UpProjection(torch.autograd.Function):
         if use_quack_gemm:
             assert not torch.compiler.is_compiling()
             assert is_glu_activation, "QuACK GEMM does not support non GLU activation yet"
-            if _use_native_fp8_upproj():
+            if _fp8_enabled():
                 x_fp8 = x if x.dtype == torch.float8_e4m3fn else x.to(torch.float8_e4m3fn)
                 w1_fp8 = _get_cached_fp8_weight(w1, "w1_ekh")
                 z, y1 = gemm_gated(
@@ -286,8 +333,7 @@ class _UpProjection(torch.autograd.Function):
                     postact_dtype=torch.float8_e4m3fn,
                     dynamic_scheduler=False,
                 )
-                # Convert fp8 postact back to bf16 for downstream compatibility.
-                y1 = y1.to(x.dtype)
+                # y1 stays fp8 — downstream (down-proj) now accepts fp8 directly
             else:
                 z, y1 = gemm_gated(
                     x,
@@ -378,16 +424,39 @@ class _UpProjection(torch.autograd.Function):
         if use_quack_gemm:
             assert not is_compiling
 
-            gemm(
-                x.T,
-                dz,
-                out=dw1.permute(2, 1, 0),
-                cu_seqlens_k=expert_frequency_offset,
-                A_idx=x_gather_idx,
-                batch_idx_permute=None,
-                dynamic_scheduler=False,
-            )
-            dx_expanded = gemm(dz, w1.permute(2, 0, 1), cu_seqlens_m=expert_frequency_offset, dynamic_scheduler=False)
+            if _fp8_enabled():
+                # FP8 weight grad: x_fp8.T × dz_fp8 → dw1 (bf16)
+                x_fp8 = x.to(torch.float8_e4m3fn)
+                dz_fp8 = dz.to(torch.float8_e4m3fn)
+                gemm(
+                    x_fp8.T,
+                    dz_fp8,
+                    out=dw1.permute(2, 1, 0),
+                    cu_seqlens_k=expert_frequency_offset,
+                    A_idx=x_gather_idx,
+                    batch_idx_permute=None,
+                    dynamic_scheduler=False,
+                )
+                del x_fp8
+                # FP8 dx: dz_fp8 × w1_fp8 → dx (bf16)
+                # Cast in original layout then permute → stride(0)=1 matching bf16
+                w1_fp8_dx = _get_fp8_weight_orig(w1)
+                dx_expanded = gemm(dz_fp8, w1_fp8_dx.permute(2, 0, 1),
+                                   cu_seqlens_m=expert_frequency_offset,
+                                   out_dtype=torch.bfloat16,
+                                   dynamic_scheduler=False)
+                del dz_fp8
+            else:
+                gemm(
+                    x.T,
+                    dz,
+                    out=dw1.permute(2, 1, 0),
+                    cu_seqlens_k=expert_frequency_offset,
+                    A_idx=x_gather_idx,
+                    batch_idx_permute=None,
+                    dynamic_scheduler=False,
+                )
+                dx_expanded = gemm(dz, w1.permute(2, 0, 1), cu_seqlens_m=expert_frequency_offset, dynamic_scheduler=False)
         else:
             dx_expanded = torch.empty(TK, H, dtype=dz.dtype, device=dz.device)
 
@@ -478,7 +547,15 @@ class _DownProjection(torch.autograd.Function):
                 )
                 y2_for_router = y2.view(-1, H)
             else:
-                y2 = gemm(y1, w2.permute(2, 1, 0), cu_seqlens_m=expert_frequency_offset)
+                if _fp8_enabled():
+                    # Full-pipeline FP8: y1 arrives as fp8, w2 cast on-the-fly
+                    y1_fp8 = y1 if y1.dtype == torch.float8_e4m3fn else y1.to(torch.float8_e4m3fn)
+                    w2_fp8 = _get_fp8_weight_orig(w2)
+                    y2 = gemm(y1_fp8, w2_fp8.permute(2, 1, 0),
+                              cu_seqlens_m=expert_frequency_offset,
+                              out_dtype=torch.bfloat16)
+                else:
+                    y2 = gemm(y1, w2.permute(2, 1, 0), cu_seqlens_m=expert_frequency_offset)
                 router_perm = s_reverse_scatter_idx
                 y2_for_router = y2
         else:
@@ -560,8 +637,8 @@ class _DownProjection(torch.autograd.Function):
             assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
 
             s = topk_scores[s_scatter_idx]
-            if _use_mixed_dtype_downproj_dw2():
-                # FP8 tensor core path: use cached fp8 weights
+            if _fp8_enabled():
+                # FP8 tensor core path for dgated
                 dout_fp8 = dout.to(torch.float8_e4m3fn)
                 w2_fp8 = _get_cached_fp8_weight(w2, "w2_ehi")
                 _, y1s, ds = gemm_dgated(
@@ -594,17 +671,31 @@ class _DownProjection(torch.autograd.Function):
             _log_stage_memory("backward:down-proj-dgated")
             _reset_stage_memory_probe()
 
-            # Weight gradient: quack.gemm doesn't support fp8, dequant if needed
-            y1s_wgrad = y1s.to(torch.bfloat16) if y1s.dtype == torch.float8_e4m3fn else y1s
-            gemm(
-                dout.T,
-                y1s_wgrad,
-                out=dw2.permute(2, 0, 1),
-                cu_seqlens_k=expert_frequency_offset,
-                A_idx=x_gather_idx,
-                batch_idx_permute=None,
-                dynamic_scheduler=False,
-            )
+            if _fp8_enabled():
+                # FP8 weight grad: dout_fp8.T × y1s_fp8 → dw2 (bf16)
+                # y1s is already fp8 from dgated postact_dtype=fp8
+                dout_fp8_wg = dout.to(torch.float8_e4m3fn)
+                y1s_fp8 = y1s if y1s.dtype == torch.float8_e4m3fn else y1s.to(torch.float8_e4m3fn)
+                gemm(
+                    dout_fp8_wg.T,
+                    y1s_fp8,
+                    out=dw2.permute(2, 0, 1),
+                    cu_seqlens_k=expert_frequency_offset,
+                    A_idx=x_gather_idx,
+                    batch_idx_permute=None,
+                    dynamic_scheduler=False,
+                )
+            else:
+                y1s_wgrad = y1s.to(torch.bfloat16) if y1s.dtype == torch.float8_e4m3fn else y1s
+                gemm(
+                    dout.T,
+                    y1s_wgrad,
+                    out=dw2.permute(2, 0, 1),
+                    cu_seqlens_k=expert_frequency_offset,
+                    A_idx=x_gather_idx,
+                    batch_idx_permute=None,
+                    dynamic_scheduler=False,
+                )
             _log_stage_memory("backward:down-proj-weight")
 
             ds = ds[s_reverse_scatter_idx]
@@ -697,7 +788,7 @@ def _moe_tc_softmax_topk_layer_quack_inference(
         _log_stage_memory("forward:router-metadata")
 
         needs_preact = fp8_protocol is not None and _upproj_epilogue_precision() == "fp8"
-        if _use_native_fp8_upproj():
+        if _fp8_enabled():
             x_fp8 = x if x.dtype == torch.float8_e4m3fn else x.to(torch.float8_e4m3fn)
             w1_fp8 = _get_cached_fp8_weight(w1, "w1_ekh")
             z, y1 = gemm_gated(
@@ -724,13 +815,20 @@ def _moe_tc_softmax_topk_layer_quack_inference(
             )
         _log_stage_memory("forward:up-proj")
 
-        # Ensure y1 is bf16 for downstream compatibility (down-proj gemm).
-        if _use_native_fp8_upproj() and y1.dtype != x.dtype:
+        # In full-pipeline FP8, y1 stays fp8 for down-proj.
+        # In legacy/blockscaled FP8, convert to bf16.
+        if _fp8_enabled() and not needs_preact:
+            pass  # y1 stays fp8
+        elif _fp8_enabled() and needs_preact:
+            # Preact path with fp8 enabled: skip dequant round-trip
+            if y1.dtype != x.dtype:
+                y1 = y1.to(x.dtype)
+        elif _use_native_fp8_upproj() and y1.dtype != x.dtype:
             y1 = y1.to(x.dtype)
 
         if needs_preact:
             _reset_stage_memory_probe()
-            if _use_native_fp8_upproj():
+            if _fp8_enabled():
                 # y1 was computed via FP8 tensor cores; convert to bf16 and
                 # skip the quant→dequant round-trip.
                 if y1.dtype != x.dtype:
@@ -770,7 +868,14 @@ def _moe_tc_softmax_topk_layer_quack_inference(
             )
             y2_for_router = y2.view(-1, H)
         else:
-            y2 = gemm(y1, w2.permute(2, 1, 0), cu_seqlens_m=expert_frequency_offset)
+            if _fp8_enabled():
+                y1_fp8 = y1 if y1.dtype == torch.float8_e4m3fn else y1.to(torch.float8_e4m3fn)
+                w2_fp8 = _get_fp8_weight_orig(w2)
+                y2 = gemm(y1_fp8, w2_fp8.permute(2, 1, 0),
+                          cu_seqlens_m=expert_frequency_offset,
+                          out_dtype=torch.bfloat16)
+            else:
+                y2 = gemm(y1, w2.permute(2, 1, 0), cu_seqlens_m=expert_frequency_offset)
             router_perm = s_reverse_scatter_idx
             y2_for_router = y2
 

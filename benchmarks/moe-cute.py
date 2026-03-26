@@ -21,6 +21,7 @@ from triton.testing import do_bench
 from sonicmoe import MoE, get_default_fp8_protocol
 from sonicmoe.enums import ActivationType, is_glu
 from sonicmoe.functional import moe_TC_softmax_topk_layer
+from sonicmoe.functional import clear_fp8_native_weight_cache
 
 
 def swiglu(x: torch.Tensor) -> torch.Tensor:
@@ -125,7 +126,14 @@ def parse_arguments() -> argparse.Namespace:
         "--native_fp8_forward",
         action="store_true",
         default=False,
-        help="Enable native FP8 tensor cores for forward up-proj and backward down-proj GEMMs",
+        help="(Legacy) Enable native FP8 tensor cores. Use --fp8_mode instead.",
+    )
+    parser.add_argument(
+        "--fp8_mode",
+        type=str,
+        default=None,
+        choices=["perf", "mem"],
+        help="Full-pipeline FP8 mode: 'perf' (cached weights), 'mem' (no cache, min memory)",
     )
     args = parser.parse_args()
 
@@ -247,6 +255,7 @@ def _run_stage_memory_case(
         dout_case = dout.detach().clone()
         for grad_tensor in [x, w1, w2, router_w]:
             grad_tensor.grad = None
+        clear_fp8_native_weight_cache()
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         with contextlib.redirect_stdout(capture):
@@ -318,6 +327,7 @@ def run(
     report_fp8_analysis: Type[bool],
     prefetch_fp8_weights: Type[bool],
     native_fp8_forward: bool = False,
+    fp8_mode: str | None = None,
     **kwargs,
 ):
     torch_dtype = {cutlass.BFloat16: torch.bfloat16, cutlass.Float16: torch.float16}[dtype]
@@ -359,18 +369,17 @@ def run(
         torch.nn.init.normal_(b2, 0, 0.01)
     dout = 0.2 * torch.randn_like(x, requires_grad=True)
 
-    # ── Native FP8 tensor core mode ──
-    if native_fp8_forward:
+    # ── FP8 mode setup ──
+    if fp8_mode is not None:
+        os.environ["SONIC_MOE_FP8_MODE"] = fp8_mode
+        print0(
+            f"[bold cyan]Full-pipeline FP8 mode='{fp8_mode}' enabled[/bold cyan]"
+        )
+    elif native_fp8_forward:
         os.environ["SONIC_MOE_OPT_NATIVE_FP8_UPPROJ"] = "1"
         os.environ["SONIC_MOE_OPT_MIXED_DTYPE_DOWNPROJ_DW2"] = "1"
-        # Pre-quantize x to fp8 before timing so cast overhead is excluded.
-        # The router still needs bf16, so keep original x; store fp8 view
-        # for any internal path that checks the flag.
-        x_fp8 = x.detach().to(torch.float8_e4m3fn)
         print0(
-            "[bold cyan]Native FP8 forward/backward enabled[/bold cyan] "
-            f"x_fp8_shape={tuple(x_fp8.shape)}, x_fp8_dtype={x_fp8.dtype}, "
-            "SONIC_MOE_OPT_NATIVE_FP8_UPPROJ=1, SONIC_MOE_OPT_MIXED_DTYPE_DOWNPROJ_DW2=1"
+            "[bold cyan]Native FP8 forward/backward enabled (legacy flags)[/bold cyan]"
         )
 
     static_fp8_prefetch_announced = False
@@ -400,6 +409,7 @@ def run(
 
         def run_metrics_case(protocol_config):
             moe.clear_fp8_weight_cache()
+            clear_fp8_native_weight_cache()
             if protocol_config is not None and static_fp8_weights_enabled:
                 prime_static_fp8_weights()
             x_case = x.detach().clone().requires_grad_()
@@ -465,6 +475,7 @@ def run(
     if report_stage_memory:
         if fp8_protocol_config is None:
             moe.clear_fp8_weight_cache()
+            clear_fp8_native_weight_cache()
             stages, final_peak_mib = _run_stage_memory_case(
                 moe=moe,
                 x=x,
@@ -487,6 +498,7 @@ def run(
             )
         else:
             moe.clear_fp8_weight_cache()
+            clear_fp8_native_weight_cache()
             bf16_stages, bf16_final_peak_mib = _run_stage_memory_case(
                 moe=moe,
                 x=x,
@@ -500,6 +512,7 @@ def run(
                 protocol_config=None,
             )
             moe.clear_fp8_weight_cache()
+            clear_fp8_native_weight_cache()
             if static_fp8_weights_enabled:
                 prime_static_fp8_weights()
             fp8_stages, fp8_final_peak_mib = _run_stage_memory_case(
@@ -735,5 +748,6 @@ if __name__ == "__main__":
         args.report_fp8_analysis,
         args.prefetch_fp8_weights,
         args.native_fp8_forward,
+        fp8_mode=args.fp8_mode,
     )
     print("PASS")

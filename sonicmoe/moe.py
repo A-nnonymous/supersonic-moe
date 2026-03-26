@@ -11,6 +11,7 @@ import torch.nn.functional as F
 from .count_cumsum import count_cumsum
 from .enums import ActivationType, KernelBackendMoE, is_glu
 from .functional import FP8Protocol, moe_TC_softmax_topk_layer
+from .quack_utils import clear_blockscaled_fp8_weight_cache, prefetch_blockscaled_w2_fp8
 
 
 try:
@@ -204,6 +205,19 @@ class MoE(nn.Module):
         )
 
         self.stream_id = torch.cuda.current_stream().cuda_stream
+
+    @torch.no_grad()
+    def prefetch_fp8_weights(self, protocol: FP8Protocol) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+        if protocol is None:
+            raise ValueError("prefetch_fp8_weights requires a valid FP8 protocol")
+
+        return {
+            "downproj": prefetch_blockscaled_w2_fp8(self.c_proj.weight.permute(1, 2, 0), protocol),
+        }
+
+    @torch.no_grad()
+    def clear_fp8_weight_cache(self) -> None:
+        clear_blockscaled_fp8_weight_cache()
 
     def forward(
         self,

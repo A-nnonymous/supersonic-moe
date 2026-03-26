@@ -21,6 +21,7 @@ from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
 from quack.gemm_wrapper_utils import GemmTensorInfo, GemmWrapperBase
 from quack.layout_utils import permute_gated_Cregs_b16
+from quack.tile_scheduler import TileSchedulerArguments, VarlenMTileSchedulerArguments
 from torch import Tensor
 
 
@@ -97,6 +98,58 @@ class GemmGatedMixin(GemmActMixin):
             beta=args.beta,
             mRowVecBroadcast=mRowVecBroadcast,
             mColVecBroadcast=mColVecBroadcast,
+        )
+
+    def get_scheduler_arguments(
+        self,
+        mA: cute.Tensor,
+        mB: cute.Tensor,
+        mD: Optional[cute.Tensor],
+        scheduler_args,
+        varlen_args,
+    ):
+        """Allow gather-A inference kernels to omit preact_out/D while keeping varlen scheduling."""
+        if const_expr(varlen_args.mCuSeqlensM is None):
+            num_problems = (
+                mD.shape[2]
+                if mD is not None
+                else (
+                    mB.shape[2]
+                    if varlen_args.mCuSeqlensK is None
+                    else varlen_args.mCuSeqlensK.shape[0] - 1
+                )
+            )
+            problem_shape_ntile_mnl = (
+                cute.ceil_div(mA.shape[0], self.cta_tile_shape_mnk[0]),
+                cute.ceil_div(mB.shape[0], self.cta_tile_shape_mnk[1]),
+                num_problems,
+            )
+            return TileSchedulerArguments(
+                problem_shape_ntile_mnl=problem_shape_ntile_mnl,
+                raster_order=scheduler_args.raster_order,
+                group_size=scheduler_args.max_swizzle_size,
+                cluster_shape_mnk=self.cluster_shape_mnk,
+                tile_count_semaphore=scheduler_args.tile_count_semaphore,
+                batch_idx_permute=scheduler_args.batch_idx_permute,
+                is_persistent=self.is_persistent,
+            )
+
+        total_m = mD.shape[0] if mD is not None else varlen_args.mAIdx.shape[0]
+        problem_shape_ntile_mnl = (
+            None,
+            cute.ceil_div(mB.shape[0], self.cta_tile_shape_mnk[1]),
+            varlen_args.mCuSeqlensM.shape[0] - 1,
+        )
+        return VarlenMTileSchedulerArguments(
+            problem_shape_ntile_mnl=problem_shape_ntile_mnl,
+            total_m=total_m,
+            cu_seqlens_m=varlen_args.mCuSeqlensM,
+            raster_order=scheduler_args.raster_order,
+            group_size=scheduler_args.max_swizzle_size,
+            tile_shape_mn=self.cta_tile_shape_mnk[:2],
+            cluster_shape_mnk=self.cluster_shape_mnk,
+            tile_count_semaphore=scheduler_args.tile_count_semaphore,
+            is_persistent=self.is_persistent,
         )
 
     @staticmethod

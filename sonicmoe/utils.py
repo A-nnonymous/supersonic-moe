@@ -105,6 +105,11 @@ class _TensorWithStream:
         return self._tensor.__dlpack_device__()
 
 
+_RUNTIME_FP8_CUTLASS_DTYPES = {
+    torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+}
+
+
 def convert_torch_tensor_to_cute_tensor(
     x: torch.Tensor,
     stride_order,
@@ -113,11 +118,18 @@ def convert_torch_tensor_to_cute_tensor(
     divisibility: int,
     stream: int | None = None,
 ):
-    # Wrap tensor with stream if provided to prevent cross-stream synchronization during CUDA graph capture
-    tensor_input = _TensorWithStream(x, stream) if stream is not None else x
+    if x.dtype in _RUNTIME_FP8_CUTLASS_DTYPES:
+        tensor_input = x.view(torch.uint8)
+    else:
+        tensor_input = x
+    tensor_input = _TensorWithStream(tensor_input, stream) if stream is not None else tensor_input
 
-    return (
-        from_dlpack(tensor_input, assumed_align=alignment)
-        .mark_layout_dynamic(leading_dim=leading_dim)
-        .mark_compact_shape_dynamic(mode=leading_dim, stride_order=stride_order, divisibility=divisibility)
+    cute_tensor = from_dlpack(tensor_input, assumed_align=alignment)
+    if x.dtype in _RUNTIME_FP8_CUTLASS_DTYPES:
+        cute_tensor.element_type = _RUNTIME_FP8_CUTLASS_DTYPES[x.dtype]
+
+    return cute_tensor.mark_layout_dynamic(leading_dim=leading_dim).mark_compact_shape_dynamic(
+        mode=leading_dim,
+        stride_order=stride_order,
+        divisibility=divisibility,
     )

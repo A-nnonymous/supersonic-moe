@@ -9,7 +9,7 @@ import torch
 from quack.autotuner import AutotuneConfig, autotune
 from quack.cute_dsl_utils import get_device_capacity
 from quack.gemm_config import GemmConfig, get_all_configs
-from quack.gemm_interface import default_config, prune_invalid_gemm_configs
+from quack.gemm_interface import default_config, prune_invalid_gemm_configs as prune_invalid_gemm_configs_base
 from torch import Tensor
 
 from .gemm_dgated import gemm_dgated as gemm_dgated_sm90_sm100
@@ -19,10 +19,18 @@ from .gemm_gated import gemm_gated as gemm_gated_sm90_sm100
 default_device_capacity = get_device_capacity(torch.device("cuda"))
 
 
+def prune_invalid_gated_configs(configs, named_args: dict, **kwargs):
+    kwargs = named_args | kwargs
+    configs = prune_invalid_gemm_configs_base(configs, named_args, **kwargs)
+    if kwargs.get("A_idx", None) is not None:
+        configs = [conf for conf in configs if conf.kwargs["config"].cluster_n == 1]
+    return configs
+
+
 @autotune(
     configs=[AutotuneConfig(config=c) for c in get_all_configs(default_device_capacity[0], "gated")],
     key=["activation", "dynamic_scheduler"],
-    prune_configs_by={"early_config_prune": prune_invalid_gemm_configs},
+    prune_configs_by={"early_config_prune": prune_invalid_gated_configs},
 )
 def gemm_gated_tuned(
     # (M, K) or or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
@@ -86,10 +94,11 @@ def gemm_gated_tuned(
 
 def prune_invalid_gemm_dgated_configs(configs, named_args: dict, **kwargs):
     kwargs = named_args | kwargs
+    configs = prune_invalid_gated_configs(configs, named_args, **kwargs)
     # if there's colvec_scale or colvec_reduce, don't swap_AB
     if kwargs.get("colvec_scale", None) is not None or kwargs.get("colvec_reduce", False):
         configs = [conf for conf in configs if not conf.kwargs["config"].swap_ab]
-    return prune_invalid_gemm_configs(configs, named_args, **kwargs)
+    return configs
 
 
 @autotune(

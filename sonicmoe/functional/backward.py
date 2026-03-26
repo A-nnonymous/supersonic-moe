@@ -432,9 +432,9 @@ def _down_projection_backward_act(
     if db2 is None:
         # we don't need to update ds
         if ds_partial.size(1) == 1:
-            ds.copy_(ds_partial.view(-1).to(dtype=ds.dtype))
+            ds.copy_(ds_partial.view(-1))
         elif ds_partial.size(1) <= 32:
-            ds.copy_(ds_partial.sum(dim=-1, dtype=ds.dtype))
+            torch.sum(ds_partial, dim=-1, dtype=ds.dtype, out=ds)
         else:
             M, N = ds_partial.size()
 
@@ -472,9 +472,9 @@ def _down_projection_backward_act(
         )
 
         if NUM_H_BLOCKS == 1:
-            ds.copy_(new_ds_partial.view(-1).to(dtype=ds.dtype))
+            ds.copy_(new_ds_partial.view(-1))
         else:
-            ds.copy_(new_ds_partial.sum(dim=-1, dtype=ds.dtype))
+            torch.sum(new_ds_partial, dim=-1, dtype=ds.dtype, out=ds)
 
 
 _down_projection_backward_act.compile_cache = {}
