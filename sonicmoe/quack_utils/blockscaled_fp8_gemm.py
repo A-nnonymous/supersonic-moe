@@ -86,6 +86,7 @@ _WEIGHT_CACHE: dict[
     tuple[torch.Tensor, torch.Tensor],
 ] = {}
 _COMPILE_CACHE: dict[tuple[object, ...], object] = {}
+_PAD_PLAN_CACHE: dict = {}       # content-key → plan
 _TORCH_TO_CUTLASS_DTYPE = {
     torch.float8_e4m3fn: cutlass.Float8E4M3FN,
     torch.float8_e8m0fnu: cutlass.Float8E8M0FNU,
@@ -226,9 +227,10 @@ def _make_cute_tensor_dynamic(tensor: torch.Tensor, leading_dim: int) -> cute.Te
 def _weight_cache_key(
     weight: torch.Tensor,
     protocol: FP8Protocol,
-) -> tuple[int, tuple[int, ...], tuple[int, ...], int | None, int, str, str, str, str]:
+) -> tuple[int, int, tuple[int, ...], tuple[int, ...], int | None, int, str, str, str, str]:
     return (
         weight.untyped_storage().data_ptr(),
+        id(weight),  # guards against CUDA memory reuse after del
         tuple(weight.shape),
         tuple(weight.stride()),
         weight.device.index,
@@ -240,11 +242,20 @@ def _weight_cache_key(
     )
 
 
+
+
 def _quantize_w2_cached(
     w2: torch.Tensor,
     protocol: FP8Protocol,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    key = _weight_cache_key(w2, protocol)
+    # Key on storage identity + version + view layout so that repeated
+    # permute() calls on the same underlying Parameter hit cache.
+    key = (
+        w2.untyped_storage().data_ptr(),
+        w2._version,
+        tuple(w2.shape),
+        tuple(w2.stride()),
+    )
     cached = _WEIGHT_CACHE.get(key)
     if cached is not None:
         return cached
@@ -252,12 +263,53 @@ def _quantize_w2_cached(
     weight_ehi = w2.permute(2, 0, 1).contiguous()
     weight_fp8_ehi, weight_scales = quantize_activation_blockwise(weight_ehi, protocol)
     packed_scales = pack_blockscaled_1x32_scales(weight_scales, weight_ehi.size(-1))
-    _WEIGHT_CACHE[key] = (weight_fp8_ehi, packed_scales)
-    return weight_fp8_ehi, packed_scales
+    result = (weight_fp8_ehi, packed_scales)
+    if len(_WEIGHT_CACHE) > 8:
+        _WEIGHT_CACHE.clear()
+    _WEIGHT_CACHE[key] = result
+    return result
 
 
 def clear_blockscaled_fp8_weight_cache() -> None:
     _WEIGHT_CACHE.clear()
+    _PAD_PLAN_CACHE.clear()
+
+
+def _get_padding_plan(
+    cu_seqlens_m: torch.Tensor,
+    total_M: int,
+) -> tuple[bool, torch.Tensor | None, int, torch.Tensor | None]:
+    """Compute (and cache) CTA-tile padding plan for a cu_seqlens_m tensor.
+
+    Content-based cache keyed on cu_seqlens values (one D2H sync per call).
+    """
+    content_key = tuple(cu_seqlens_m.tolist())
+    cached = _PAD_PLAN_CACHE.get(content_key)
+    if cached is not None:
+        return cached
+
+    seg_lens = cu_seqlens_m[1:] - cu_seqlens_m[:-1]
+    remainders = seg_lens % _SF_TILE_M
+    needs_pad = bool(remainders.any().item())
+
+    if needs_pad:
+        padded_lens = seg_lens + (_SF_TILE_M - remainders) % _SF_TILE_M
+        padded_cu = torch.zeros_like(cu_seqlens_m)
+        padded_cu[1:] = torch.cumsum(padded_lens, dim=0)
+        padded_total = int(padded_cu[-1].item())
+
+        token_idx = torch.arange(total_M, device=cu_seqlens_m.device, dtype=torch.int64)
+        expert_ids = torch.searchsorted(cu_seqlens_m, token_idx, right=True) - 1
+        local_off = token_idx - cu_seqlens_m[expert_ids].to(torch.int64)
+        dst_idx = padded_cu[expert_ids].to(torch.int64) + local_off
+        plan = (True, padded_cu, padded_total, dst_idx)
+    else:
+        plan = (False, None, 0, None)
+
+    if len(_PAD_PLAN_CACHE) > 16:
+        _PAD_PLAN_CACHE.clear()
+    _PAD_PLAN_CACHE[content_key] = plan
+    return plan
 
 
 def prefetch_blockscaled_w2_fp8(
@@ -295,35 +347,44 @@ def _quantize_flat_blockscaled_kernel(
     fp8_max: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
+    GROUPS_PER_BLOCK: tl.constexpr,
 ):
-    """Quantize a flat (M, K) bf16 tensor to blockscaled FP8 with 1×GROUP_SIZE scales."""
-    row_id = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
-    group_id = tl.program_id(1)
-    col_offsets = group_id * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+    """Quantize a flat (M, K) bf16 tensor to blockscaled FP8 with 1×GROUP_SIZE scales.
 
-    row_mask = row_id[:, None] < rows
-    col_mask = col_offsets[None, :] < cols
-    mask = row_mask & col_mask
+    Each program processes BLOCK_ROWS × GROUPS_PER_BLOCK groups.
+    """
+    row_base = tl.program_id(0) * BLOCK_ROWS
+    group_base = tl.program_id(1) * GROUPS_PER_BLOCK
 
-    src_ptrs = src_ptr + row_id[:, None] * src_stride_row + col_offsets[None, :] * src_stride_col
-    values = tl.load(src_ptrs, mask=mask, other=0.0).to(tl.float32)
+    row_ids = row_base + tl.arange(0, BLOCK_ROWS)
+    row_mask_1d = row_ids < rows
 
-    block_amax = tl.max(tl.abs(values), axis=1)
-    raw_scale = block_amax / fp8_max
-    positive = raw_scale > 0
-    exponent = tl.where(positive, tl.ceil(tl.log2(tl.where(positive, raw_scale, 1.0))), 0.0)
-    dequant_scale = tl.exp2(exponent)
-    quant_scale = tl.exp2(-exponent)
+    for g in range(GROUPS_PER_BLOCK):
+        group_id = group_base + g
+        col_offsets = group_id * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
 
-    quantized = (values * quant_scale[:, None]).to(tl.float8e4nv)
-    dst_ptrs = dst_fp8_ptr + row_id[:, None] * dst_stride_row + col_offsets[None, :] * dst_stride_col
-    tl.store(dst_ptrs, quantized, mask=mask)
+        col_mask = col_offsets[None, :] < cols
+        mask = row_mask_1d[:, None] & col_mask
 
-    scale_ptrs = dst_scale_ptr + row_id * scale_stride_row + group_id * scale_stride_col
-    # Extract E8M0 exponent: float32 → int32 bitcast → shift right 23 → mask 8 bits
-    scale_i32 = dequant_scale.to(tl.float32).to(tl.int32, bitcast=True)
-    e8m0_byte = ((scale_i32 >> 23) & 0xFF).to(tl.uint8)
-    tl.store(scale_ptrs, e8m0_byte, mask=row_id < rows)
+        src_ptrs = src_ptr + row_ids[:, None] * src_stride_row + col_offsets[None, :] * src_stride_col
+        values = tl.load(src_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+        block_amax = tl.max(tl.abs(values), axis=1)
+        raw_scale = block_amax / fp8_max
+        positive = raw_scale > 0
+        exponent = tl.where(positive, tl.ceil(tl.log2(tl.where(positive, raw_scale, 1.0))), 0.0)
+        quant_scale = tl.exp2(-exponent)
+
+        quantized = (values * quant_scale[:, None]).to(tl.float8e4nv)
+        dst_ptrs = dst_fp8_ptr + row_ids[:, None] * dst_stride_row + col_offsets[None, :] * dst_stride_col
+        tl.store(dst_ptrs, quantized, mask=mask)
+
+        # E8M0 exponent extraction
+        dequant_scale = tl.exp2(exponent)
+        scale_i32 = dequant_scale.to(tl.float32).to(tl.int32, bitcast=True)
+        e8m0_byte = ((scale_i32 >> 23) & 0xFF).to(tl.uint8)
+        scale_ptrs = dst_scale_ptr + row_ids * scale_stride_row + group_id * scale_stride_col
+        tl.store(scale_ptrs, e8m0_byte, mask=row_mask_1d)
 
 
 def quantize_activation_blockscaled_fast(
@@ -339,11 +400,14 @@ def quantize_activation_blockscaled_fast(
     num_groups = _div_up(K, group_size)
 
     fp8_out = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=x.device)
-    # Scale stored as uint8 (E8M0 exponent). Will be view-cast to float8_e8m0fnu for CUTLASS.
     scale_out = torch.empty(M, num_groups, dtype=torch.uint8, device=x.device)
 
+    # Process 4 rows × all-groups-per-block to maximize work per block.
+    # For (65536, 4096): 128 groups per row, GROUPS_PER_BLOCK=128 → 1 col-block.
+    # Grid: (16384, 1) = 16K blocks, each processing 4×128 groups = 16K elements.
     BLOCK_ROWS = 4
-    grid = (_div_up(M, BLOCK_ROWS), num_groups)
+    GROUPS_PER_BLOCK = min(num_groups, 128)
+    grid = (_div_up(M, BLOCK_ROWS), _div_up(num_groups, GROUPS_PER_BLOCK))
     _quantize_flat_blockscaled_kernel[grid](
         x,
         fp8_out,
@@ -359,6 +423,7 @@ def quantize_activation_blockscaled_fast(
         fp8_max=float(torch.finfo(torch.float8_e4m3fn).max),
         GROUP_SIZE=group_size,
         BLOCK_ROWS=BLOCK_ROWS,
+        GROUPS_PER_BLOCK=GROUPS_PER_BLOCK,
     )
     return fp8_out, scale_out.view(torch.float8_e8m0fnu)
 
@@ -753,99 +818,202 @@ def blockscaled_fp8_gemm_grouped(
     return grouped_out
 
 
-def blockscaled_fp8_gemm_varlen(
-    a: torch.Tensor,
-    w2: torch.Tensor,
-    cu_seqlens_m: torch.Tensor,
-    *,
-    protocol: FP8Protocol,
-    out_dtype: Optional[torch.dtype] = None,
-) -> torch.Tensor:
-    """Blockscaled FP8 GEMM using the varlen scheduler — no grouped packing.
+def quantize_and_pack_activation(
+    x: torch.Tensor,
+    group_size: int = _SF_VEC_SIZE,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize bf16 activation to blockscaled FP8 with ISA-packed scales.
 
-    Unlike ``blockscaled_fp8_gemm_grouped`` this keeps the activation flat
-    (total_M, K) and relies on ``cu_seqlens_m`` to map token-ranges to experts,
-    avoiding the expert-capacity env-var, 3-D padding, and unpack step.
+    Call this *outside* the GEMM to make the quantization boundary explicit.
 
     Parameters
     ----------
-    a : Tensor (total_M, K) bf16 — activations, contiguous in expert order.
-    w2 : Tensor (H, I, E) bf16 — expert weights.
-    cu_seqlens_m : Tensor (E+1,) int32 — expert token boundaries.
-    protocol : FP8Protocol
-    out_dtype : optional output dtype (defaults to ``a.dtype``).
+    x : Tensor (M, K) bf16/fp16 — contiguous activation tensor.
+    group_size : block size for scale computation (default 32).
 
     Returns
     -------
-    Tensor (total_M, H) — result of per-expert matmuls.
-
-    Notes
-    -----
-    Uses the rank-aware ``_tile_atom_to_shape_SF_rank_aware`` installed at
-    module load time to handle the 2-D activation tensors produced by the
-    varlen_m scheduler.
+    fp8_data : Tensor (M, K) float8_e4m3fn
+    packed_scales : Tensor (1, packed_size) float8_e8m0fnu in ISA layout
     """
-    protocol = validate_fp8_runtime_support(_blockscaled_protocol(protocol), a.device, quack_enabled=True)
-    if get_device_capacity(a.device)[0] != 10:
-        raise RuntimeError("blockscaled_fp8_gemm_varlen currently supports Blackwell only")
+    x_fp8, scales_raw = quantize_activation_blockscaled_fast(x.contiguous(), group_size=group_size)
+    packed_scales = pack_blockscaled_1x32_scales(scales_raw, x.size(1))
+    return x_fp8, packed_scales
+
+
+def precompute_weight_fp8(
+    w: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pre-quantize a 3D expert weight to blockscaled FP8 with ISA-packed scales.
+
+    Converts (H, I, E) bf16 weights to (E, H, I) fp8 + packed scales.
+    Call once at init / first forward.  Handles both original and transposed
+    weight layouts.
+
+    Parameters
+    ----------
+    w : Tensor (dim0, dim1, E) bf16 — expert weights in any layout.
+
+    Returns
+    -------
+    w_fp8 : Tensor (E, dim0, dim1) float8_e4m3fn
+    w_scales : Tensor packed float8_e8m0fnu in ISA layout
+    """
+    w_ehi = w.permute(2, 0, 1).contiguous()
+    proto = FP8Protocol(scale_granularity=FP8ScaleGranularity.BLOCK_1X32)
+    w_fp8, w_scales_raw = quantize_activation_blockwise(w_ehi, proto)
+    w_scales_packed = pack_blockscaled_1x32_scales(w_scales_raw, w_ehi.size(-1))
+    return w_fp8, w_scales_packed
+
+
+def blockscaled_fp8_gemm_varlen(
+    a: torch.Tensor,
+    w: torch.Tensor,
+    cu_seqlens_m: torch.Tensor,
+    *,
+    protocol: FP8Protocol | None = None,
+    out_dtype: Optional[torch.dtype] = None,
+    a_scales: Optional[torch.Tensor] = None,
+    w_fp8: Optional[torch.Tensor] = None,
+    w_scales: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Blockscaled FP8 GEMM using the varlen scheduler.
+
+    Supports two calling conventions:
+
+    **Pre-quantized (preferred)** — pass fp8 data + packed scales directly::
+
+        a_fp8, a_scales = quantize_and_pack_activation(x_bf16)
+        w_fp8, w_scales = precompute_weight_fp8(w_bf16)
+        out = blockscaled_fp8_gemm_varlen(
+            a_fp8, w_bf16, cu,             # w_bf16 only for shape/device
+            a_scales=a_scales, w_fp8=w_fp8, w_scales=w_scales,
+            out_dtype=torch.bfloat16,
+        )
+
+    **Legacy (backward compat)** — pass bf16 and let the function quantize::
+
+        out = blockscaled_fp8_gemm_varlen(x_bf16, w_bf16, cu, protocol=protocol)
+
+    Parameters
+    ----------
+    a : Tensor (total_M, K) — fp8 (pre-quantized) or bf16 (legacy).
+    w : Tensor (H, I, E) bf16 — expert weights (used for shape; ignored
+        if w_fp8/w_scales are provided).
+    cu_seqlens_m : Tensor (E+1,) int32 — expert boundaries.
+    protocol : FP8Protocol — required for legacy bf16 path.
+    out_dtype : output dtype (defaults to bf16).
+    a_scales : packed ISA-layout scales for ``a`` (pre-quantized path).
+    w_fp8 : pre-quantized weight fp8 (E,H,I).
+    w_scales : packed ISA-layout scales for weights.
+    """
+    device = a.device
+    if get_device_capacity(device)[0] != 10:
+        raise RuntimeError("blockscaled_fp8_gemm_varlen requires Blackwell (sm_100)")
 
     if a.ndim != 2:
-        raise ValueError(f"expected activation to be 2D, got shape {tuple(a.shape)}")
-    if w2.ndim != 3:
-        raise ValueError(f"expected w2 to be 3D (H, I, E), got shape {tuple(w2.shape)}")
+        raise ValueError(f"expected activation 2D, got {tuple(a.shape)}")
+    if w.ndim != 3:
+        raise ValueError(f"expected w 3D (H, I, E), got {tuple(w.shape)}")
     if cu_seqlens_m.ndim != 1 or cu_seqlens_m.dtype != torch.int32:
-        raise ValueError("cu_seqlens_m must be a 1D int32 tensor")
-    if a.size(1) % _SF_TILE_K != 0:
-        raise RuntimeError(f"blockscaled_fp8_gemm_varlen requires intermediate width multiple of {_SF_TILE_K}")
-    if w2.size(0) % _SF_TILE_M != 0:
-        raise RuntimeError(f"blockscaled_fp8_gemm_varlen requires hidden width multiple of {_SF_TILE_M}")
+        raise ValueError("cu_seqlens_m must be 1D int32")
 
     total_M, K = a.shape
-    H, I, num_experts = w2.shape
-    assert K == I, f"K dimension mismatch: a has {K}, w2 has I={I}"
-    assert cu_seqlens_m.shape[0] == num_experts + 1, (
-        f"cu_seqlens_m length {cu_seqlens_m.shape[0]} != num_experts+1 ({num_experts + 1})"
+    H, I, num_experts = w.shape
+    assert K == I, f"K mismatch: a has {K}, w has I={I}"
+    assert cu_seqlens_m.shape[0] == num_experts + 1
+
+    if K % _SF_TILE_K != 0:
+        raise RuntimeError(f"K must be multiple of {_SF_TILE_K}, got {K}")
+    if H % _SF_TILE_M != 0:
+        raise RuntimeError(f"H must be multiple of {_SF_TILE_M}, got {H}")
+
+    # --- Determine if inputs are pre-quantized ---
+    pre_quantized_act = (a.dtype == torch.float8_e4m3fn and a_scales is not None)
+    pre_quantized_wt = (w_fp8 is not None and w_scales is not None)
+
+    # --- CTA tile alignment padding ---
+    if not torch.cuda.is_current_stream_capturing():
+        needs_pad, padded_cu, padded_total, dst_idx = _get_padding_plan(cu_seqlens_m, total_M)
+    else:
+        needs_pad = False
+
+    if needs_pad:
+        if pre_quantized_act:
+            # Must re-quantize after padding (scale layout changes)
+            a_bf16 = a.to(torch.bfloat16)  # dequant approximation
+            padded_a = torch.zeros(padded_total, K, dtype=torch.bfloat16, device=device)
+            padded_a[dst_idx] = a_bf16
+            padded_out = blockscaled_fp8_gemm_varlen(
+                padded_a, w, padded_cu,
+                protocol=protocol, out_dtype=out_dtype,
+                w_fp8=w_fp8, w_scales=w_scales,
+            )
+        else:
+            padded_a = torch.zeros(padded_total, K, dtype=a.dtype, device=device)
+            padded_a[dst_idx] = a
+            padded_out = blockscaled_fp8_gemm_varlen(
+                padded_a, w, padded_cu,
+                protocol=protocol, out_dtype=out_dtype,
+                w_fp8=w_fp8, w_scales=w_scales,
+            )
+        return padded_out[dst_idx]
+
+    # --- Weight quantization ---
+    if pre_quantized_wt:
+        weight_fp8, weight_scales = w_fp8, w_scales
+    else:
+        # Legacy path: ensure blockscaled protocol for weight quantization
+        bs_proto = _blockscaled_protocol(protocol or FP8Protocol(scale_granularity=FP8ScaleGranularity.BLOCK_1X32))
+        weight_fp8, weight_scales = _quantize_w2_cached(w, bs_proto)
+
+    # --- Activation quantization ---
+    if pre_quantized_act:
+        a_fp8_data, packed_a_scales = a, a_scales
+    else:
+        a_fp8_data, a_scales_raw = quantize_activation_blockscaled_fast(
+            a.contiguous(), group_size=_SF_VEC_SIZE
+        )
+        packed_a_scales = pack_blockscaled_1x32_scales(a_scales_raw, K)
+
+    # --- Run CUTLASS GEMM kernel ---
+    d_dtype = torch.bfloat16 if out_dtype is None else out_dtype
+    return _run_cutlass_blockscaled_gemm(
+        a_fp8_data, packed_a_scales,
+        weight_fp8, weight_scales,
+        cu_seqlens_m,
+        total_M, K, H, num_experts,
+        d_dtype, device,
     )
 
-    # Blockscaled GEMM requires each expert segment ≥ _SF_VEC_SIZE tokens.
-    # Smaller segments corrupt the blockscaled scale-factor tile layout.
-    if not torch.cuda.is_current_stream_capturing():
-        seg_lens = cu_seqlens_m[1:] - cu_seqlens_m[:-1]
-        active = seg_lens > 0
-        if active.any():
-            min_active = int(seg_lens[active].min().item())
-            if min_active < _SF_VEC_SIZE:
-                raise ValueError(
-                    f"blockscaled_fp8_gemm_varlen requires all active expert segments "
-                    f"≥ {_SF_VEC_SIZE} tokens, but min active segment has {min_active}. "
-                    f"Use the bf16 fallback for small per-expert token counts."
-                )
 
-    # --- weight quantization (cached, 3D: E×H×I) ---
-    weight_fp8, weight_scales = _quantize_w2_cached(w2, protocol)
+def _run_cutlass_blockscaled_gemm(
+    a_fp8: torch.Tensor,
+    a_scales_packed: torch.Tensor,
+    w_fp8: torch.Tensor,
+    w_scales_packed: torch.Tensor,
+    cu_seqlens_m: torch.Tensor,
+    total_M: int,
+    K: int,
+    H: int,
+    num_experts: int,
+    out_dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Pure CUTLASS blockscaled FP8 GEMM — all inputs pre-quantized."""
+    out = torch.empty(total_M, H, dtype=out_dtype, device=device)
 
-    # --- activation quantization (flat 2D: total_M × K) ---
-    a_fp8, a_scales_raw = quantize_activation_blockscaled_fast(a.contiguous(), group_size=_SF_VEC_SIZE)
-    packed_a_scales = pack_blockscaled_1x32_scales(a_scales_raw, K)
-
-    # --- output tensor (flat 2D: total_M × H) ---
-    d_dtype = a.dtype if out_dtype is None else out_dtype
-    out = torch.empty(total_M, H, dtype=d_dtype, device=a.device)
-
-    config = default_config(a.device)
+    config = default_config(device)
     if config.swap_ab:
-        raise RuntimeError("blockscaled_fp8_gemm_varlen does not support swap_ab configs")
+        raise RuntimeError("blockscaled_fp8_gemm_varlen does not support swap_ab")
 
-    # --- tensor infos ---
-    # For varlen_m: A is 2D (total_M, K), B is 3D (E, H, I), D is 2D (total_M, H)
     tensor_infos = {
         "A": GemmTensorInfo(a_fp8),
-        "B": GemmTensorInfo(weight_fp8),
+        "B": GemmTensorInfo(w_fp8),
         "D": GemmTensorInfo(out),
         "C": GemmTensorInfo(None),
     }
 
-    # Permute B from (E, H, I) → (H, I, E)  [the standard (n, k, l) convention]
     GemmWrapperBase.permute_tensors(tensor_infos, varlen_m=True)
 
     major_configs = {
@@ -875,11 +1043,10 @@ def blockscaled_fp8_gemm_varlen(
         tensor_infos["A"].major,
         tensor_infos["B"].major,
     ):
-        raise TypeError("Unsupported FP8 blockscaled type/major combination for varlen path")
+        raise TypeError("Unsupported FP8 blockscaled type/major combination")
 
     max_active_clusters = get_max_active_clusters(config.cluster_m * config.cluster_n)
 
-    # --- scheduler (persistent for varlen) ---
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters,
         tile_count_semaphore=None,
@@ -887,7 +1054,6 @@ def blockscaled_fp8_gemm_varlen(
         max_swizzle_size=config.max_swizzle_size,
     )
 
-    # --- varlen args ---
     varlen_args = GemmWrapperBase.create_varlen_args(
         cu_seqlens_m,
         cu_seqlens_k=None,
@@ -901,8 +1067,8 @@ def blockscaled_fp8_gemm_varlen(
 
     epi_args = GemmDefaultSm100.EpilogueArguments()
     current_stream = cutlass_torch.current_stream()
-    a_scale_cute = _make_cute_tensor_dynamic(packed_a_scales, leading_dim=1)
-    b_scale_cute = _make_cute_tensor_dynamic(weight_scales, leading_dim=1)
+    a_scale_cute = _make_cute_tensor_dynamic(a_scales_packed, leading_dim=1)
+    b_scale_cute = _make_cute_tensor_dynamic(w_scales_packed, leading_dim=1)
 
     compile_key = (
         "varlen",
@@ -911,14 +1077,12 @@ def blockscaled_fp8_gemm_varlen(
         tensor_infos["D"].dtype,
         tile_shape_mn,
         cluster_shape_mnk,
-        tuple(tensor_infos["A"].tensor.shape),
-        tuple(tensor_infos["A"].tensor.stride()),
+        K,
         tuple(tensor_infos["B"].tensor.shape),
         tuple(tensor_infos["B"].tensor.stride()),
-        tuple(tensor_infos["D"].tensor.shape),
-        tuple(tensor_infos["D"].tensor.stride()),
-        tuple(packed_a_scales.shape),
-        tuple(weight_scales.shape),
+        H,
+        a_scales_packed.size(1),
+        tuple(w_scales_packed.shape),
         tensor_infos["A"].major,
         tensor_infos["B"].major,
         config.pingpong,
@@ -989,3 +1153,219 @@ def blockscaled_fp8_gemm(
         capacity=capacity,
     )
     return _unpack_grouped_rows(grouped_out, cu_seqlens_m, out=out)
+
+
+def blockscaled_fp8_weight_grad_gemm(
+    a_flat: torch.Tensor,
+    b_flat: torch.Tensor,
+    cu_seqlens_m: torch.Tensor,
+    *,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: Optional[torch.dtype] = None,
+) -> torch.Tensor:
+    """Blockscaled FP8 weight-gradient GEMM: D[e] = A_e^T @ B_e per expert.
+
+    Both *a_flat* and *b_flat* are flat 2-D activations in expert-sorted
+    token order (``TK, dim``).  ``cu_seqlens_m`` (int32, ``E+1``) marks
+    expert boundaries.
+
+    The function:
+
+    1. Packs both operands into ``(E, capacity, dim)`` groups.
+    2. Transposes to ``(E, dim, capacity)`` so that K=capacity is the
+       last dimension — required for correct 1x32 blockscaled quantisation.
+    3. Quantises to blockscaled FP8 (E8M0 scales).
+    4. Runs a batched CUTLASS GEMM producing ``D(E, dim_A, dim_B)``.
+
+    Parameters
+    ----------
+    a_flat : Tensor (TK, dim_A) bf16 — first operand (will be transposed).
+    b_flat : Tensor (TK, dim_B) bf16 — second operand.
+    cu_seqlens_m : Tensor (E+1,) int32 — expert token boundaries.
+    out : optional pre-allocated Tensor (E, dim_A, dim_B).
+    out_dtype : output element type (default bf16).
+
+    Returns
+    -------
+    D : Tensor (E, dim_A, dim_B).
+    """
+    device = a_flat.device
+    if get_device_capacity(device)[0] != 10:
+        raise RuntimeError("blockscaled_fp8_weight_grad_gemm requires Blackwell (sm_100)")
+    if a_flat.ndim != 2 or b_flat.ndim != 2:
+        raise ValueError(
+            f"expected 2D operands, got a={tuple(a_flat.shape)}, b={tuple(b_flat.shape)}"
+        )
+    if a_flat.size(0) != b_flat.size(0):
+        raise ValueError("a_flat and b_flat must have the same number of rows (TK)")
+    if cu_seqlens_m.ndim != 1 or cu_seqlens_m.dtype != torch.int32:
+        raise ValueError("cu_seqlens_m must be 1D int32")
+
+    num_experts = cu_seqlens_m.shape[0] - 1
+    dim_A = a_flat.size(1)
+    dim_B = b_flat.size(1)
+    capacity = _auto_capacity(cu_seqlens_m)
+
+    if dim_A % _SF_TILE_M != 0:
+        raise RuntimeError(
+            f"dim_A ({dim_A}) must be a multiple of {_SF_TILE_M} for blockscaled tiling"
+        )
+    if dim_B % _SF_TILE_M != 0:
+        raise RuntimeError(
+            f"dim_B ({dim_B}) must be a multiple of {_SF_TILE_M} for blockscaled tiling"
+        )
+    # capacity is already tile-aligned by _auto_capacity
+
+    # 1. Pack flat tokens into per-expert groups: (E, cap, dim)
+    a_grouped = _pack_grouped_rows(a_flat, cu_seqlens_m, num_experts, capacity)
+    b_grouped = _pack_grouped_rows(b_flat, cu_seqlens_m, num_experts, capacity)
+
+    # 2. Transpose so K=capacity is the last dim for correct blockscaling
+    a_t = a_grouped.transpose(1, 2).contiguous()   # (E, dim_A, cap)
+    b_t = b_grouped.transpose(1, 2).contiguous()   # (E, dim_B, cap)
+    del a_grouped, b_grouped
+
+    # 3. Quantise to blockscaled FP8 — reshape to 2-D, quantise, reshape back
+    a_2d = a_t.reshape(-1, capacity)                # (E*dim_A, cap)
+    a_fp8_2d, a_scales_2d = quantize_activation_blockscaled_fast(a_2d)
+    a_fp8 = a_fp8_2d.reshape(num_experts, dim_A, capacity)
+    a_scales_3d = a_scales_2d.reshape(num_experts, dim_A, -1)
+    del a_t, a_2d, a_fp8_2d, a_scales_2d
+
+    b_2d = b_t.reshape(-1, capacity)                # (E*dim_B, cap)
+    b_fp8_2d, b_scales_2d = quantize_activation_blockscaled_fast(b_2d)
+    b_fp8 = b_fp8_2d.reshape(num_experts, dim_B, capacity)
+    b_scales_3d = b_scales_2d.reshape(num_experts, dim_B, -1)
+    del b_t, b_2d, b_fp8_2d, b_scales_2d
+
+    # 4. Pack scales into ISA tile layout
+    packed_a_scales = pack_blockscaled_1x32_scales(a_scales_3d, capacity)
+    packed_b_scales = pack_blockscaled_1x32_scales(b_scales_3d, capacity)
+    del a_scales_3d, b_scales_3d
+
+    # 5. Allocate output — CUTLASS needs a contiguous buffer
+    d_dtype = torch.bfloat16 if out_dtype is None else out_dtype
+    out_is_alias = out is not None and not out.is_contiguous()
+    if out is not None and out.is_contiguous():
+        grouped_out = out
+    else:
+        grouped_out = torch.empty(num_experts, dim_A, dim_B, dtype=d_dtype, device=device)
+
+    # 6. Run CUTLASS grouped blockscaled GEMM
+    #    A_cutlass (E, M=dim_A, K=cap)  @  B_cutlass (E, N=dim_B, K=cap)^T
+    #    → D (E, M=dim_A, N=dim_B)
+    config = default_config(device)
+    if config.swap_ab:
+        raise RuntimeError("blockscaled_fp8_weight_grad_gemm does not support swap_ab")
+
+    tensor_infos = {
+        "A": GemmTensorInfo(a_fp8),
+        "B": GemmTensorInfo(b_fp8),
+        "D": GemmTensorInfo(grouped_out),
+        "C": GemmTensorInfo(None),
+    }
+    GemmWrapperBase.permute_tensors(tensor_infos)
+
+    major_configs = {
+        "A": ("m", "k", "l"),
+        "B": ("n", "k", "l"),
+        "D": ("m", "n", "l"),
+        "C": ("m", "n", "l"),
+    }
+    GemmWrapperBase.determine_major_orders(tensor_infos, major_configs)
+    for name, info in tensor_infos.items():
+        if info.tensor is not None:
+            info.dtype = _TORCH_TO_CUTLASS_DTYPE[info.tensor.dtype]
+            if name != "C":
+                info.cute_tensor = _make_cute_tensor_dynamic(
+                    info.tensor,
+                    leading_dim=1 if info.major == major_configs[name][1] else 0,
+                )
+
+    tile_shape_mn = (config.tile_m, config.tile_n)
+    cluster_shape_mnk = (config.cluster_m, config.cluster_n, 1)
+    if not GemmDefaultSm100.is_valid_dtypes(
+        tensor_infos["A"].dtype,
+        tensor_infos["B"].dtype,
+        Float32,
+        tensor_infos["D"].dtype,
+        tensor_infos["A"].major,
+        tensor_infos["B"].major,
+    ):
+        raise TypeError("Unsupported FP8 blockscaled type/major combination for weight-grad GEMM")
+
+    max_active_clusters = get_max_active_clusters(config.cluster_m * config.cluster_n)
+    scheduler_args = GemmWrapperBase.create_scheduler_args(
+        max_active_clusters,
+        tile_count_semaphore=None,
+        batch_idx_permute=None,
+        max_swizzle_size=config.max_swizzle_size,
+    )
+    varlen_args = None
+    epi_args = GemmDefaultSm100.EpilogueArguments()
+    current_stream = cutlass_torch.current_stream()
+    a_scale_cute = _make_cute_tensor_dynamic(packed_a_scales, leading_dim=1)
+    b_scale_cute = _make_cute_tensor_dynamic(packed_b_scales, leading_dim=1)
+
+    compile_key = (
+        "weight_grad",
+        tensor_infos["A"].dtype,
+        tensor_infos["B"].dtype,
+        tensor_infos["D"].dtype,
+        tile_shape_mn,
+        cluster_shape_mnk,
+        tuple(tensor_infos["A"].tensor.shape),
+        tuple(tensor_infos["A"].tensor.stride()),
+        tuple(tensor_infos["B"].tensor.shape),
+        tuple(tensor_infos["B"].tensor.stride()),
+        tuple(tensor_infos["D"].tensor.shape),
+        tuple(tensor_infos["D"].tensor.stride()),
+        tuple(packed_a_scales.shape),
+        tuple(packed_b_scales.shape),
+        tensor_infos["A"].major,
+        tensor_infos["B"].major,
+        config.pingpong,
+        True,
+        _SF_VEC_SIZE,
+    )
+    compiled = _COMPILE_CACHE.get(compile_key)
+    if compiled is None:
+        gemm_obj = GemmDefaultSm100(
+            Float32,
+            tensor_infos["A"].dtype,
+            tile_shape_mn,
+            cluster_shape_mnk,
+            sf_vec_size=_SF_VEC_SIZE,
+            gather_A=False,
+        )
+        compiled = cute.compile(
+            gemm_obj,
+            tensor_infos["A"].cute_tensor,
+            tensor_infos["B"].cute_tensor,
+            tensor_infos["D"].cute_tensor,
+            tensor_infos["C"].cute_tensor,
+            epi_args,
+            scheduler_args,
+            varlen_args,
+            current_stream,
+            a_scale_cute,
+            b_scale_cute,
+        )
+        _COMPILE_CACHE[compile_key] = compiled
+
+    compiled(
+        tensor_infos["A"].cute_tensor,
+        tensor_infos["B"].cute_tensor,
+        tensor_infos["D"].cute_tensor,
+        tensor_infos["C"].cute_tensor,
+        epi_args,
+        scheduler_args,
+        varlen_args,
+        current_stream,
+        a_scale_cute,
+        b_scale_cute,
+    )
+    if out_is_alias:
+        out.copy_(grouped_out)
+        return out
+    return grouped_out

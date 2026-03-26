@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from .count_cumsum import count_cumsum
 from .enums import ActivationType, KernelBackendMoE, is_glu
-from .functional import FP8Protocol, moe_TC_softmax_topk_layer
+from .functional import FP8Protocol, moe_TC_softmax_topk_layer, clear_all_fp8_weight_caches
 from .quack_utils import clear_blockscaled_fp8_weight_cache, prefetch_blockscaled_w2_fp8
 
 
@@ -217,7 +217,8 @@ class MoE(nn.Module):
 
     @torch.no_grad()
     def clear_fp8_weight_cache(self) -> None:
-        clear_blockscaled_fp8_weight_cache()
+        """Clear all FP8 weight caches (per-tensor + blockscaled)."""
+        clear_all_fp8_weight_caches()
 
     def forward(
         self,

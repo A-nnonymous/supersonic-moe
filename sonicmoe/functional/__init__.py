@@ -12,9 +12,12 @@ from ..quack_utils import (
     blockscaled_fp8_gemm,
     blockscaled_fp8_gemm_grouped,
     blockscaled_fp8_gemm_varlen,
+    blockscaled_fp8_weight_grad_gemm,
     gemm_dgated,
     gemm_gated,
     make_blockscaled_grouped_reverse_scatter_idx,
+    precompute_weight_fp8,
+    quantize_and_pack_activation,
 )
 from quack.gemm_interface import gemm
 from ..quack_utils.fp8_quack_patch import apply_fp8_quack_patch
@@ -51,6 +54,73 @@ from .fp8_reference import (
 from .forward import _down_projection_forward, _router_forward, _softmax_topk_fwd, _up_projection_forward
 from .triton_kernels import TC_topk_router_metadata_triton
 from .utils import enable_quack_gemm, is_using_quack_gemm
+
+
+# ---------------------------------------------------------------------------
+# Standalone SwiGLU forward/backward (for blockscaled split path)
+# ---------------------------------------------------------------------------
+# SonicMoE stores w1 interleaved: [gate_row0, up_row0, gate_row1, ...].
+# The GEMM output z thus has interleaved layout: columns 0,2,4,...=gate,
+# columns 1,3,5,...=up.
+
+from ..quack_utils.swiglu_triton import (
+    swiglu_forward_triton,
+    swiglu_backward_triton,
+    swiglu_forward_quant_triton,
+    swiglu_backward_quant_triton,
+)
+from ..quack_utils.blockscaled_fp8_gemm import pack_blockscaled_1x32_scales
+
+
+def _swiglu_forward_interleaved(z: torch.Tensor) -> torch.Tensor:
+    """Apply SwiGLU on interleaved pre-activation z(TK, 2I) → y1(TK, I)."""
+    return swiglu_forward_triton(z)
+
+
+def _swiglu_backward_interleaved(
+    dy1: torch.Tensor,
+    z: torch.Tensor,
+    s: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Backward SwiGLU + router score weighting on interleaved layout."""
+    return swiglu_backward_triton(dy1, z, s)
+
+
+def _use_fused_swiglu_quant() -> bool:
+    """Check if fused SwiGLU+quantize kernels are enabled (default: enabled)."""
+    return os.getenv("SONIC_MOE_FP8_FUSED_SWIGLU_QUANT", "1").lower() in {"1", "true", "yes", "on"}
+
+
+# Transfer pre-packed blockscaled scales between autograd Function boundaries.
+# Each entry maps a tag to (fp8_tensor, packed_scales).  The consumer checks
+# that its input tensor ``is`` the stored fp8_tensor before using the scales,
+# which avoids id-reuse hazards.
+# "fwd": _UpProjection.forward -> _DownProjection.forward
+# "bwd": _DownProjection.backward -> _UpProjection.backward
+_PREQUANTIZED_SCALES: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+_MIN_SEG_CACHE: dict[tuple, int] = {}
+
+def _min_expert_segment(expert_frequency_offset: torch.Tensor) -> int:
+    """Return minimum active expert segment length from cu_seqlens.
+
+    Content-based cache keyed on cu_seqlens values.
+    """
+    if torch.cuda.is_current_stream_capturing():
+        return 0
+    content_key = tuple(expert_frequency_offset.tolist())
+    cached = _MIN_SEG_CACHE.get(content_key)
+    if cached is not None:
+        return cached
+    seg_lens = expert_frequency_offset[1:] - expert_frequency_offset[:-1]
+    masked = torch.where(seg_lens > 0, seg_lens, 2**30)
+    val = int(masked.min().item())
+    result = 0 if val >= 2**30 else val
+    if len(_MIN_SEG_CACHE) > 16:
+        _MIN_SEG_CACHE.clear()
+    _MIN_SEG_CACHE[content_key] = result
+    return result
 
 
 def _use_cutely_fused_fp8_adapter() -> bool:
@@ -155,14 +225,21 @@ def _make_fp8_weight(w: torch.Tensor, tag: str) -> torch.Tensor:
     return fp8_w
 
 
+# Flag for one-shot lazy eviction when switching to blockscaled path.
+_PER_TENSOR_EVICTED: bool = False
+
+
 def _get_cached_fp8_weight(w: torch.Tensor, tag: str) -> torch.Tensor:
     """Return a cached fp8 copy of *w*. Always cached (essential for fused kernels)."""
+    global _PER_TENSOR_EVICTED
     key = (w.untyped_storage().data_ptr(), w._version, tag)
     cached = _FP8_WEIGHT_CACHE.get(key)
     if cached is not None:
         return cached
     fp8_w = _make_fp8_weight(w, tag)
     _FP8_WEIGHT_CACHE[key] = fp8_w
+    # Per-tensor cache is being populated again; allow future eviction.
+    _PER_TENSOR_EVICTED = False
     return fp8_w
 
 
@@ -172,6 +249,7 @@ _FP8_ORIG_CACHE: dict[tuple[int, int], torch.Tensor] = {}
 
 def _get_fp8_weight_orig(w: torch.Tensor) -> torch.Tensor:
     """Return fp8 copy of *w* in original layout. Cached in perf mode."""
+    global _PER_TENSOR_EVICTED
     if _fp8_mode() != "perf":
         return w.to(torch.float8_e4m3fn)
     key = (w.untyped_storage().data_ptr(), w._version)
@@ -180,13 +258,45 @@ def _get_fp8_weight_orig(w: torch.Tensor) -> torch.Tensor:
         return cached
     fp8_w = w.to(torch.float8_e4m3fn)
     _FP8_ORIG_CACHE[key] = fp8_w
+    # Per-tensor cache is being populated again; allow future eviction.
+    _PER_TENSOR_EVICTED = False
     return fp8_w
 
 
 def clear_fp8_native_weight_cache() -> None:
     """Call between steps if weights change (e.g. optimizer step)."""
+    global _PER_TENSOR_EVICTED
     _FP8_WEIGHT_CACHE.clear()
     _FP8_ORIG_CACHE.clear()
+    _PER_TENSOR_EVICTED = False
+
+
+def _evict_per_tensor_caches_once() -> None:
+    """Clear per-tensor FP8 weight caches when transitioning to blockscaled path.
+
+    Called once when the blockscaled path is first taken; subsequent calls are no-ops
+    until the flag is reset (e.g. by clear_all_fp8_weight_caches).
+    """
+    global _PER_TENSOR_EVICTED
+    if _PER_TENSOR_EVICTED:
+        return
+    _FP8_WEIGHT_CACHE.clear()
+    _FP8_ORIG_CACHE.clear()
+    _PER_TENSOR_EVICTED = True
+
+
+def clear_all_fp8_weight_caches() -> None:
+    """Clear every FP8 weight cache (per-tensor + blockscaled).
+
+    Intended for MoE.clear_fp8_weight_cache() and optimizer-step boundaries.
+    """
+    global _PER_TENSOR_EVICTED
+    _FP8_WEIGHT_CACHE.clear()
+    _FP8_ORIG_CACHE.clear()
+    _PER_TENSOR_EVICTED = False
+    # Also clear the blockscaled weight cache in blockscaled_fp8_gemm.py
+    from ..quack_utils import clear_blockscaled_fp8_weight_cache as _clear_bs
+    _clear_bs()
 
 
 def _validate_runtime_precision_switches(fp8_protocol: FP8Protocol | None) -> None:
@@ -326,7 +436,34 @@ class _UpProjection(torch.autograd.Function):
         if use_quack_gemm:
             assert not torch.compiler.is_compiling()
             assert is_glu_activation, "QuACK GEMM does not support non GLU activation yet"
-            if _fp8_enabled():
+            if _fp8_enabled() and _min_expert_segment(expert_frequency_offset) >= 32:
+                # Blockscaled FP8 up-proj: explicit quant → GEMM → SwiGLU
+                _evict_per_tensor_caches_once()
+                x_gathered = x[x_gather_idx]  # (TK, H)
+                x_fp8, x_scales = quantize_and_pack_activation(x_gathered.contiguous())
+                # Pre-quantize weight (cached internally by _quantize_w2_cached)
+                z = blockscaled_fp8_gemm_varlen(
+                    x_fp8,
+                    w1,  # (2I, H, E) — for shape info
+                    expert_frequency_offset,
+                    a_scales=x_scales,
+                    out_dtype=torch.bfloat16,
+                )
+                del x_gathered, x_fp8, x_scales
+                if _use_fused_swiglu_quant():
+                    # Fused SwiGLU + blockscaled fp8 quantize — zero bf16 intermediate
+                    y1_fp8, y1_scales_raw = swiglu_forward_quant_triton(z)
+                    y1_scales_packed = pack_blockscaled_1x32_scales(
+                        y1_scales_raw.view(torch.float8_e8m0fnu), y1_fp8.shape[-1]
+                    )
+                    # Store (tensor, scales) for _DownProjection.forward to pick up
+                    _PREQUANTIZED_SCALES["fwd"] = (y1_fp8, y1_scales_packed)
+                    y1 = y1_fp8
+                    del y1_fp8, y1_scales_raw
+                else:
+                    y1 = _swiglu_forward_interleaved(z)
+            elif _fp8_enabled():
+                # Per-tensor FP8 fallback for small expert segments
                 x_fp8 = x if x.dtype == torch.float8_e4m3fn else x.to(torch.float8_e4m3fn)
                 w1_fp8 = _get_cached_fp8_weight(w1, "w1_ekh")
                 z, y1 = gemm_gated(
@@ -429,7 +566,45 @@ class _UpProjection(torch.autograd.Function):
         if use_quack_gemm:
             assert not is_compiling
 
-            if _fp8_enabled():
+            if _fp8_enabled() and _min_expert_segment(expert_frequency_offset) >= 32:
+                # Blockscaled FP8 up-proj backward
+                _evict_per_tensor_caches_once()
+
+                # Weight grad: x^T × dz per expert — per-tensor FP8 via QuACK
+                # (weight gradients are accumulated; per-tensor precision is sufficient)
+                dz_for_wgrad = dz if dz.dtype == torch.bfloat16 else dz.to(torch.bfloat16)
+                x_fp8_wg = x.to(torch.float8_e4m3fn)
+                dz_fp8_wg = dz_for_wgrad.to(torch.float8_e4m3fn)
+                gemm(
+                    x_fp8_wg.T,
+                    dz_fp8_wg,
+                    out=dw1.permute(2, 1, 0),
+                    cu_seqlens_k=expert_frequency_offset,
+                    A_idx=x_gather_idx,
+                    batch_idx_permute=None,
+                    dynamic_scheduler=False,
+                )
+                del x_fp8_wg, dz_fp8_wg, dz_for_wgrad
+
+                # Act grad: dz × w1^T → dx_expanded (TK, H) — explicit quant
+                # Check if dz was already quantized by fused backward+quant
+                _bwd_entry = _PREQUANTIZED_SCALES.pop("bwd", None)
+                if _bwd_entry is not None and _bwd_entry[0] is dz:
+                    # dz is already fp8 with pre-packed scales from fused backward
+                    dz_fp8_bs, dz_scales = dz, _bwd_entry[1]
+                else:
+                    # Fallback: separate quantization
+                    dz_fp8_bs, dz_scales = quantize_and_pack_activation(dz.contiguous())
+                w1_perm = w1.permute(1, 0, 2)  # (H, 2I, E) — view, not copy
+                dx_expanded = blockscaled_fp8_gemm_varlen(
+                    dz_fp8_bs,
+                    w1_perm,
+                    expert_frequency_offset,
+                    a_scales=dz_scales,
+                    out_dtype=torch.bfloat16,
+                )
+                del w1_perm, dz_fp8_bs, dz_scales
+            elif _fp8_enabled():
                 # FP8 weight grad: x_fp8.T × dz_fp8 → dw1 (bf16)
                 x_fp8 = x.to(torch.float8_e4m3fn)
                 dz_fp8 = dz.to(torch.float8_e4m3fn)
@@ -537,40 +712,30 @@ class _DownProjection(torch.autograd.Function):
             assert not torch.compiler.is_compiling()
 
             assert b2 is None
-            if fp8_protocol is not None and _use_blockscaled_fp8_downproj():
-                y2 = blockscaled_fp8_gemm_grouped(
-                    y1,
+            if _fp8_enabled() and _min_expert_segment(expert_frequency_offset) >= 32:
+                # Blockscaled FP8 down-proj: quant → GEMM
+                _evict_per_tensor_caches_once()
+                # Check if y1 was already quantized by fused SwiGLU+quant
+                _fwd_entry = _PREQUANTIZED_SCALES.pop("fwd", None)
+                if _fwd_entry is not None and _fwd_entry[0] is y1:
+                    # y1 is already fp8 with pre-packed scales from fused forward
+                    y1_fp8, y1_scales = y1, _fwd_entry[1]
+                else:
+                    # Fallback: separate quantization
+                    y1_bf16 = y1 if y1.dtype == torch.bfloat16 else y1.to(torch.bfloat16)
+                    y1_fp8, y1_scales = quantize_and_pack_activation(y1_bf16)
+                y2 = blockscaled_fp8_gemm_varlen(
+                    y1_fp8,
                     w2,
                     expert_frequency_offset,
-                    protocol=fp8_protocol,
+                    a_scales=y1_scales,
+                    out_dtype=torch.bfloat16,
                 )
-                router_perm = make_blockscaled_grouped_reverse_scatter_idx(
-                    s_reverse_scatter_idx,
-                    expert_frequency_offset,
-                    expert_ids=selected_experts.reshape(-1),
-                )
-                y2_for_router = y2.view(-1, H)
-            elif fp8_protocol is not None and _fp8_enabled():
-                # Blockscaled FP8 varlen down-proj (only with explicit protocol)
-                _bs_protocol = _get_blockscaled_protocol()
-                _seg_lens = expert_frequency_offset[1:] - expert_frequency_offset[:-1]
-                _min_seg = int(_seg_lens[_seg_lens > 0].min().item()) if (_seg_lens > 0).any() else 0
-                if _min_seg >= 32:
-                    y2 = blockscaled_fp8_gemm_varlen(
-                        y1 if y1.dtype == torch.bfloat16 else y1.to(torch.bfloat16),
-                        w2,
-                        expert_frequency_offset,
-                        protocol=_bs_protocol,
-                    )
-                else:
-                    # Fallback: raw fp8 GEMM for small expert segments
-                    y1_fp8 = y1 if y1.dtype == torch.float8_e4m3fn else y1.to(torch.float8_e4m3fn)
-                    w2_fp8 = _get_fp8_weight_orig(w2)
-                    y2 = gemm(y1_fp8, w2_fp8.permute(2, 1, 0), cu_seqlens_m=expert_frequency_offset)
+                del y1_fp8, y1_scales
                 router_perm = s_reverse_scatter_idx
                 y2_for_router = y2
             elif _fp8_enabled():
-                # Legacy raw fp8 path (no protocol)
+                # Per-tensor FP8 fallback for small expert segments
                 y1_fp8 = y1 if y1.dtype == torch.float8_e4m3fn else y1.to(torch.float8_e4m3fn)
                 w2_fp8 = _get_fp8_weight_orig(w2)
                 y2 = gemm(y1_fp8, w2_fp8.permute(2, 1, 0), cu_seqlens_m=expert_frequency_offset)
@@ -663,68 +828,118 @@ class _DownProjection(torch.autograd.Function):
             assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
 
             s = topk_scores[s_scatter_idx]
-            if _fp8_enabled():
-                # FP8 tensor core dgated: fp8 inputs, bf16 outputs (no postact fp8 underflow)
-                dout_fp8 = dout.to(torch.float8_e4m3fn)
-                w2_fp8 = _get_cached_fp8_weight(w2, "w2_ehi")
-                _, y1s, ds = gemm_dgated(
-                    dout_fp8,
-                    w2_fp8,
-                    PreAct=z,
-                    activation="swiglu",
-                    dx_out=dz,
-                    out_dtype=torch.bfloat16,
-                    postact_dtype=torch.float8_e4m3fn,
-                    colvec_scale=s,
-                    colvec_reduce=True,
-                    cu_seqlens_m=expert_frequency_offset,
-                    A_idx=x_gather_idx,
-                    dynamic_scheduler=False,
-                )
-            else:
-                _, y1s, ds = gemm_dgated(
-                    dout,
-                    w2.permute(2, 0, 1),
-                    PreAct=z,
-                    activation="swiglu",
-                    dx_out=dz,
-                    colvec_scale=s,
-                    colvec_reduce=True,
-                    cu_seqlens_m=expert_frequency_offset,
-                    A_idx=x_gather_idx,
-                    dynamic_scheduler=False,
-                )
-            _log_stage_memory("backward:down-proj-dgated")
-            _reset_stage_memory_probe()
+            if _fp8_enabled() and _min_expert_segment(expert_frequency_offset) >= 32:
+                # --- Blockscaled FP8: split GEMM + SwiGLU backward ---
+                _evict_per_tensor_caches_once()
+                dout_expanded = dout[x_gather_idx]  # (TK, H)
 
-            if _fp8_enabled():
-                # FP8 weight grad: dout_fp8.T × y1s_fp8 → dw2 (bf16)
-                # y1s is already fp8 from dgated postact_dtype=fp8
-                dout_fp8_wg = dout.to(torch.float8_e4m3fn)
-                y1s_fp8 = y1s if y1s.dtype == torch.float8_e4m3fn else y1s.to(torch.float8_e4m3fn)
+                # Act grad: dout × w2^T → dy1 (TK, I) — explicit quant
+                dout_fp8, dout_scales = quantize_and_pack_activation(dout_expanded.contiguous())
+                w2_perm = w2.permute(1, 0, 2)  # (I, H, E) — view, not copy
+                dy1 = blockscaled_fp8_gemm_varlen(
+                    dout_fp8,
+                    w2_perm,
+                    expert_frequency_offset,
+                    a_scales=dout_scales,
+                    out_dtype=torch.bfloat16,
+                )
+                del w2_perm, dout_fp8, dout_scales
+
+                # Backward SwiGLU + router score
+                if _use_fused_swiglu_quant():
+                    # Fused dSwiGLU + blockscaled fp8 quantize — zero bf16 intermediate
+                    dz_fp8, dz_scales_raw, y1s, ds = swiglu_backward_quant_triton(
+                        dy1, z, s
+                    )
+                    dz_scales_packed = pack_blockscaled_1x32_scales(
+                        dz_scales_raw.view(torch.float8_e8m0fnu), dz_fp8.shape[-1]
+                    )
+                    # Store (tensor, scales) for _UpProjection.backward to pick up
+                    _PREQUANTIZED_SCALES["bwd"] = (dz_fp8, dz_scales_packed)
+                    dz = dz_fp8
+                    del dz_fp8, dz_scales_raw
+                else:
+                    dz[:], y1s, ds = _swiglu_backward_interleaved(dy1, z, s)
+                del dy1
+                _log_stage_memory("backward:down-proj-dgated")
+                _reset_stage_memory_probe()
+
+                # Weight grad: dout^T × y1s per expert — per-tensor FP8 via QuACK
+                # (weight gradients are accumulated; per-tensor precision is sufficient)
+                dout_fp8_wg = dout_expanded.to(torch.float8_e4m3fn)
+                y1s_fp8_wg = y1s.to(torch.float8_e4m3fn)
                 gemm(
                     dout_fp8_wg.T,
-                    y1s_fp8,
+                    y1s_fp8_wg,
                     out=dw2.permute(2, 0, 1),
                     cu_seqlens_k=expert_frequency_offset,
                     A_idx=x_gather_idx,
                     batch_idx_permute=None,
                     dynamic_scheduler=False,
                 )
+                del dout_fp8_wg, y1s_fp8_wg, dout_expanded
+                _log_stage_memory("backward:down-proj-weight")
+                ds = ds[s_reverse_scatter_idx]
             else:
-                y1s_wgrad = y1s.to(torch.bfloat16) if y1s.dtype == torch.float8_e4m3fn else y1s
-                gemm(
-                    dout.T,
-                    y1s_wgrad,
-                    out=dw2.permute(2, 0, 1),
-                    cu_seqlens_k=expert_frequency_offset,
-                    A_idx=x_gather_idx,
-                    batch_idx_permute=None,
-                    dynamic_scheduler=False,
-                )
-            _log_stage_memory("backward:down-proj-weight")
+                # --- Per-tensor FP8 / BF16 path (original fused dgated) ---
+                if _fp8_enabled():
+                    dout_fp8 = dout.to(torch.float8_e4m3fn)
+                    w2_fp8 = _get_cached_fp8_weight(w2, "w2_ehi")
+                    _, y1s, ds = gemm_dgated(
+                        dout_fp8,
+                        w2_fp8,
+                        PreAct=z,
+                        activation="swiglu",
+                        dx_out=dz,
+                        out_dtype=torch.bfloat16,
+                        postact_dtype=torch.float8_e4m3fn,
+                        colvec_scale=s,
+                        colvec_reduce=True,
+                        cu_seqlens_m=expert_frequency_offset,
+                        A_idx=x_gather_idx,
+                        dynamic_scheduler=False,
+                    )
+                else:
+                    _, y1s, ds = gemm_dgated(
+                        dout,
+                        w2.permute(2, 0, 1),
+                        PreAct=z,
+                        activation="swiglu",
+                        dx_out=dz,
+                        colvec_scale=s,
+                        colvec_reduce=True,
+                        cu_seqlens_m=expert_frequency_offset,
+                        A_idx=x_gather_idx,
+                        dynamic_scheduler=False,
+                    )
+                _log_stage_memory("backward:down-proj-dgated")
+                _reset_stage_memory_probe()
 
-            ds = ds[s_reverse_scatter_idx]
+                if _fp8_enabled():
+                    dout_fp8_wg = dout.to(torch.float8_e4m3fn)
+                    y1s_fp8 = y1s if y1s.dtype == torch.float8_e4m3fn else y1s.to(torch.float8_e4m3fn)
+                    gemm(
+                        dout_fp8_wg.T,
+                        y1s_fp8,
+                        out=dw2.permute(2, 0, 1),
+                        cu_seqlens_k=expert_frequency_offset,
+                        A_idx=x_gather_idx,
+                        batch_idx_permute=None,
+                        dynamic_scheduler=False,
+                    )
+                else:
+                    y1s_wgrad = y1s.to(torch.bfloat16) if y1s.dtype == torch.float8_e4m3fn else y1s
+                    gemm(
+                        dout.T,
+                        y1s_wgrad,
+                        out=dw2.permute(2, 0, 1),
+                        cu_seqlens_k=expert_frequency_offset,
+                        A_idx=x_gather_idx,
+                        batch_idx_permute=None,
+                        dynamic_scheduler=False,
+                    )
+                _log_stage_memory("backward:down-proj-weight")
+                ds = ds[s_reverse_scatter_idx]
         else:
             ds = torch.empty_like(topk_scores)
 

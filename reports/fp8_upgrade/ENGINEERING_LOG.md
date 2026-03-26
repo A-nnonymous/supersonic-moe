@@ -6,35 +6,31 @@
 
 ## 0. 读法
 
-如果你只想知道“现在到底到了哪一步”，请只看：
+如果你只想知道”现在到底到了哪一步”，请只看：
 
 - `## 1. 主线里程碑`
-- `## 3. 当前最可信的数据
-
-> **2026-03-26 注意**：本节 3.1/3.2 数据来自早期"算子边界 FP8"（非全链条）。
-> 全链条 FP8 最新数据请看 § 6.3.1（forward -40~50%, E2E -33~39%, 但显存 +3 GiB, 精度不合格）。
-> 下方旧数据仅保留作为历史参考。
-
----
-
-### ⚠️ 旧版 3. 当前最可信的数据（历史，已被 § 6.3.1 取代）`
 - `## 5. 经验与教训`
 - `## 6. 当前缺口`
 
+> **2026-03-26 Session 2 注意**：Forward + act-grad 已全部切换到 blockscaled FP8。训练 E2E 因 pack/unpack 开销比 BF16 慢 4x。详见 HANDOFF.md § 3。
+> 旧版”算子边界 FP8”数据（Section 3/4）已从本文件删除。
+
 ### 0.1 论文 8 个算子 ↔ 工程函数 ↔ 当前 dtype / 支持状态
 
-**重要更新 (2026-03-26)**：下表所有标记「per-tensor cast」的 FP8 路径使用 `.to(fp8)` 无 scale factor 量化。在训练典型小幅值激活下精度不可接受 (RelRMSE ~100%)。已有 `blockscaled_fp8_gemm_varlen` 原型验证 1×32 UE8M0 blockscaling 精度 3.74% RelRMSE，但尚未集成为默认路径。下一步必须全面替换为 blockscaled 量化。
+**重要更新 (2026-03-26 Session 2)**：Forward + act-grad 已切换到 1x32 blockscaled UE8M0 + fused SwiGLU Triton 内核。Weight-grad 仍用 per-tensor FP8。训练 E2E 比 BF16 慢 4x（blockscaled varlen GEMM pack/unpack 开销），推理 forward 快 43%。详见 `HANDOFF.md`。
 
-| 论文算子 | 工程路径 | FP8 方式 | 量化方式 | 精度状态 | 完成度 |
-| --- | --- | --- | --- | --- | --- |
-| up-proj fwd | `gemm_gated(x_fp8, w1_fp8)` | FP8 TC + FP32 accum | per-tensor cast ⚠️ | 需 blockscaled | 🔧 量化待替换 |
-| down-proj fwd | `gemm(y1_fp8, w2_fp8)` / `blockscaled_fp8_gemm_varlen` | FP8 TC | per-tensor (default) ⚠️ / blockscaled (opt-in) ✅ | blockscaled 可用 | 🔧 需设 blockscaled 为 default |
-| expert aggregation | `_router_forward` | 不变 (非 GEMM) | N/A | N/A | ✅ |
-| down-proj act grad | `gemm_dgated(dout_fp8, w2_fp8)` | FP8 TC + FP32 accum | per-tensor cast ⚠️ | 需 blockscaled | 🔧 量化待替换 |
-| down-proj wt grad | `gemm(dout_fp8.T, y1s_fp8)` | FP8 TC | per-tensor cast ⚠️ | 需 blockscaled | 🔧 量化待替换 |
-| up-proj act grad | `gemm(dz_fp8, w1_fp8.permute)` | FP8 TC | per-tensor cast ⚠️ | 需 blockscaled | 🔧 量化待替换 |
-| up-proj wt grad | `gemm(x_fp8.T, dz_fp8)` | FP8 TC | per-tensor cast ⚠️ | 需 blockscaled | 🔧 量化待替换 |
-| backward aggregation | `_token_broadcast_backward` | 不变 (非 GEMM) | N/A | N/A | ✅ |
+| 论文算子 | 工程路径 | 量化方式 | 完成度 |
+| --- | --- | --- | --- |
+| up-proj fwd | `blockscaled_fp8_gemm_varlen(x_fp8, w1, cu_seqlens)` | 1x32 blockscaled ✅ | ✅ DONE |
+| SwiGLU act+quant | `swiglu_forward_quant_triton(z)` | 1x32 blockscaled fused ✅ | ✅ DONE |
+| down-proj fwd | `blockscaled_fp8_gemm_varlen(y1_fp8, w2, cu_seqlens)` | 1x32 blockscaled ✅ (pre-quantized) | ✅ DONE |
+| expert aggregation | `_router_forward` | N/A | ✅ |
+| down-proj act grad | `blockscaled_fp8_gemm_varlen(dout_fp8, w2, cu_seqlens)` | 1x32 blockscaled ✅ | ✅ DONE |
+| dSwiGLU+quant | `swiglu_backward_quant_triton(dy1, z, s)` | 1x32 blockscaled fused ✅ | ✅ DONE |
+| up-proj act grad | `blockscaled_fp8_gemm_varlen(dz_fp8, w1, cu_seqlens)` | 1x32 blockscaled ✅ (pre-quantized) | ✅ DONE |
+| down-proj wt grad | `gemm(dout_fp8.T, y1s_fp8, cu_seqlens_k=...)` | per-tensor cast ⚠️ | 🔧 待优化 |
+| up-proj wt grad | `gemm(x_fp8.T, dz_fp8, cu_seqlens_k=...)` | per-tensor cast ⚠️ | 🔧 待优化 |
+| backward aggregation | `_token_broadcast_backward` | N/A | ✅ |
 
 ### 0.2 论文变量 ↔ 工程变量（之后汇报不要只写简写）
 
@@ -1080,133 +1076,15 @@ workspace cache 试验结果（未保留，仅记录）：
 
 ---
 
-## 3. 当前最可信的数据
+## ~~3. 当前最可信的数据~~ — 已删除
 
-> **2026-03-26 注意**：本节 3.1/3.2 数据来自早期"算子边界 FP8"（非全链条）。
-> 全链条 FP8 最新数据请看 § 6.3.1（forward -40~50%, E2E -33~39%, 但显存 +3 GiB, 精度不合格）。
-> 下方旧数据仅保留作为历史参考。
+> 历史数据（算子边界 FP8）已被全链条数据取代。最新性能数据见 `HANDOFF.md § 3`。
 
 ---
 
-### ⚠️ 旧版 3. 当前最可信的数据（历史，已被 § 6.3.1 取代）
+## ~~4. 理论账本~~ — 已删除
 
-### 3.1 stable 主线，shape `8192,4096,1024,128,8`（2026-03-25 同机空闲卡复测）
-
-复测环境：
-
-- host `10.51.203.82`（空闲卡）
-- `USE_QUACK_GEMM=1`
-- bf16 与 fp8 在**同一台空闲机器**上重测，避免共享卡噪声
-
-当前最可信结果：
-
-- bf16：
-  - inf / train fwd / e2e / bwd `1.930 / 1.944 / 5.676 / 3.746 ms`
-- stable fp8：
-  - output RMSE `0.01074111`
-  - loss RMSE `0.00000025`
-  - metrics probe：`bf16_peak_mib=7690.38`, `fp8_peak_mib=7572.50`
-  - stagewise final peak：`7572.50 -> 7702.50 MiB`
-  - inf / train fwd / e2e / bwd `1.947 / 2.144 / 5.871 / 3.924 ms`
-
-相对 bf16 baseline：
-
-- inference：`-0.88%`
-- train fwd：`-10.29%`
-- e2e：`-3.43%`
-- backward：`-4.75%`
-
-当前正确解释：
-
-- **这版 stable fp8 在干净复测下没有性能收益**
-- 理论上它仍可能靠更小的 activation payload 获益，但前提是：
-  - `saved_traffic + overlap > quant/dequant + scales + extra_buffer + sync`
-- 当前这条主线属于：
-  - `up-proj -> fp8 boundary -> bf16 restored A_e -> down-proj`
-  - 即**算子边界 fp8**，不是原生 full-chain fp8 算子
-- 因此当前没有赢的根因是：
-  1. 核心算子主体并没有变成原生 fp8 mainloop
-  2. 额外引入了 quant / dequant / scale 处理
-  3. 还会物化压缩态与恢复后的 `bf16 A_e`
-  4. backward 侧仍有明显 transient overhead（stagewise `+130 MiB`）
-
-收益来源若未来出现，应该主要来自：
-
-- 更小的 `A_e` 边界 payload 带来的 HBM/L2 traffic 下降
-- 更小 working-set 带来的 cache / residency 改善
-- 若后续打通原生 fp8 算子，还可能出现 kernel 内部融合收益
-
-但**当前这版收益没有出现**，因此不能再把“加了 quant/dequant 仍可能赢”当作已被当前主线实证支持的结论。
-
-### 3.1.1 stable 主线，shape `32768,4096,1024,128,8`（并发复测状态）
-
-- 已按并行规则把 bf16 / fp8 分别发到两台空闲 host：
-  - bf16：`10.51.203.76`
-  - fp8：`10.51.203.82`
-- 两边都被 `SIGKILL (exit code 137)` 打断，未拿到可用 timing
-
-当前解释：
-
-- 这不是“fp8 比 bf16 快/慢”的证据
-- 只说明当前这组超大 shape 在本轮空闲节点条件下没有稳定完成
-- 后续如果还要复测 `32768`，应单独走：
-  - 更轻量的 timing 口径
-  - 或先确认该 host 的可用显存 / 作业限制
-
-### 3.2 stable 主线，shape `4096,4096,1024,128,8`
-
-- bf16：
-  - peak `7049.88 MiB`
-  - inf / train fwd / e2e / bwd `1.141 / 1.210 / 3.437 / 2.296 ms`
-- stable fp8：
-  - peak `6931.00 MiB`
-  - output RMSE `0.01073675`
-  - loss RMSE `0.00000021`
-  - inf / train fwd / e2e / bwd `1.125 / 1.697 / 3.733 / 2.608 ms`
-
-正确解释：
-
-- 显存优势稳定存在
-- 训练前向 / e2e 还没有彻底超过 bf16
-
-### 3.3 blockscaled static weight benchmark，shape `1024,512,512,32,4`
-
-- bf16：
-  - peak `380.25 MiB`
-  - inf / train fwd / e2e / bwd `0.184 / 1.187 / 3.184 / 3.000 ms`
-- static fp8 `w2`：
-  - peak `144.78 MiB`
-  - output RMSE `0.00131902`
-  - loss RMSE `0.00000013`
-  - inf / train fwd / e2e / bwd `0.275 / 2.683 / 5.066 / 4.790 ms`
-
-正确解释：
-
-- 省显存很大
-- 但变慢也非常明显
-- 这不是因为在线量化，而是因为路径本身不对
-
----
-
-## 4. 理论账本
-
-### 4.1 `4096,4096,1024,128,8`
-
-- 当前稳定主线：
-  - `stable_fp8_saved_payload_mib=31.00`
-- 若打通 varlen-friendly direct FP8 mainloop：
-  - `direct_fp8_boundary_saved_mib=97.75`
-- 若进一步把 `w1/w2` 做成 FP8 存储：
-  - `aggressive_weight_saved_mib=1524.00`
-- 合并理论上限：
-  - `aggressive_total_saved_mib=1555.75`
-
-### 4.2 结论
-
-- 现在最值得追的大头非常明确：
-  1. 去掉 `bf16` 回退边界
-  2. 做真正的 weight fp8 存储与消费
-- 小于这个量级的收益，不值得为之破坏 SonicMoE 的核心内存合同
+> 理论显存账本已整合至 `HANDOFF.md § 3.5`。
 
 ---
 
@@ -1382,74 +1260,6 @@ Monkey-patch (fp8_quack_patch.py):
 
 ---
 
-## 7. 当前工作树里最重要的非文档改动
+## 7. 文件改动 & 推荐命令
 
-- `sonicmoe/functional/__init__.py` — **核心文件，全部 FP8 逻辑**
-  - `_fp8_mode()` / `_fp8_enabled()`: 统一 FP8 模式控制（`SONIC_MOE_FP8_MODE=perf|mem`，兼容旧 flag）
-  - `_FP8_WEIGHT_CACHE`: permuted contiguous 缓存（w1_ekh, w2_ehi），always-cached
-  - `_FP8_ORIG_CACHE`: original-layout 缓存（w1_orig, w2_orig），perf-only
-  - 6 个 GEMM call site 全部支持 FP8
-  - 推理路径同样全链条 FP8
-  - `apply_fp8_quack_patch()` 在 import 时自动应用
-- `sonicmoe/quack_utils/fp8_quack_patch.py` — **monkey-patch quack.gemm for FP8**
-  - 添加 `torch.float8_e4m3fn` → CuTe dtype 映射
-  - Override `create_cute_tensor` 处理 fp8 via `.view(torch.uint8)` 保持 stride
-- `benchmarks/moe-cute.py`
-  - `--fp8_mode perf|mem` flag（取代旧 `--native_fp8_forward`）
-  - Import `clear_fp8_native_weight_cache` 用于内存测量前清理缓存
-- `tests/fp8_large_project_contract_test.py`
-  - 11 个 contract tests（前向 + 反向 + 梯度全量验证 + 大 shape）
----
-
-## 8. 当前推荐命令
-
-### 快速回归
-
-```bash
-source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate
-cd /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe
-USE_QUACK_GEMM=1 python -m pytest -q tests/fp8_protocol_test.py tests/moe_blackwell_test.py
-```
-
-### 稳定主线 metrics / theory / stage memory
-
-```bash
-USE_QUACK_GEMM=1 python benchmarks/moe-cute.py \
-  --thiek 4096,4096,1024,128,8 \
-  --dtype BFloat16 \
-  --activation swiglu \
-  --skip_test \
-  --fp8_protocol blackwell \
-  --report_fp8_metrics \
-  --report_fp8_analysis \
-  --report_stage_memory
-```
-
-### static fp8 weight benchmark（仅做实验，不要误判为主线）
-
-```bash
-USE_QUACK_GEMM=1 \
-SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ=1 \
-SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY=256 \
-SONIC_MOE_FP8_DOWNPROJ_WEIGHT_PRECISION=fp8 \
-python benchmarks/moe-cute.py \
-  --thiek 1024,512,512,32,4 \
-  --dtype BFloat16 \
-  --activation swiglu \
-  --skip_test \
-  --fp8_protocol blackwell \
-  --report_fp8_metrics \
-  --prefetch_fp8_weights
-```
-
-### Native FP8 tensor core benchmark（主线）
-
-```bash
-USE_QUACK_GEMM=1 python benchmarks/moe-cute.py \
-  --thiek 4096,4096,1024,128,8 \
-  --dtype BFloat16 \
-  --activation swiglu \
-  --skip_test \
-  --report_stage_memory \
-  --native_fp8_forward
-```
+> 已整合至 `HANDOFF.md § 7`（关键文件表 + 环境与命令速查）。请参阅该文件。
