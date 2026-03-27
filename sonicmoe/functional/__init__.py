@@ -606,21 +606,17 @@ class _UpProjection(torch.autograd.Function):
                 # Blockscaled FP8 up-proj backward
                 _evict_per_tensor_caches_once()
 
-                # Weight grad: x^T × dz per expert — per-tensor FP8 via QuACK
-                # (weight gradients are accumulated; per-tensor precision is sufficient)
+                # Weight grad: x^T × dz per expert — blockscaled 1x32 FP8
+                # x is (T, H), needs gather to (TK, H); dz is (TK, 2I)
                 dz_for_wgrad = dz if dz.dtype == torch.bfloat16 else dz.to(torch.bfloat16)
-                x_fp8_wg = x.to(torch.float8_e4m3fn)
-                dz_fp8_wg = dz_for_wgrad.to(torch.float8_e4m3fn)
-                gemm(
-                    x_fp8_wg.T,
-                    dz_fp8_wg,
+                x_gathered_wg = x[x_gather_idx]  # (TK, H)
+                blockscaled_fp8_weight_grad_gemm(
+                    x_gathered_wg,
+                    dz_for_wgrad,
+                    expert_frequency_offset,
                     out=dw1.permute(2, 1, 0),
-                    cu_seqlens_k=expert_frequency_offset,
-                    A_idx=x_gather_idx,
-                    batch_idx_permute=None,
-                    dynamic_scheduler=False,
                 )
-                del x_fp8_wg, dz_fp8_wg, dz_for_wgrad
+                del x_gathered_wg, dz_for_wgrad
 
                 # Act grad: dz × w1^T → dx_expanded (TK, H) — explicit quant
                 # Check if dz was already quantized by fused backward+quant
@@ -867,7 +863,6 @@ class _DownProjection(torch.autograd.Function):
             if _fp8_enabled() and _min_expert_segment(expert_frequency_offset) >= 32:
                 # --- Blockscaled FP8 backward ---
                 _evict_per_tensor_caches_once()
-                dout_expanded = dout[x_gather_idx]  # (TK, H) — needed for weight grad
 
                 if _use_fused_blockscaled_gated():
                     # FUSED path: gemm_dgated with blockscaled FP8
@@ -921,19 +916,16 @@ class _DownProjection(torch.autograd.Function):
                 _log_stage_memory("backward:down-proj-dgated")
                 _reset_stage_memory_probe()
 
-                # Weight grad: dout^T × y1s per expert — per-tensor FP8 via QuACK
-                dout_fp8_wg = dout_expanded.to(torch.float8_e4m3fn)
-                y1s_fp8_wg = y1s.to(torch.float8_e4m3fn)
-                gemm(
-                    dout_fp8_wg.T,
-                    y1s_fp8_wg,
+                # Weight grad: dout^T × y1s per expert — blockscaled 1x32 FP8
+                # dout is (T, H), needs gather to (TK, H); y1s is already (TK, I)
+                dout_gathered = dout[x_gather_idx]  # (TK, H)
+                blockscaled_fp8_weight_grad_gemm(
+                    dout_gathered,
+                    y1s,
+                    expert_frequency_offset,
                     out=dw2.permute(2, 0, 1),
-                    cu_seqlens_k=expert_frequency_offset,
-                    A_idx=x_gather_idx,
-                    batch_idx_permute=None,
-                    dynamic_scheduler=False,
                 )
-                del dout_fp8_wg, y1s_fp8_wg, dout_expanded
+                del dout_gathered
                 _log_stage_memory("backward:down-proj-weight")
                 ds = ds[s_reverse_scatter_idx]
             else:

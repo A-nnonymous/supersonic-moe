@@ -1,138 +1,191 @@
-# FP8 Next-Agent Handoff
+# FP8 Blockscaled Upgrade — Status & Handoff
 
-> **最后更新：2026-03-27 Session 3 — 诚实最终版**
-
----
-
-## 0. 一句话现状
-
-**FP8 blockscaled 在当前 shape (8192,4096,1024,128,8) 下 E2E 训练比 BF16 慢 ~78%（13.8ms vs 7.8ms）。Forward 接近（2.8ms vs 2.5ms），backward 是主要差距（11.0ms vs 5.3ms）。根因：FP8 backward 每次 GEMM 前需要 activation quantize + ISA scale packing 开销，而 BF16 直接用 fused `gemm_dgated` 零额外开销。推理 forward 快 43%（2.2ms vs 3.9ms，CUDA graph）。精度合同测试 8/8 PASSED。**
-
-**核心 insight：blockscaled FP8 的 quantize overhead（bf16→fp8+scales→ISA pack）在 MoE 的多次 GEMM 调用中累积，严重抵消了 FP8 tensor core 的 2x throughput 优势。除非能做到 zero-overhead quantization（如 ernie-core 的 FP8 dispatch 在通信前已量化），否则 FP8 在 MoE 训练中的收益有限。**
+> **Last updated: 2026-03-27**
 
 ---
 
-## 1. 硬约束
+## 1. 现状概述
 
-- 量化方案：1x32 blockscaled UE8M0（Blackwell tcgen05.mma 硬件原生 descale）
-- 精度：RelRMSE < 10%, cosine > 0.99
-- 不做 site-packages 直接修改（monkey-patch via git commit 可以）
+SonicMoE 全链路 blockscaled FP8 已完成 **8/8 GEMM 算子切换至 blockscaled 1x32**：
+- Forward (2 GEMM): blockscaled 1x32 ✅
+- Backward act-grad (2 GEMM): blockscaled 1x32 ✅
+- Backward weight-grad (2 GEMM): **已改为 `blockscaled_fp8_weight_grad_gemm`** ✅ (本次 session 完成)
 
----
+**核心路径**: Token rounding routing（生产模式）保证 128-aligned segments，blockscaled FP8 零 padding 开销。
 
-## 2. 公平对比数据（同 shape, token rounding, weight cached）
-
-**Shape: T=8192, H=4096, I=1024, E=128, K=8, TK=65920**
-
-| 配置 | Forward (ms) | Backward (ms) | E2E (ms) | TFLOPS | Peak (MiB) |
-|------|-------------|---------------|---------|--------|-----------|
-| **BF16 (fused dgated)** | **2.471** | **5.293** | **7.764** | **641** | **7530** |
-| FP8 fused fwd + fused bwd | 2.759 | 11.070 | 13.829 | 360 | 10241 |
-| FP8 fused fwd + separate bwd | 2.772 | 7.308 | 10.079 | 494 | 10935 |
-
-**推理（CUDA graph, vanilla top-K）：**
-
-| 配置 | Inference (ms) | TFLOPS |
-|------|---------------|--------|
-| BF16 | 3.878 | 425 |
-| FP8 blockscaled | **2.216** | **744** |
-| **加速** | **-42.9%** | **+75%** |
-
-### 性能分析
-
-**FP8 Forward (2.77ms) vs BF16 Forward (2.47ms) — 差 12%：**
-- BF16: fused `gemm_gated` 单 kernel（零 quantize 开销）
-- FP8: `gather_quantize_and_pack` (~0.05ms) + fused `gemm_gated` blockscaled (~0.47ms 仅 GEMM) + weight cache lookup
-- GEMM kernel 本身 FP8 快 1.81x，但 quantize overhead 吃掉了大部分收益
-
-**FP8 Backward — 主要差距来源：**
-- BF16 fused dgated: 单 CUTLASS kernel 完成 GEMM + dSwiGLU + score weighting
-- FP8 separate bwd: `gather_quantize_and_pack` + `blockscaled_fp8_gemm_varlen` + `swiglu_backward_quant_triton` + per-tensor weight grad — 至少 4 个 kernel
-- FP8 fused dgated bwd: 仍需要 activation quantize + weight quantize 前置，且 dgated epilogue 性能在 blockscaled 下不理想
-
-### 精度
-
-| 测试 | 结果 |
-|------|------|
-| 合同测试 8/8 | **PASSED** (5% rtol/atol) |
-| Official moe_blackwell_test | **PASSED** |
-| Fused gemm_gated D RelRMSE | 3.75% |
-| Fused gemm_gated PostAct RelRMSE | 5.29% |
-
-### 显存（排除共同 master weights）
-
-| 组件 | BF16 | FP8 perf | FP8 mem |
-|------|------|---------|---------|
-| Forward peak activation | 896 MiB | 2238 MiB | 648 MiB |
-| Weight cache | 0 | +1590 MiB | 0 |
+**当前代码状态**: 已修改未验证。Weight-grad blockscaled 代码已写入 `sonicmoe/functional/__init__.py`，但由于集群 GPU 资源全满（16 节点全部 100% 占用），benchmark 和 RMSE 验证未完成。
 
 ---
 
-## 3. 代码状态
+## 2. 代码架构
 
-### GEMM 算子
+### GEMM 算子状态 (全部 8/8 blockscaled)
 
-| 算子 | BF16 路径 | FP8 路径 | 状态 |
-|------|---------|---------|------|
-| up-proj forward | fused `gemm_gated` | fused `gemm_gated` + blockscaled | DONE |
-| down-proj forward | `quack.gemm` varlen | `blockscaled_fp8_gemm_varlen` | DONE |
-| down-proj act-grad | fused `gemm_dgated` | separate `blockscaled_fp8_gemm_varlen` + SwiGLU bwd | DONE |
-| up-proj act-grad | `quack.gemm` varlen | `blockscaled_fp8_gemm_varlen` | DONE |
-| weight-grad (×2) | `quack.gemm` varlen-K | per-tensor `.to(fp8)` + `quack.gemm` | DONE |
+| 算子 | 精度 | 实现 | 验证状态 |
+|------|------|------|----------|
+| up-proj forward | blockscaled 1x32 | fused `gemm_gated` + a_scales/b_scales | ✅ 已验证 |
+| down-proj forward | blockscaled 1x32 | `blockscaled_fp8_gemm_varlen` | ✅ 已验证 |
+| down-proj act-grad | blockscaled 1x32 | separate `blockscaled_fp8_gemm_varlen` + SwiGLU bwd | ✅ 已验证 |
+| up-proj act-grad | blockscaled 1x32 | `blockscaled_fp8_gemm_varlen` | ✅ 已验证 |
+| down-proj weight-grad | **blockscaled 1x32** | `blockscaled_fp8_weight_grad_gemm` | ⚠️ 待验证 |
+| up-proj weight-grad | **blockscaled 1x32** | `blockscaled_fp8_weight_grad_gemm` | ⚠️ 待验证 |
 
-### 已修复的 Bug
+### 本次代码变更详情 (functional/__init__.py)
 
-- **QuACK varlen alignment bug**: `gemm_default_epi.py:127-129` `domain_offset` 降低 bf16 colvec 指针对齐。**修复**: `colvec_scale=s.float()` — fp32 指针动态偏移后仍 32-bit aligned。
+**变更 1: down-proj weight-grad (line ~919-928)**
+```python
+# 旧代码 (per-tensor):
+dout_fp8_wg = dout.to(torch.float8_e4m3fn)
+y1s_fp8_wg = y1s.to(torch.float8_e4m3fn)
+gemm(dout_fp8_wg.T, y1s_fp8_wg, out=dw2.permute(2, 0, 1), ...)
 
-### Fused Kernel 清单
+# 新代码 (blockscaled):
+dout_gathered = dout[x_gather_idx]  # (TK, H)
+blockscaled_fp8_weight_grad_gemm(
+    dout_gathered, y1s, expert_frequency_offset,
+    out=dw2.permute(2, 0, 1),
+)
+```
 
-| Kernel | 功能 | 节省 |
-|--------|------|------|
-| `_quantize_and_pack_kernel` | bf16→fp8+ISA scales (1 kernel) | raw_scales tensor |
-| `_gather_quantize_and_pack_kernel` | gather+quant+pack (1 kernel) | ~512 MiB bf16 intermediate |
-| `swiglu_forward_quant_triton` | SwiGLU+blockscaled quant | bf16 y1 intermediate |
-| `swiglu_backward_quant_triton` | dSwiGLU+score+blockscaled quant | bf16 dz intermediate |
+**变更 2: up-proj weight-grad (line ~609-618)**
+```python
+# 旧代码 (per-tensor):
+dz_for_wgrad = dz if dz.dtype == torch.bfloat16 else dz.to(torch.bfloat16)
+x_fp8_wg = x.to(torch.float8_e4m3fn)
+dz_fp8_wg = dz_for_wgrad.to(torch.float8_e4m3fn)
+gemm(x_fp8_wg.T, dz_fp8_wg, out=dw1.permute(2, 1, 0), ...)
+
+# 新代码 (blockscaled):
+dz_for_wgrad = dz if dz.dtype == torch.bfloat16 else dz.to(torch.bfloat16)
+x_gathered_wg = x[x_gather_idx]  # (TK, H)
+blockscaled_fp8_weight_grad_gemm(
+    x_gathered_wg, dz_for_wgrad, expert_frequency_offset,
+    out=dw1.permute(2, 1, 0),
+)
+```
+
+**变更 3: 消除冗余 dout_expanded (节省 512 MiB)**
+- 旧 blockscaled path 中 `dout_expanded = dout[x_gather_idx]` 创建了 (65536, 4096) bf16 中间张量，仅用于 weight-grad 的 `.to(fp8)`
+- 现已替换为 `dout_gathered = dout[x_gather_idx]` 直接传入 `blockscaled_fp8_weight_grad_gemm`，逻辑等价但避免了额外复制
+
+### Fused Kernels
+
+| Kernel | 功能 | 代码位置 |
+|--------|------|----------|
+| `gather_quantize_and_pack_kernel` | gather + bf16→fp8 + ISA scale pack | `blockscaled_fp8_gemm.py:889` |
+| `quantize_and_pack_kernel` | bf16→fp8 + ISA scale pack | `blockscaled_fp8_gemm.py` |
+| `swiglu_forward_quant_triton` | SwiGLU + blockscaled quant (fwd) | `swiglu_triton.py` |
+| `swiglu_backward_quant_triton` | dSwiGLU + score + blockscaled quant (bwd) | `swiglu_triton.py` |
+
+### 数据流关键机制
+
+- **`_PREQUANTIZED_SCALES`**: Dict-based FP8 tensor 复用机制
+  - `"fwd"`: `swiglu_forward_quant_triton` 输出的 y1_fp8 + scales → `_DownProjection.forward` 复用（跳过重复 quantize）
+  - `"bwd"`: `swiglu_backward_quant_triton` 输出的 dz_fp8 + scales → `_UpProjection.backward` act-grad 复用
+  - 每次复用通过 `is` identity check 验证安全性
+
+### 已修复 Bug
+
+- **QuACK varlen alignment**: `colvec_scale=s.float()` — fp32 指针始终 32-bit aligned（BF16 指针在 domain_offset 后可能 16-bit aligned，触发 async copy 崩溃）
 
 ---
 
-## 4. 高价值信息源
+## 3. 精度数据 (前 6/8 GEMM 的验证结果)
 
-| 信息 | 位置 |
-|------|------|
-| QuACK blockscaled + varlen 支持 | `quack/gemm_sm100.py:423` GemmSm100.__call__ accepts mSFA/mSFB |
-| VarlenMTileScheduler | `quack/tile_scheduler.py:587` |
-| alignment bug 根因 | `quack/gemm_default_epi.py:117-138` varlen domain_offset |
-| ernie-core FP8 weight 策略 | ernie-core `src/ernie_core/models/moe/moe_layer.py:2195` Fp8FusedMoeFunc |
-| SonicMoE 论文 | https://arxiv.org/html/2512.14080 |
-| 128-alignment 硬约束分析 | `reports/fp8_upgrade/BLOCKSCALED_ALIGNMENT.md` |
+| 测试 | 结果 | 条件 |
+|------|------|------|
+| Contract tests 8/8 | PASSED (5% rtol/atol) | `SONIC_MOE_FP8_MODE=perf`, 不含 large_shape |
+| Official moe_blackwell_test | PASSED | 标准测试 |
+| Fused gemm_gated D RelRMSE | 3.75% | shape: 65536×4096×2048, E=128 |
+| Fused gemm_gated PostAct RelRMSE | 5.29% | 同上 |
 
----
-
-## 5. 教训
-
-1. **BF16 fused `gemm_dgated` 极强**。单 CUTLASS kernel 完成 GEMM+dSwiGLU+score weighting，零额外开销。FP8 要赢需要把 quantize overhead 做到 ~0。
-2. **Activation quantize 是 FP8 MoE 的核心瓶颈**。每次 GEMM 前的 bf16→fp8+ISA-pack 开销累积（4-6 次/step），严重抵消 FP8 tensor core 优势。
-3. **ernie-core 的方案**：FP8 dispatch（通信前已量化）+ deep_gemm（C++ 级别 GEMM，无 Python overhead）+ 每个 GEMM 只做 1 次量化。SonicMoE 的 CUTLASS DSL 路径有更多 Python/Triton kernel launch overhead。
-4. **`colvec_scale=s.float()` 修复 alignment bug**：fp32 元素 4 bytes，动态偏移后永远 32-bit aligned。简单有效。
-5. **FP8 推理有明确优势**（-43%）因为只有 forward，quantize 只做 1-2 次。
+**Weight-grad blockscaled 精度**: ⚠️ 待 RMSE 验证。验证脚本已就绪 (`tools/rmse_verification.py`)。
 
 ---
 
-## 6. 下一步方向
+## 4. 性能数据
 
-### P0: 消除 activation quantize overhead
-- 当前每次 blockscaled GEMM 前都要 `quantize_and_pack_activation`（bf16→fp8+ISA pack，~30-50μs/call × 4-6 calls = 200μs+）
-- 方案 A: 全 pipeline fp8 保持，避免 bf16↔fp8 往返（需要 GEMM 输出直接为 fp8）
-- 方案 B: 参考 ernie-core 的 deep_gemm，用 C++ kernel 替代 Python Triton quantize
-- 方案 C: 将 quantize 融合到 CUTLASS GEMM prologue（mainloop 内做 on-the-fly quantize）
+> **全部性能数据待采集** — 本次 session 集群 16 节点全部 100% GPU 占用，无法运行 benchmark。
 
-### P1: 利用 fused dgated + blockscaled（已有基础设施）
-- `gemm_dgated` + `a_scales/b_scales` 已能编译运行（13.8ms），但性能不如 separate path
-- 需要 profile 分析 fused dgated blockscaled 的 overhead 来源（autotune config？epilogue overhead？）
+**Benchmark 工具**: `tools/final_benchmark.py`
+**RMSE 工具**: `tools/rmse_verification.py` (比较 FP8 vs BF16 的 output/dx/d_scores/dw1/dw2)
+**Shape**: T=8192, H=4096, I=1024, E=128, K=8 (token rounding routing)
 
-### P2: Weight-grad blockscaled
-- 当前 per-tensor `.to(fp8)` cast，精度可能不够稳定
-- 需要 per-operator RMSE 分析确认是否需要改进
+---
+
+## 5. 已发现的关键问题 (HIGH VALUE)
+
+### 问题 1: up-proj weight-grad 的 dz 有损转换 (BUG — 影响 dw1 精度)
+
+**位置**: `_UpProjection.backward` line 611
+
+当 fused swiglu quant 开启时 (默认)，`_DownProjection.backward` 将 `dz` 设为 `dz_fp8`（blockscaled fp8 tensor，line 910）。在 `_UpProjection.backward` 中：
+
+```python
+dz_for_wgrad = dz if dz.dtype == torch.bfloat16 else dz.to(torch.bfloat16)  # line 611
+```
+
+`dz` 是 `float8_e4m3fn`，所以执行 `.to(torch.bfloat16)`。**这是错误的**：
+
+- blockscaled fp8 tensor 的实际值 = `fp8_raw * 2^(e8m0_scale_per_block)`
+- `.to(bf16)` 只转换 `fp8_raw` 部分，**丢失了 block scale factor**
+- 后续 `blockscaled_fp8_weight_grad_gemm` 接收到的是**缺少 scale 的错误 bf16 值**
+- 最终 dw1 weight gradient 的量级可能偏差很大
+
+**修复方向**:
+1. 在 `_DownProjection.backward` 中将 `dz` 正确反量化回 bf16（需要 block scale 信息）
+2. 或让 `blockscaled_fp8_weight_grad_gemm` 接受 pre-quantized fp8 + scales 输入，跳过内部量化
+3. 或不在 backward boundary 替换 `dz` 为 fp8 — 保持 bf16 传递
+
+**注意**: 这个 bug 在旧的 per-tensor weight-grad 路径中也存在（`.to(bf16)` 再 `.to(fp8)`），但因为 per-tensor fp8 没有 block scale 分离（scale 融入值中），影响更小。
+
+### 问题 2: quantize 开销是 FP8 性能退化主因
+
+**完整 E2E quantize 操作清单** (blockscaled path, separate backward):
+
+| # | 阶段 | 操作 | 形状 | 类型 |
+|---|------|------|------|------|
+| 1 | FWD up-proj | `quantize_and_pack_activation(x_gathered)` | (TK, 4096) | blockscaled Triton |
+| 2 | FWD up-proj | `swiglu_forward_quant_triton(z)` | (TK, 2048)→(TK, 1024) | fused Triton |
+| 3 | FWD down-proj | SKIPPED via `_PREQUANTIZED_SCALES["fwd"]` | — | — |
+| 4 | BWD down-proj | `gather_quantize_and_pack_activation(dout, idx)` | (T, 4096)→(TK, 4096) | blockscaled Triton |
+| 5 | BWD down-proj | `swiglu_backward_quant_triton(dy1, z, s)` | (TK, 1024)+(TK, 2048) | fused Triton |
+| 6 | BWD up-proj act-grad | SKIPPED via `_PREQUANTIZED_SCALES["bwd"]` | — | — |
+| 7 | BWD down-proj wgrad | `blockscaled_fp8_weight_grad_gemm` 内部量化 x2 | (TK, H) + (TK, I) | 内部 |
+| 8 | BWD up-proj wgrad | `blockscaled_fp8_weight_grad_gemm` 内部量化 x2 | (TK, H) + (TK, 2I) | 内部 |
+
+**BF16 对比**: BF16 用 fused `gemm_dgated` 单 kernel 完成 GEMM+dSwiGLU+score，零量化开销。FP8 多了 4 次 blockscaled quantize（#1,#2,#4,#5）+ weight-grad GEMM 内部的 4 次量化。
+
+### 问题 3: weight-grad GEMM 内部有不必要的 pack/unpack
+
+`blockscaled_fp8_weight_grad_gemm` 内部流程：
+1. `_pack_grouped_rows`: 将 flat tokens 按 expert 分组 → (E, capacity, dim)
+2. `.transpose(1,2).contiguous()`: → (E, dim, capacity)
+3. `quantize_activation_blockscaled_fast`: bf16 → fp8 + e8m0 scales
+4. `pack_blockscaled_1x32_scales`: ISA layout packing
+5. CUTLASS batched GEMM
+
+其中 step 1 的 `_pack_grouped_rows` 和 gather 操作有冗余：
+- down-proj wgrad 中 `dout_gathered = dout[x_gather_idx]` 已经做了 gather，然后 `_pack_grouped_rows` 再做一次 expert 分组
+- 可以考虑直接将 already-gathered 数据 reshape + pad 为 grouped 格式，跳过 Triton scatter
+
+---
+
+## 6. 优先级与下一步
+
+| 优先级 | 任务 | 状态 | 说明 |
+|--------|------|------|------|
+| **P0** | 修复 dz 有损转换 bug | 🔴 TODO | 影响 dw1 精度，必须在验证前修复 |
+| **P0** | RMSE 验证 + benchmark | 🔴 TODO | 等 GPU 空闲后运行 `tools/rmse_verification.py` |
+| P1 | 消除 backward quantize overhead | IN PROGRESS | 已有分析，需实现 |
+| P2 | weight-grad 复用 act-grad fp8 数据 | PENDING | 消除重复量化 |
+| P3 | 显存优化 — 统一 weight cache | PENDING | |
+
+**下一个 agent 应做的第一件事**:
+1. 修复 `_UpProjection.backward` line 611 的 dz 有损转换 bug
+2. 在 GPU 空闲时运行 `python tools/rmse_verification.py` 验证精度
+3. 运行 `python -m pytest tests/fp8_large_project_contract_test.py -v -k "not large_shape"` 验证 8/8 pass
+4. 运行 `python tools/final_benchmark.py` 采集性能数据（BF16 / FP8 两种模式）
 
 ---
 
@@ -142,11 +195,11 @@
 source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate
 cd /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe
 
-# 合同测试 (8/8 pass)
+# Contract tests (8/8 pass excluding large_shape)
 CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
   python -m pytest tests/fp8_large_project_contract_test.py -v -k "not large_shape"
 
-# BF16 E2E benchmark (token rounding, fused dgated)
+# BF16 E2E benchmark (token rounding)
 CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=off \
   python tools/final_benchmark.py
 
@@ -154,20 +207,46 @@ CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=off \
 CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf SONIC_MOE_FP8_FUSED_GATED=1 \
   python tools/final_benchmark.py
 
-# nsys profiles
-output/fp8_fused_profile.nsys-rep
-output/bf16_fwd_profile.nsys-rep
+# RMSE verification (per-step FP8 vs BF16)
+CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 \
+  python tools/rmse_verification.py
+
+# 查找集群空闲 GPU
+python tools/cluster_idle_launch.py scan
+# 在远程节点运行（注意：scan 只报告真正 idle 的 GPU，低利用率但有内存占用的不算 idle）
+python tools/cluster_idle_launch.py launch --command "..." --workdir "$(pwd)"
 ```
 
 ### 关键文件
 
 | 文件 | 作用 |
 |------|------|
-| `sonicmoe/functional/__init__.py` | 核心 forward/backward + FP8 调度 |
-| `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` | Blockscaled GEMM + fused kernels |
-| `sonicmoe/quack_utils/swiglu_triton.py` | Fused SwiGLU+quantize kernels |
-| `sonicmoe/quack_utils/gemm_gated.py` | Fused GEMM+SwiGLU (+ blockscaled) |
-| `sonicmoe/quack_utils/gemm_dgated.py` | Fused GEMM+dSwiGLU (+ blockscaled) |
-| `sonicmoe/quack_utils/fp8_quack_patch.py` | QuACK patches (FP8 dtype + bug docs) |
-| `tools/final_benchmark.py` | Fair comparison benchmark |
-| `tools/nsys_profile.py` | NVTX profiling |
+| `sonicmoe/functional/__init__.py` | 核心 forward/backward + FP8 调度 (`_UpProjection`, `_DownProjection`) |
+| `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` | blockscaled GEMM + `blockscaled_fp8_weight_grad_gemm` + fused quantize kernels |
+| `sonicmoe/quack_utils/swiglu_triton.py` | fused SwiGLU+quantize Triton kernels |
+| `sonicmoe/quack_utils/gemm_gated.py` | fused GEMM+SwiGLU + blockscaled (forward) |
+| `sonicmoe/quack_utils/gemm_dgated.py` | fused GEMM+dSwiGLU + blockscaled (backward) |
+| `sonicmoe/quack_utils/gemm_interface.py` | QuACK GEMM interface wrappers |
+| `tools/rmse_verification.py` | Per-step RMSE 验证工具 |
+| `tools/final_benchmark.py` | E2E 性能 benchmark |
+| `tools/cluster_idle_launch.py` | 集群 GPU 扫描 + 远程启动 |
+| `reports/fp8_upgrade/BLOCKSCALED_ALIGNMENT.md` | 128-alignment 硬约束分析 |
+
+### 环境变量
+
+| 变量 | 值 | 说明 |
+|------|-----|------|
+| `USE_QUACK_GEMM` | `1` | 启用 QuACK CUTLASS GEMM |
+| `SONIC_MOE_FP8_MODE` | `off`/`perf`/`mem` | FP8 模式 (`off`=BF16, `perf`=FP8) |
+| `SONIC_MOE_FP8_FUSED_GATED` | `0`/`1` | 启用 fused gemm_gated forward |
+
+---
+
+## 8. 教训与陷阱
+
+1. **128-row alignment 是硬约束**: blockscaled FP8 在 Blackwell 上要求每个 expert segment M-dim 是 128 的倍数。Token rounding routing 保证了这一点，vanilla top-K 需要 padding（会引入巨大性能退化，之前误报的 4x 退化就是这个原因）。
+2. **QuACK varlen alignment bug**: BF16 指针偏移后可能不满足 32-bit alignment，必须用 `colvec_scale=s.float()` 强制 fp32 指针。
+3. **blockscaled fp8 的 `.to(bf16)` 是有损操作**: 不会反应用 block scale factor，只做 raw fp8→bf16 数值转换。正确的反量化需要乘以 per-block e8m0 scale。
+4. **`_PREQUANTIZED_SCALES` identity check**: 用 Python `is` 检查确保 tensor 没被复制或替换，安全复用 pre-quantized 数据。
+5. **集群 GPU 扫描的 "idle" 定义**: `cluster_idle_launch.py` 用利用率 < 10% + 内存 < 5000 MiB 判断 idle。有些 GPU 0% 利用率但占了 70 GiB 内存（reserved），不算 idle。
+6. **SSH 远程执行需要 cd 到项目目录**: 直接 `ssh node python tools/xxx.py` 会在 `/root` 下执行，找不到文件。必须 `ssh node "cd $WORKDIR && python tools/xxx.py"`。
