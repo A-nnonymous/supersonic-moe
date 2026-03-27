@@ -27,6 +27,8 @@ from torch import Tensor
 
 _TORCH_TO_CUTLASS_DTYPE = {
     torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+    torch.float8_e8m0fnu: cutlass.Float8E8M0FNU,
+    torch.uint8: cutlass.Uint8,
     torch.float16: cutlass.Float16,
     torch.bfloat16: cutlass.BFloat16,
     torch.float32: cutlass.Float32,
@@ -36,7 +38,7 @@ _TORCH_TO_CUTLASS_DTYPE = {
 
 
 def _is_runtime_fp8_tensor(tensor: Tensor) -> bool:
-    return tensor.dtype == torch.float8_e4m3fn
+    return tensor.dtype in {torch.float8_e4m3fn, torch.float8_e8m0fnu}
 
 
 def _make_cute_tensor_dynamic(tensor: Tensor, leading_dim: int) -> cute.Tensor:
@@ -226,6 +228,8 @@ def gemm_gated(
     colvec_bias: Optional[Tensor] = None,  # (l, m), or (total_m,) if varlen_m
     cu_seqlens_m: Optional[Tensor] = None,  # (l+1,) cumulative sum of m values for variable length
     A_idx: Optional[Tensor] = None,  # (total_m,) if gather_A with varlen_m
+    a_scales: Optional[Tensor] = None,  # ISA-packed blockscaled scales for A
+    b_scales: Optional[Tensor] = None,  # ISA-packed blockscaled scales for B
 ) -> None:
     if cu_seqlens_m is not None:
         assert persistent, "varlen_m requires persistent=True"
@@ -333,6 +337,18 @@ def gemm_gated(
     )
 
     current_stream = cutlass_torch.current_stream()
+
+    blockscaled = a_scales is not None and b_scales is not None
+    sf_vec_size = 32 if blockscaled else None
+
+    # Prepare blockscaled scale cute tensors if provided
+    if blockscaled:
+        a_scale_cute = _make_cute_tensor_dynamic(a_scales, leading_dim=1)
+        b_scale_cute = _make_cute_tensor_dynamic(b_scales, leading_dim=1)
+    else:
+        a_scale_cute = None
+        b_scale_cute = None
+
     compile_key = GemmWrapperBase.get_compile_key(
         tensor_infos,
         activation,
@@ -347,6 +363,7 @@ def gemm_gated(
         colvec_bias.dtype if colvec_bias is not None else None,
         cu_seqlens_m is not None,
         A_idx is not None,
+        blockscaled,
         key_tensor_names=("A", "B", "D", "PostAct", "C"),
     )
     cache = gemm_gated.compile_cache
@@ -359,6 +376,7 @@ def gemm_gated(
             tile_shape_mn,
             cluster_shape_mnk,
             gather_A=gather_A,
+            sf_vec_size=sf_vec_size,
         )
         cache[compile_key] = cute.compile(
             gemm_obj,
@@ -370,6 +388,8 @@ def gemm_gated(
             scheduler_args,
             varlen_args,
             current_stream,
+            a_scale_cute,
+            b_scale_cute,
         )
     cache[compile_key](
         tensor_infos["A"].cute_tensor,
@@ -380,6 +400,8 @@ def gemm_gated(
         scheduler_args,
         varlen_args,
         current_stream,
+        a_scale_cute,
+        b_scale_cute,
     )
 
 

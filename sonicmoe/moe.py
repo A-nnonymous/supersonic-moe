@@ -11,7 +11,13 @@ import torch.nn.functional as F
 from .count_cumsum import count_cumsum
 from .enums import ActivationType, KernelBackendMoE, is_glu
 from .functional import FP8Protocol, moe_TC_softmax_topk_layer, clear_all_fp8_weight_caches
-from .quack_utils import clear_blockscaled_fp8_weight_cache, prefetch_blockscaled_w2_fp8
+from .quack_utils import (
+    clear_blockscaled_fp8_weight_cache,
+    prefetch_blockscaled_w2_fp8,
+    precompute_weight_fp8,
+    precompute_weight_fp8_for_fused_gated,
+    quantize_and_pack_activation,
+)
 
 
 try:
@@ -214,6 +220,33 @@ class MoE(nn.Module):
         return {
             "downproj": prefetch_blockscaled_w2_fp8(self.c_proj.weight.permute(1, 2, 0), protocol),
         }
+
+    @torch.no_grad()
+    def prefetch_all_fp8_weights(self) -> None:
+        """Pre-quantize all expert weights to blockscaled FP8 for fused gated path.
+
+        Stores FP8 weights as attributes on the parameter objects (ernie-core pattern).
+        Call once after model init or after optimizer step. The fused forward path
+        will check for these cached attributes before quantizing on-the-fly.
+
+        Caches:
+        - w1 for fused gemm_gated forward: (E, H, 2I) fp8 + ISA-packed scales
+        - w2 for blockscaled varlen backward: (E, I, H) fp8 + ISA-packed scales
+        - w2 for fused gemm_dgated backward (when available): (E, H, I) fp8 + ISA-packed scales
+        """
+        w1 = self.c_fc.weight   # (E, 2I, H) parameter
+        w2 = self.c_proj.weight  # (E, H, I) parameter
+
+        # Forward path: gemm_gated expects (L, K, N) = (E, H, 2I)
+        w1_fp8, w1_scales = precompute_weight_fp8_for_fused_gated(w1.permute(1, 2, 0))
+        w1.fp8_fused_gated = w1_fp8
+        w1.fp8_fused_gated_scales = w1_scales
+
+        # Backward act-grad path: blockscaled_fp8_gemm_varlen expects (I, H, E) for w2^T
+        w2_for_varlen = w2.permute(1, 2, 0)  # (H, I, E) → permute for varlen
+        w2_fp8_varlen, w2_scales_varlen = precompute_weight_fp8(w2_for_varlen)
+        w2.fp8_varlen = w2_fp8_varlen
+        w2.fp8_varlen_scales = w2_scales_varlen
 
     @torch.no_grad()
     def clear_fp8_weight_cache(self) -> None:

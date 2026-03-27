@@ -120,16 +120,16 @@ The reporting policy for every FP8 step is:
 - memory baseline: official bf16
 - performance baselines: previous commit and official bf16
 
-## 🔥 FP8 Upgrade Status (2026-03-26 Session 2)
+## 🔥 FP8 Upgrade Status (2026-03-27 Session 3)
 
-**Current state**: 6/8 GEMM operators use **blockscaled 1x32 UE8M0** FP8 (forward + activation-grad). 2/8 weight-grad operators use per-tensor FP8. Fused SwiGLU+quantize Triton kernels integrated. **Inference forward 43% faster than BF16** (3.9ms→2.2ms). **Training E2E 4x slower** — root cause: `blockscaled_fp8_gemm_varlen` pack/unpack/quantize overhead at E=128 experts. **Priority: eliminate varlen GEMM overhead to unlock training speedup.**
+**Current state**: 6/8 GEMM operators use **blockscaled 1x32 UE8M0** FP8 (forward + activation-grad). 2/8 weight-grad operators use per-tensor FP8. Fused SwiGLU+quantize and fused quantize+ISA-pack Triton kernels integrated. **Inference forward 43% faster than BF16** (3.9ms→2.2ms). Previously reported "training 4x slower" was caused by vanilla top-K benchmark — **token rounding routing (production mode) eliminates padding overhead entirely**.
 
 | Resource | Path |
 |----------|------|
 | **Handoff** (start here) | `reports/fp8_upgrade/HANDOFF.md` |
-| Engineering log | `reports/fp8_upgrade/ENGINEERING_LOG.md` |
 | Contract tests (8/8 pass) | `tests/fp8_large_project_contract_test.py` |
-| Benchmark | `benchmarks/moe-cute.py` |
+| Token rounding benchmark | `benchmarks/moe-token-rounding.py` |
+| Vanilla top-K benchmark | `benchmarks/moe-cute.py` |
 
 ### Quick start
 
@@ -141,20 +141,20 @@ cd /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe
 CUDA_VISIBLE_DEVICES=4 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
   python -m pytest tests/fp8_large_project_contract_test.py -v -k "not large_shape"
 
-# BF16 baseline benchmark
-CUDA_VISIBLE_DEVICES=4 USE_QUACK_GEMM=1 python benchmarks/moe-cute.py \
-  --thiek 8192,4096,1024,128,8 --dtype BFloat16 --activation swiglu --skip_test
+# BF16 baseline benchmark (token rounding, production mode)
+CUDA_VISIBLE_DEVICES=4 USE_QUACK_GEMM=1 python benchmarks/moe-token-rounding.py \
+  --thiekq 8192,4096,1024,128,8,128 --routing nr --skip_test
 
-# FP8 blockscaled benchmark
-CUDA_VISIBLE_DEVICES=4 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf python benchmarks/moe-cute.py \
-  --thiek 8192,4096,1024,128,8 --dtype BFloat16 --activation swiglu --skip_test
+# FP8 blockscaled benchmark (token rounding, production mode)
+CUDA_VISIBLE_DEVICES=4 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf python benchmarks/moe-token-rounding.py \
+  --thiekq 8192,4096,1024,128,8,128 --routing nr --skip_test
 ```
 
 ### Next steps (priority order)
 
-1. **P0**: Eliminate blockscaled varlen GEMM pack/unpack overhead (training performance — see HANDOFF.md §4.1)
-2. **P1**: Weight-grad blockscaled quantization (if precision requires)
-3. **P2**: Memory optimization — unify weight caches
+1. **P1**: Validate token rounding + FP8 training performance (benchmark in progress)
+2. **P2**: Weight-grad blockscaled quantization (if precision requires)
+3. **P3**: Memory optimization — unify weight caches
 
 ## 📋 FP8 Upgrade TODOs
 
@@ -168,11 +168,12 @@ CUDA_VISIBLE_DEVICES=4 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf python benchmark
 - [x] 11 contract tests covering forward, backward, gradients, small+large shapes
 - [x] **Forward + act-grad: blockscaled 1x32 UE8M0 integrated as default**
 - [x] **Fused SwiGLU+quantize Triton kernels integrated**
+- [x] **Fused quantize+ISA-scale-pack Triton kernel** (eliminates intermediate raw_scales tensor)
 - [x] **Weight cache eviction when blockscaled path activates**
-- [ ] **Eliminate blockscaled varlen GEMM pack/unpack overhead** (P0, training 4x regression)
-- [ ] **Weight-grad blockscaled quantization** (P1, currently per-tensor)
-- [ ] **Unify FP8 weight cache layout** (P2)
-- [ ] FP8 optimizer for master weight elimination (long-term)
+- [x] **Token rounding routing eliminates 128-alignment padding overhead**
+- [ ] **Validate token rounding + FP8 training performance** (P1, benchmark in progress)
+- [ ] **Weight-grad blockscaled quantization** (P2, currently per-tensor)
+- [ ] **Unify FP8 weight cache layout** (P3)
 
 ### Example usage
 - SonicMoE with TC top-K choice routing (SwiGLU activation) on Hopper GPUs

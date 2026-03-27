@@ -272,6 +272,7 @@ def _quantize_w2_cached(
 
 def clear_blockscaled_fp8_weight_cache() -> None:
     _WEIGHT_CACHE.clear()
+    _FUSED_WEIGHT_CACHE.clear()
     _PAD_PLAN_CACHE.clear()
 
 
@@ -818,13 +819,200 @@ def blockscaled_fp8_gemm_grouped(
     return grouped_out
 
 
+@triton.jit
+def _quantize_and_pack_kernel(
+    src_ptr,
+    dst_fp8_ptr,
+    dst_packed_scale_ptr,
+    rows,
+    cols,
+    src_stride_row,
+    src_stride_col,
+    dst_stride_row,
+    dst_stride_col,
+    k_tiles,
+    fp8_max: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    SF_TILE_M: tl.constexpr,
+    SF_TILE_STORAGE: tl.constexpr,
+):
+    """Fused blockscaled quantize + ISA scale pack in a single kernel.
+
+    Each program handles BLOCK_ROWS rows × one scale group (GROUP_SIZE cols).
+    Writes fp8 data contiguously and scales directly into ISA tile layout.
+    """
+    row_base = tl.program_id(0) * BLOCK_ROWS
+    group_id = tl.program_id(1)  # which 32-element group along K
+
+    row_ids = row_base + tl.arange(0, BLOCK_ROWS)
+    row_mask_1d = row_ids < rows
+
+    col_offsets = group_id * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+    col_mask = col_offsets[None, :] < cols
+    mask = row_mask_1d[:, None] & col_mask
+
+    # --- Load bf16 values ---
+    src_ptrs = src_ptr + row_ids[:, None] * src_stride_row + col_offsets[None, :] * src_stride_col
+    values = tl.load(src_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    # --- Compute per-row-group scale (E8M0) ---
+    block_amax = tl.max(tl.abs(values), axis=1)
+    raw_scale = block_amax / fp8_max
+    positive = raw_scale > 0
+    exponent = tl.where(positive, tl.ceil(tl.log2(tl.where(positive, raw_scale, 1.0))), 0.0)
+    quant_scale = tl.exp2(-exponent)
+
+    # --- Quantize to fp8 ---
+    quantized = (values * quant_scale[:, None]).to(tl.float8e4nv)
+    dst_ptrs = dst_fp8_ptr + row_ids[:, None] * dst_stride_row + col_offsets[None, :] * dst_stride_col
+    tl.store(dst_ptrs, quantized, mask=mask)
+
+    # --- Write E8M0 scale directly into ISA tile layout ---
+    dequant_scale = tl.exp2(exponent)
+    scale_i32 = dequant_scale.to(tl.float32).to(tl.int32, bitcast=True)
+    e8m0_byte = ((scale_i32 >> 23) & 0xFF).to(tl.uint8)
+
+    # ISA tile layout: tile_base + row_base + k_in_tile
+    row_tiles = row_ids // SF_TILE_M
+    row_in_tile = row_ids % SF_TILE_M
+    k_tiles_idx = group_id // (SF_TILE_M // GROUP_SIZE)  # = group_id // 4  (SF_TILE_K == SF_TILE_M)
+    k_in_tile = group_id % (SF_TILE_M // GROUP_SIZE)     # = group_id % 4  (K-dim scale groups per tile)
+
+    tile_base = (row_tiles * k_tiles + k_tiles_idx) * SF_TILE_STORAGE
+    row_base_offset = (row_in_tile % 32) * 16 + (row_in_tile // 32) * 4
+    packed_offset = tile_base + row_base_offset + k_in_tile
+
+    tl.store(dst_packed_scale_ptr + packed_offset, e8m0_byte, mask=row_mask_1d)
+
+
+@triton.jit
+def _gather_quantize_and_pack_kernel(
+    src_ptr,          # original (T, K) tensor
+    gather_idx_ptr,   # (TK,) int32/int64 gather indices
+    dst_fp8_ptr,      # (TK, K) fp8 output
+    dst_packed_scale_ptr,  # ISA-packed scales
+    rows,             # TK
+    cols,             # K
+    src_stride_row,
+    src_stride_col,
+    dst_stride_row,
+    dst_stride_col,
+    k_tiles,
+    fp8_max: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    SF_TILE_M: tl.constexpr,
+    SF_TILE_STORAGE: tl.constexpr,
+):
+    """Fused gather + blockscaled quantize + ISA scale pack.
+
+    Reads from src[gather_idx[row], col] and writes fp8 + ISA-packed scales
+    without materializing a bf16 gathered intermediate tensor.
+    """
+    row_base = tl.program_id(0) * BLOCK_ROWS
+    group_id = tl.program_id(1)
+
+    row_ids = row_base + tl.arange(0, BLOCK_ROWS)
+    row_mask_1d = row_ids < rows
+
+    # Load gather indices
+    gather_ids = tl.load(gather_idx_ptr + row_ids, mask=row_mask_1d, other=0)
+
+    col_offsets = group_id * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+    col_mask = col_offsets[None, :] < cols
+    mask = row_mask_1d[:, None] & col_mask
+
+    # Gather from original tensor using indices
+    src_ptrs = src_ptr + gather_ids[:, None] * src_stride_row + col_offsets[None, :] * src_stride_col
+    values = tl.load(src_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    # Quantize
+    block_amax = tl.max(tl.abs(values), axis=1)
+    raw_scale = block_amax / fp8_max
+    positive = raw_scale > 0
+    exponent = tl.where(positive, tl.ceil(tl.log2(tl.where(positive, raw_scale, 1.0))), 0.0)
+    quant_scale = tl.exp2(-exponent)
+    quantized = (values * quant_scale[:, None]).to(tl.float8e4nv)
+
+    dst_ptrs = dst_fp8_ptr + row_ids[:, None] * dst_stride_row + col_offsets[None, :] * dst_stride_col
+    tl.store(dst_ptrs, quantized, mask=mask)
+
+    # ISA-packed scale
+    dequant_scale = tl.exp2(exponent)
+    scale_i32 = dequant_scale.to(tl.float32).to(tl.int32, bitcast=True)
+    e8m0_byte = ((scale_i32 >> 23) & 0xFF).to(tl.uint8)
+
+    row_tiles = row_ids // SF_TILE_M
+    row_in_tile = row_ids % SF_TILE_M
+    k_tiles_idx = group_id // (SF_TILE_M // GROUP_SIZE)
+    k_in_tile_val = group_id % (SF_TILE_M // GROUP_SIZE)
+
+    tile_base = (row_tiles * k_tiles + k_tiles_idx) * SF_TILE_STORAGE
+    row_base_offset = (row_in_tile % 32) * 16 + (row_in_tile // 32) * 4
+    packed_offset = tile_base + row_base_offset + k_in_tile_val
+
+    tl.store(dst_packed_scale_ptr + packed_offset, e8m0_byte, mask=row_mask_1d)
+
+
+def gather_quantize_and_pack_activation(
+    x: torch.Tensor,
+    gather_idx: torch.Tensor,
+    group_size: int = _SF_VEC_SIZE,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused gather + blockscaled FP8 quantize + ISA scale pack.
+
+    Eliminates the bf16 gathered intermediate tensor.
+    Instead of: x_gathered = x[gather_idx]; fp8, scales = quantize_and_pack(x_gathered)
+    Does:       fp8, scales = gather_quantize_and_pack(x, gather_idx)
+
+    Parameters
+    ----------
+    x : Tensor (T, K) bf16 — original activation (NOT gathered).
+    gather_idx : Tensor (TK,) int32/int64 — token gather indices.
+
+    Returns
+    -------
+    fp8_data : Tensor (TK, K) float8_e4m3fn
+    packed_scales : Tensor (1, packed_size) float8_e8m0fnu in ISA layout
+    """
+    TK = gather_idx.shape[0]
+    K = x.shape[1]
+    num_groups = _div_up(K, group_size)
+    k_tiles = _div_up(K, _SF_TILE_K)
+
+    fp8_out = torch.empty(TK, K, dtype=torch.float8_e4m3fn, device=x.device)
+    per_batch_storage = _storage_per_batch(TK, K)
+    packed_scales = torch.full((1, per_batch_storage), 127, dtype=torch.uint8, device=x.device)
+
+    BLOCK_ROWS = 4
+    grid = (_div_up(TK, BLOCK_ROWS), num_groups)
+    _gather_quantize_and_pack_kernel[grid](
+        x,
+        gather_idx,
+        fp8_out,
+        packed_scales,
+        TK, K,
+        x.stride(0), x.stride(1),
+        fp8_out.stride(0), fp8_out.stride(1),
+        k_tiles,
+        fp8_max=float(torch.finfo(torch.float8_e4m3fn).max),
+        GROUP_SIZE=group_size,
+        BLOCK_ROWS=BLOCK_ROWS,
+        SF_TILE_M=_SF_TILE_M,
+        SF_TILE_STORAGE=_SF_TILE_STORAGE,
+    )
+    return fp8_out, packed_scales.view(torch.float8_e8m0fnu)
+
+
 def quantize_and_pack_activation(
     x: torch.Tensor,
     group_size: int = _SF_VEC_SIZE,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize bf16 activation to blockscaled FP8 with ISA-packed scales.
 
-    Call this *outside* the GEMM to make the quantization boundary explicit.
+    Single fused Triton kernel: bf16 → fp8 + ISA-layout packed E8M0 scales.
+    Eliminates the intermediate raw_scales tensor and fancy-indexing scatter.
 
     Parameters
     ----------
@@ -836,9 +1024,39 @@ def quantize_and_pack_activation(
     fp8_data : Tensor (M, K) float8_e4m3fn
     packed_scales : Tensor (1, packed_size) float8_e8m0fnu in ISA layout
     """
-    x_fp8, scales_raw = quantize_activation_blockscaled_fast(x.contiguous(), group_size=group_size)
-    packed_scales = pack_blockscaled_1x32_scales(scales_raw, x.size(1))
-    return x_fp8, packed_scales
+    x = x.contiguous()
+    M, K = x.shape
+    num_groups = _div_up(K, group_size)
+    k_tiles = _div_up(K, _SF_TILE_K)
+
+    fp8_out = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=x.device)
+
+    per_batch_storage = _storage_per_batch(M, K)
+    # Initialize to 127 (E8M0 encoding of scale=1.0: exponent bias 127)
+    packed_scales = torch.full(
+        (1, per_batch_storage), 127, dtype=torch.uint8, device=x.device
+    )
+
+    BLOCK_ROWS = 4
+    grid = (_div_up(M, BLOCK_ROWS), num_groups)
+    _quantize_and_pack_kernel[grid](
+        x,
+        fp8_out,
+        packed_scales,
+        M,
+        K,
+        x.stride(0),
+        x.stride(1),
+        fp8_out.stride(0),
+        fp8_out.stride(1),
+        k_tiles,
+        fp8_max=float(torch.finfo(torch.float8_e4m3fn).max),
+        GROUP_SIZE=group_size,
+        BLOCK_ROWS=BLOCK_ROWS,
+        SF_TILE_M=_SF_TILE_M,
+        SF_TILE_STORAGE=_SF_TILE_STORAGE,
+    )
+    return fp8_out, packed_scales.view(torch.float8_e8m0fnu)
 
 
 def precompute_weight_fp8(
@@ -864,6 +1082,50 @@ def precompute_weight_fp8(
     w_fp8, w_scales_raw = quantize_activation_blockwise(w_ehi, proto)
     w_scales_packed = pack_blockscaled_1x32_scales(w_scales_raw, w_ehi.size(-1))
     return w_fp8, w_scales_packed
+
+
+_FUSED_WEIGHT_CACHE: dict[
+    tuple[int, int, tuple[int, ...], tuple[int, ...]],
+    tuple[torch.Tensor, torch.Tensor],
+] = {}
+
+
+def precompute_weight_fp8_for_fused_gated(
+    w: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pre-quantize expert weight for fused gemm_gated blockscaled path (cached).
+
+    gemm_gated_tuned expects B in (L, K, N) format and applies .mT internally
+    to get (L, N, K). To match, we quantize w in (E, K, N) = (E, H, 2I) layout.
+
+    Parameters
+    ----------
+    w : Tensor (2I, H, E) or (H, I, E) bf16 — expert weights.
+
+    Returns
+    -------
+    w_fp8 : Tensor (E, dim1, dim0) float8_e4m3fn — matches (L, K, N) for gemm_gated
+    w_scales : Tensor packed float8_e8m0fnu in ISA layout
+    """
+    key = (
+        w.untyped_storage().data_ptr(),
+        w._version,
+        tuple(w.shape),
+        tuple(w.stride()),
+    )
+    cached = _FUSED_WEIGHT_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    w_ekn = w.permute(2, 1, 0).contiguous()
+    proto = FP8Protocol(scale_granularity=FP8ScaleGranularity.BLOCK_1X32)
+    w_fp8, w_scales_raw = quantize_activation_blockwise(w_ekn, proto)
+    w_scales_packed = pack_blockscaled_1x32_scales(w_scales_raw, w_ekn.size(-1))
+    result = (w_fp8, w_scales_packed)
+    if len(_FUSED_WEIGHT_CACHE) > 8:
+        _FUSED_WEIGHT_CACHE.clear()
+    _FUSED_WEIGHT_CACHE[key] = result
+    return result
 
 
 def blockscaled_fp8_gemm_varlen(
@@ -971,10 +1233,9 @@ def blockscaled_fp8_gemm_varlen(
     if pre_quantized_act:
         a_fp8_data, packed_a_scales = a, a_scales
     else:
-        a_fp8_data, a_scales_raw = quantize_activation_blockscaled_fast(
+        a_fp8_data, packed_a_scales = quantize_and_pack_activation(
             a.contiguous(), group_size=_SF_VEC_SIZE
         )
-        packed_a_scales = pack_blockscaled_1x32_scales(a_scales_raw, K)
 
     # --- Run CUTLASS GEMM kernel ---
     d_dtype = torch.bfloat16 if out_dtype is None else out_dtype

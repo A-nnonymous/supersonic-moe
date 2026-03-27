@@ -1,4 +1,4 @@
-# Blockscaled FP8 CTA-Tile Alignment: Why It Exists and Why It Doesn't Matter
+# Blockscaled FP8 CTA-Tile Alignment: Why It Exists and How Token Rounding Solves It
 
 ## TL;DR
 
@@ -6,20 +6,19 @@ Blockscaled FP8 GEMM on Blackwell requires each expert's M-dimension segment to 
 a multiple of **128**. This is a hardware ISA constraint from the `tcgen05.mma`
 instruction's scale-factor atom layout — not a software design choice.
 
-**This constraint is architecturally irrelevant in production** because SonicMoE's
-**token rounding routing** (paper Section 5, Algorithm 4) already guarantees that
-every expert receives a 128-aligned token count. The padding infrastructure in
-`blockscaled_fp8_gemm_varlen` exists only as a safety net for non-rounded routing
-(tests, debugging, research benchmarks).
+**Token rounding routing** (SonicMoE paper Section 5, Algorithm 4) guarantees that
+every expert receives a 128-aligned token count in production. The routing logic
+lives in the benchmark at `benchmarks/moe-token-rounding.py` (function
+`forward_token_choice_rounding`), which rounds expert frequencies to multiples of
+`Mtile=128`. The padding infrastructure in `blockscaled_fp8_gemm_varlen` exists as
+a safety net for non-rounded routing (vanilla top-K, tests, debugging).
 
-Measured impact (production shape T=8192, H=4096, I=1024, E=128, K=8):
+Measured impact (production shape T=8192, H=4096, I=1024, E=128, K=8, token rounding nr):
 
-| GEMM Path | Token-rounded (no pad) | Vanilla top-K (padded) | Overhead |
-|-----------|----------------------|----------------------|----------|
-| Down-proj (TK,I)→(TK,H) | **2.9 ms** | 5.7 ms | +96% |
-| Up-proj (TK,H)→(TK,2I) | **3.9 ms** | 7.7 ms | +97% |
-
-With token rounding, blockscaled FP8 adds **zero padding overhead**.
+| Routing | FP8 E2E fwd+bwd (ms) | Wasted ratio | Padding overhead |
+|---------|---------------------|-------------|-----------------|
+| Token rounding (nr) | **10.880** | **0.000** | **zero** |
+| Vanilla top-K (padded) | 48.486 | >0 | 4x regression |
 
 ---
 

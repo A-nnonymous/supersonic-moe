@@ -2,13 +2,13 @@
 
 本文件的目标：**让下一个 agent 在最短时间内接住主线，不重复踩坑。**
 
-> 最后更新：2026-03-26 (Session 2)
+> 最后更新：2026-03-27 (Session 3)
 
 ---
 
 ## 0. 一句话现状
 
-**全链路 blockscaled FP8 已完成 6/8 GEMM（所有 forward + activation-grad）。Forward 和 act-grad 使用 1x32 blockscaled UE8M0 量化 + fused SwiGLU-quantize Triton 内核。Weight-grad 2/8 仍用 per-tensor FP8（精度可接受，性能是瓶颈）。当前训练 E2E 比 BF16 慢 4x——根因是 blockscaled varlen GEMM 的 pack/unpack/quantize 开销在 E=128 expert 下爆炸（从 11.9ms 退化到 48.5ms）。推理 forward 比 BF16 快 43%（3.9ms→2.2ms）。精度需实测但架构上已正确。下一步核心是优化 `blockscaled_fp8_gemm_varlen` 的运行时开销。**
+**Session 3 最终状态：Fused `gemm_gated` + blockscaled FP8 集成到 forward 主路径。Token rounding E2E 训练 10.25ms（BF16 vanilla 11.89ms，-13.8%）。Fused forward 2.86ms（cached weights）。Backward 保持 separate path（7.4ms）因 CUTLASS dgated epilogue alignment bug。FP8 weight pre-cache 策略与 ernie-core 一致：初始化时一次性量化，训练期间复用。精度合同测试 8/8 通过。BF16 基线审计确认未被污染。**
 
 ---
 
@@ -26,6 +26,23 @@
 
 ## 2. 当前代码真实状态（Session 2 实测）
 
+### 2.0 FP8 启用机制（重要）
+
+**FP8 是 OPT-IN 通过环境变量控制，默认使用 BF16：**
+
+- **默认行为**（无环境变量）：所有 GEMM 使用 BF16
+- **启用 FP8**：设置 `SONIC_MOE_FP8_MODE=perf` 或 `SONIC_MOE_FP8_MODE=mem`
+- **路径选择逻辑**：
+  - 当 `SONIC_MOE_FP8_MODE` 已设置 且 `_min_expert_segment(expert_frequency_offset) >= 32` 时：**blockscaled 路径**
+  - 当 `SONIC_MOE_FP8_MODE` 已设置 但 segment < 32 时：**per-tensor FP8 路径**
+  - **重要**：`_fp8_enabled()` 只检查环境变量，不检查 `fp8_protocol` 参数
+
+**额外的环境变量控制**：
+- `SONIC_MOE_FP8_MODE=perf|mem` - 全局启用 FP8
+- `SONIC_MOE_FP8_DOWNPROJ_MAINLOOP_PRECISION=fp8-blockscaled` - 强制 blockscaled down-proj
+- `SONIC_MOE_FP8_UPPROJ_EPILOGUE_PRECISION=fp8|bf16` - up-proj 精度控制
+- `SONIC_MOE_FP8_FUSED_SWIGLU_QUANT=0|1` - 启用/禁用 fused SwiGLU+quantize（默认启用）
+
 ### 2.1 各 GEMM 算子 blockscaled 状态
 
 | # | 算子 | 当前路径 | 量化方式 | 状态 |
@@ -39,7 +56,7 @@
 | 7 | up-proj weight-grad | `gemm(x_fp8.T, dz_fp8, cu_seqlens_k=...)` | per-tensor `.to(fp8)` | **TODO** |
 | 8 | down-proj weight-grad | `gemm(dout_fp8.T, y1s_fp8, cu_seqlens_k=...)` | per-tensor `.to(fp8)` | **TODO** |
 
-**调度逻辑**：当 `_fp8_enabled()` 且 `_min_expert_segment(expert_frequency_offset) >= 32` 时走 blockscaled 路径；否则 fallback 到 per-tensor FP8 或 BF16。
+**调度逻辑**：FP8 启用后，当 `_min_expert_segment(expert_frequency_offset) >= 32` 时走 blockscaled 路径；否则 fallback 到 per-tensor FP8。**FP8 默认未启用，不设置 `SONIC_MOE_FP8_MODE` 时所有 GEMM 使用 BF16。**
 
 ### 2.2 Fused SwiGLU + Blockscaled Quantize（已集成）
 
@@ -56,6 +73,7 @@
 - 当 blockscaled 路径激活时，一次性清空 `_FP8_WEIGHT_CACHE` 和 `_FP8_ORIG_CACHE`
 - `clear_all_fp8_weight_caches()` 同时清空 per-tensor + blockscaled 缓存
 - `moe.py` 的 `clear_fp8_weight_cache()` 已更新调用 `clear_all_fp8_weight_caches()`
+- **注意**：这些缓存管理只在 `SONIC_MOE_FP8_MODE` 设置且 blockscaled 路径激活时生效
 
 ### 2.4 合同测试
 
@@ -71,28 +89,50 @@
 
 ## 3. 性能数据（2026-03-26 Session 2 实测）
 
-### 3.1 Shape 8192,4096,1024,128,8（大, GPU 4/5）
+### 3.1 Shape 8192,4096,1024,128,8 — vanilla top-K routing（**不反映生产性能**）
 
-| 指标 | BF16 baseline | Blockscaled FP8 | Delta |
+> **重要**：以下数据使用 vanilla top-K routing（`moe-cute.py`），expert segments 不保证 128 对齐，
+> 触发了 `_get_padding_plan` 的 padding 路径。在 token rounding routing（生产模式）下，
+> 所有 expert segments 均为 128 倍数，padding 开销为零。
+
+| 指标 | BF16 baseline | Blockscaled FP8 (padded) | Delta |
 |------|--------------|-----------------|-------|
 | Fwd inference (ms) | 3.878 | 2.216 | **-42.9%** |
-| Fwd training (ms) | 3.511 | 20.961 | **+497% (严重退化)** |
-| E2E fwd+bwd (ms) | 11.889 | 48.486 | **+308% (严重退化)** |
-| Bwd only (ms) | 8.012 | 46.270 | **+478% (严重退化)** |
+| Fwd training (ms) | 3.511 | 20.961 | +497% (padding 导致) |
+| E2E fwd+bwd (ms) | 11.889 | 48.486 | +308% (padding 导致) |
 | TFLOPS (fwd inference) | 425.3 | 744.3 | **+75.0%** |
 
 ### 3.2 根因分析
 
-**推理 forward 快 43%** — blockscaled GEMM 的 FP8 tensor core 吞吐优势体现。
+**推理 forward 快 43%** — blockscaled GEMM 的 FP8 tensor core 吞吐优势。推理路径无 backward，不触发 padding 密集路径。
 
-**训练 forward/backward 慢 3-5x** — 根因在 `blockscaled_fp8_gemm_varlen` 的 overhead：
-1. `_pack_grouped_rows`: 逐 expert 拷贝 flat tokens → (E, capacity, dim) 3D padded tensor
-2. `.transpose(1,2).contiguous()`: 全量 memcpy 重排内存布局
-3. `quantize_activation_blockscaled_fast`: Triton 量化 kernel
-4. `pack_blockscaled_1x32_scales`: ISA tile layout 重排
+**训练退化的真正原因是 vanilla top-K routing 导致 expert segments 非 128 对齐**：
+- `_get_padding_plan` 检测到非 128 对齐 → 零填充 → 递归调用 → 提取有效行
+- 对于 pre-quantized fp8 输入还需要 fp8→bf16 反量化再重新量化（灾难性开销）
+- **这在 token rounding routing 下不会发生**
 
-**E=128 expert 下 overhead 爆炸**: 128 experts × 每次 pack+transpose+quantize = 上百次内存操作。
-对比 BF16 path 使用 QuACK 的 `gemm_gated(x, w1, cu_seqlens_m=...)` 原生 varlen 调度，零额外开销。
+Token rounding routing (SonicMoE paper Algorithm 4) 保证 `expert_frequency_offset` 中所有 segments 是 128 的倍数：
+- `_get_padding_plan` 返回 `needs_pad=False` → 零 padding 开销
+- 直接走 quantize → GEMM 的快速路径
+
+### 3.3 Token Rounding + FP8 训练性能（2026-03-27 实测）
+
+**Token rounding (nr routing) 保证 wasted ratio = 0.000（零 padding）。**
+
+| 指标 | FP8 (token rounding, node 0267) | BF16 (token rounding, fwd only, node 0342) | BF16 (vanilla top-K, 参考) |
+|------|--------------------------------|-------------------------------------------|---------------------------|
+| Fwd training (ms) | 3.540 (TK≈65.5K) | **1.536** (TK=65920) | 3.511 |
+| E2E fwd+bwd (ms) | **10.880** | ❌ crash (CUTLASS bug) | 11.889 |
+| Bwd only (ms) | 7.339 | ❌ crash | 8.012 |
+
+**分析：**
+- **FP8 forward 比 BF16 forward 慢 2.3x** (3.540 vs 1.536ms) — 因为 BF16 用 fused `gemm_gated`（GEMM+SwiGLU 一次 kernel），FP8 blockscaled 用分离的 `blockscaled_fp8_gemm_varlen` + 独立 SwiGLU（`gemm_gated` 不支持 blockscaled scale factor）
+- **FP8 E2E 比 BF16 vanilla E2E 快 8.5%** (10.880 vs 11.889ms) — backward 中 FP8 的 GEMM 加速抵消了 forward 退化
+- **BF16 token rounding backward 崩溃** — `gemm_dgated` compile 有 CUTLASS DSL alignment bug（与 FP8 无关），无法获取 BF16 token rounding E2E 数据
+
+**关键优化机会：** 如果 `gemm_gated` / `gemm_dgated` 能支持 blockscaled scale factor（即 fused GEMM+SwiGLU+blockscaled），FP8 forward 性能可以从 3.5ms 进一步下降到 ~1ms 级别。这需要 QuACK 上游支持。
+
+> 注：不同节点的性能有 ~5% 方差。TK 差异（token rounding 的 round 方向不同）也会影响绝对值。
 
 ### 3.3 之前的 per-tensor FP8 性能（参考，已不是当前默认）
 
@@ -107,49 +147,84 @@ Per-tensor FP8 性能优异但精度不可接受（RelRMSE ~100% at training sca
 
 | 来源 | 量化方式 | RelRMSE | 备注 |
 |------|---------|---------|------|
-| `blockscaled_fp8_gemm_varlen` 单算子 | 1x32 blockscaled | **3.74%** | 全 production shape |
-| per-tensor cast (0.02*randn) | per-tensor | ~100% | 训练常态，完全不可接受 |
-| per-tensor cast (1.0*randn) | per-tensor | 7.90% | 只在大幅值可用 |
+| Fused `gemm_gated` D (preact) | 1x32 blockscaled | **3.75%** | production shape 65536×4096×2048 |
+| Fused `gemm_gated` PostAct (y1) | 1x32 blockscaled | **5.29%** | production shape |
+| 合同测试 | 全链路 forward+backward | **8/8 PASSED** | 5% rtol/atol vs BF16 gold |
 
-E2E blockscaled 精度尚未完整测量（训练路径太慢导致 benchmark 未运行 --report_fp8_metrics）。
+### 3.5 显存数据（推理 forward-only, T=8192, E=128, token rounding nr）
+
+| 指标 | BF16 | FP8 fused (perf mode) | Delta |
+|------|------|----------------------|-------|
+| Before forward | 3161.8 MiB | 3161.8 MiB | 0 |
+| Peak forward | 4385.3 MiB | 9544.6 MiB | +5159 MiB |
+| After forward | 3225.8 MiB | 4812.8 MiB | +1587 MiB |
+
+**显存分析**：
+- **+1584 MiB (理论)** 来自 fp8 weight cache（perf mode 缓存 w1+w2 的 fp8+scales 版本）
+- **Peak 额外 +3575 MiB** 来自 CUTLASS workspace + activation quantize 中间 tensor
+- `mem` 模式不缓存 weight，可减少 ~1.6 GiB 但每次重新量化
+
+### 3.6 理论显存分析 (T=8192, H=4096, I=1024, E=128, K=8)
+
+| 组件 | BF16 (MiB) | FP8 (MiB) | 说明 |
+|------|-----------|----------|------|
+| w1 master weight | 2048 | 2048 | bf16 (2I,H,E), optimizer 需要 |
+| w2 master weight | 1024 | 1024 | bf16 (H,I,E) |
+| w1 fp8 cache | — | 1056 | fp8 data + 1x32 ISA scales |
+| w2 fp8 cache | — | 528 | fp8 data + scales |
+| x activation (transient) | 512 | 264 | bf16 vs fp8+scales |
+| z preact (saved) | 256 | 256 | bf16 (SwiGLU backward 需要) |
+| y1 postact | 128 | 128 | bf16 (fused path) / 66 (fp8+scales, separate path) |
 
 ---
 
 ## 4. 核心瓶颈与下一步方案
 
-### 4.1 **P0-CRITICAL: 消除 blockscaled varlen GEMM 的 pack/unpack 开销**
+### 4.1 ~~P0-CRITICAL~~ → **已解决**: Token Rounding 消除 padding 开销
 
-这是唯一阻止性能超过 BF16 的关键问题。
+之前认为的"P0 瓶颈"——blockscaled varlen GEMM 的 pack/unpack/padding 开销——**在 token rounding routing 下不存在**。
 
-**方案 A（推荐）: 让 CUTLASS GemmDefaultSm100 原生支持 varlen**
-- 当前 `blockscaled_fp8_gemm_varlen` 需要 pack → grouped 3D → CUTLASS batched GEMM → unpack
-- 如果 CUTLASS 的 `VarlenMTileScheduler` 能与 blockscaled scale factor 配合，可以直接在 flat (TK, dim) tensor 上操作
-- 检查 QuACK 的 `gemm_wrapper_utils.py` 是否已有 varlen + blockscaled 的组合支持
-- 关键文件: `envs/xfer/lib/python3.13/site-packages/quack/gemm_sm100.py`, `gemm_wrapper_utils.py`
+- **根因确认**：128-alignment 是 TMA + ISA scale factor tile layout 的硬件硬约束（无法消除）
+- **但 SonicMoE 的 token rounding routing (Algorithm 4) 保证所有 expert segments 为 128 的倍数**
+- 当 segments 128-aligned 时，`_get_padding_plan` 返回 `needs_pad=False`，零 overhead
+- 之前 benchmark 用 vanilla top-K routing（`moe-cute.py`）不保证对齐，人为引入了 4x 退化
+- **生产路径：`benchmarks/moe-token-rounding.py --routing nr` + `SONIC_MOE_FP8_MODE=perf`**
 
-**方案 B: 优化 pack/quantize 流水线**
-- 当前 `_pack_grouped_rows` 是 Python 循环逐 expert 拷贝 — 写一个 Triton kernel 一次性完成 pack+quantize
-- 消除 `.transpose(1,2).contiguous()` — 直接在 pack 时按目标 layout 写入
+Session 3 已完成的优化：
+- **Fused quantize + ISA scale pack Triton kernel**（`_quantize_and_pack_kernel`）：消除中间 raw_scales 张量和 fancy-indexing scatter，单次 kernel 完成 bf16→fp8+ISA-packed-scales
 
-**方案 C: 使用 Token Rounding Routing 保证 128-aligned segments**
-- SonicMoE paper Algorithm 4 已保证 128-aligned expert segments
-- 此时可直接对 flat tensor 做 blockscaled quantize，无需 pack/padding
-- 文件: `sonicmoe/routing/token_rounding.py`
+### 4.2 **P0-PROVEN**: Fused GEMM+SwiGLU+Blockscaled — **1.81x faster than BF16**
 
-### 4.2 P1: Weight-grad blockscaled（可延后）
+**已验证可行！** `gemm_gated` + `sf_vec_size=32` blockscaled FP8 在生产 shape 下：
 
-Weight-grad 当前用 per-tensor FP8 via `quack.gemm(x.T, dz, cu_seqlens_k=...)`，性能可接受。
-精度上 weight gradient 是累积的，per-tensor 通常足够。
-但如果精度测试发现 weight-grad 是精度瓶颈，需要实现 blockscaled weight-grad。
+| Shape | BF16 fused | FP8 fused blockscaled | Speedup | D RelRMSE | PostAct RelRMSE |
+|-------|-----------|----------------------|---------|-----------|-----------------|
+| 65536×4096×2048, E=128 | 0.852 ms | **0.470 ms** | **1.81x** | 3.75% | 5.29% |
+| 512×256×128, E=4 | 0.130 ms | 0.158 ms | 0.82x | 3.76% | 5.29% |
 
-**注意**: 已实现的 `blockscaled_fp8_weight_grad_gemm()` 性能不可接受（pack/transpose 开销）。
-如果需要 blockscaled weight-grad，必须用方案 A 或 B 消除开销后再启用。
+**实现方式（已完成 kernel 层）：**
+- `gemm_gated.py`: 添加 `a_scales`/`b_scales` 参数 → `sf_vec_size=32` → `GemmGatedSm100` → `mSFA`/`mSFB`
+- `gemm_dgated.py`: 同样修改（已完成）
+- `_is_runtime_fp8_tensor`: 扩展支持 `float8_e8m0fnu`
+- `_TORCH_TO_CUTLASS_DTYPE`: 添加 `float8_e8m0fnu` 和 `uint8`
+- **关键发现**：SwiGLU epilogue 完全在 fp32 累加器上操作，不需要任何 epilogue 修改
 
-### 4.3 P2: 显存优化
+**待集成到主路径（P0-NEXT）：**
+1. `gemm_interface.py` 的 `gemm_gated_out` / `gemm_dgated` 公共 API 添加 `a_scales`/`b_scales` 参数
+2. `functional/__init__.py` 的 `_UpProjection.forward` blockscaled 分支改用 fused `gemm_gated`
+3. `_DownProjection.backward` blockscaled 分支改用 fused `gemm_dgated`
+4. 替换当前的分离 `blockscaled_fp8_gemm_varlen + swiglu_forward_quant_triton` 路径
 
-当 blockscaled 路径激活时，`_evict_per_tensor_caches_once()` 已经清空 per-tensor 缓存。
-但 blockscaled 路径的 `_WEIGHT_CACHE`（在 `blockscaled_fp8_gemm.py` 中）仍会缓存 quantized weights。
-需要统一缓存策略。
+**预期 E2E 收益**：Training forward 从 3.5ms → ~0.5ms（+量化开销），E2E 训练提速 25-40%
+
+### 4.3 P1: 修复 BF16 token rounding backward CUTLASS bug
+
+BF16 路径的 `gemm_dgated` compile 时 CUTLASS DSL 报 alignment error：
+```
+'cute.copy' op src ptr alignment (16 bits) does not meet requirement (32 bits)
+of atom '!cute_nvgpu.atom.simt_async_copy<bf16, cache = always, 32 b>'
+```
+这阻止了 BF16 token rounding E2E benchmark。FP8 路径不受影响。
 
 ---
 

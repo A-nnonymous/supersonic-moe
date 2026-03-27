@@ -46,6 +46,8 @@ def gemm_gated_tuned(
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = False,
     config: Optional[GemmConfig] = None,
+    a_scales: Optional[Tensor] = None,  # ISA-packed blockscaled scales for A
+    b_scales: Optional[Tensor] = None,  # ISA-packed blockscaled scales for B
 ) -> None:
     if config is None:
         config = default_config(A.device)
@@ -89,6 +91,8 @@ def gemm_gated_tuned(
         colvec_bias=bias if config.swap_ab else None,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
+        a_scales=a_scales,
+        b_scales=b_scales,
     )
 
 
@@ -121,6 +125,8 @@ def gemm_dgated_tuned(
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = True,
     config: Optional[GemmConfig] = None,
+    a_scales: Optional[Tensor] = None,
+    b_scales: Optional[Tensor] = None,
 ) -> Optional[Tensor]:
     if config is None:
         config = default_config(A.device)
@@ -178,6 +184,8 @@ def gemm_dgated_tuned(
         colvec_reduce=colvec_reduce_partial,
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
+        a_scales=a_scales,
+        b_scales=b_scales,
     )
     if colvec_reduce:
         colvec_reduce_final = colvec_reduce_partial.sum(dim=-1)
@@ -255,10 +263,13 @@ def gemm_gated_out(
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = False,
     tuned: bool = True,
+    a_scales: Optional[Tensor] = None,
+    b_scales: Optional[Tensor] = None,
 ) -> None:
     """GEMM with gated activation and pre-allocated output tensors."""
     fn = gemm_gated_tuned if tuned else partial(gemm_gated_tuned.fn, config=None)
-    fn(A, B, preact_out, postact_out, C, bias, activation, cu_seqlens_m, A_idx, dynamic_scheduler)
+    fn(A, B, preact_out, postact_out, C, bias, activation, cu_seqlens_m, A_idx, dynamic_scheduler,
+       a_scales=a_scales, b_scales=b_scales)
 
 
 def gemm_dgated(
