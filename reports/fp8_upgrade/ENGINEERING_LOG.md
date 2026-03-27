@@ -1,8 +1,40 @@
 # FP8 Engineering Log
 
-> **Primary reference: [HANDOFF.md](HANDOFF.md)**. This file records historical development context, variable mappings, and lessons learned. For current status, performance data, and next steps, see HANDOFF.md.
+> **Primary reference: [HANDOFF.md](HANDOFF.md)**
 
-> **2026-03-27 Session 3 update**: Token rounding routing eliminates all padding overhead. FP8 training E2E **8.5% faster than BF16** (10.88ms vs 11.89ms). Previous "4x regression" was a benchmark artifact (vanilla top-K routing). Fused quantize+ISA-pack Triton kernel integrated. Contract tests 8/8 pass.
+> **2026-03-27 Session 3 final**: FP8 fused blockscaled E2E 10.08ms (-15.2% vs BF16). BF16 token rounding backward crash is upstream QuACK bug (gemm_default_epi.py alignment), not our code. Official moe_blackwell_test PASSED.
+
+---
+
+## Variable Name Mapping
+
+| Var | Paper | dtype |
+| --- | --- | --- |
+| `x` | layer input X | bf16 |
+| `z` | pre-activation H_e = X_e W1_e | bf16 (saved for backward) |
+| `y1` | activated A_e = SwiGLU(H_e) | bf16 or fp8 (fused path) |
+| `y1s` | router-weighted S·A_e | bf16 (for weight grad) |
+| `w1` | up-proj W1_e | bf16 master, fp8 cached |
+| `w2` | down-proj W2_e | bf16 master, fp8 cached |
+| `dz` | ∂L/∂H_e | bf16 or fp8 (fused dSwiGLU path) |
+
+---
+
+## Experiment Failures (Do Not Repeat)
+
+1. **Per-tensor FP8 training**: RelRMSE ~100% at 0.02*randn scale. Unacceptable.
+2. **Grouped/static-capacity blockscaled**: Violates varlen memory contract.
+3. **blockscaled_fp8_weight_grad_gemm**: Pack/transpose overhead > GEMM at E=128.
+4. **QuACK alignment fix via assumed_align=2**: Triggers different CUTLASS verification failure.
+
+---
+
+## Lessons
+
+1. Verify benchmark routing mode before concluding performance.
+2. Weight quantization must be cached (200ms cold, 0ms cached).
+3. gemm_gated epilogue is dtype-agnostic (fp32 accumulator) — blockscaled support is pure plumbing.
+4. The QuACK varlen + colvec_scale alignment bug exists in upstream, not our code.
 
 ---
 

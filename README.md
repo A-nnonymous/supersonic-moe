@@ -120,16 +120,17 @@ The reporting policy for every FP8 step is:
 - memory baseline: official bf16
 - performance baselines: previous commit and official bf16
 
-## 🔥 FP8 Upgrade Status (2026-03-27 Session 3)
+## 🔥 FP8 Upgrade Status (2026-03-27 Session 3 Final)
 
-**Current state**: 6/8 GEMM operators use **blockscaled 1x32 UE8M0** FP8 (forward + activation-grad). 2/8 weight-grad operators use per-tensor FP8. Fused SwiGLU+quantize and fused quantize+ISA-pack Triton kernels integrated. **Inference forward 43% faster than BF16** (3.9ms→2.2ms). Previously reported "training 4x slower" was caused by vanilla top-K benchmark — **token rounding routing (production mode) eliminates padding overhead entirely**.
+**E2E training 10.08ms (-15.2% vs BF16 11.89ms). Forward 2.77ms (598 TFLOPS). 8/8 contract tests PASSED. Official moe_blackwell_test PASSED.**
 
 | Resource | Path |
 |----------|------|
 | **Handoff** (start here) | `reports/fp8_upgrade/HANDOFF.md` |
-| Contract tests (8/8 pass) | `tests/fp8_large_project_contract_test.py` |
-| Token rounding benchmark | `benchmarks/moe-token-rounding.py` |
-| Vanilla top-K benchmark | `benchmarks/moe-cute.py` |
+| Contract tests | `tests/fp8_large_project_contract_test.py` |
+| Realistic benchmark | `tools/final_benchmark.py` |
+| NVTX profiling | `tools/nsys_profile.py` |
+| nsys profiles | `output/fp8_fused_profile.nsys-rep`, `output/bf16_fwd_profile.nsys-rep` |
 
 ### Quick start
 
