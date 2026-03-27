@@ -867,29 +867,56 @@ class _DownProjection(torch.autograd.Function):
             if _fp8_enabled() and _min_expert_segment(expert_frequency_offset) >= 32:
                 # --- Blockscaled FP8 backward ---
                 _evict_per_tensor_caches_once()
+                dout_expanded = dout[x_gather_idx]  # (TK, H) — needed for weight grad
 
-                # Fused gather + quantize: dout[x_gather_idx] → fp8 + ISA-packed scales
-                dout_fp8, dout_scales = gather_quantize_and_pack_activation(dout, x_gather_idx)
-                dout_expanded = dout[x_gather_idx]  # still needed for weight grad (per-tensor path)
-
-                # Act grad: blockscaled varlen GEMM (dout_fp8 × w2^T)
-                w2_perm = w2.permute(1, 0, 2)  # (I, H, E)
-                dy1 = blockscaled_fp8_gemm_varlen(
-                    dout_fp8, w2_perm, expert_frequency_offset,
-                    a_scales=dout_scales, out_dtype=torch.bfloat16,
-                )
-                del w2_perm, dout_fp8, dout_scales
-                if _use_fused_swiglu_quant():
-                    dz_fp8, dz_scales_raw, y1s, ds = swiglu_backward_quant_triton(dy1, z, s)
-                    dz_scales_packed = pack_blockscaled_1x32_scales(
-                        dz_scales_raw.view(torch.float8_e8m0fnu), dz_fp8.shape[-1]
+                if _use_fused_blockscaled_gated():
+                    # FUSED path: gemm_dgated with blockscaled FP8
+                    dout_fp8, dout_scales = gather_quantize_and_pack_activation(dout, x_gather_idx)
+                    # w2 = (H,I,E). BF16 dgated uses w2.permute(2,0,1) = (E,H,I).
+                    # Quantize in that layout for gemm_dgated.
+                    w2_ehi = w2.permute(2, 0, 1).contiguous()  # (E, H, I)
+                    from ..quack_utils.blockscaled_fp8_gemm import quantize_activation_blockwise, FP8ScaleGranularity
+                    _proto = FP8Protocol(scale_granularity=FP8ScaleGranularity.BLOCK_1X32)
+                    w2_fp8, w2_scales_raw = quantize_activation_blockwise(w2_ehi, _proto)
+                    w2_scales = pack_blockscaled_1x32_scales(w2_scales_raw, w2_ehi.size(-1))
+                    TK_bwd = z.shape[0]
+                    I_bwd = w2.shape[1]
+                    y1s = torch.empty(TK_bwd, I_bwd, dtype=torch.bfloat16, device=dout.device)
+                    from ..quack_utils.gemm_interface import gemm_dgated_tuned
+                    ds = gemm_dgated_tuned.fn(
+                        dout_fp8, w2_fp8,
+                        z, dz, y1s,
+                        colvec_scale=s.float(),
+                        activation="swiglu",
+                        colvec_reduce=True,
+                        cu_seqlens_m=expert_frequency_offset,
+                        A_idx=x_gather_idx,
+                        dynamic_scheduler=False,
+                        config=None,
+                        a_scales=dout_scales,
+                        b_scales=w2_scales,
                     )
-                    _PREQUANTIZED_SCALES["bwd"] = (dz_fp8, dz_scales_packed)
-                    dz = dz_fp8
-                    del dz_fp8, dz_scales_raw
+                    del dout_fp8, dout_scales, w2_fp8, w2_scales, w2_ehi
                 else:
-                    dz[:], y1s, ds = _swiglu_backward_interleaved(dy1, z, s)
-                del dy1
+                    # SEPARATE path: blockscaled varlen GEMM + standalone SwiGLU backward
+                    dout_fp8, dout_scales = gather_quantize_and_pack_activation(dout, x_gather_idx)
+                    w2_perm = w2.permute(1, 0, 2)  # (I, H, E)
+                    dy1 = blockscaled_fp8_gemm_varlen(
+                        dout_fp8, w2_perm, expert_frequency_offset,
+                        a_scales=dout_scales, out_dtype=torch.bfloat16,
+                    )
+                    del w2_perm, dout_fp8, dout_scales
+                    if _use_fused_swiglu_quant():
+                        dz_fp8, dz_scales_raw, y1s, ds = swiglu_backward_quant_triton(dy1, z, s)
+                        dz_scales_packed = pack_blockscaled_1x32_scales(
+                            dz_scales_raw.view(torch.float8_e8m0fnu), dz_fp8.shape[-1]
+                        )
+                        _PREQUANTIZED_SCALES["bwd"] = (dz_fp8, dz_scales_packed)
+                        dz = dz_fp8
+                        del dz_fp8, dz_scales_raw
+                    else:
+                        dz[:], y1s, ds = _swiglu_backward_interleaved(dy1, z, s)
+                    del dy1
 
                 _log_stage_memory("backward:down-proj-dgated")
                 _reset_stage_memory_probe()
@@ -922,20 +949,24 @@ class _DownProjection(torch.autograd.Function):
                         dx_out=dz,
                         out_dtype=torch.bfloat16,
                         postact_dtype=torch.float8_e4m3fn,
-                        colvec_scale=s,
+                        colvec_scale=s.float(),
                         colvec_reduce=True,
                         cu_seqlens_m=expert_frequency_offset,
                         A_idx=x_gather_idx,
                         dynamic_scheduler=False,
                     )
                 else:
+                    # BF16 path: cast colvec_scale to fp32 to avoid QuACK varlen
+                    # alignment bug (domain_offset on bf16 ptr reduces to 16-bit
+                    # alignment, but async copy requires 32-bit; fp32 is always
+                    # 32-bit aligned after any integer offset)
                     _, y1s, ds = gemm_dgated(
                         dout,
                         w2.permute(2, 0, 1),
                         PreAct=z,
                         activation="swiglu",
                         dx_out=dz,
-                        colvec_scale=s,
+                        colvec_scale=s.float(),
                         colvec_reduce=True,
                         cu_seqlens_m=expert_frequency_offset,
                         A_idx=x_gather_idx,
