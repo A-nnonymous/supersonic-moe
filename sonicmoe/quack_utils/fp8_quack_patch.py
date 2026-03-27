@@ -39,3 +39,13 @@ def apply_fp8_quack_patch() -> None:
         ).mark_layout_dynamic(leading_dim=leading_dim)
 
     GemmWrapperBase.create_cute_tensor = staticmethod(_fp8_create_cute_tensor)
+
+    # 3. Fix CUTLASS DSL alignment bug: varlen + colvec_scale.
+    #    QuACK's gemm_default_epi.py line 127-129 uses domain_offset with a
+    #    dynamic cu_seqlens_m[batch_idx] on a bf16 colvec pointer, reducing
+    #    alignment from 32-bit to 16-bit. The async copy atom requires 32-bit.
+    #    Fix: we do NOT monkey-patch here — instead, we pass colvec_scale with
+    #    assumed_align=2 (bf16 element size) in the call sites that use varlen.
+    #    The actual fix is applied in gemm_dgated.py where we create the cute
+    #    tensor from colvec_scale.
+    #    Note: this is an upstream QuACK bug (gemm_default_epi.py:121-138).
