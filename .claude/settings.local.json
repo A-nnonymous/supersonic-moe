@@ -1,0 +1,43 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(nvidia-smi:*)",
+      "Bash(source:*)",
+      "Bash(python3:*)",
+      "Bash(for f:*)",
+      "Bash(do echo:*)",
+      "Read(//tmp/claude-0/-root-paddlejob-share-storage-gpfs-system-public-panzhaowu-lab-sonic-moe/03044194-a236-48d0-a896-b34d279a8e86/tasks/**)",
+      "Bash(done)",
+      "Bash(ls:*)",
+      "Bash(ssh:*)",
+      "Bash(mpirun:*)",
+      "Bash(cat:*)",
+      "Bash(/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/pip install:*)",
+      "Bash(/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python -c \"\nimport ast, sys\nfiles = [\n    'sonicmoe/quack_utils/blockscaled_fp8_gemm.py',\n    'sonicmoe/quack_utils/gemm_gated.py',\n    'sonicmoe/quack_utils/gemm_dgated.py',\n]\nok = True\nfor f in files:\n    try:\n        ast.parse\\(open\\(f\\).read\\(\\)\\)\n        print\\(f'OK: {f}'\\)\n    except SyntaxError as e:\n        print\\(f'SYNTAX ERROR: {f}: {e}'\\)\n        ok = False\nsys.exit\\(0 if ok else 1\\)\n\")",
+      "Bash(/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python -c \"\nimport ast\nfor f in ['sonicmoe/functional/__init__.py', 'sonicmoe/quack_utils/gemm_interface.py', 'sonicmoe/quack_utils/gemm_gated.py', 'sonicmoe/quack_utils/gemm_dgated.py', 'sonicmoe/quack_utils/blockscaled_fp8_gemm.py', 'sonicmoe/quack_utils/__init__.py']:\n    try:\n        ast.parse\\(open\\(f\\).read\\(\\)\\)\n        print\\(f'OK: {f}'\\)\n    except SyntaxError as e:\n        print\\(f'SYNTAX ERROR: {f}: {e}'\\)\n\")",
+      "Bash(/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python -c \"import ast; ast.parse\\(open\\('sonicmoe/functional/__init__.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python -c \"import ast; ast.parse\\(open\\('sonicmoe/moe.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(for id:*)",
+      "Bash(/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python -c \"\nimport ast\nfor f in ['sonicmoe/functional/__init__.py', 'sonicmoe/quack_utils/blockscaled_fp8_gemm.py', 'sonicmoe/quack_utils/__init__.py', 'sonicmoe/moe.py']:\n    try: ast.parse\\(open\\(f\\).read\\(\\)\\); print\\(f'OK: {f}'\\)\n    except SyntaxError as e: print\\(f'ERR: {f}: {e}'\\)\n\")",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(export:*)",
+      "Bash(/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python -c \"import ast; ast.parse\\(open\\('sonicmoe/quack_utils/fp8_quack_patch.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(find:*)",
+      "Bash(/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python -c \"import ast; ast.parse\\(open\\('sonicmoe/quack_utils/gemm_dgated.py'\\).read\\(\\)\\); ast.parse\\(open\\('sonicmoe/quack_utils/fp8_quack_patch.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(git reset:*)",
+      "Bash(/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python -c \"import ast; ast.parse\\(open\\('sonicmoe/functional/__init__.py'\\).read\\(\\)\\); print\\('OK'\\)\" && ssh 10.51.203.76 \"CUDA_VISIBLE_DEVICES=1 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf SONIC_MOE_FP8_FUSED_GATED=1 /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe/tools/final_benchmark.py 2>&1\" 2>&1)",
+      "Read(//tmp/claude-0/-root-paddlejob-share-storage-gpfs-system-public-panzhaowu-lab-sonic-moe/36d8b50c-3df8-4037-be28-f598dbd76a65/tasks/**)",
+      "Bash(python:*)",
+      "Bash(WORKDIR=\"/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe\"\npython tools/cluster_idle_launch.py launch \\\\\n  --host 10.51.203.82 \\\\\n  --gpu 0 \\\\\n  --workdir \"$WORKDIR\" \\\\\n  --command \"CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=off python tools/final_benchmark.py\" \\\\\n  2>&1)",
+      "Bash(WORKDIR=\"/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe\"\npython tools/cluster_idle_launch.py launch \\\\\n  --host 10.51.203.82 \\\\\n  --gpu 1 \\\\\n  --workdir \"$WORKDIR\" \\\\\n  --command \"CUDA_VISIBLE_DEVICES=1 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf SONIC_MOE_FP8_FUSED_GATED=1 python tools/final_benchmark.py\" \\\\\n  2>&1)",
+      "Bash(WORKDIR=\"/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe\"\npython tools/cluster_idle_launch.py launch \\\\\n  --host 10.51.203.82 \\\\\n  --gpu 2 \\\\\n  --workdir \"$WORKDIR\" \\\\\n  --command \"CUDA_VISIBLE_DEVICES=2 USE_QUACK_GEMM=1 python tools/rmse_verification.py\" \\\\\n  2>&1)",
+      "Bash(WORKDIR=\"/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe\"\npython tools/cluster_idle_launch.py launch \\\\\n  --host 10.51.203.82 \\\\\n  --gpu 3 \\\\\n  --workdir \"$WORKDIR\" \\\\\n  --command \"CUDA_VISIBLE_DEVICES=3 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf python -m pytest tests/fp8_large_project_contract_test.py -v -k 'not large_shape'\" \\\\\n  2>&1)",
+      "Bash(TASK_DIR=\"/tmp/claude-0/-root-paddlejob-share-storage-gpfs-system-public-panzhaowu-lab-sonic-moe/36d8b50c-3df8-4037-be28-f598dbd76a65/tasks\")",
+      "Read(//root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe/$TASK_DIR/**)",
+      "Bash(TASK_DIR=\"/tmp/claude-0/-root-paddlejob-share-storage-gpfs-system-public-panzhaowu-lab-sonic-moe/36d8b50c-3df8-4037-be28-f598dbd76a65/tasks\"\ncat \"$TASK_DIR/bwpkphcyo.output\" 2>/dev/null | tail -120)",
+      "Bash(git status:*)",
+      "Bash(git push:*)"
+    ]
+  }
+}

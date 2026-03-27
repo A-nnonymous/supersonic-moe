@@ -53,15 +53,19 @@ def run_comparison(fp8_mode: str, fused_gated: str, label: str):
         from sonicmoe.functional import clear_all_fp8_weight_caches
         clear_all_fp8_weight_caches()
 
+        # Fresh input each call to avoid graph reuse issues
+        x_local = x.detach().clone().requires_grad_(True)
+        rs_local = rs.detach().clone().requires_grad_(True)
+
         # Forward
         o, ef = moe_general_routing_inputs(
-            x, rs, ti, ei,
+            x_local, rs_local, ti, ei,
             w1.permute(1, 2, 0), None,
             w2.permute(1, 2, 0), None,
             E, moe.stream_id, ActivationType.SWIGLU, False
         )
         # Backward
-        grads = torch.autograd.grad(o, [x, rs, w1, w2], dout, retain_graph=False)
+        grads = torch.autograd.grad(o, [x_local, rs_local, w1, w2], dout)
         return o.detach().clone(), [g.detach().clone() for g in grads]
 
     # BF16 baseline

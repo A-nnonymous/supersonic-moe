@@ -17,3 +17,4 @@ from .blockscaled_fp8_gemm import (
     quantize_and_pack_activation,
 )
 from .gemm_interface import gemm_dgated, gemm_gated
+from .swiglu_triton import dequantize_blockscaled_fp8

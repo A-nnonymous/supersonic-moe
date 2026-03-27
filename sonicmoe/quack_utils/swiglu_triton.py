@@ -378,3 +378,58 @@ def swiglu_backward_quant_triton(
         GROUP_SIZE=32,
     )
     return dz_fp8, dz_scales, y1s, ds
+
+
+# ===================================================================
+# Dequantize: blockscaled fp8 (TK, D) + e8m0 scales → bf16 (TK, D)
+# ===================================================================
+
+@triton.jit
+def _dequant_blockscaled_fp8_kernel(
+    FP8_ptr, SCALES_ptr, OUT_ptr,
+    stride_fp8_row, stride_scale_row, stride_out_row,
+    D: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+):
+    """Dequantize one row of blockscaled FP8 data to bfloat16.
+
+    Each group of GROUP_SIZE fp8 elements shares one e8m0 scale.
+    Actual value = fp8_raw * 2^(e8m0 - 127).
+    """
+    row = tl.program_id(0)
+    num_groups: tl.constexpr = D // GROUP_SIZE
+
+    for g in range(num_groups):
+        e8m0_val = tl.load(SCALES_ptr + row * stride_scale_row + g)
+        # Reconstruct float32 scale from e8m0: place exponent bits in IEEE754
+        scale_f32 = (e8m0_val.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+
+        col_offs = g * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+        mask = col_offs < D
+        fp8_vals = tl.load(FP8_ptr + row * stride_fp8_row + col_offs, mask=mask)
+        bf16_vals = (fp8_vals.to(tl.float32) * scale_f32).to(tl.bfloat16)
+        tl.store(OUT_ptr + row * stride_out_row + col_offs, bf16_vals, mask=mask)
+
+
+def dequantize_blockscaled_fp8(
+    fp8_data: torch.Tensor,
+    scales_uint8: torch.Tensor,
+) -> torch.Tensor:
+    """Dequantize blockscaled FP8 tensor to bfloat16.
+
+    Args:
+        fp8_data:     (TK, D) float8_e4m3fn — raw FP8 values.
+        scales_uint8: (TK, D//32) uint8 — e8m0 scale per group of 32.
+
+    Returns:
+        (TK, D) bfloat16 — properly dequantized values.
+    """
+    TK, D = fp8_data.shape
+    assert D % _GROUP_SIZE == 0, f"D={D} must be multiple of {_GROUP_SIZE}"
+    out = torch.empty(TK, D, dtype=torch.bfloat16, device=fp8_data.device)
+    _dequant_blockscaled_fp8_kernel[(TK,)](
+        fp8_data, scales_uint8, out,
+        fp8_data.stride(0), scales_uint8.stride(0), out.stride(0),
+        D=D, GROUP_SIZE=_GROUP_SIZE,
+    )
+    return out
