@@ -171,6 +171,30 @@ _GEMM_ALIGN = 16   # sgl-kernel GEMM requires M_i % 16 == 0 per expert
 _TILE_ALIGN = 128  # ScaleFactorTileLayout requires 128-row tiles
 
 
+def _build_pad_indices(
+    cu_src: torch.Tensor,
+    cu_dst: torch.Tensor,
+    expert_tokens: torch.Tensor,
+    total_M: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Vectorised src→dst index mapping for per-expert padding.
+
+    Returns (src_idx, dst_idx) such that ``buf[dst_idx] = a[src_idx]``
+    copies each expert's tokens to padded positions.  O(total_M) work,
+    no Python loop over experts.
+    """
+    # expert id for every token: [0]*n0, [1]*n1, ...
+    expert_ids = torch.repeat_interleave(
+        torch.arange(expert_tokens.numel(), device=cu_src.device, dtype=torch.int64),
+        expert_tokens.long(),
+    )
+    src_idx = torch.arange(total_M, device=cu_src.device, dtype=torch.int64)
+    # Position within each expert: token_pos - cu_src[expert_id]
+    within = src_idx - cu_src[expert_ids].long()
+    dst_idx = cu_dst[expert_ids].long() + within
+    return src_idx, dst_idx
+
+
 def sgl_mxfp8_gemm_varlen(
     a: torch.Tensor,
     w: torch.Tensor,
@@ -183,6 +207,8 @@ def sgl_mxfp8_gemm_varlen(
     Handles arbitrary expert token counts via dual-alignment padding:
     - Activations padded to 16  (GEMM requirement)
     - Scale factors padded to 128  (ScaleFactorTileLayout tiles)
+
+    All index computation is vectorised — no Python loops over experts.
 
     Parameters
     ----------
@@ -214,21 +240,9 @@ def sgl_mxfp8_gemm_varlen(
         padded_cu[1:] = torch.cumsum(padded_tokens, 0)
         total_padded = padded_cu[-1].item()
 
-        src_ranges = []
-        dst_ranges = []
-        for e in range(E):
-            m_e = expert_tokens[e].item()
-            if m_e > 0:
-                src_s = cu_seqlens_m[e].item()
-                dst_s = padded_cu[e].item()
-                src_ranges.append(torch.arange(src_s, src_s + m_e, device=a.device))
-                dst_ranges.append(torch.arange(dst_s, dst_s + m_e, device=a.device))
-
-        if src_ranges:
-            src_idx = torch.cat(src_ranges)
-            dst_idx = torch.cat(dst_ranges)
-        else:
-            src_idx = dst_idx = torch.empty(0, dtype=torch.long, device=a.device)
+        src_idx, dst_idx = _build_pad_indices(
+            cu_seqlens_m, padded_cu, expert_tokens, total_M,
+        )
 
         a_padded = torch.zeros(total_padded, K, dtype=a.dtype, device=a.device)
         a_padded[dst_idx] = a[src_idx]
@@ -242,33 +256,42 @@ def sgl_mxfp8_gemm_varlen(
     a_fp8, a_scales_e8m0 = quantize_activation_blockscaled_fast(a_padded)
     a_scales_uint8 = a_scales_e8m0.view(torch.uint8).contiguous()
 
-    # ── Step 3: Build 128-aligned scale buffer + tile ────────────────
+    # ── Step 3: Build 128-aligned tiled scale buffer ─────────────────
     scale_padded_tokens = (padded_tokens + _TILE_ALIGN - 1) // _TILE_ALIGN * _TILE_ALIGN
-    scale_cu = torch.zeros(E + 1, dtype=torch.int32, device=a.device)
-    scale_cu[1:] = torch.cumsum(scale_padded_tokens, 0)
-    total_scale = scale_cu[-1].item()
+    max_sp = int(scale_padded_tokens.max().item()) if total_M > 0 else _TILE_ALIGN
+    min_sp = int(scale_padded_tokens.min().item()) if total_M > 0 else _TILE_ALIGN
 
-    # Scatter row-major activation scales into 128-aligned scale buffer
-    sfa_buf = torch.zeros(total_scale, n_groups, dtype=torch.uint8, device=a.device)
-    for e in range(E):
-        m_p = padded_tokens[e].item()
-        if m_p > 0:
-            src_s = act_offsets[e].item()
-            dst_s = scale_cu[e].item()
-            sfa_buf[dst_s : dst_s + m_p] = a_scales_uint8[src_s : src_s + m_p]
+    # Fast path: all experts same size AND already 128-aligned (no scatter)
+    use_fast_tile = (
+        not needs_act_padding
+        and total_M > 0
+        and max_sp == min_sp
+        and int(padded_tokens[0].item()) == max_sp  # TPE itself is 128-aligned
+    )
 
-    # Tile per expert (each expert's scale block is independently 128-aligned)
-    sfa_tiled = torch.zeros_like(sfa_buf)
-    for e in range(E):
-        sp = scale_padded_tokens[e].item()
-        if sp > 0:
-            d = scale_cu[e].item()
-            chunk = sfa_buf[d : d + sp]
-            sfa_tiled[d : d + sp] = rowmajor_to_sgl_tiled(
-                chunk.unsqueeze(0).reshape(sp, n_groups), 1, sp, n_groups
+    if use_fast_tile:
+        # Scales are already contiguous per expert in cu_seqlens_m order;
+        # each expert block is exactly max_sp rows → tile in one call.
+        sfa_tiled = rowmajor_to_sgl_tiled(a_scales_uint8, E, max_sp, n_groups)
+        blockscale_offsets = act_offsets.clone()
+    else:
+        # General path: scatter into uniform (E * max_sp) buffer, then tile.
+        scale_buf = torch.zeros(E * max_sp, n_groups, dtype=torch.uint8, device=a.device)
+
+        if total_padded > 0:
+            padded_expert_ids = torch.repeat_interleave(
+                torch.arange(E, device=a.device, dtype=torch.int64),
+                padded_tokens.long(),
             )
+            padded_rows = torch.arange(total_padded, device=a.device, dtype=torch.int64)
+            within_padded = padded_rows - act_offsets[padded_expert_ids].long()
+            scale_dst = padded_expert_ids * max_sp + within_padded
+            scale_buf[scale_dst] = a_scales_uint8
 
-    blockscale_offsets = scale_cu[:-1].to(torch.int32).contiguous()
+        sfa_tiled = rowmajor_to_sgl_tiled(scale_buf, E, max_sp, n_groups)
+        blockscale_offsets = (
+            torch.arange(E, dtype=torch.int32, device=a.device) * max_sp
+        ).contiguous()
 
     # ── Step 4: Problem sizes + precomputed weights ──────────────────
     problem_sizes = torch.empty(E, 3, dtype=torch.int32, device=a.device)
