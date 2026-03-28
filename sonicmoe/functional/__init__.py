@@ -564,23 +564,28 @@ class _UpProjection(torch.autograd.Function):
             assert not is_compiling
 
             if _fp8_enabled():
-                # Blockscaled FP8 backward: 1×32 E8M0 block scales preserve
-                # gradient precision (unlike per-tensor FP8 which truncates
-                # small gradients to near-zero).
+                # Blockscaled FP8 act-grad + BF16 weight-grad.
+                # Act-grad: FP8 is compute-bound (large K) → use sgl MXFP8 GEMM.
+                # Weight-grad: bandwidth-bound (small K = TPE) → BF16 QuACK is
+                # faster than FP8 quantize+pack+GEMM overhead.
 
-                # Weight grad: blockscaled FP8 (x^T × dz → dw1 per expert)
-                x_gathered = x[x_gather_idx]  # (TK, H) expert-sorted
-                blockscaled_fp8_weight_grad_gemm(
-                    x_gathered, dz,
-                    expert_frequency_offset,
+                # Weight grad: BF16 varlen GEMM (x^T × dz → dw1 per expert)
+                dz_bf16 = dz if dz.dtype == torch.bfloat16 else dz.to(torch.bfloat16)
+                gemm(
+                    x.T,
+                    dz_bf16,
                     out=dw1.permute(2, 1, 0),
+                    cu_seqlens_k=expert_frequency_offset,
+                    A_idx=x_gather_idx,
+                    batch_idx_permute=None,
+                    dynamic_scheduler=False,
                 )
-                del x_gathered
 
                 # Act grad: blockscaled FP8 GEMM (dz × w1^T → dx_expanded)
                 dx_expanded = sgl_mxfp8_gemm_varlen(
-                    dz, w1.permute(1, 0, 2), expert_frequency_offset,
+                    dz_bf16, w1.permute(1, 0, 2), expert_frequency_offset,
                 )
+                del dz_bf16
             else:
                 gemm(
                     x.T,
@@ -784,15 +789,20 @@ class _DownProjection(torch.autograd.Function):
                 _log_stage_memory("backward:down-proj-dgated")
                 _reset_stage_memory_probe()
 
-                # Weight-grad: blockscaled FP8 (dout^T × y1s → dw2 per expert)
-                dout_gathered = dout[x_gather_idx]  # (TK, H) expert-sorted
+                # Weight-grad: BF16 varlen GEMM (dout^T × y1s → dw2 per expert)
+                # BF16 is faster here: bandwidth-bound GEMM (small K = per-expert
+                # token count) gains nothing from FP8 quantize+pack overhead.
                 y1s_wgrad = y1s if y1s.dtype == torch.bfloat16 else y1s.to(torch.bfloat16)
-                blockscaled_fp8_weight_grad_gemm(
-                    dout_gathered, y1s_wgrad,
-                    expert_frequency_offset,
+                gemm(
+                    dout.T,
+                    y1s_wgrad,
                     out=dw2.permute(2, 0, 1),
+                    cu_seqlens_k=expert_frequency_offset,
+                    A_idx=x_gather_idx,
+                    batch_idx_permute=None,
+                    dynamic_scheduler=False,
                 )
-                del dout_gathered, y1s_wgrad
+                del y1s_wgrad
                 _log_stage_memory("backward:down-proj-weight")
                 ds = ds[s_reverse_scatter_idx]
             else:
