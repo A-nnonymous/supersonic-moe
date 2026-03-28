@@ -1096,16 +1096,23 @@ def precompute_weight_fp8_for_fused_gated(
     """Pre-quantize expert weight for fused gemm_gated blockscaled path (cached).
 
     gemm_gated_tuned expects B in (L, K, N) format and applies .mT internally
-    to get (L, N, K). To match, we quantize w in (E, K, N) = (E, H, 2I) layout.
+    to get (L, N, K).  Blockscaled 1x32 quantisation is done on the physical
+    (contiguous) layout which must match what CUTLASS sees after .mT.
+
+    We quantise in (E, N, K) contiguous layout (scales along K), then return
+    the .mT view (E, K, N) so that gemm_gated_tuned's internal .mT recovers
+    the original contiguous (E, N, K) layout with correctly-aligned scales.
 
     Parameters
     ----------
-    w : Tensor (2I, H, E) or (H, I, E) bf16 — expert weights.
+    w : Tensor (2I, H, E) bf16 — expert weights.
 
     Returns
     -------
-    w_fp8 : Tensor (E, dim1, dim0) float8_e4m3fn — matches (L, K, N) for gemm_gated
-    w_scales : Tensor packed float8_e8m0fnu in ISA layout
+    w_fp8 : Tensor (E, K, N) float8_e4m3fn — .mT view of contiguous (E, N, K).
+        gemm_gated_tuned's internal B.mT will recover the contiguous (E, N, K).
+    w_scales : Tensor packed float8_e8m0fnu in ISA layout (scales along K-axis
+        of the contiguous layout)
     """
     key = (
         w.untyped_storage().data_ptr(),
@@ -1117,11 +1124,14 @@ def precompute_weight_fp8_for_fused_gated(
     if cached is not None:
         return cached
 
-    w_ekn = w.permute(2, 1, 0).contiguous()
+    # w is (2I, H, E) -> (E, 2I, H) contiguous = (E, N, K) physical layout
+    w_enk = w.permute(2, 1, 0).mT.contiguous()  # (E, N=2I, K=H) contiguous
     proto = FP8Protocol(scale_granularity=FP8ScaleGranularity.BLOCK_1X32)
-    w_fp8, w_scales_raw = quantize_activation_blockwise(w_ekn, proto)
-    w_scales_packed = pack_blockscaled_1x32_scales(w_scales_raw, w_ekn.size(-1))
-    result = (w_fp8, w_scales_packed)
+    w_fp8_enk, w_scales_raw = quantize_activation_blockwise(w_enk, proto)
+    w_scales_packed = pack_blockscaled_1x32_scales(w_scales_raw, w_enk.size(-1))
+    # Return .mT view (E, K, N) so gemm_gated_tuned's B.mT recovers (E, N, K)
+    w_fp8_ekn = w_fp8_enk.mT  # stride view — same physical memory
+    result = (w_fp8_ekn, w_scales_packed)
     if len(_FUSED_WEIGHT_CACHE) > 8:
         _FUSED_WEIGHT_CACHE.clear()
     _FUSED_WEIGHT_CACHE[key] = result

@@ -459,7 +459,8 @@ class _UpProjection(torch.autograd.Function):
                     # FUSED path: gather+quantize → fused gemm_gated+blockscaled
                     # Fused gather+quantize eliminates bf16 gathered intermediate
                     x_fp8, x_scales = gather_quantize_and_pack_activation(x, x_gather_idx)
-                    # Pre-quantize weight: (2I, H, E) → (E, H, 2I) fp8 for gemm_gated
+                    # Pre-quantize weight: (2I, H, E) → (E,K,N) fp8 view for gemm_gated
+                    # gemm_gated_tuned's .mT recovers contiguous (E,N,K) with K-axis scales
                     w1_fp8, w1_scales = precompute_weight_fp8_for_fused_gated(w1)
                     # Allocate outputs
                     z = torch.empty(TK, 2 * I if is_glu_activation else I,
@@ -597,14 +598,10 @@ class _UpProjection(torch.autograd.Function):
             assert not is_compiling
 
             if _fp8_enabled() and _min_expert_segment(expert_frequency_offset) >= 32:
-                # --- Hybrid FP8 up-proj backward: BF16 weight-grad + BF16 act-grad ---
-                # Forward uses blockscaled FP8; backward uses BF16 to avoid quantize overhead.
+                # --- BF16 up-proj backward (FP8 forward + BF16 backward hybrid) ---
                 _evict_per_tensor_caches_once()
-
-                # Consume any stale pre-quantized entry (no longer needed with BF16 backward)
                 _PREQUANTIZED_SCALES.pop("bwd", None)
 
-                # dz is always bf16 now (from BF16 gemm_dgated in _DownProjection.backward)
                 dz_bf16 = dz if dz.dtype == torch.bfloat16 else dz.to(torch.bfloat16)
 
                 # Weight grad: x^T × dz per expert — BF16 varlen GEMM
@@ -732,13 +729,17 @@ class _DownProjection(torch.autograd.Function):
 
             assert b2 is None
             if _fp8_enabled() and _min_expert_segment(expert_frequency_offset) >= 32:
-                # Hybrid: BF16 down-proj GEMM avoids y1→fp8 quantize overhead
+                # Full-chain: blockscaled FP8 down-proj GEMM
                 _evict_per_tensor_caches_once()
-                _PREQUANTIZED_SCALES.pop("fwd", None)  # consume stale entry if any
-                y1_bf16 = y1 if y1.dtype == torch.bfloat16 else y1.to(torch.bfloat16)
-                y2 = gemm(y1_bf16, w2.permute(2, 1, 0),
-                          cu_seqlens_m=expert_frequency_offset)
-                del y1_bf16
+                _PREQUANTIZED_SCALES.pop("fwd", None)
+                y1_fp8, y1_scales = quantize_and_pack_activation(
+                    y1 if y1.dtype == torch.bfloat16 else y1.to(torch.bfloat16)
+                )
+                y2 = blockscaled_fp8_gemm_varlen(
+                    y1_fp8, w2, expert_frequency_offset,
+                    a_scales=y1_scales, out_dtype=torch.bfloat16,
+                )
+                del y1_fp8, y1_scales
                 router_perm = s_reverse_scatter_idx
                 y2_for_router = y2
             elif _fp8_enabled():
@@ -836,9 +837,9 @@ class _DownProjection(torch.autograd.Function):
 
             s = topk_scores[s_scatter_idx]
             if _fp8_enabled() and _min_expert_segment(expert_frequency_offset) >= 32:
-                # --- Hybrid FP8 backward: BF16 fused act-grad + BF16 varlen weight-grad ---
-                # Forward uses blockscaled FP8 for compute/memory benefit.
-                # Backward uses BF16 fused GEMMs to avoid quantize overhead (MoE is IO-bound).
+                # --- FP8 forward + BF16 backward ---
+                # MoE at current shapes (E=128, K=8, I=1024) is IO-bound.
+                # BF16 backward fused GEMMs achieve 55% peak with no quantize overhead.
                 _evict_per_tensor_caches_once()
 
                 # Act-grad: BF16 fused gemm_dgated (dout × w2^T → dz, with SwiGLU bwd + score grad)
