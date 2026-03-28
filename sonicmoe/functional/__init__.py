@@ -564,31 +564,23 @@ class _UpProjection(torch.autograd.Function):
             assert not is_compiling
 
             if _fp8_enabled():
-                # BF16 backward: per-tensor FP8 gradient casts destroy precision
-                # (gradients have small magnitudes → FP8 E4M3FN truncates to
-                # near-zero, yielding ~0.86 RelRMSE).  BF16 varlen GEMMs are
-                # fast and accurate.
-                dz_bf16 = dz if dz.dtype == torch.bfloat16 else dz.to(torch.bfloat16)
+                # Blockscaled FP8 backward: 1×32 E8M0 block scales preserve
+                # gradient precision (unlike per-tensor FP8 which truncates
+                # small gradients to near-zero).
 
-                # Weight grad: BF16 varlen GEMM (x^T × dz → dw1 per expert)
-                gemm(
-                    x.T,
-                    dz_bf16,
+                # Weight grad: blockscaled FP8 (x^T × dz → dw1 per expert)
+                x_gathered = x[x_gather_idx]  # (TK, H) expert-sorted
+                blockscaled_fp8_weight_grad_gemm(
+                    x_gathered, dz,
+                    expert_frequency_offset,
                     out=dw1.permute(2, 1, 0),
-                    cu_seqlens_k=expert_frequency_offset,
-                    A_idx=x_gather_idx,
-                    batch_idx_permute=None,
-                    dynamic_scheduler=False,
                 )
+                del x_gathered
 
-                # Act grad: BF16 varlen GEMM (dz × w1^T → dx_expanded)
-                dx_expanded = gemm(
-                    dz_bf16, w1.permute(2, 0, 1),
-                    cu_seqlens_m=expert_frequency_offset,
-                    out_dtype=torch.bfloat16,
-                    dynamic_scheduler=False,
+                # Act grad: blockscaled FP8 GEMM (dz × w1^T → dx_expanded)
+                dx_expanded = sgl_mxfp8_gemm_varlen(
+                    dz, w1.permute(1, 0, 2), expert_frequency_offset,
                 )
-                del dz_bf16
             else:
                 gemm(
                     x.T,
@@ -792,18 +784,15 @@ class _DownProjection(torch.autograd.Function):
                 _log_stage_memory("backward:down-proj-dgated")
                 _reset_stage_memory_probe()
 
-                # Weight-grad: BF16 varlen GEMM (dout^T × y1s → dw2 per expert)
+                # Weight-grad: blockscaled FP8 (dout^T × y1s → dw2 per expert)
+                dout_gathered = dout[x_gather_idx]  # (TK, H) expert-sorted
                 y1s_wgrad = y1s if y1s.dtype == torch.bfloat16 else y1s.to(torch.bfloat16)
-                gemm(
-                    dout.T,
-                    y1s_wgrad,
+                blockscaled_fp8_weight_grad_gemm(
+                    dout_gathered, y1s_wgrad,
+                    expert_frequency_offset,
                     out=dw2.permute(2, 0, 1),
-                    cu_seqlens_k=expert_frequency_offset,
-                    A_idx=x_gather_idx,
-                    batch_idx_permute=None,
-                    dynamic_scheduler=False,
                 )
-                del y1s_wgrad
+                del dout_gathered, y1s_wgrad
                 _log_stage_memory("backward:down-proj-weight")
                 ds = ds[s_reverse_scatter_idx]
             else:
