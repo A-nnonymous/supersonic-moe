@@ -1069,6 +1069,76 @@ def quantize_and_pack_activation(
     return fp8_out, packed_scales.view(torch.float8_e8m0fnu)
 
 
+def quantize_and_pack_activation_varlen(
+    x: torch.Tensor,
+    cu_seqlens_m: torch.Tensor,
+    group_size: int = _SF_VEC_SIZE,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize varlen activation to blockscaled FP8 with per-expert ISA-packed scales.
+
+    Three-step pipeline:
+    1. Quantize entire (TK, K) in one kernel → fp8 + raw E8M0 scales (TK, num_groups)
+    2. Reshape raw scales to per-expert (E, max_TPE, num_groups) with padding
+    3. ISA-pack → (E, per_expert_storage) packed scales
+
+    For uniform TPE, step 2 is a zero-copy reshape.
+
+    Parameters
+    ----------
+    x : Tensor (TK, K) bf16 — contiguous, expert-sorted activation.
+    cu_seqlens_m : Tensor (E+1,) int32 — expert token boundaries.
+    group_size : block size for scale computation (default 32).
+
+    Returns
+    -------
+    fp8_data : Tensor (TK, K) float8_e4m3fn
+    packed_scales : Tensor (E, per_expert_storage) float8_e8m0fnu in ISA layout
+    """
+    x = x.contiguous()
+    TK, K = x.shape
+    E = cu_seqlens_m.numel() - 1
+
+    # Step 1: Quantize entire tensor in one kernel
+    fp8_data, raw_scales = quantize_activation_blockscaled_fast(x, group_size)
+    # raw_scales: (TK, num_groups) float8_e8m0fnu
+    num_groups = raw_scales.size(1)
+
+    # Step 2: Reshape raw scales to per-expert with padding
+    offsets_cpu = cu_seqlens_m.cpu()
+    lens = offsets_cpu[1:] - offsets_cpu[:-1]
+    max_tpe = int(lens.max().item())
+
+    if max_tpe == 0:
+        per_batch_storage = max(_storage_per_batch(0, K), 1)
+        empty_scales = torch.full(
+            (E, per_batch_storage), 127, dtype=torch.uint8, device=x.device
+        )
+        return fp8_data, empty_scales.view(torch.float8_e8m0fnu)
+
+    raw_uint8 = raw_scales.view(torch.uint8)
+    min_tpe = int(lens.min().item())
+
+    if min_tpe == max_tpe and TK == E * max_tpe:
+        # Uniform TPE: zero-copy reshape
+        padded_scales = raw_uint8.view(E, max_tpe, num_groups)
+    else:
+        # Non-uniform: vectorized scatter into padded tensor
+        padded_scales = torch.full(
+            (E, max_tpe, num_groups), 127, dtype=torch.uint8, device=x.device
+        )
+        row_indices = torch.arange(TK, device=x.device)
+        # searchsorted with right=True on cu_seqlens_m[1:] gives expert_id for each row
+        expert_ids = torch.searchsorted(cu_seqlens_m[1:].long(), row_indices.long(), right=True)
+        local_rows = row_indices - cu_seqlens_m[expert_ids]
+        padded_scales[expert_ids, local_rows] = raw_uint8
+
+    # Step 3: ISA-pack the 3D scales
+    packed = pack_blockscaled_1x32_scales(
+        padded_scales.view(torch.float8_e8m0fnu), K
+    )
+    return fp8_data, packed
+
+
 def precompute_weight_fp8(
     w: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:

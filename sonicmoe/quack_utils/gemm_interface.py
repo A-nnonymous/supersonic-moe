@@ -210,6 +210,8 @@ def gemm_gated(
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     store_preact: bool = True,
     dynamic_scheduler: bool = False,
+    a_scales: Optional[Tensor] = None,
+    b_scales: Optional[Tensor] = None,
     tuned: bool = True,
 ) -> Tuple[Optional[Tensor], Tensor]:
     """GEMM with gated activation and optional output tensors."""
@@ -241,6 +243,8 @@ def gemm_gated(
         A_idx,
         dynamic_scheduler,
         tuned,
+        a_scales,
+        b_scales,
     )
     return preact_out, postact_out
 
@@ -286,6 +290,8 @@ def gemm_dgated(
     cu_seqlens_m: Optional[Tensor] = None,
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = True,
+    a_scales: Optional[Tensor] = None,
+    b_scales: Optional[Tensor] = None,
     tuned: bool = True,
 ) -> Tuple[Tensor, Tensor]:
     """GEMM with gated activation gradient and optional output tensors."""
@@ -318,6 +324,8 @@ def gemm_dgated(
         A_idx,
         dynamic_scheduler,
         tuned,
+        a_scales,
+        b_scales,
     )
     if not colvec_reduce:
         return dx_out, postact_out
@@ -329,7 +337,7 @@ def gemm_dgated(
     "quack::gemm_dgated_out",
     mutates_args=("dx_out", "postact_out"),
     device_types="cuda",
-    schema="(Tensor A, Tensor B, Tensor PreAct, Tensor(a3!) dx_out, Tensor(a4!) postact_out, Tensor? colvec_scale=None, str activation='swiglu', bool colvec_reduce=False, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=True, bool tuned=True) -> Tensor?",
+    schema="(Tensor A, Tensor B, Tensor PreAct, Tensor(a3!) dx_out, Tensor(a4!) postact_out, Tensor? colvec_scale=None, str activation='swiglu', bool colvec_reduce=False, Tensor? cu_seqlens_m=None, Tensor? A_idx=None, bool dynamic_scheduler=True, bool tuned=True, Tensor? a_scales=None, Tensor? b_scales=None) -> Tensor?",
 )
 def gemm_dgated_out(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
@@ -344,6 +352,8 @@ def gemm_dgated_out(
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = True,
     tuned: bool = True,
+    a_scales: Optional[Tensor] = None,
+    b_scales: Optional[Tensor] = None,
 ) -> Optional[Tensor]:
     """GEMM with gated activation gradient and pre-allocated output tensors."""
     fn = gemm_dgated_tuned if tuned else partial(gemm_dgated_tuned.fn, config=None)
@@ -359,6 +369,8 @@ def gemm_dgated_out(
         cu_seqlens_m,
         A_idx,
         dynamic_scheduler,
+        a_scales=a_scales,
+        b_scales=b_scales,
     )
 
 
@@ -376,6 +388,8 @@ def gemm_dgated_out_fake(
     A_idx: Optional[Tensor] = None,  # (total_M,) if gather_A with varlen_m
     dynamic_scheduler: bool = True,
     tuned: bool = True,
+    a_scales: Optional[Tensor] = None,
+    b_scales: Optional[Tensor] = None,
 ) -> Optional[Tensor]:
     if not colvec_reduce:
         return None

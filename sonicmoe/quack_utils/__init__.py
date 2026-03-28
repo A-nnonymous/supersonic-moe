@@ -16,6 +16,7 @@ from .blockscaled_fp8_gemm import (
     precompute_weight_fp8_for_fused_dgated,
     precompute_weight_fp8_for_fused_gated,
     quantize_and_pack_activation,
+    quantize_and_pack_activation_varlen,
 )
 from .gemm_interface import gemm_dgated, gemm_gated, gemm_gated_out
 from .swiglu_triton import dequantize_blockscaled_fp8

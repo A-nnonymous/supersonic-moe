@@ -28,6 +28,7 @@ from ..quack_utils import (
     precompute_weight_fp8_raw_scales,
     quantize_activation_raw,
     quantize_and_pack_activation,
+    quantize_and_pack_activation_varlen,
     sgl_mxfp8_gemm_varlen,
 )
 from quack.gemm_interface import gemm
@@ -465,14 +466,25 @@ class _UpProjection(torch.autograd.Function):
             assert not torch.compiler.is_compiling()
             assert is_glu_activation, "QuACK GEMM does not support non GLU activation yet"
             if _fp8_enabled():
-                # FP8 up-proj using sgl-kernel MXFP8 blockscaled GEMM.
-                # CUTLASS gated GEMM has a SM100 arch-detection bug, so we
-                # decompose into: gather → FP8 GEMM → SwiGLU.
+                # Blockscaled FP8 up-proj: non-gated GEMM + manual SwiGLU.
+                # GemmGatedSm100 with blockscaled FP8 is broken in CUTLASS DSL
+                # (illegal instruction / zero output), so we decompose into
+                # a working GemmDefaultSm100 varlen GEMM + separate activation.
                 _evict_per_tensor_caches_once()
                 x_gathered = x[x_gather_idx]  # (TK, H) expert-sorted
-                z = sgl_mxfp8_gemm_varlen(x_gathered, w1, expert_frequency_offset)
-                # z: (TK, 2*I) — raw gated output
-                y1 = F.silu(z[:, :I]) * z[:, I:]
+                x_fp8, x_scales = quantize_and_pack_activation_varlen(
+                    x_gathered, expert_frequency_offset,
+                )
+                w1_fp8, w1_scales = precompute_weight_fp8(w1)
+                z = blockscaled_fp8_gemm_varlen(
+                    x_fp8, w1, expert_frequency_offset,
+                    a_scales=x_scales, w_fp8=w1_fp8, w_scales=w1_scales,
+                    out_dtype=torch.bfloat16,
+                )  # (TK, 2I) bf16 pre-activation
+                gate, value = z.chunk(2, dim=-1)
+                y1 = F.silu(gate) * value  # (TK, I)
+                if use_low_precision_postact_buffer:
+                    y1 = y1.to(torch.float8_e4m3fn)
             else:
                 z, y1 = gemm_gated(
                     x,
@@ -565,9 +577,7 @@ class _UpProjection(torch.autograd.Function):
 
             if _fp8_enabled():
                 # Blockscaled FP8 act-grad + BF16 weight-grad.
-                # Act-grad: FP8 is compute-bound (large K) → use sgl MXFP8 GEMM.
-                # Weight-grad: bandwidth-bound (small K = TPE) → BF16 QuACK is
-                # faster than FP8 quantize+pack+GEMM overhead.
+                # Weight-grad stays BF16: bandwidth-bound (small K = TPE).
 
                 # Weight grad: BF16 varlen GEMM (x^T × dz → dw1 per expert)
                 dz_bf16 = dz if dz.dtype == torch.bfloat16 else dz.to(torch.bfloat16)
@@ -581,11 +591,18 @@ class _UpProjection(torch.autograd.Function):
                     dynamic_scheduler=False,
                 )
 
-                # Act grad: blockscaled FP8 GEMM (dz × w1^T → dx_expanded)
-                dx_expanded = sgl_mxfp8_gemm_varlen(
-                    dz_bf16, w1.permute(1, 0, 2), expert_frequency_offset,
+                # Act grad: native blockscaled FP8 GEMM (dz × w1^T → dx_expanded)
+                # w1 is (2I, H, E); w1.permute(1, 0, 2) = (H, 2I, E) for non-gated GEMM
+                dz_fp8, dz_scales = quantize_and_pack_activation_varlen(
+                    dz_bf16, expert_frequency_offset,
                 )
-                del dz_bf16
+                w1T_fp8, w1T_scales = precompute_weight_fp8(w1.permute(1, 0, 2))
+                dx_expanded = blockscaled_fp8_gemm_varlen(
+                    dz_fp8, w1.permute(1, 0, 2), expert_frequency_offset,
+                    a_scales=dz_scales, w_fp8=w1T_fp8, w_scales=w1T_scales,
+                    out_dtype=torch.bfloat16,
+                )
+                del dz_bf16, dz_fp8, dz_scales
             else:
                 gemm(
                     x.T,
@@ -674,10 +691,16 @@ class _DownProjection(torch.autograd.Function):
 
             assert b2 is None
             if _fp8_enabled():
-                # Blockscaled FP8 down-proj via sgl-kernel MXFP8 grouped GEMM.
-                # Hardware-native MXFP8 on SM100 tensor cores with E8M0
-                # blockscales in ScaleFactorTileLayout.
-                y2 = sgl_mxfp8_gemm_varlen(y1, w2, expert_frequency_offset)
+                # Blockscaled FP8 down-proj via native CUTLASS varlen GEMM.
+                y1_fp8, y1_scales = quantize_and_pack_activation_varlen(
+                    y1, expert_frequency_offset,
+                )
+                w2_fp8, w2_scales = precompute_weight_fp8(w2)
+                y2 = blockscaled_fp8_gemm_varlen(
+                    y1_fp8, w2, expert_frequency_offset,
+                    a_scales=y1_scales, w_fp8=w2_fp8, w_scales=w2_scales,
+                    out_dtype=torch.bfloat16,
+                )
                 router_perm = s_reverse_scatter_idx
                 y2_for_router = y2
             else:
@@ -768,30 +791,52 @@ class _DownProjection(torch.autograd.Function):
 
             s = topk_scores[s_scatter_idx]
             if _fp8_enabled():
-                # BF16 fused dgated backward: per-tensor FP8 gradient casts
-                # destroy precision (~0.86 RelRMSE).  BF16 fused dgated is fast
-                # (55% peak) and accurate.
+                # Decomposed FP8 backward: non-gated GEMM + manual SwiGLU backward.
+                # GemmDgatedSm100 with blockscaled FP8 is broken in CUTLASS DSL,
+                # so we decompose into working GemmDefaultSm100 + manual epilogue.
 
-                # Act-grad: BF16 fused gemm_dgated (dout × w2^T → dz, SwiGLU bwd, score grad)
-                _, y1s, ds = gemm_dgated(
-                    dout,
-                    w2.permute(2, 0, 1),
-                    PreAct=z,
-                    activation="swiglu",
-                    dx_out=dz,
-                    colvec_scale=s.float(),
-                    colvec_reduce=True,
-                    cu_seqlens_m=expert_frequency_offset,
-                    A_idx=x_gather_idx,
-                    dynamic_scheduler=False,
+                # Step 1: FP8 GEMM — dout_gathered × w2^T → (TK, I)
+                dout_gathered = dout[x_gather_idx]  # (TK, H)
+                dout_fp8, dout_scales = quantize_and_pack_activation_varlen(
+                    dout_gathered, expert_frequency_offset,
                 )
+                # w2 is (H, I, E); for GEMM output (TK, I) need (I, H, E)
+                w2_perm = w2.permute(1, 0, 2)
+                w2_perm_fp8, w2_perm_scales = precompute_weight_fp8(w2_perm)
+                dy = blockscaled_fp8_gemm_varlen(
+                    dout_fp8, w2_perm, expert_frequency_offset,
+                    a_scales=dout_scales, w_fp8=w2_perm_fp8, w_scales=w2_perm_scales,
+                    out_dtype=torch.bfloat16,
+                )  # (TK, I)
+                del dout_gathered, dout_fp8, dout_scales
+
+                # Step 2: SwiGLU forward for post-activation and router gradient
+                I_dim = dy.size(-1)
+                gate = z[:, :I_dim]
+                value = z[:, I_dim:]
+                sig = torch.sigmoid(gate.float())
+                silu_gate = gate.float() * sig
+                y1_forward = (silu_gate * value.float()).to(z.dtype)  # (TK, I)
+
+                # Step 3: Router score gradient (using UNscaled dy, per CUTLASS epilogue)
+                ds = (y1_forward.float() * dy.float()).sum(dim=-1)  # (TK,)
+
+                # Step 4: Scale GEMM output by router weight, then SwiGLU backward
+                s_f = s.float().unsqueeze(-1)
+                dy_scaled = dy.float() * s_f
+                d_gate = (dy_scaled * value.float() * sig * (1.0 + gate.float() * (1.0 - sig))).to(z.dtype)
+                d_value = (dy_scaled * silu_gate).to(z.dtype)
+                dz[:, :I_dim] = d_gate
+                dz[:, I_dim:] = d_value
+                del dy_scaled, d_gate, d_value, sig, silu_gate, gate, value
+
+                # Step 5: Scale post-activation by router weight (for weight-grad)
+                y1s = y1_forward * s.unsqueeze(-1)
 
                 _log_stage_memory("backward:down-proj-dgated")
                 _reset_stage_memory_probe()
 
-                # Weight-grad: BF16 varlen GEMM (dout^T × y1s → dw2 per expert)
-                # BF16 is faster here: bandwidth-bound GEMM (small K = per-expert
-                # token count) gains nothing from FP8 quantize+pack overhead.
+                # Weight-grad: BF16 varlen GEMM (bandwidth-bound, FP8 overhead > benefit)
                 y1s_wgrad = y1s if y1s.dtype == torch.bfloat16 else y1s.to(torch.bfloat16)
                 gemm(
                     dout.T,
