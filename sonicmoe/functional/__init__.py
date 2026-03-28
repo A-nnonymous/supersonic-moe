@@ -12,14 +12,19 @@ from ..quack_utils import (
     blockscaled_fp8_gemm,
     blockscaled_fp8_gemm_grouped,
     blockscaled_fp8_gemm_varlen,
+    blockscaled_fp8_gemm_varlen_triton,
     blockscaled_fp8_weight_grad_gemm,
+    clear_raw_weight_cache,
     gather_quantize_and_pack_activation,
     gemm_dgated,
     gemm_gated,
+    gemm_gated_out,
     make_blockscaled_grouped_reverse_scatter_idx,
     precompute_weight_fp8,
     precompute_weight_fp8_for_fused_dgated,
     precompute_weight_fp8_for_fused_gated,
+    precompute_weight_fp8_raw_scales,
+    quantize_activation_raw,
     quantize_and_pack_activation,
 )
 from quack.gemm_interface import gemm
@@ -313,6 +318,8 @@ def clear_all_fp8_weight_caches() -> None:
     # Also clear the blockscaled weight cache in blockscaled_fp8_gemm.py
     from ..quack_utils import clear_blockscaled_fp8_weight_cache as _clear_bs
     _clear_bs()
+    # Clear the Triton raw-scale weight cache
+    clear_raw_weight_cache()
 
 
 def _validate_runtime_precision_switches(fp8_protocol: FP8Protocol | None) -> None:
@@ -453,21 +460,18 @@ class _UpProjection(torch.autograd.Function):
             assert not torch.compiler.is_compiling()
             assert is_glu_activation, "QuACK GEMM does not support non GLU activation yet"
             if _fp8_enabled():
-                # Per-tensor FP8 up-proj: QuACK autotuned CUTLASS kernel with
-                # integrated gather (A_idx).  Profiling shows blockscaled
-                # gather+quantize costs 1.08ms while per-tensor cast is <0.05ms,
-                # and CUTLASS blockscaled varlen is 6.8x slower than QuACK gemm.
-                # postact_dtype=fp8 produces y1 in FP8 for zero-cost down-proj.
-                x_fp8 = x if x.dtype == torch.float8_e4m3fn else x.to(torch.float8_e4m3fn)
-                w1_fp8 = _get_cached_fp8_weight(w1, "w1_ekh")
+                # FP8 mode: BF16 up-proj + blockscaled FP8 down-proj.
+                # CUTLASS gated GEMM with ISA-packed blockscales has a SM100
+                # arch-detection bug (CUDA_ERROR_ILLEGAL_INSTRUCTION), so the
+                # up-proj stays BF16 while the down-proj uses our Triton
+                # blockscaled kernel which is both correct and fast.
+                _evict_per_tensor_caches_once()
                 z, y1 = gemm_gated(
-                    x_fp8,
-                    w1_fp8,
+                    x,
+                    w1.permute(2, 1, 0),
                     activation="swiglu",
                     cu_seqlens_m=expert_frequency_offset,
                     A_idx=x_gather_idx,
-                    out_dtype=torch.bfloat16,
-                    postact_dtype=torch.float8_e4m3fn,
                     dynamic_scheduler=False,
                 )
             else:
@@ -674,12 +678,17 @@ class _DownProjection(torch.autograd.Function):
 
             assert b2 is None
             if _fp8_enabled():
-                # Per-tensor FP8 down-proj: QuACK's fast varlen scheduler.
-                # CUTLASS blockscaled varlen (GemmDefaultSm100) is 6.8x slower
-                # than QuACK gemm.  y1 is already FP8 from up-proj postact_dtype.
-                y1_fp8 = y1 if y1.dtype == torch.float8_e4m3fn else y1.to(torch.float8_e4m3fn)
-                w2_fp8 = _get_fp8_weight_orig(w2)
-                y2 = gemm(y1_fp8, w2_fp8.permute(2, 1, 0), cu_seqlens_m=expert_frequency_offset)
+                # Blockscaled FP8 down-proj: custom Triton kernel with
+                # software dequant (FP8 tensor cores + per-32-element E8M0 scales).
+                # Replaces the slow CUTLASS GemmDefaultSm100 path (6.8× slower).
+                y1_fp8, y1_scales = quantize_activation_raw(y1)
+                w2_fp8, w2_scales = precompute_weight_fp8_raw_scales(w2)
+                y2 = blockscaled_fp8_gemm_varlen_triton(
+                    y1_fp8, y1_scales,
+                    w2_fp8, w2_scales,
+                    expert_frequency_offset,
+                    out_dtype=torch.bfloat16,
+                )
                 router_perm = s_reverse_scatter_idx
                 y2_for_router = y2
             else:
