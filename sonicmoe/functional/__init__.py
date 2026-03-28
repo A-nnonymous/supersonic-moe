@@ -452,50 +452,12 @@ class _UpProjection(torch.autograd.Function):
         if use_quack_gemm:
             assert not torch.compiler.is_compiling()
             assert is_glu_activation, "QuACK GEMM does not support non GLU activation yet"
-            if _fp8_enabled() and _min_expert_segment(expert_frequency_offset) >= 32:
-                # Blockscaled FP8 up-proj
-                _evict_per_tensor_caches_once()
-
-                if _use_fused_blockscaled_gated():
-                    # FUSED path: gather+quantize → fused gemm_gated+blockscaled
-                    # Fused gather+quantize eliminates bf16 gathered intermediate
-                    x_fp8, x_scales = gather_quantize_and_pack_activation(x, x_gather_idx)
-                    # Pre-quantize weight: (2I, H, E) → (E,K,N) fp8 view for gemm_gated
-                    # gemm_gated_tuned's .mT recovers contiguous (E,N,K) with K-axis scales
-                    w1_fp8, w1_scales = precompute_weight_fp8_for_fused_gated(w1)
-                    # Allocate outputs
-                    z = torch.empty(TK, 2 * I if is_glu_activation else I,
-                                    dtype=torch.bfloat16, device=x.device)
-                    y1 = torch.empty(TK, I, dtype=torch.bfloat16, device=x.device)
-                    # Fused GEMM + SwiGLU with blockscaled FP8
-                    # Bypass custom_op wrapper (gemm_gated_out) which has fixed schema
-                    from ..quack_utils.gemm_interface import gemm_gated_tuned
-                    gemm_gated_tuned.fn(
-                        x_fp8, w1_fp8,
-                        z, y1,      # preact_out, postact_out
-                        None, None,  # C, bias
-                        "swiglu",
-                        expert_frequency_offset,  # cu_seqlens_m
-                        None,                     # A_idx=None (already gathered)
-                        False,                    # dynamic_scheduler
-                        config=None,
-                        a_scales=x_scales,
-                        b_scales=w1_scales,
-                    )
-                    del x_fp8, x_scales, w1_fp8, w1_scales
-                else:
-                    # SEPARATE path: fused gather+quantize → blockscaled GEMM → SwiGLU
-                    x_fp8, x_scales = gather_quantize_and_pack_activation(x, x_gather_idx)
-                    z = blockscaled_fp8_gemm_varlen(
-                        x_fp8, w1, expert_frequency_offset,
-                        a_scales=x_scales, out_dtype=torch.bfloat16,
-                    )
-                    del x_fp8, x_scales
-                    # Standalone SwiGLU (bf16) — down-proj uses BF16 GEMM,
-                    # so fused SwiGLU+quant would waste effort.
-                    y1 = _swiglu_forward_interleaved(z)
-            elif _fp8_enabled():
-                # Per-tensor FP8 fallback for small expert segments
+            if _fp8_enabled():
+                # Per-tensor FP8 up-proj: QuACK autotuned CUTLASS kernel with
+                # integrated gather (A_idx).  Profiling shows blockscaled
+                # gather+quantize costs 1.08ms while per-tensor cast is <0.05ms,
+                # and CUTLASS blockscaled varlen is 6.8x slower than QuACK gemm.
+                # postact_dtype=fp8 produces y1 in FP8 for zero-cost down-proj.
                 x_fp8 = x if x.dtype == torch.float8_e4m3fn else x.to(torch.float8_e4m3fn)
                 w1_fp8 = _get_cached_fp8_weight(w1, "w1_ekh")
                 z, y1 = gemm_gated(
@@ -598,16 +560,11 @@ class _UpProjection(torch.autograd.Function):
         if use_quack_gemm:
             assert not is_compiling
 
-            if _fp8_enabled() and _min_expert_segment(expert_frequency_offset) >= 32:
-                # --- Blockscaled FP8 up-proj backward ---
-                # Both weight-grad and act-grad stay BF16 varlen GEMM.
-                # Rationale:
-                #  - Weight-grad: per-expert FP8 splitting is 4.7x slower for E=128
-                #  - Act-grad: blockscaled FP8 quantize+CUTLASS is slower than
-                #    QuACK BF16 varlen (quantization overhead > tensor-core gain)
-                _evict_per_tensor_caches_once()
-                _PREQUANTIZED_SCALES.pop("bwd", None)
-
+            if _fp8_enabled():
+                # BF16 backward: per-tensor FP8 gradient casts destroy precision
+                # (gradients have small magnitudes → FP8 E4M3FN truncates to
+                # near-zero, yielding ~0.86 RelRMSE).  BF16 varlen GEMMs are
+                # fast and accurate.
                 dz_bf16 = dz if dz.dtype == torch.bfloat16 else dz.to(torch.bfloat16)
 
                 # Weight grad: BF16 varlen GEMM (x^T × dz → dw1 per expert)
@@ -629,27 +586,6 @@ class _UpProjection(torch.autograd.Function):
                     dynamic_scheduler=False,
                 )
                 del dz_bf16
-            elif _fp8_enabled():
-                # FP8 weight grad: x_fp8.T × dz_fp8 → dw1 (bf16)
-                x_fp8 = x.to(torch.float8_e4m3fn)
-                dz_fp8 = dz.to(torch.float8_e4m3fn)
-                gemm(
-                    x_fp8.T,
-                    dz_fp8,
-                    out=dw1.permute(2, 1, 0),
-                    cu_seqlens_k=expert_frequency_offset,
-                    A_idx=x_gather_idx,
-                    batch_idx_permute=None,
-                    dynamic_scheduler=False,
-                )
-                del x_fp8
-                # FP8 dx: dz_fp8 × w1_fp8 → dx (bf16)
-                w1_fp8_dx = _get_fp8_weight_orig(w1)
-                dx_expanded = gemm(dz_fp8, w1_fp8_dx.permute(2, 0, 1),
-                                   cu_seqlens_m=expert_frequency_offset,
-                                   out_dtype=torch.bfloat16,
-                                   dynamic_scheduler=False)
-                del dz_fp8
             else:
                 gemm(
                     x.T,
@@ -737,24 +673,10 @@ class _DownProjection(torch.autograd.Function):
             assert not torch.compiler.is_compiling()
 
             assert b2 is None
-            if _fp8_enabled() and _min_expert_segment(expert_frequency_offset) >= 32:
-                # Full-chain: blockscaled FP8 down-proj GEMM (activation + weight)
-                _evict_per_tensor_caches_once()
-                _PREQUANTIZED_SCALES.pop("fwd", None)
-                y1_fp8, y1_scales = quantize_and_pack_activation(
-                    y1 if y1.dtype == torch.bfloat16 else y1.to(torch.bfloat16)
-                )
-                w2_fp8, w2_scales = precompute_weight_fp8(w2)
-                y2 = blockscaled_fp8_gemm_varlen(
-                    y1_fp8, w2, expert_frequency_offset,
-                    a_scales=y1_scales, w_fp8=w2_fp8, w_scales=w2_scales,
-                    out_dtype=torch.bfloat16,
-                )
-                del y1_fp8, y1_scales
-                router_perm = s_reverse_scatter_idx
-                y2_for_router = y2
-            elif _fp8_enabled():
-                # Per-tensor FP8 fallback for small expert segments
+            if _fp8_enabled():
+                # Per-tensor FP8 down-proj: QuACK's fast varlen scheduler.
+                # CUTLASS blockscaled varlen (GemmDefaultSm100) is 6.8x slower
+                # than QuACK gemm.  y1 is already FP8 from up-proj postact_dtype.
                 y1_fp8 = y1 if y1.dtype == torch.float8_e4m3fn else y1.to(torch.float8_e4m3fn)
                 w2_fp8 = _get_fp8_weight_orig(w2)
                 y2 = gemm(y1_fp8, w2_fp8.permute(2, 1, 0), cu_seqlens_m=expert_frequency_offset)
@@ -847,13 +769,10 @@ class _DownProjection(torch.autograd.Function):
             assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
 
             s = topk_scores[s_scatter_idx]
-            if _fp8_enabled() and _min_expert_segment(expert_frequency_offset) >= 32:
-                # --- Blockscaled FP8 backward (hybrid: BF16 fused dgated + BF16 wt-grad) ---
-                # gemm_dgated_tuned with blockscaled FP8 scales produces unacceptable
-                # accuracy (RelRMSE ~0.44); BF16 fused dgated is fast (55% peak) and
-                # accurate.  Weight-grad stays BF16 varlen (per-expert FP8 splitting
-                # is 4.7x slower for E=128).
-                _evict_per_tensor_caches_once()
+            if _fp8_enabled():
+                # BF16 fused dgated backward: per-tensor FP8 gradient casts
+                # destroy precision (~0.86 RelRMSE).  BF16 fused dgated is fast
+                # (55% peak) and accurate.
 
                 # Act-grad: BF16 fused gemm_dgated (dout × w2^T → dz, SwiGLU bwd, score grad)
                 _, y1s, ds = gemm_dgated(
@@ -887,67 +806,35 @@ class _DownProjection(torch.autograd.Function):
                 _log_stage_memory("backward:down-proj-weight")
                 ds = ds[s_reverse_scatter_idx]
             else:
-                # --- Per-tensor FP8 / BF16 path (original fused dgated) ---
-                if _fp8_enabled():
-                    dout_fp8 = dout.to(torch.float8_e4m3fn)
-                    w2_fp8 = _get_cached_fp8_weight(w2, "w2_ehi")
-                    _, y1s, ds = gemm_dgated(
-                        dout_fp8,
-                        w2_fp8,
-                        PreAct=z,
-                        activation="swiglu",
-                        dx_out=dz,
-                        out_dtype=torch.bfloat16,
-                        postact_dtype=torch.float8_e4m3fn,
-                        colvec_scale=s.float(),
-                        colvec_reduce=True,
-                        cu_seqlens_m=expert_frequency_offset,
-                        A_idx=x_gather_idx,
-                        dynamic_scheduler=False,
-                    )
-                else:
-                    # BF16 path: cast colvec_scale to fp32 to avoid QuACK varlen
-                    # alignment bug (domain_offset on bf16 ptr reduces to 16-bit
-                    # alignment, but async copy requires 32-bit; fp32 is always
-                    # 32-bit aligned after any integer offset)
-                    _, y1s, ds = gemm_dgated(
-                        dout,
-                        w2.permute(2, 0, 1),
-                        PreAct=z,
-                        activation="swiglu",
-                        dx_out=dz,
-                        colvec_scale=s.float(),
-                        colvec_reduce=True,
-                        cu_seqlens_m=expert_frequency_offset,
-                        A_idx=x_gather_idx,
-                        dynamic_scheduler=False,
-                    )
+                # BF16 path: cast colvec_scale to fp32 to avoid QuACK varlen
+                # alignment bug (domain_offset on bf16 ptr reduces to 16-bit
+                # alignment, but async copy requires 32-bit; fp32 is always
+                # 32-bit aligned after any integer offset)
+                _, y1s, ds = gemm_dgated(
+                    dout,
+                    w2.permute(2, 0, 1),
+                    PreAct=z,
+                    activation="swiglu",
+                    dx_out=dz,
+                    colvec_scale=s.float(),
+                    colvec_reduce=True,
+                    cu_seqlens_m=expert_frequency_offset,
+                    A_idx=x_gather_idx,
+                    dynamic_scheduler=False,
+                )
                 _log_stage_memory("backward:down-proj-dgated")
                 _reset_stage_memory_probe()
 
-                if _fp8_enabled():
-                    dout_fp8_wg = dout.to(torch.float8_e4m3fn)
-                    y1s_fp8 = y1s if y1s.dtype == torch.float8_e4m3fn else y1s.to(torch.float8_e4m3fn)
-                    gemm(
-                        dout_fp8_wg.T,
-                        y1s_fp8,
-                        out=dw2.permute(2, 0, 1),
-                        cu_seqlens_k=expert_frequency_offset,
-                        A_idx=x_gather_idx,
-                        batch_idx_permute=None,
-                        dynamic_scheduler=False,
-                    )
-                else:
-                    y1s_wgrad = y1s.to(torch.bfloat16) if y1s.dtype == torch.float8_e4m3fn else y1s
-                    gemm(
-                        dout.T,
-                        y1s_wgrad,
-                        out=dw2.permute(2, 0, 1),
-                        cu_seqlens_k=expert_frequency_offset,
-                        A_idx=x_gather_idx,
-                        batch_idx_permute=None,
-                        dynamic_scheduler=False,
-                    )
+                y1s_wgrad = y1s.to(torch.bfloat16) if y1s.dtype == torch.float8_e4m3fn else y1s
+                gemm(
+                    dout.T,
+                    y1s_wgrad,
+                    out=dw2.permute(2, 0, 1),
+                    cu_seqlens_k=expert_frequency_offset,
+                    A_idx=x_gather_idx,
+                    batch_idx_permute=None,
+                    dynamic_scheduler=False,
+                )
                 _log_stage_memory("backward:down-proj-weight")
                 ds = ds[s_reverse_scatter_idx]
         else:
