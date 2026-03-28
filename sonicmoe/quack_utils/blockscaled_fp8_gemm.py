@@ -371,19 +371,29 @@ def _quantize_flat_blockscaled_kernel(
         values = tl.load(src_ptrs, mask=mask, other=0.0).to(tl.float32)
 
         block_amax = tl.max(tl.abs(values), axis=1)
-        raw_scale = block_amax / fp8_max
-        positive = raw_scale > 0
-        exponent = tl.where(positive, tl.ceil(tl.log2(tl.where(positive, raw_scale, 1.0))), 0.0)
-        quant_scale = tl.exp2(-exponent)
+
+        # Pure-integer E8M0 computation (matches CUTLASS/sgl convention):
+        # E8M0 = biased_exponent(amax) - 8 + carry
+        # where carry = 1 iff mantissa(amax) > mantissa(fp8_max=448=1.75*2^8)
+        # This avoids all log2/ceil/exp2 float precision issues.
+        amax_bits = block_amax.to(tl.int32, bitcast=True)
+        biased_exp = (amax_bits >> 23) & 0xFF
+        mantissa_bits = amax_bits & 0x7FFFFF
+        # fp8_max = 448 = 1.75 * 2^8; mantissa of 1.75 in IEEE754 = 0x600000
+        carry = tl.where(mantissa_bits > 0x600000, 1, 0)
+        e8m0_i32 = biased_exp - 8 + carry
+        e8m0_i32 = tl.where(biased_exp > 0, e8m0_i32, 0)
+        e8m0_byte = tl.maximum(e8m0_i32, 0).to(tl.uint8)
+
+        # Quant scale = 2^(127 - e8m0) = 1 / dequant_scale
+        # Construct exact power-of-2 float via bit manipulation.
+        quant_biased_exp = 254 - e8m0_i32
+        quant_biased_exp = tl.maximum(tl.minimum(quant_biased_exp, 254), 1)
+        quant_scale = (quant_biased_exp.to(tl.int32) << 23).to(tl.float32, bitcast=True)
 
         quantized = (values * quant_scale[:, None]).to(tl.float8e4nv)
         dst_ptrs = dst_fp8_ptr + row_ids[:, None] * dst_stride_row + col_offsets[None, :] * dst_stride_col
         tl.store(dst_ptrs, quantized, mask=mask)
-
-        # E8M0 exponent extraction
-        dequant_scale = tl.exp2(exponent)
-        scale_i32 = dequant_scale.to(tl.float32).to(tl.int32, bitcast=True)
-        e8m0_byte = ((scale_i32 >> 23) & 0xFF).to(tl.uint8)
         scale_ptrs = dst_scale_ptr + row_ids * scale_stride_row + group_id * scale_stride_col
         tl.store(scale_ptrs, e8m0_byte, mask=row_mask_1d)
 

@@ -19,6 +19,13 @@ from .blockscaled_fp8_gemm import (
 )
 from .gemm_interface import gemm_dgated, gemm_gated, gemm_gated_out
 from .swiglu_triton import dequantize_blockscaled_fp8
+from .sgl_mxfp8_gemm import (
+    clear_sgl_weight_cache,
+    has_sgl_kernel,
+    precompute_weight_fp8_sgl,
+    rowmajor_to_sgl_tiled,
+    sgl_mxfp8_gemm_varlen,
+)
 from .triton_blockscaled_gemm import (
     blockscaled_fp8_gemm_varlen_triton,
     clear_raw_weight_cache,

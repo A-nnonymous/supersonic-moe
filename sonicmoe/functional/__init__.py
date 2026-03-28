@@ -15,10 +15,12 @@ from ..quack_utils import (
     blockscaled_fp8_gemm_varlen_triton,
     blockscaled_fp8_weight_grad_gemm,
     clear_raw_weight_cache,
+    clear_sgl_weight_cache,
     gather_quantize_and_pack_activation,
     gemm_dgated,
     gemm_gated,
     gemm_gated_out,
+    has_sgl_kernel,
     make_blockscaled_grouped_reverse_scatter_idx,
     precompute_weight_fp8,
     precompute_weight_fp8_for_fused_dgated,
@@ -26,6 +28,7 @@ from ..quack_utils import (
     precompute_weight_fp8_raw_scales,
     quantize_activation_raw,
     quantize_and_pack_activation,
+    sgl_mxfp8_gemm_varlen,
 )
 from quack.gemm_interface import gemm
 from ..quack_utils.fp8_quack_patch import apply_fp8_quack_patch
@@ -320,6 +323,8 @@ def clear_all_fp8_weight_caches() -> None:
     _clear_bs()
     # Clear the Triton raw-scale weight cache
     clear_raw_weight_cache()
+    # Clear the sgl-kernel weight cache
+    clear_sgl_weight_cache()
 
 
 def _validate_runtime_precision_switches(fp8_protocol: FP8Protocol | None) -> None:
@@ -460,20 +465,14 @@ class _UpProjection(torch.autograd.Function):
             assert not torch.compiler.is_compiling()
             assert is_glu_activation, "QuACK GEMM does not support non GLU activation yet"
             if _fp8_enabled():
-                # FP8 mode: BF16 up-proj + blockscaled FP8 down-proj.
-                # CUTLASS gated GEMM with ISA-packed blockscales has a SM100
-                # arch-detection bug (CUDA_ERROR_ILLEGAL_INSTRUCTION), so the
-                # up-proj stays BF16 while the down-proj uses our Triton
-                # blockscaled kernel which is both correct and fast.
+                # FP8 up-proj using sgl-kernel MXFP8 blockscaled GEMM.
+                # CUTLASS gated GEMM has a SM100 arch-detection bug, so we
+                # decompose into: gather → FP8 GEMM → SwiGLU.
                 _evict_per_tensor_caches_once()
-                z, y1 = gemm_gated(
-                    x,
-                    w1.permute(2, 1, 0),
-                    activation="swiglu",
-                    cu_seqlens_m=expert_frequency_offset,
-                    A_idx=x_gather_idx,
-                    dynamic_scheduler=False,
-                )
+                x_gathered = x[x_gather_idx]  # (TK, H) expert-sorted
+                z = sgl_mxfp8_gemm_varlen(x_gathered, w1, expert_frequency_offset)
+                # z: (TK, 2*I) — raw gated output
+                y1 = F.silu(z[:, :I]) * z[:, I:]
             else:
                 z, y1 = gemm_gated(
                     x,
@@ -678,17 +677,10 @@ class _DownProjection(torch.autograd.Function):
 
             assert b2 is None
             if _fp8_enabled():
-                # Blockscaled FP8 down-proj: custom Triton kernel with
-                # software dequant (FP8 tensor cores + per-32-element E8M0 scales).
-                # Replaces the slow CUTLASS GemmDefaultSm100 path (6.8× slower).
-                y1_fp8, y1_scales = quantize_activation_raw(y1)
-                w2_fp8, w2_scales = precompute_weight_fp8_raw_scales(w2)
-                y2 = blockscaled_fp8_gemm_varlen_triton(
-                    y1_fp8, y1_scales,
-                    w2_fp8, w2_scales,
-                    expert_frequency_offset,
-                    out_dtype=torch.bfloat16,
-                )
+                # Blockscaled FP8 down-proj via sgl-kernel MXFP8 grouped GEMM.
+                # Hardware-native MXFP8 on SM100 tensor cores with E8M0
+                # blockscales in ScaleFactorTileLayout.
+                y2 = sgl_mxfp8_gemm_varlen(y1, w2, expert_frequency_offset)
                 router_perm = s_reverse_scatter_idx
                 y2_for_router = y2
             else:
