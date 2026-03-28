@@ -1062,11 +1062,11 @@ def quantize_and_pack_activation(
 def precompute_weight_fp8(
     w: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Pre-quantize a 3D expert weight to blockscaled FP8 with ISA-packed scales.
+    """Pre-quantize a 3D expert weight to blockscaled FP8 with ISA-packed scales (cached).
 
-    Converts (H, I, E) bf16 weights to (E, H, I) fp8 + packed scales.
-    Call once at init / first forward.  Handles both original and transposed
-    weight layouts.
+    Converts (dim0, dim1, E) bf16 weights to (E, dim0, dim1) fp8 + packed scales.
+    Uses the same storage-identity cache as the fused variants so repeated
+    calls with the same weight tensor are free.
 
     Parameters
     ----------
@@ -1077,11 +1077,25 @@ def precompute_weight_fp8(
     w_fp8 : Tensor (E, dim0, dim1) float8_e4m3fn
     w_scales : Tensor packed float8_e8m0fnu in ISA layout
     """
+    key = (
+        w.untyped_storage().data_ptr(),
+        w._version,
+        tuple(w.shape),
+        tuple(w.stride()),
+    )
+    cached = _FUSED_WEIGHT_CACHE.get(key)
+    if cached is not None:
+        return cached
+
     w_ehi = w.permute(2, 0, 1).contiguous()
     proto = FP8Protocol(scale_granularity=FP8ScaleGranularity.BLOCK_1X32)
     w_fp8, w_scales_raw = quantize_activation_blockwise(w_ehi, proto)
     w_scales_packed = pack_blockscaled_1x32_scales(w_scales_raw, w_ehi.size(-1))
-    return w_fp8, w_scales_packed
+    result = (w_fp8, w_scales_packed)
+    if len(_FUSED_WEIGHT_CACHE) > 8:
+        _FUSED_WEIGHT_CACHE.clear()
+    _FUSED_WEIGHT_CACHE[key] = result
+    return result
 
 
 _FUSED_WEIGHT_CACHE: dict[
@@ -1130,6 +1144,52 @@ def precompute_weight_fp8_for_fused_gated(
     w_fp8_enk, w_scales_raw = quantize_activation_blockwise(w_enk, proto)
     w_scales_packed = pack_blockscaled_1x32_scales(w_scales_raw, w_enk.size(-1))
     # Return .mT view (E, K, N) so gemm_gated_tuned's B.mT recovers (E, N, K)
+    w_fp8_ekn = w_fp8_enk.mT  # stride view — same physical memory
+    result = (w_fp8_ekn, w_scales_packed)
+    if len(_FUSED_WEIGHT_CACHE) > 8:
+        _FUSED_WEIGHT_CACHE.clear()
+    _FUSED_WEIGHT_CACHE[key] = result
+    return result
+
+
+def precompute_weight_fp8_for_fused_dgated(
+    w: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pre-quantize expert weight for fused gemm_dgated blockscaled path (cached).
+
+    gemm_dgated_tuned expects B in (L, K, N) format and applies .mT internally
+    to get (L, N, K).  For w2 (H, I, E), the input to gemm_dgated_tuned is
+    w2.permute(2, 0, 1) = (E, H, I) = (E, K, N).  After .mT: (E, I, H) = (E, N, K).
+
+    We quantise in (E, N=I, K=H) contiguous layout (scales along K=H), then
+    return the .mT view (E, H, I) so gemm_dgated_tuned's internal .mT recovers
+    the original contiguous (E, I, H) layout with correctly-aligned scales.
+
+    Parameters
+    ----------
+    w : Tensor (H, I, E) bf16 — expert weights.
+
+    Returns
+    -------
+    w_fp8 : Tensor (E, H, I) float8_e4m3fn — .mT view of contiguous (E, I, H).
+    w_scales : Tensor packed float8_e8m0fnu in ISA layout (scales along K=H)
+    """
+    key = (
+        w.untyped_storage().data_ptr(),
+        w._version,
+        tuple(w.shape),
+        tuple(w.stride()),
+    )
+    cached = _FUSED_WEIGHT_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    # w is (H, I, E) → (E, I, H) contiguous = (E, N, K) physical layout
+    w_enk = w.permute(2, 1, 0).contiguous()  # (E, N=I, K=H) contiguous
+    proto = FP8Protocol(scale_granularity=FP8ScaleGranularity.BLOCK_1X32)
+    w_fp8_enk, w_scales_raw = quantize_activation_blockwise(w_enk, proto)
+    w_scales_packed = pack_blockscaled_1x32_scales(w_scales_raw, w_enk.size(-1))
+    # Return .mT view (E, K=H, N=I) so gemm_dgated_tuned's B.mT recovers (E, N=I, K=H)
     w_fp8_ekn = w_fp8_enk.mT  # stride view — same physical memory
     result = (w_fp8_ekn, w_scales_packed)
     if len(_FUSED_WEIGHT_CACHE) > 8:

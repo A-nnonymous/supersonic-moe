@@ -32,7 +32,7 @@ order = ti.argsort().int(); ti = ti[order]; ei = ei[order]
 rs = scores[ti, ei].contiguous()
 
 mode = os.environ.get("SONIC_MOE_FP8_MODE", "off")
-fused = os.environ.get("SONIC_MOE_FP8_FUSED_GATED", "0")
+fused = os.environ.get("SONIC_MOE_FP8_FUSED_GATED", "1")  # match default in _use_fused_blockscaled_gated()
 print(f"Config: FP8_MODE={mode}, FUSED_GATED={fused}, T={T}, H={H}, I={I}, E={E}, K={K}")
 
 def fwd():

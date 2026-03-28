@@ -18,6 +18,7 @@ from ..quack_utils import (
     gemm_gated,
     make_blockscaled_grouped_reverse_scatter_idx,
     precompute_weight_fp8,
+    precompute_weight_fp8_for_fused_dgated,
     precompute_weight_fp8_for_fused_gated,
     quantize_and_pack_activation,
 )
@@ -475,7 +476,7 @@ class _UpProjection(torch.autograd.Function):
                         None, None,  # C, bias
                         "swiglu",
                         expert_frequency_offset,  # cu_seqlens_m
-                        x_gather_idx,             # A_idx
+                        None,                     # A_idx=None (already gathered)
                         False,                    # dynamic_scheduler
                         config=None,
                         a_scales=x_scales,
@@ -598,13 +599,18 @@ class _UpProjection(torch.autograd.Function):
             assert not is_compiling
 
             if _fp8_enabled() and _min_expert_segment(expert_frequency_offset) >= 32:
-                # --- BF16 up-proj backward (FP8 forward + BF16 backward hybrid) ---
+                # --- Blockscaled FP8 up-proj backward ---
+                # Both weight-grad and act-grad stay BF16 varlen GEMM.
+                # Rationale:
+                #  - Weight-grad: per-expert FP8 splitting is 4.7x slower for E=128
+                #  - Act-grad: blockscaled FP8 quantize+CUTLASS is slower than
+                #    QuACK BF16 varlen (quantization overhead > tensor-core gain)
                 _evict_per_tensor_caches_once()
                 _PREQUANTIZED_SCALES.pop("bwd", None)
 
                 dz_bf16 = dz if dz.dtype == torch.bfloat16 else dz.to(torch.bfloat16)
 
-                # Weight grad: x^T × dz per expert — BF16 varlen GEMM
+                # Weight grad: BF16 varlen GEMM (x^T × dz → dw1 per expert)
                 gemm(
                     x.T,
                     dz_bf16,
@@ -615,10 +621,13 @@ class _UpProjection(torch.autograd.Function):
                     dynamic_scheduler=False,
                 )
 
-                # Act grad: dz × w1^T → dx_expanded (TK, H) — BF16 varlen GEMM
-                dx_expanded = gemm(dz_bf16, w1.permute(2, 0, 1),
-                                   cu_seqlens_m=expert_frequency_offset,
-                                   dynamic_scheduler=False)
+                # Act grad: BF16 varlen GEMM (dz × w1^T → dx_expanded)
+                dx_expanded = gemm(
+                    dz_bf16, w1.permute(2, 0, 1),
+                    cu_seqlens_m=expert_frequency_offset,
+                    out_dtype=torch.bfloat16,
+                    dynamic_scheduler=False,
+                )
                 del dz_bf16
             elif _fp8_enabled():
                 # FP8 weight grad: x_fp8.T × dz_fp8 → dw1 (bf16)
@@ -729,15 +738,17 @@ class _DownProjection(torch.autograd.Function):
 
             assert b2 is None
             if _fp8_enabled() and _min_expert_segment(expert_frequency_offset) >= 32:
-                # Full-chain: blockscaled FP8 down-proj GEMM
+                # Full-chain: blockscaled FP8 down-proj GEMM (activation + weight)
                 _evict_per_tensor_caches_once()
                 _PREQUANTIZED_SCALES.pop("fwd", None)
                 y1_fp8, y1_scales = quantize_and_pack_activation(
                     y1 if y1.dtype == torch.bfloat16 else y1.to(torch.bfloat16)
                 )
+                w2_fp8, w2_scales = precompute_weight_fp8(w2)
                 y2 = blockscaled_fp8_gemm_varlen(
                     y1_fp8, w2, expert_frequency_offset,
-                    a_scales=y1_scales, out_dtype=torch.bfloat16,
+                    a_scales=y1_scales, w_fp8=w2_fp8, w_scales=w2_scales,
+                    out_dtype=torch.bfloat16,
                 )
                 del y1_fp8, y1_scales
                 router_perm = s_reverse_scatter_idx
@@ -837,12 +848,14 @@ class _DownProjection(torch.autograd.Function):
 
             s = topk_scores[s_scatter_idx]
             if _fp8_enabled() and _min_expert_segment(expert_frequency_offset) >= 32:
-                # --- FP8 forward + BF16 backward ---
-                # MoE at current shapes (E=128, K=8, I=1024) is IO-bound.
-                # BF16 backward fused GEMMs achieve 55% peak with no quantize overhead.
+                # --- Blockscaled FP8 backward (hybrid: BF16 fused dgated + BF16 wt-grad) ---
+                # gemm_dgated_tuned with blockscaled FP8 scales produces unacceptable
+                # accuracy (RelRMSE ~0.44); BF16 fused dgated is fast (55% peak) and
+                # accurate.  Weight-grad stays BF16 varlen (per-expert FP8 splitting
+                # is 4.7x slower for E=128).
                 _evict_per_tensor_caches_once()
 
-                # Act-grad: BF16 fused gemm_dgated (dout × w2^T → dz, with SwiGLU bwd + score grad)
+                # Act-grad: BF16 fused gemm_dgated (dout × w2^T → dz, SwiGLU bwd, score grad)
                 _, y1s, ds = gemm_dgated(
                     dout,
                     w2.permute(2, 0, 1),
