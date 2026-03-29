@@ -1069,6 +1069,153 @@ def quantize_and_pack_activation(
     return fp8_out, packed_scales.view(torch.float8_e8m0fnu)
 
 
+@triton.jit
+def _pad_quantize_and_pack_kernel(
+    src_ptr,               # original (total_M, K) bf16
+    src_idx_ptr,           # (padded_total,) int64 — padded → original row, -1 for pad
+    dst_fp8_ptr,           # (padded_total, K) fp8 output
+    dst_packed_scale_ptr,  # ISA-packed scales for padded layout
+    rows,                  # padded_total
+    cols,                  # K
+    src_stride_row,
+    src_stride_col,
+    dst_stride_row,
+    dst_stride_col,
+    k_tiles,
+    fp8_max: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    SF_TILE_M: tl.constexpr,
+    SF_TILE_STORAGE: tl.constexpr,
+):
+    """Fused pad + blockscaled quantize + ISA scale pack.
+
+    For data rows (src_idx >= 0): reads from src, quantizes, packs scales.
+    For padding rows (src_idx == -1): writes fp8 zeros + e8m0 scale 0.
+    Avoids materializing a bf16 padded intermediate buffer.
+    """
+    row_base = tl.program_id(0) * BLOCK_ROWS
+    group_id = tl.program_id(1)
+
+    row_ids = row_base + tl.arange(0, BLOCK_ROWS)
+    row_mask_1d = row_ids < rows
+
+    # Load source indices (-1 for padding rows)
+    src_rows = tl.load(src_idx_ptr + row_ids, mask=row_mask_1d, other=-1)
+    is_data = src_rows >= 0
+
+    col_offsets = group_id * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+    col_mask = col_offsets[None, :] < cols
+    data_mask = is_data[:, None] & col_mask
+
+    # Read from original data (use row 0 for padding rows to avoid OOB)
+    safe_src_rows = tl.where(is_data, src_rows, 0)
+    src_ptrs = src_ptr + safe_src_rows[:, None] * src_stride_row + col_offsets[None, :] * src_stride_col
+    values = tl.load(src_ptrs, mask=data_mask, other=0.0).to(tl.float32)
+
+    # Quantize (zeros for padding rows)
+    block_amax = tl.max(tl.abs(values), axis=1)
+    amax_bits = block_amax.to(tl.int32, bitcast=True)
+    biased_exp = (amax_bits >> 23) & 0xFF
+    mantissa_bits = amax_bits & 0x7FFFFF
+    carry = tl.where(mantissa_bits > 0x600000, 1, 0)
+    e8m0_i32 = biased_exp - 8 + carry
+    e8m0_i32 = tl.where(biased_exp > 0, e8m0_i32, 0)
+    e8m0_byte = tl.maximum(e8m0_i32, 0).to(tl.uint8)
+
+    quant_biased_exp = 254 - e8m0_i32
+    quant_biased_exp = tl.maximum(tl.minimum(quant_biased_exp, 254), 1)
+    quant_scale = (quant_biased_exp.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+
+    quantized = (values * quant_scale[:, None]).to(tl.float8e4nv)
+
+    # Write fp8 data
+    mask = row_mask_1d[:, None] & col_mask
+    dst_ptrs = dst_fp8_ptr + row_ids[:, None] * dst_stride_row + col_offsets[None, :] * dst_stride_col
+    tl.store(dst_ptrs, quantized, mask=mask)
+
+    # Write ISA-packed scale
+    row_tiles = row_ids // SF_TILE_M
+    row_in_tile = row_ids % SF_TILE_M
+    k_tiles_idx = group_id // (SF_TILE_M // GROUP_SIZE)
+    k_in_tile = group_id % (SF_TILE_M // GROUP_SIZE)
+
+    tile_base = (row_tiles * k_tiles + k_tiles_idx) * SF_TILE_STORAGE
+    row_base_offset = (row_in_tile % 32) * 16 + (row_in_tile // 32) * 4
+    packed_offset = tile_base + row_base_offset + k_in_tile
+
+    tl.store(dst_packed_scale_ptr + packed_offset, e8m0_byte, mask=row_mask_1d)
+
+
+_SRC_IDX_CACHE: dict[tuple, torch.Tensor] = {}
+
+
+def pad_quantize_and_pack_activation(
+    a: torch.Tensor,
+    padded_total: int,
+    dst_idx: torch.Tensor,
+    group_size: int = _SF_VEC_SIZE,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused pad + quantize + ISA-pack: avoids bf16 padded intermediate.
+
+    Instead of allocating a (padded_total, K) bf16 buffer, scattering, then
+    quantizing 25% more rows, this function:
+    1. Computes the inverse mapping (padded_row → original_row)
+    2. Runs a single kernel that reads from original data and writes padded
+       fp8 + ISA-packed scales directly
+
+    Parameters
+    ----------
+    a : Tensor (total_M, K) bf16 — original (non-padded) activation.
+    padded_total : int — total padded rows.
+    dst_idx : Tensor (total_M,) int64 — original → padded row mapping.
+
+    Returns
+    -------
+    fp8_data : Tensor (padded_total, K) float8_e4m3fn
+    packed_scales : Tensor (1, packed_size) float8_e8m0fnu in ISA layout
+    """
+    total_M, K = a.shape
+    num_groups = _div_up(K, group_size)
+    k_tiles = _div_up(K, _SF_TILE_K)
+
+    # Compute inverse index: padded_row → original_row (cached)
+    cache_key = (total_M, padded_total, id(dst_idx))
+    src_idx = _SRC_IDX_CACHE.get(cache_key)
+    if src_idx is None:
+        src_idx = torch.full((padded_total,), -1, device=a.device, dtype=torch.int64)
+        src_idx[dst_idx] = torch.arange(total_M, device=a.device, dtype=torch.int64)
+        if len(_SRC_IDX_CACHE) > 16:
+            _SRC_IDX_CACHE.clear()
+        _SRC_IDX_CACHE[cache_key] = src_idx
+
+    fp8_out = torch.empty(padded_total, K, dtype=torch.float8_e4m3fn, device=a.device)
+    per_batch_storage = _storage_per_batch(padded_total, K)
+    packed_scales = torch.zeros((1, per_batch_storage), dtype=torch.uint8, device=a.device)
+
+    BLOCK_ROWS = 4
+    grid = (_div_up(padded_total, BLOCK_ROWS), num_groups)
+    _pad_quantize_and_pack_kernel[grid](
+        a,
+        src_idx,
+        fp8_out,
+        packed_scales,
+        padded_total,
+        K,
+        a.stride(0),
+        a.stride(1),
+        fp8_out.stride(0),
+        fp8_out.stride(1),
+        k_tiles,
+        fp8_max=float(torch.finfo(torch.float8_e4m3fn).max),
+        GROUP_SIZE=group_size,
+        BLOCK_ROWS=BLOCK_ROWS,
+        SF_TILE_M=_SF_TILE_M,
+        SF_TILE_STORAGE=_SF_TILE_STORAGE,
+    )
+    return fp8_out, packed_scales.view(torch.float8_e8m0fnu)
+
+
 def quantize_and_pack_activation_varlen(
     x: torch.Tensor,
     cu_seqlens_m: torch.Tensor,
@@ -1351,24 +1498,34 @@ def blockscaled_fp8_gemm_varlen(
         needs_pad = False
 
     if needs_pad:
-        if pre_quantized_act:
-            # Must re-quantize after padding (scale layout changes)
-            a_bf16 = a.to(torch.bfloat16)  # dequant approximation
-            padded_a = torch.zeros(padded_total, K, dtype=torch.bfloat16, device=device)
-            padded_a[dst_idx] = a_bf16
-            padded_out = blockscaled_fp8_gemm_varlen(
-                padded_a, w, padded_cu,
-                protocol=protocol, out_dtype=out_dtype,
-                w_fp8=w_fp8, w_scales=w_scales,
-            )
+        # --- Weight quantization (shared by both paths) ---
+        if pre_quantized_wt:
+            weight_fp8, weight_scales = w_fp8, w_scales
         else:
-            padded_a = torch.zeros(padded_total, K, dtype=a.dtype, device=device)
-            padded_a[dst_idx] = a
-            padded_out = blockscaled_fp8_gemm_varlen(
-                padded_a, w, padded_cu,
-                protocol=protocol, out_dtype=out_dtype,
-                w_fp8=w_fp8, w_scales=w_scales,
-            )
+            bs_proto = _blockscaled_protocol(protocol or FP8Protocol(scale_granularity=FP8ScaleGranularity.BLOCK_1X32))
+            weight_fp8, weight_scales = _quantize_w2_cached(w, bs_proto)
+
+        if pre_quantized_act:
+            # Pre-quantized with non-aligned segments: dequant is lossy.
+            # This path should be avoided (see _all_segments_128_aligned guard
+            # in functional/__init__.py). Fallback: raw cast + re-quantize.
+            a_bf16 = a.to(torch.bfloat16)
+        else:
+            a_bf16 = a
+
+        # Fused pad + quantize + ISA-pack: avoids the bf16 padded buffer.
+        padded_fp8, padded_scales = pad_quantize_and_pack_activation(
+            a_bf16, padded_total, dst_idx,
+        )
+
+        d_dtype = torch.bfloat16 if out_dtype is None else out_dtype
+        padded_out = _run_cutlass_blockscaled_gemm(
+            padded_fp8, padded_scales,
+            weight_fp8, weight_scales,
+            padded_cu,
+            padded_total, K, H, num_experts,
+            d_dtype, device,
+        )
         return padded_out[dst_idx]
 
     # --- Weight quantization ---

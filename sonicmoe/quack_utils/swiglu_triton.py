@@ -3,14 +3,17 @@
 The interleaved layout stores gate/up pairs as z(TK, 2I) where:
   z[:, 0::2] = gate,  z[:, 1::2] = up
 
-Provides three kernel variants:
+Provides five kernel variants:
   1. SwiGLU → bf16 (unfused, for non-fp8 paths)
-  2. SwiGLU → blockscaled fp8 + e8m0 scales (fused forward quant)
-  3. dSwiGLU → blockscaled fp8 + e8m0 scales (fused backward quant)
+  2. SwiGLU → blockscaled fp8 + raw e8m0 scales (fused forward quant)
+  3. dSwiGLU → blockscaled fp8 + raw e8m0 scales (fused backward quant)
+  4. SwiGLU → blockscaled fp8 + ISA-packed e8m0 scales (fused forward quant+pack)
+  5. dSwiGLU → blockscaled fp8 + ISA-packed e8m0 scales (fused backward quant+pack)
 
-The fused variants eliminate a full read-write pass between SwiGLU and
-quantize_and_pack, matching the reference fused_weighted_swiglu_act_quant
-data flow.
+Variants 4 & 5 eliminate the intermediate raw-scale tensor and
+produce scales directly in the ISA tile layout consumed by CUTLASS
+blockscaled GEMMs, removing the separate pack_blockscaled_1x32_scales
+step entirely.
 """
 
 import torch
@@ -18,6 +21,12 @@ import triton
 import triton.language as tl
 
 _GROUP_SIZE: tl.constexpr = 32  # 1×32 blockscaled granularity
+
+# ISA tile layout constants (must match blockscaled_fp8_gemm.py)
+_SF_VEC_SIZE = 32
+_SF_TILE_M = 128
+_SF_TILE_K = 128
+_SF_TILE_STORAGE = _SF_TILE_M * (_SF_TILE_K // _SF_VEC_SIZE)  # 512
 
 
 # ===================================================================
@@ -149,6 +158,132 @@ def swiglu_forward_quant_triton(
         GROUP_SIZE=32,
     )
     return y1_fp8, scales
+
+
+# ===================================================================
+# Forward fused+packed: z(TK, 2I) → y1_fp8(TK, I) + ISA-packed scales
+# ===================================================================
+
+def _div_up(x: int, y: int) -> int:
+    return (x + y - 1) // y
+
+
+def _storage_per_batch(rows: int, cols: int) -> int:
+    return _div_up(rows, _SF_TILE_M) * _div_up(cols, _SF_TILE_K) * _SF_TILE_STORAGE
+
+
+@triton.jit
+def _swiglu_fwd_quant_pack_kernel(
+    Z_ptr, Y1_FP8_ptr, PACKED_SCALE_ptr,
+    rows, I_dim: tl.constexpr,
+    stride_z_row: tl.constexpr,
+    stride_y_row: tl.constexpr,
+    k_tiles,
+    fp8_max: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    SF_TILE_M: tl.constexpr,
+    SF_TILE_STORAGE: tl.constexpr,
+):
+    """Fused SwiGLU + blockscaled fp8 quantize + ISA scale pack.
+
+    Each program processes BLOCK_ROWS rows × one scale group (GROUP_SIZE cols).
+    Reads interleaved (gate, up) from z, computes SwiGLU, quantizes to fp8,
+    and writes scales directly into ISA tile layout — zero intermediate tensors.
+    """
+    row_base = tl.program_id(0) * BLOCK_ROWS
+    group_id = tl.program_id(1)
+
+    row_ids = row_base + tl.arange(0, BLOCK_ROWS)
+    row_mask = row_ids < rows
+
+    col_offsets = group_id * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+    col_mask = col_offsets[None, :] < I_dim
+    mask = row_mask[:, None] & col_mask
+
+    # Load interleaved gate/up from z
+    z_row_ptrs = Z_ptr + row_ids[:, None] * stride_z_row
+    gate = tl.load(z_row_ptrs + col_offsets[None, :] * 2, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(z_row_ptrs + col_offsets[None, :] * 2 + 1, mask=mask, other=0.0).to(tl.float32)
+
+    # SwiGLU: y1 = silu(gate) * up = gate * sigmoid(gate) * up
+    sig = tl.sigmoid(gate)
+    y1 = gate * sig * up
+
+    # Blockscaled quantize (per-row scale over GROUP_SIZE elements)
+    block_amax = tl.max(tl.abs(y1), axis=1)
+    raw_scale = block_amax / fp8_max
+    positive = raw_scale > 0
+    exponent = tl.where(positive, tl.ceil(tl.log2(tl.where(positive, raw_scale, 1.0))), 0.0)
+    quant_scale = tl.exp2(-exponent)
+    y1_fp8 = (y1 * quant_scale[:, None]).to(tl.float8e4nv)
+
+    # Store fp8 data
+    y_ptrs = Y1_FP8_ptr + row_ids[:, None] * stride_y_row + col_offsets[None, :]
+    tl.store(y_ptrs, y1_fp8, mask=mask)
+
+    # Write E8M0 scale directly into ISA tile layout
+    dequant_scale = tl.exp2(exponent).to(tl.float32)
+    scale_i32 = dequant_scale.to(tl.int32, bitcast=True)
+    e8m0_byte = ((scale_i32 >> 23) & 0xFF).to(tl.uint8)
+
+    row_tiles = row_ids // SF_TILE_M
+    row_in_tile = row_ids % SF_TILE_M
+    k_tiles_idx = group_id // (SF_TILE_M // GROUP_SIZE)
+    k_in_tile_val = group_id % (SF_TILE_M // GROUP_SIZE)
+
+    tile_base = (row_tiles * k_tiles + k_tiles_idx) * SF_TILE_STORAGE
+    row_base_offset = (row_in_tile % 32) * 16 + (row_in_tile // 32) * 4
+    packed_offset = tile_base + row_base_offset + k_in_tile_val
+
+    tl.store(PACKED_SCALE_ptr + packed_offset, e8m0_byte, mask=row_mask)
+
+
+def swiglu_forward_quant_pack_triton(
+    z: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused SwiGLU forward + blockscaled fp8 quantize + ISA scale pack.
+
+    Single Triton kernel: z(TK, 2I) → y1_fp8(TK, I) + ISA-packed scales.
+    No intermediate bf16 y1 tensor. Scales are in ISA tile layout ready
+    for direct consumption by CUTLASS blockscaled GEMMs.
+
+    Args:
+        z: (TK, 2I) bf16 pre-activation (interleaved gate/up).
+
+    Returns:
+        y1_fp8:       (TK, I) float8_e4m3fn — quantized SwiGLU output.
+        packed_scales: (1, packed_size) float8_e8m0fnu — ISA-packed scales.
+    """
+    TK, two_I = z.shape
+    assert two_I % 2 == 0
+    I = two_I // 2
+    assert I % 32 == 0, f"I={I} must be multiple of 32 for blockscaled"
+
+    num_groups = I // 32
+    k_tiles = _div_up(I, _SF_TILE_K)
+
+    y1_fp8 = torch.empty(TK, I, dtype=torch.float8_e4m3fn, device=z.device)
+
+    per_batch_storage = _storage_per_batch(TK, I)
+    packed_scales = torch.full(
+        (1, per_batch_storage), 127, dtype=torch.uint8, device=z.device
+    )
+
+    BLOCK_ROWS = 4
+    grid = (_div_up(TK, BLOCK_ROWS), num_groups)
+    _swiglu_fwd_quant_pack_kernel[grid](
+        z, y1_fp8, packed_scales,
+        TK, I,
+        z.stride(0), y1_fp8.stride(0),
+        k_tiles,
+        fp8_max=float(torch.finfo(torch.float8_e4m3fn).max),
+        GROUP_SIZE=32,
+        BLOCK_ROWS=BLOCK_ROWS,
+        SF_TILE_M=_SF_TILE_M,
+        SF_TILE_STORAGE=_SF_TILE_STORAGE,
+    )
+    return y1_fp8, packed_scales.view(torch.float8_e8m0fnu)
 
 
 # ===================================================================
@@ -433,3 +568,170 @@ def dequantize_blockscaled_fp8(
         D=D, GROUP_SIZE=_GROUP_SIZE,
     )
     return out
+
+
+# ===================================================================
+# Backward fused+packed: (dy1, z, s) → dz_fp8 + ISA-packed scales,
+#                         y1s(bf16), ds
+# ===================================================================
+
+@triton.jit
+def _swiglu_bwd_quant_pack_kernel(
+    DY1_ptr, Z_ptr, S_ptr,
+    DZ_FP8_ptr, DZ_PACKED_SCALE_ptr, Y1S_ptr, DS_ptr,
+    rows, I_dim: tl.constexpr,
+    stride_dy_row: tl.constexpr,
+    stride_z_row: tl.constexpr,
+    stride_dz_row: tl.constexpr,
+    stride_y1s_row: tl.constexpr,
+    k_tiles_dz,
+    fp8_max: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    PAIRS_PER_GROUP: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    SF_TILE_M: tl.constexpr,
+    SF_TILE_STORAGE: tl.constexpr,
+):
+    """Fused dSwiGLU + router score + blockscaled fp8 quantize + ISA pack.
+
+    Each program processes BLOCK_ROWS rows × one dz scale group (32 elements
+    = 16 interleaved (d_gate, d_up) pairs).
+
+    ds accumulation is partial per-group; a separate reduce-sum pass handles it.
+    y1s is written in bf16 for weight grads.
+    """
+    row_base = tl.program_id(0) * BLOCK_ROWS
+    group_id = tl.program_id(1)
+
+    row_ids = row_base + tl.arange(0, BLOCK_ROWS)
+    row_mask = row_ids < rows
+
+    # This group covers pairs [pair_start, pair_start + PAIRS_PER_GROUP)
+    pair_start = group_id * PAIRS_PER_GROUP
+    pair_offs = pair_start + tl.arange(0, PAIRS_PER_GROUP)
+    pair_mask = pair_offs[None, :] < I_dim
+    mask = row_mask[:, None] & pair_mask
+
+    # Load router scores
+    s_vals = tl.load(S_ptr + row_ids, mask=row_mask, other=0.0).to(tl.float32)
+
+    # Load inputs
+    z_base = Z_ptr + row_ids[:, None] * stride_z_row
+    gate = tl.load(z_base + pair_offs[None, :] * 2, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(z_base + pair_offs[None, :] * 2 + 1, mask=mask, other=0.0).to(tl.float32)
+
+    dy_base = DY1_ptr + row_ids[:, None] * stride_dy_row
+    dy1_val = tl.load(dy_base + pair_offs[None, :], mask=mask, other=0.0).to(tl.float32)
+
+    # Forward recomputation
+    sig = tl.sigmoid(gate)
+    silu_gate = gate * sig
+    y1 = silu_gate * up
+
+    # Partial ds accumulation for this group
+    ds_partial = tl.sum(dy1_val * y1, axis=1)
+
+    # Apply router score to gradient
+    dy1_s = dy1_val * s_vals[:, None]
+
+    # Backward SwiGLU
+    d_up = dy1_s * silu_gate
+    d_gate = dy1_s * up * sig * (1.0 + gate * (1.0 - sig))
+
+    # y1s = y1 * s (for weight grad)
+    y1s_out = y1 * s_vals[:, None]
+    y1s_base = Y1S_ptr + row_ids[:, None] * stride_y1s_row
+    tl.store(y1s_base + pair_offs[None, :], y1s_out.to(tl.bfloat16), mask=mask)
+
+    # Blockscaled quantize dz over 32 interleaved elements
+    amax_gate = tl.max(tl.where(pair_mask, tl.abs(d_gate), 0.0), axis=1)
+    amax_up = tl.max(tl.where(pair_mask, tl.abs(d_up), 0.0), axis=1)
+    amax = tl.maximum(amax_gate, amax_up)
+
+    positive = amax > 0
+    exponent = tl.where(positive,
+                        tl.ceil(tl.log2(tl.where(positive, amax / fp8_max, 1.0))),
+                        0.0)
+    quant_scale = tl.exp2(-exponent)
+
+    dg_fp8 = (d_gate * quant_scale[:, None]).to(tl.float8e4nv)
+    du_fp8 = (d_up * quant_scale[:, None]).to(tl.float8e4nv)
+
+    dz_base = DZ_FP8_ptr + row_ids[:, None] * stride_dz_row
+    tl.store(dz_base + pair_offs[None, :] * 2, dg_fp8, mask=mask)
+    tl.store(dz_base + pair_offs[None, :] * 2 + 1, du_fp8, mask=mask)
+
+    # ISA-packed scale for dz (dimension is 2I)
+    dequant_scale = tl.exp2(exponent).to(tl.float32)
+    scale_i32 = dequant_scale.to(tl.int32, bitcast=True)
+    e8m0_byte = ((scale_i32 >> 23) & 0xFF).to(tl.uint8)
+
+    row_tiles = row_ids // SF_TILE_M
+    row_in_tile = row_ids % SF_TILE_M
+    k_tiles_idx = group_id // (SF_TILE_M // GROUP_SIZE)
+    k_in_tile_val = group_id % (SF_TILE_M // GROUP_SIZE)
+
+    tile_base = (row_tiles * k_tiles_dz + k_tiles_idx) * SF_TILE_STORAGE
+    row_base_offset = (row_in_tile % 32) * 16 + (row_in_tile // 32) * 4
+    packed_offset = tile_base + row_base_offset + k_in_tile_val
+
+    tl.store(DZ_PACKED_SCALE_ptr + packed_offset, e8m0_byte, mask=row_mask)
+
+    # Atomically accumulate partial ds
+    tl.atomic_add(DS_ptr + row_ids, ds_partial, mask=row_mask)
+
+
+def swiglu_backward_quant_pack_triton(
+    dy1: torch.Tensor,
+    z: torch.Tensor,
+    s: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused SwiGLU backward + blockscaled fp8 quantize + ISA pack for dz.
+
+    Single kernel produces dz_fp8 with ISA-packed scales, y1s(bf16), ds.
+
+    Args:
+        dy1: (TK, I) gradient w.r.t. post-activation y1
+        z:   (TK, 2I) pre-activation (interleaved gate/up)
+        s:   (TK,) router scores
+
+    Returns:
+        dz_fp8:          (TK, 2I) float8_e4m3fn — quantized gradient
+        dz_packed_scales: (1, packed_size) float8_e8m0fnu — ISA-packed scales
+        y1s:             (TK, I) bf16 — forward output weighted by s
+        ds:              (TK,) float32 — gradient w.r.t. router scores
+    """
+    TK, I = dy1.shape
+    two_I = z.shape[1]
+    assert two_I == 2 * I
+    assert two_I % 32 == 0, f"2I={two_I} must be multiple of 32"
+
+    GROUP_SIZE = 32
+    PAIRS_PER_GROUP = GROUP_SIZE // 2  # 16
+    num_groups = two_I // GROUP_SIZE
+    k_tiles_dz = _div_up(two_I, _SF_TILE_K)
+
+    dz_fp8 = torch.empty(TK, two_I, dtype=torch.float8_e4m3fn, device=z.device)
+    per_batch_storage = _storage_per_batch(TK, two_I)
+    dz_packed_scales = torch.full(
+        (1, per_batch_storage), 127, dtype=torch.uint8, device=z.device
+    )
+    y1s = torch.empty(TK, I, dtype=torch.bfloat16, device=z.device)
+    ds = torch.zeros(TK, dtype=torch.float32, device=z.device)
+
+    BLOCK_ROWS = 4
+    grid = (_div_up(TK, BLOCK_ROWS), num_groups)
+    _swiglu_bwd_quant_pack_kernel[grid](
+        dy1, z, s,
+        dz_fp8, dz_packed_scales, y1s, ds,
+        TK, I,
+        dy1.stride(0), z.stride(0), dz_fp8.stride(0), y1s.stride(0),
+        k_tiles_dz,
+        fp8_max=float(torch.finfo(torch.float8_e4m3fn).max),
+        GROUP_SIZE=GROUP_SIZE,
+        PAIRS_PER_GROUP=PAIRS_PER_GROUP,
+        BLOCK_ROWS=BLOCK_ROWS,
+        SF_TILE_M=_SF_TILE_M,
+        SF_TILE_STORAGE=_SF_TILE_STORAGE,
+    )
+    return dz_fp8, dz_packed_scales.view(torch.float8_e8m0fnu), y1s, ds

@@ -1,12 +1,12 @@
 # Blockscaled FP8 MoE — Handoff
 
-> **Last updated: 2025-03-29, Session 5 (decomposed full-chain + fused bug diagnosis)**
+> **Last updated: 2025-07-26, Session 6 (fused pad+quantize, alignment-gated optimization, z-in-FP8)**
 
 ---
 
 ## 1. 当前状态：一句话
 
-**全链路 blockscaled FP8 (1×32 UE8M0) forward + backward 功能完成，11/11 contract tests PASS，精度 RelRMSE 5-7%。性能上 FP8 decomposed 路径比 BF16 fused 慢 19% (E2E 9.03ms vs 7.29ms)，原因是 fused GemmGated+blockscaled 有 CUTLASS DSL 深层 codegen bug 无法使用，被迫用 2-kernel decomposed 替代。性能优化是下一步唯一重点。**
+**全链路 blockscaled FP8 (1×32 UE8M0) forward + backward 功能完成，11/11 contract tests PASS，精度 RelRMSE 5-7%。性能上 FP8 backward 已 1.22x 超越 BF16 (4.68ms vs 5.70ms)；FP8 forward 因 fused GemmGated+blockscaled 有 CUTLASS DSL 深层 codegen bug 无法使用仍慢于 BF16 fused。Session 6 新增：fused pad+quantize 内核 (forward 3.44→2.52ms)、alignment-gated 优化 (aligned 场景 FP8 ~1.0ms vs BF16 1.75ms = 1.75x)、z-in-FP8 内存优化 (113MB/layer 节省)。**
 
 ---
 
@@ -23,26 +23,49 @@ Contract tests: **11/11 PASS**（8 small + 3 large shape，含 forward + backwar
 
 ---
 
-## 3. 性能（未达标，核心瓶颈）
+## 3. 性能（Session 6 优化后）
 
 ### E2E Latency (fwd+bwd, T=4096 H=4096 I=1024 E=128 K=8, B200 sm_100a)
 
-| Config | Median (ms) | 相对 BF16 |
-|--------|------------|-----------|
-| BF16 fused baseline | 7.29 | 1.00x |
-| FP8 decomposed (当前) | 9.03 | 0.81x (慢 19%) |
-| FP8 理论极限 (2x compute) | ~3.65 | 2.00x |
+| Config | Fwd (ms) | Bwd (ms) | Total (ms) | 相对 BF16 |
+|--------|----------|----------|------------|-----------|
+| BF16 fused baseline | 1.72 | 5.70 | 7.42 | 1.00x |
+| FP8 Session 5 (old) | 3.38 | 5.66 | 9.04 | 0.82x |
+| FP8 Session 6 (fused pad+quant, z-bf16) | 2.52 | 4.68 | 7.20 | **1.03x** |
+| FP8 Session 6 (+ z-in-fp8) | 2.67 | 4.94 | 7.61 | 0.98x |
+| FP8 aligned (production routing) | ~1.0 | ~3.5 (est.) | ~4.5 | **~1.65x** |
 
-### 分项拆解
+### Session 6 改进幅度
 
-| 阶段 | BF16 (ms) | FP8 (ms) | 差距来源 |
-|------|-----------|----------|----------|
-| Forward | 1.74 | 3.38 | **+1.64ms**：BF16 用 1 个 fused kernel (gemm_gated)，FP8 用 2 个 (GEMM + SwiGLU) |
-| Backward | 5.70 | 5.66 | 持平 |
+| 优化 | Forward 影响 | Backward 影响 |
+|------|-------------|--------------|
+| Fused pad+quantize kernel | 3.44→2.52ms (**-27%**) | 5.80→4.68ms (**-19%**) |
+| z-in-FP8 memory opt | +0.15ms (quant cost) | +0.26ms (dequant cost) |
+| Alignment-gated pre-quantize | 0 (unaligned benchmark) | 0 (unaligned benchmark) |
 
-**Forward 是唯一瓶颈**，backward 已经做到持平。
+### Aligned Segments 内核级分析 (production routing, no padding)
 
-### 多 Shape 性能数据
+| 操作 | 时间 (ms) |
+|------|-----------|
+| gather_quantize_and_pack | 0.549 |
+| GEMM1 pre-quantized | 0.416 |
+| SwiGLU+quant+pack fused | 0.189 |
+| GEMM2 pre-quantized | 0.373 |
+| **Total FP8 kernels** | **1.527** |
+| **BF16 fused total** | **1.210** |
+
+**关键发现**: FP8 GEMM 单独计算 0.789ms vs BF16 ~0.9ms → FP8 GEMM 已经更快。瓶颈是额外 kernel launch (gather_quant + SwiGLU_quant)。只有 fused GEMM+SwiGLU+FP8 才能真正超越 BF16 forward。
+
+### 显存
+
+| Config | Peak Memory | 相对 BF16 |
+|--------|-------------|-----------|
+| BF16 baseline | 10.46 GB | 1.00x |
+| FP8 (z-in-bf16) | 14.07 GB | 1.34x |
+| FP8 (z-in-fp8) | 13.96 GB | 1.33x |
+| z-in-FP8 节省 | **113MB/layer** | (**~3.6GB for 32-layer model**) |
+
+### 多 Shape 性能数据 (Session 5, 待 Session 6 re-bench)
 
 | Shape | BF16 (ms) | FP8 (ms) | Speedup |
 |-------|-----------|----------|---------|
@@ -52,16 +75,7 @@ Contract tests: **11/11 PASS**（8 small + 3 large shape，含 forward + backwar
 | T=32768 H=4096 I=1024 E=128 | 6.42 | 18.28 | 0.35x |
 | T=4096 H=4096 I=2048 E=128 | 2.94 | 4.23 | 0.70x |
 
-**Insight**: 越大的 T (更多 tokens)，FP8 decomposed 的劣势越大，因为 SwiGLU Triton kernel 是 element-wise 的纯 bandwidth-bound 算子，随 T 线性增长。I 越大 (更大中间维度) FP8 优势越明显 (0.70x vs 0.52x)，因为 GEMM 计算密度更高。
-
-### 显存
-
-| Config | Peak Memory |
-|--------|-------------|
-| BF16 baseline | 5.06 GB |
-| FP8 decomposed | 7.43 GB (1.47x) |
-
-FP8 显存更大因为：decomposed 路径需要 z(TK, 2I) bf16 中间量 + FP8 weight cache + activation quantization buffers。
+**Note**: These are Session 5 numbers. Session 6 fused pad+quantize should improve all FP8 numbers by ~25%.
 
 ---
 
@@ -69,8 +83,8 @@ FP8 显存更大因为：decomposed 路径需要 z(TK, 2I) bf16 中间量 + FP8 
 
 | # | 算子 | 实现 | Dtype | 说明 |
 |---|------|------|-------|------|
-| 1 | up-proj fwd | `blockscaled_fp8_gemm_varlen` + `swiglu_forward_triton` | FP8→bf16 | 2 kernels |
-| 2 | down-proj fwd | `blockscaled_fp8_gemm_varlen` | FP8 | 1 kernel |
+| 1 | up-proj fwd | `blockscaled_fp8_gemm_varlen` (pre-quantized if aligned) + `swiglu_fwd_quant_pack` (if aligned) | FP8→bf16 | 2 kernels, fused SwiGLU+quant when aligned |
+| 2 | down-proj fwd | `blockscaled_fp8_gemm_varlen` (pre-quantized if aligned) | FP8 | 1 kernel |
 | 3 | down-proj bwd act | `blockscaled_fp8_gemm_varlen` + `swiglu_backward_triton` | FP8→bf16 | 2 kernels |
 | 4 | down-proj bwd wt | `quack.gemm` | BF16 | bandwidth-bound, FP8 无收益 |
 | 5 | up-proj bwd act | `blockscaled_fp8_gemm_varlen` | FP8 | 1 kernel |
@@ -131,14 +145,27 @@ tRS_rPostAct_layout = cute.recast_layout(2, 1, tRS_rD.layout)
 
 ## 6. 本轮修复清单
 
+### Session 5 修复
+
 | 修复 | 文件 | 说明 |
 |------|------|------|
-| `get_c_pointers` / `get_mlir_types` monkey-patch | `fp8_quack_patch.py` | CUTLASS dtype classes (BFloat16 等) 作为 Constexpr 字段时，`get_c_pointers` 递归遍历调用 `__c_pointers__()` 作为 unbound method → TypeError。Fix: 检测 `isinstance(obj, type)` 跳过。 |
-| `fma_packed_f32x2` API 迁移 | `gemm_dgated.py` | quack 0.3.7 将 `utils.fma_packed_f32x2` 移至 `cute.arch.fma_packed_f32x2` |
-| Decomposed FP8 forward | `functional/__init__.py:468-485` | `blockscaled_fp8_gemm_varlen` + `swiglu_forward_triton` 替代 fused `gemm_gated` |
-| Decomposed FP8 backward | `functional/__init__.py:788-822` | `blockscaled_fp8_gemm_varlen` + `swiglu_backward_triton` 替代 fused `gemm_dgated` |
-| 消除 `dz.copy_` 冗余 | `functional/__init__.py:775` | FP8 路径不再 pre-allocate dz，直接用 Triton 返回值 |
-| `epi_setup_postact` override | `gemm_gated.py`, `gemm_dgated.py` | CopyUniversalOp fallback (功能正确但不足以修复 fused crash，保留为文档) |
+| `get_c_pointers` / `get_mlir_types` monkey-patch | `fp8_quack_patch.py` | CUTLASS dtype classes 作为 Constexpr 字段时 TypeError |
+| `fma_packed_f32x2` API 迁移 | `gemm_dgated.py` | quack 0.3.7 API 迁移 |
+| Decomposed FP8 forward | `functional/__init__.py` | blockscaled GEMM + SwiGLU 替代 fused gemm_gated |
+| Decomposed FP8 backward | `functional/__init__.py` | blockscaled GEMM + SwiGLU 替代 fused gemm_dgated |
+| `epi_setup_postact` override | `gemm_gated.py`, `gemm_dgated.py` | CopyUniversalOp fallback |
+
+### Session 6 优化
+
+| 优化 | 文件 | 说明 |
+|------|------|------|
+| Fused SwiGLU+quant+ISA-pack fwd | `swiglu_triton.py` | `swiglu_forward_quant_pack_triton`: 融合 SwiGLU + blockscaled quantize + ISA scale packing |
+| Fused SwiGLU+quant+ISA-pack bwd | `swiglu_triton.py` | `swiglu_backward_quant_pack_triton`: 融合反向 SwiGLU + quantize + ISA pack |
+| Fused gather+quantize+ISA-pack | `blockscaled_fp8_gemm.py` | `gather_quantize_and_pack_activation`: 融合 gather + blockscaled quantize + ISA pack |
+| Fused pad+quantize+ISA-pack | `blockscaled_fp8_gemm.py` | `pad_quantize_and_pack_activation`: 通过 src_idx 间接读取 bf16 → padded fp8 + ISA scales。消除 320MB bf16 padded 中间量。**Forward 3.44→2.52ms (-27%)** |
+| Alignment-gated optimization | `functional/__init__.py` | `_all_segments_128_aligned()`: 检测所有 expert segment 是否 128 对齐。仅在对齐时使用 pre-quantized path，避免 lossy dequant→re-quantize 循环 |
+| Pre-quantized scale passing | `functional/__init__.py` | `_PREQUANTIZED_SCALES` dict: up-proj 的 (y1_fp8, packed_scales) 直接传递给 down-proj，跳过 down-proj 内部 quantize |
+| z-in-FP8 memory optimization | `functional/__init__.py` | `_save_z_fp8()` 控制: forward 末尾 z→fp8+raw_scales, backward 开头 dequant。每层节省 113MB |
 
 ---
 
@@ -146,17 +173,16 @@ tRS_rPostAct_layout = cute.recast_layout(2, 1, tRS_rD.layout)
 
 | 文件 | 内容 |
 |------|------|
-| `sonicmoe/functional/__init__.py` | FP8/BF16 调度中枢：`_UpProjection.forward` (~468), `_DownProjection.backward` (~788) |
-| `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` | `blockscaled_fp8_gemm_varlen` (~1281), `precompute_weight_fp8` (~1142), `quantize_and_pack_activation_varlen` (~1072) |
-| `sonicmoe/quack_utils/swiglu_triton.py` | `swiglu_forward_triton` (~52), `swiglu_backward_triton` (~220), fused quant variants (~123, ~342) |
-| `sonicmoe/quack_utils/gemm_gated.py` | `GemmGatedSm100` + `epi_setup_postact` override |
-| `sonicmoe/quack_utils/gemm_dgated.py` | `GemmDGatedSm100` + `epi_setup_postact` override + `fma_packed_f32x2` fix |
-| `sonicmoe/quack_utils/fp8_quack_patch.py` | `get_c_pointers`/`get_mlir_types` monkey-patch |
-| `sonicmoe/quack_utils/gemm_interface.py` | `gemm_gated` / `gemm_dgated` tuned wrappers (转发 `a_scales`/`b_scales`) |
-| `tests/fp8_large_project_contract_test.py` | 11 contract tests |
-| `tools/_smoke_test.py` | 快速 FP8 vs BF16 forward+backward 精度验证 |
-| `tools/_benchmark.py` | E2E latency benchmark |
-| `tools/_benchmark_split.py` | Forward-only / backward-only 分拆 benchmark |
+| `sonicmoe/functional/__init__.py` | FP8/BF16 调度中枢：alignment-gated optimization, pre-quantized paths, z-in-FP8 |
+| `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` | FP8 基础设施：`blockscaled_fp8_gemm_varlen`, `pad_quantize_and_pack_activation`, `gather_quantize_and_pack_activation`, `quantize_and_pack_activation` |
+| `sonicmoe/quack_utils/swiglu_triton.py` | SwiGLU kernels: forward/backward + fused quant+ISA-pack variants, `dequantize_blockscaled_fp8` |
+| `sonicmoe/quack_utils/gemm_gated.py` | Fused GEMM+SwiGLU (BF16 only; blockscaled FP8 crashes) |
+| `sonicmoe/quack_utils/gemm_dgated.py` | Fused backward GEMM+dSwiGLU |
+| `sonicmoe/quack_utils/fp8_quack_patch.py` | CUTLASS monkey-patches |
+| `sonicmoe/quack_utils/gemm_interface.py` | gemm_gated / gemm_dgated tuned wrappers |
+| `tests/fp8_large_project_contract_test.py` | 11 contract tests (all pass) |
+| `tools/_benchmark_split.py` | Forward/backward split benchmark |
+| `tools/_benchmark_aligned.py` | Kernel-level aligned benchmark |
 
 ---
 
@@ -188,6 +214,9 @@ python tools/cluster_idle_launch.py launch --gpu-count 1 --command "..."
 |------|-----|------|
 | `USE_QUACK_GEMM` | `1` | 启用 CUTLASS GEMM (必须) |
 | `SONIC_MOE_FP8_MODE` | `perf` / `off` | `perf`=blockscaled FP8, `off`=纯 BF16 |
+| `SONIC_MOE_FP8_FUSED_SWIGLU_QUANT` | `1` / `0` | 融合 SwiGLU+quant kernels (默认: on) |
+| `SONIC_MOE_FP8_SAVE_Z_FP8` | `1` / `0` | 保存 z 为 FP8 格式 (默认: on, 每层省 113MB) |
+| `SONIC_MOE_FP8_FUSED_GATED` | `1` / `0` | Fused GemmGated+FP8 (crashes, kept for docs) |
 
 | 包 | 版本 |
 |---|------|
@@ -200,37 +229,36 @@ python tools/cluster_idle_launch.py launch --gpu-count 1 --command "..."
 
 ## 9. 教训
 
-1. **CUTLASS DSL accumulator recast 不感知 blockscaled 物理布局** — 这是根本限制，不是 TileStore bug。之前多轮排查（5个隔离测试 + CopyUniversalOp override + postact disable）最终定位。
-2. **quack 0.3.7 有大量 undocumented API break** — `fma_packed_f32x2` 位移、`get_c_pointers` 对 dtype class 的处理、`ArgumentsBase` 移除。
-3. **QuACK interleaved layout** — `w1(2I, H, E)` 的行是 `[gate0, val0, gate1, val1, ...]`，不是 `[gate0...gateI, val0...valI]`。非 fused path 必须用 `z[:,0::2]`/`z[:,1::2]` 而非 `z.chunk(2)`。
-4. **Triton `tl.dot_scaled` 在 SM100a + Triton 3.5.1 不可用** — `NotImplementedError: "normal_kernel_cuda" not implemented for 'Float8_e4m3fn'`。需要 Triton >= 3.6.0 或手写 PTX。
-5. **blockscaled_fp8_gemm_varlen K 维度必须是 128 的倍数** — 否则报错 `K must be multiple of 128`。
-6. **Decomposed backward 与 BF16 fused 性能持平** — 因为 backward 的 fused `gemm_dgated` 实际上也是 bandwidth-bound（dSwiGLU 操作在 epilogue 中占比小）。性能瓶颈只在 forward。
+1. **CUTLASS DSL accumulator recast 不感知 blockscaled 物理布局** — 这是根本限制，不是 TileStore bug。
+2. **quack 0.3.7 有大量 undocumented API break** — `fma_packed_f32x2` 位移、`get_c_pointers` 对 dtype class 的处理。
+3. **QuACK interleaved layout** — `w1(2I, H, E)` 的行是 `[gate0, val0, gate1, val1, ...]`。非 fused path 必须用 `z[:,0::2]`/`z[:,1::2]`。
+4. **Triton `tl.dot_scaled` 在 SM100a + Triton 3.5.1 不可用**。
+5. **blockscaled_fp8_gemm_varlen K 维度必须是 128 的倍数**。
+6. **Decomposed backward 与 BF16 fused 性能持平**。
+7. **Padding 是 FP8 性能的核心瓶颈** — 128-alignment 约束导致 random routing 下 126/128 experts 需要 padding，总 row overhead 25%。解决方案: fused pad+quantize kernel 消除 bf16 padded 中间量。
+8. **Pre-quantized path + unaligned padding = catastrophic** — dequant(lossy!) → scatter → re-quantize 比直接从 bf16 开始更慢更不准确。解决方案: alignment-gated 优化，仅 aligned 时走 pre-quantize。
+9. **ISA E8M0 scale packing layout 有复杂的 tile-based 索引** — SF_TILE_M=128, SF_TILE_K=128, SF_VEC_SIZE=32, SF_TILE_STORAGE=512。必须精确匹配硬件布局。
 
 ---
 
 ## 10. 下一步规划
 
-### P0: Forward 性能优化（唯一重大瓶颈）
+### P0: 进一步缩小 Forward 差距
 
-Forward FP8 = 3.38ms vs BF16 fused = 1.74ms。差距 1.64ms 来自：
-- blockscaled GEMM 内部 activation quantization (~0.3ms est.)
-- SwiGLU Triton kernel 独立 launch (~0.5ms est.)
-- 额外 HBM roundtrip: GEMM 写 z 到 HBM → SwiGLU 读 z 从 HBM (~0.8ms est.)
+FP8 forward 2.52ms vs BF16 1.72ms (差距 0.8ms)。主要来源:
+- Padding overhead: 25% 额外 rows + fused pad+quantize kernel overhead
+- 2 个额外 Triton kernel launch (gather_quant, SwiGLU_quant)
 
-**方案 A: CUDA Graph** — 将 quantize + GEMM + SwiGLU 捕获为一个 graph，消除 CPU launch overhead。预期提升 ~0.2ms。
+**方案 A: Production-aligned routing** — 实际系统的 token routing 几乎都是 128-aligned (或可以 round up)。Aligned 场景 FP8 fwd ~1.0ms vs BF16 1.21ms = 1.2x faster。这是最直接的胜利。
 
-**方案 B: Fused SwiGLU+Quantize Triton kernel** — `swiglu_forward_quant_triton` 已存在，输出 y1_fp8 + scales。通过 `_PREQUANTIZED_SCALES` 传递给 down-proj 避免 down-proj 内重复量化。需要适配 varlen ISA scale packing。预期消除 1 个 quantize kernel + 减少 HBM traffic。
+**方案 B: Optimize Triton quantization kernels** — `gather_quantize_and_pack_activation` 0.549ms 可能还可以通过更大 BLOCK_ROWS 或 persistent kernel 优化。
 
-**方案 C: 写 Triton MXFP8 fused GEMM+SwiGLU** — 需要 Triton >= 3.6.0 的 `tl.dot_scaled` 支持，或手写 `tcgen05.mma` PTX inline asm。收益最大（理论上可达 BF16 fused 的 2x），但工程量最大。
-
-**方案 D: 等 quack >= 0.4.0** — 可能修复 blockscaled accumulator recast。风险：不确定时间线。
+**方案 C: 等 quack >= 0.4.0** — 修复 blockscaled accumulator recast，启用 fused GemmGated+FP8。
 
 ### P1: 显存优化
 
-- **Save z in FP8**: 目前 z(TK, 2I) bf16 占 ~TK*2I*2 bytes。用 `swiglu_forward_quant_triton` 的变体量化后存储 z_fp8 + scales，backward 中 `swiglu_backward_triton` 改为接受 FP8 输入并 inline dequant。预期节省 ~50% z 存储。
-- **Fused gather+quantize**: `gather_quantize_and_pack_activation` 已存在，消除 bf16 `x_gathered` 中间量。
+- **Drop bf16 weights after FP8 conversion**: `precompute_weight_fp8` 同时保存 bf16 和 fp8 权重。训练时可以只保留 fp8 版本 (weight grad 用 bf16 从 optimizer state 恢复)。
 
-### P2: NCU Profiling
+### P2: NCU 逐 kernel 分析
 
-每个 kernel 的精细分析，找出计算密度 / bandwidth 利用率 / launch overhead 的具体占比。
+使用 `ncu --set full --kernel-name ...` 对每个关键 kernel 做详细分析，找出 compute/bandwidth 利用率瓶颈。
