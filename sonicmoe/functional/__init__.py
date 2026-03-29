@@ -470,18 +470,18 @@ class _UpProjection(torch.autograd.Function):
                 # GemmGatedSm100 with blockscaled FP8 is broken in CUTLASS DSL
                 # (illegal instruction / zero output), so we decompose into
                 # a working GemmDefaultSm100 varlen GEMM + separate activation.
+                # Activations stay bf16 (function quantizes internally) to avoid
+                # padding-path dequantization issues; weights are pre-quantized & cached.
                 _evict_per_tensor_caches_once()
                 x_gathered = x[x_gather_idx]  # (TK, H) expert-sorted
-                x_fp8, x_scales = quantize_and_pack_activation_varlen(
-                    x_gathered, expert_frequency_offset,
-                )
                 w1_fp8, w1_scales = precompute_weight_fp8(w1)
                 z = blockscaled_fp8_gemm_varlen(
-                    x_fp8, w1, expert_frequency_offset,
-                    a_scales=x_scales, w_fp8=w1_fp8, w_scales=w1_scales,
+                    x_gathered, w1, expert_frequency_offset,
+                    w_fp8=w1_fp8, w_scales=w1_scales,
                     out_dtype=torch.bfloat16,
-                )  # (TK, 2I) bf16 pre-activation
-                gate, value = z.chunk(2, dim=-1)
+                )  # (TK, 2I) bf16 pre-activation — interleaved [gate0,val0,gate1,val1,...]
+                gate = z[:, 0::2]   # even cols = gate (QuACK weight layout)
+                value = z[:, 1::2]  # odd cols = value
                 y1 = F.silu(gate) * value  # (TK, I)
                 if use_low_precision_postact_buffer:
                     y1 = y1.to(torch.float8_e4m3fn)
@@ -593,16 +593,13 @@ class _UpProjection(torch.autograd.Function):
 
                 # Act grad: native blockscaled FP8 GEMM (dz × w1^T → dx_expanded)
                 # w1 is (2I, H, E); w1.permute(1, 0, 2) = (H, 2I, E) for non-gated GEMM
-                dz_fp8, dz_scales = quantize_and_pack_activation_varlen(
-                    dz_bf16, expert_frequency_offset,
-                )
                 w1T_fp8, w1T_scales = precompute_weight_fp8(w1.permute(1, 0, 2))
                 dx_expanded = blockscaled_fp8_gemm_varlen(
-                    dz_fp8, w1.permute(1, 0, 2), expert_frequency_offset,
-                    a_scales=dz_scales, w_fp8=w1T_fp8, w_scales=w1T_scales,
+                    dz_bf16, w1.permute(1, 0, 2), expert_frequency_offset,
+                    w_fp8=w1T_fp8, w_scales=w1T_scales,
                     out_dtype=torch.bfloat16,
                 )
-                del dz_bf16, dz_fp8, dz_scales
+                del dz_bf16
             else:
                 gemm(
                     x.T,
@@ -692,13 +689,10 @@ class _DownProjection(torch.autograd.Function):
             assert b2 is None
             if _fp8_enabled():
                 # Blockscaled FP8 down-proj via native CUTLASS varlen GEMM.
-                y1_fp8, y1_scales = quantize_and_pack_activation_varlen(
-                    y1, expert_frequency_offset,
-                )
                 w2_fp8, w2_scales = precompute_weight_fp8(w2)
                 y2 = blockscaled_fp8_gemm_varlen(
-                    y1_fp8, w2, expert_frequency_offset,
-                    a_scales=y1_scales, w_fp8=w2_fp8, w_scales=w2_scales,
+                    y1, w2, expert_frequency_offset,
+                    w_fp8=w2_fp8, w_scales=w2_scales,
                     out_dtype=torch.bfloat16,
                 )
                 router_perm = s_reverse_scatter_idx
@@ -797,23 +791,20 @@ class _DownProjection(torch.autograd.Function):
 
                 # Step 1: FP8 GEMM — dout_gathered × w2^T → (TK, I)
                 dout_gathered = dout[x_gather_idx]  # (TK, H)
-                dout_fp8, dout_scales = quantize_and_pack_activation_varlen(
-                    dout_gathered, expert_frequency_offset,
-                )
                 # w2 is (H, I, E); for GEMM output (TK, I) need (I, H, E)
                 w2_perm = w2.permute(1, 0, 2)
                 w2_perm_fp8, w2_perm_scales = precompute_weight_fp8(w2_perm)
                 dy = blockscaled_fp8_gemm_varlen(
-                    dout_fp8, w2_perm, expert_frequency_offset,
-                    a_scales=dout_scales, w_fp8=w2_perm_fp8, w_scales=w2_perm_scales,
+                    dout_gathered, w2_perm, expert_frequency_offset,
+                    w_fp8=w2_perm_fp8, w_scales=w2_perm_scales,
                     out_dtype=torch.bfloat16,
                 )  # (TK, I)
-                del dout_gathered, dout_fp8, dout_scales
+                del dout_gathered
 
                 # Step 2: SwiGLU forward for post-activation and router gradient
-                I_dim = dy.size(-1)
-                gate = z[:, :I_dim]
-                value = z[:, I_dim:]
+                # z has interleaved columns: [gate0,val0,gate1,val1,...] (QuACK weight layout)
+                gate = z[:, 0::2]   # even cols = gate
+                value = z[:, 1::2]  # odd cols = value
                 sig = torch.sigmoid(gate.float())
                 silu_gate = gate.float() * sig
                 y1_forward = (silu_gate * value.float()).to(z.dtype)  # (TK, I)
@@ -826,8 +817,8 @@ class _DownProjection(torch.autograd.Function):
                 dy_scaled = dy.float() * s_f
                 d_gate = (dy_scaled * value.float() * sig * (1.0 + gate.float() * (1.0 - sig))).to(z.dtype)
                 d_value = (dy_scaled * silu_gate).to(z.dtype)
-                dz[:, :I_dim] = d_gate
-                dz[:, I_dim:] = d_value
+                dz[:, 0::2] = d_gate   # interleaved: even cols = gate grad
+                dz[:, 1::2] = d_value  # odd cols = value grad
                 del dy_scaled, d_gate, d_value, sig, silu_gate, gate, value
 
                 # Step 5: Scale post-activation by router weight (for weight-grad)
