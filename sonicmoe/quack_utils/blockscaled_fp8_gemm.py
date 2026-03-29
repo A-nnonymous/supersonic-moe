@@ -122,7 +122,8 @@ def _get_blockscaled_expert_capacity() -> int:
 def _validate_blockscaled_capacity(cu_seqlens_m: torch.Tensor, capacity: int) -> None:
     if torch.cuda.is_current_stream_capturing():
         return
-    max_expert_tokens = int((cu_seqlens_m[1:] - cu_seqlens_m[:-1]).max().item())
+    vals = _get_cu_seqlens_cpu(cu_seqlens_m)
+    max_expert_tokens = max(vals[i + 1] - vals[i] for i in range(len(vals) - 1)) if len(vals) > 1 else 0
     if max_expert_tokens > capacity:
         raise RuntimeError(
             "SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY is smaller than the routed expert load: "
@@ -276,29 +277,48 @@ def clear_blockscaled_fp8_weight_cache() -> None:
     _PAD_PLAN_CACHE.clear()
 
 
+def _get_cu_seqlens_cpu(cu_seqlens: torch.Tensor) -> tuple:
+    """Return cu_seqlens values as a Python tuple, cached on the tensor object.
+
+    Exactly ONE D2H sync per tensor object lifetime.  All subsequent calls
+    with the same tensor are pure Python attribute lookups — zero GPU sync.
+    """
+    cached = getattr(cu_seqlens, '_cached_cpu_tuple', None)
+    if cached is not None:
+        return cached
+    cpu_tuple = tuple(cu_seqlens.tolist())
+    cu_seqlens._cached_cpu_tuple = cpu_tuple
+    return cpu_tuple
+
+
 def _get_padding_plan(
     cu_seqlens_m: torch.Tensor,
     total_M: int,
 ) -> tuple[bool, torch.Tensor | None, int, torch.Tensor | None]:
     """Compute (and cache) CTA-tile padding plan for a cu_seqlens_m tensor.
 
-    Content-based cache keyed on cu_seqlens values (one D2H sync per call).
+    Uses tensor-attribute caching: zero D2H sync after first call per tensor.
+    Even on cache miss, all decisions are made from CPU tuple — no `.item()`.
     """
-    content_key = tuple(cu_seqlens_m.tolist())
-    cached = _PAD_PLAN_CACHE.get(content_key)
+    cpu_tuple = _get_cu_seqlens_cpu(cu_seqlens_m)
+    cached = _PAD_PLAN_CACHE.get(cpu_tuple)
     if cached is not None:
         return cached
 
-    seg_lens = cu_seqlens_m[1:] - cu_seqlens_m[:-1]
-    remainders = seg_lens % _SF_TILE_M
-    needs_pad = bool(remainders.any().item())
+    # Pure Python arithmetic — zero GPU operations
+    cpu_lens = [cpu_tuple[i + 1] - cpu_tuple[i] for i in range(len(cpu_tuple) - 1)]
+    remainders = [s % _SF_TILE_M for s in cpu_lens]
+    needs_pad = any(r > 0 for r in remainders)
 
     if needs_pad:
-        padded_lens = seg_lens + (_SF_TILE_M - remainders) % _SF_TILE_M
-        padded_cu = torch.zeros_like(cu_seqlens_m)
-        padded_cu[1:] = torch.cumsum(padded_lens, dim=0)
-        padded_total = int(padded_cu[-1].item())
+        padded_lens = [s + (_SF_TILE_M - r) % _SF_TILE_M for s, r in zip(cpu_lens, remainders)]
+        padded_cu_list = [0]
+        for pl in padded_lens:
+            padded_cu_list.append(padded_cu_list[-1] + pl)
+        padded_total = padded_cu_list[-1]
 
+        # H2D transfer (async, no sync) + GPU scatter
+        padded_cu = torch.tensor(padded_cu_list, dtype=torch.int32, device=cu_seqlens_m.device)
         token_idx = torch.arange(total_M, device=cu_seqlens_m.device, dtype=torch.int64)
         expert_ids = torch.searchsorted(cu_seqlens_m, token_idx, right=True) - 1
         local_off = token_idx - cu_seqlens_m[expert_ids].to(torch.int64)
@@ -309,7 +329,7 @@ def _get_padding_plan(
 
     if len(_PAD_PLAN_CACHE) > 16:
         _PAD_PLAN_CACHE.clear()
-    _PAD_PLAN_CACHE[content_key] = plan
+    _PAD_PLAN_CACHE[cpu_tuple] = plan
     return plan
 
 
@@ -1263,9 +1283,9 @@ def quantize_and_pack_activation_varlen(
     num_groups = raw_scales.size(1)
 
     # Step 2: Reshape raw scales to per-expert with padding
-    offsets_cpu = cu_seqlens_m.cpu()
-    lens = offsets_cpu[1:] - offsets_cpu[:-1]
-    max_tpe = int(lens.max().item())
+    cpu_tuple = _get_cu_seqlens_cpu(cu_seqlens_m)
+    cpu_lens = [cpu_tuple[i + 1] - cpu_tuple[i] for i in range(len(cpu_tuple) - 1)]
+    max_tpe = max(cpu_lens) if cpu_lens else 0
 
     if max_tpe == 0:
         per_batch_storage = max(_storage_per_batch(0, K), 1)
@@ -1275,7 +1295,7 @@ def quantize_and_pack_activation_varlen(
         return fp8_data, empty_scales.view(torch.float8_e8m0fnu)
 
     raw_uint8 = raw_scales.view(torch.uint8)
-    min_tpe = int(lens.min().item())
+    min_tpe = min(cpu_lens)
 
     if min_tpe == max_tpe and TK == E * max_tpe:
         # Uniform TPE: zero-copy reshape
@@ -1447,6 +1467,7 @@ def blockscaled_fp8_gemm_varlen(
     a_scales: Optional[torch.Tensor] = None,
     w_fp8: Optional[torch.Tensor] = None,
     w_scales: Optional[torch.Tensor] = None,
+    assume_aligned: bool = False,
 ) -> torch.Tensor:
     """Blockscaled FP8 GEMM using the varlen scheduler.
 
@@ -1477,6 +1498,9 @@ def blockscaled_fp8_gemm_varlen(
     a_scales : packed ISA-layout scales for ``a`` (pre-quantized path).
     w_fp8 : pre-quantized weight fp8 (E,H,I).
     w_scales : packed ISA-layout scales for weights.
+    assume_aligned : if True, skip the CTA-tile alignment check (avoids
+        D2H sync).  Caller must guarantee all expert segments in
+        cu_seqlens_m are multiples of the CTA tile size (128).
     """
     device = a.device
     if get_device_capacity(device)[0] != 10:
@@ -1504,10 +1528,10 @@ def blockscaled_fp8_gemm_varlen(
     pre_quantized_wt = (w_fp8 is not None and w_scales is not None)
 
     # --- CTA tile alignment padding ---
-    if not torch.cuda.is_current_stream_capturing():
-        needs_pad, padded_cu, padded_total, dst_idx = _get_padding_plan(cu_seqlens_m, total_M)
-    else:
+    if assume_aligned or torch.cuda.is_current_stream_capturing():
         needs_pad = False
+    else:
+        needs_pad, padded_cu, padded_total, dst_idx = _get_padding_plan(cu_seqlens_m, total_M)
 
     if needs_pad:
         # --- Weight quantization (shared by both paths) ---

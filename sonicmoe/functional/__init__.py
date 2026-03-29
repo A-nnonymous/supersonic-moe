@@ -88,6 +88,7 @@ from ..quack_utils.swiglu_triton import (
 from ..quack_utils.blockscaled_fp8_gemm import (
     pack_blockscaled_1x32_scales,
     quantize_activation_blockscaled_fast,
+    quantize_and_pack_activation,
 )
 
 
@@ -140,30 +141,38 @@ def _use_fused_blockscaled_gated() -> bool:
 _PREQUANTIZED_SCALES: dict[str, tuple] = {}
 
 
-_MIN_SEG_CACHE: dict[tuple, int] = {}
+def _get_cu_seqlens_cpu(cu_seqlens: torch.Tensor) -> tuple:
+    """Return cu_seqlens values as a Python tuple, cached on the tensor object.
+
+    Exactly ONE D2H sync per tensor object lifetime.  All subsequent calls
+    with the same tensor are pure Python attribute lookups — zero GPU sync.
+    """
+    cached = getattr(cu_seqlens, '_cached_cpu_tuple', None)
+    if cached is not None:
+        return cached
+    cpu_tuple = tuple(cu_seqlens.tolist())
+    cu_seqlens._cached_cpu_tuple = cpu_tuple
+    return cpu_tuple
+
 
 def _min_expert_segment(expert_frequency_offset: torch.Tensor) -> int:
     """Return minimum active expert segment length from cu_seqlens.
 
-    Content-based cache keyed on cu_seqlens values.
+    Pure Python arithmetic on cached CPU values — zero GPU sync after first call.
     """
     if torch.cuda.is_current_stream_capturing():
         return 0
-    content_key = tuple(expert_frequency_offset.tolist())
-    cached = _MIN_SEG_CACHE.get(content_key)
-    if cached is not None:
-        return cached
-    seg_lens = expert_frequency_offset[1:] - expert_frequency_offset[:-1]
-    masked = torch.where(seg_lens > 0, seg_lens, 2**30)
-    val = int(masked.min().item())
-    result = 0 if val >= 2**30 else val
-    if len(_MIN_SEG_CACHE) > 16:
-        _MIN_SEG_CACHE.clear()
-    _MIN_SEG_CACHE[content_key] = result
-    return result
+    vals = _get_cu_seqlens_cpu(expert_frequency_offset)
+    active = [vals[i + 1] - vals[i] for i in range(len(vals) - 1) if vals[i + 1] > vals[i]]
+    return min(active) if active else 0
 
 
-_ALIGN_CACHE: dict[tuple, bool] = {}
+_ALIGNMENT_STREAK: int = 0
+_ALIGNMENT_ASSUMED: bool = (
+    os.getenv("SONIC_MOE_FP8_ASSUME_ALIGNED", "").lower() in {"1", "true", "yes", "on"}
+)
+_ALIGNMENT_STREAK_THRESHOLD: int = 3
+
 
 def _all_segments_128_aligned(cu_seqlens: torch.Tensor) -> bool:
     """Return True if all expert segments are 128-aligned (no GEMM padding needed).
@@ -171,18 +180,24 @@ def _all_segments_128_aligned(cu_seqlens: torch.Tensor) -> bool:
     Pre-quantized activation input to blockscaled_fp8_gemm_varlen is only
     beneficial when no padding is required, because the padding fallback must
     dequantize → pad → re-quantize which is very expensive.
+
+    After ``_ALIGNMENT_STREAK_THRESHOLD`` consecutive aligned iterations, the
+    check is skipped entirely (zero D2H sync).  The env var
+    ``SONIC_MOE_FP8_ASSUME_ALIGNED=1`` forces immediate zero-sync mode.
     """
+    global _ALIGNMENT_STREAK, _ALIGNMENT_ASSUMED
+    if _ALIGNMENT_ASSUMED:
+        return True
     if torch.cuda.is_current_stream_capturing():
         return False
-    key = tuple(cu_seqlens.tolist())
-    cached = _ALIGN_CACHE.get(key)
-    if cached is not None:
-        return cached
-    seg_lens = cu_seqlens[1:] - cu_seqlens[:-1]
-    result = bool((seg_lens % 128 == 0).all().item())
-    if len(_ALIGN_CACHE) > 16:
-        _ALIGN_CACHE.clear()
-    _ALIGN_CACHE[key] = result
+    vals = _get_cu_seqlens_cpu(cu_seqlens)
+    result = all((vals[i + 1] - vals[i]) % 128 == 0 for i in range(len(vals) - 1))
+    if result:
+        _ALIGNMENT_STREAK += 1
+        if _ALIGNMENT_STREAK >= _ALIGNMENT_STREAK_THRESHOLD:
+            _ALIGNMENT_ASSUMED = True
+    else:
+        _ALIGNMENT_STREAK = 0
     return result
 
 
@@ -525,6 +540,7 @@ class _UpProjection(torch.autograd.Function):
                         a_scales=x_scales,
                         w_fp8=w1_fp8, w_scales=w1_scales,
                         out_dtype=torch.bfloat16,
+                        assume_aligned=aligned,
                     )
                     del x_fp8, x_scales
                 else:
@@ -535,6 +551,7 @@ class _UpProjection(torch.autograd.Function):
                         x_gathered, w1, expert_frequency_offset,
                         w_fp8=w1_fp8, w_scales=w1_scales,
                         out_dtype=torch.bfloat16,
+                        assume_aligned=False,
                     )
                     del x_gathered
 
@@ -661,11 +678,28 @@ class _UpProjection(torch.autograd.Function):
 
                 # Act grad: native blockscaled FP8 GEMM (dz × w1^T → dx_expanded)
                 w1T_fp8, w1T_scales = precompute_weight_fp8(w1.permute(1, 0, 2))
-                dx_expanded = blockscaled_fp8_gemm_varlen(
-                    dz_bf16, w1.permute(1, 0, 2), expert_frequency_offset,
-                    w_fp8=w1T_fp8, w_scales=w1T_scales,
-                    out_dtype=torch.bfloat16,
-                )
+                if _ALIGNMENT_ASSUMED:
+                    # Pre-quantize dz to skip the _get_padding_plan sync
+                    # inside blockscaled_fp8_gemm_varlen (safe because we've
+                    # verified alignment for N consecutive iterations).
+                    dz_fp8, dz_scales = quantize_and_pack_activation(
+                        dz_bf16.contiguous(), group_size=32
+                    )
+                    dx_expanded = blockscaled_fp8_gemm_varlen(
+                        dz_fp8, w1.permute(1, 0, 2), expert_frequency_offset,
+                        a_scales=dz_scales,
+                        w_fp8=w1T_fp8, w_scales=w1T_scales,
+                        out_dtype=torch.bfloat16,
+                        assume_aligned=True,
+                    )
+                    del dz_fp8, dz_scales
+                else:
+                    dx_expanded = blockscaled_fp8_gemm_varlen(
+                        dz_bf16, w1.permute(1, 0, 2), expert_frequency_offset,
+                        w_fp8=w1T_fp8, w_scales=w1T_scales,
+                        out_dtype=torch.bfloat16,
+                        assume_aligned=False,
+                    )
                 del dz_bf16
             else:
                 gemm(
@@ -766,12 +800,14 @@ class _DownProjection(torch.autograd.Function):
                         a_scales=y1_packed_scales,
                         w_fp8=w2_fp8, w_scales=w2_scales,
                         out_dtype=torch.bfloat16,
+                        assume_aligned=_ALIGNMENT_ASSUMED,
                     )
                 else:
                     y2 = blockscaled_fp8_gemm_varlen(
                         y1, w2, expert_frequency_offset,
                         w_fp8=w2_fp8, w_scales=w2_scales,
                         out_dtype=torch.bfloat16,
+                        assume_aligned=False,
                     )
                 router_perm = s_reverse_scatter_idx
                 y2_for_router = y2
@@ -915,6 +951,7 @@ class _DownProjection(torch.autograd.Function):
                         a_scales=dout_scales,
                         w_fp8=w2_fp8, w_scales=w2_scales,
                         out_dtype=torch.bfloat16,
+                        assume_aligned=aligned,
                     )
                     del dout_fp8, dout_scales
                 else:
@@ -923,6 +960,7 @@ class _DownProjection(torch.autograd.Function):
                         dout_gathered, w2_actgrad, expert_frequency_offset,
                         w_fp8=w2_fp8, w_scales=w2_scales,
                         out_dtype=torch.bfloat16,
+                        assume_aligned=False,
                     )
                     del dout_gathered
 
