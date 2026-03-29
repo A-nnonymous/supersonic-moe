@@ -416,7 +416,7 @@ def quantize_activation_blockscaled_fast(
     # Process 4 rows × all-groups-per-block to maximize work per block.
     # For (65536, 4096): 128 groups per row, GROUPS_PER_BLOCK=128 → 1 col-block.
     # Grid: (16384, 1) = 16K blocks, each processing 4×128 groups = 16K elements.
-    BLOCK_ROWS = 32
+    BLOCK_ROWS = 2  # Optimal at production TK=512: better wave distribution
     GROUPS_PER_BLOCK = min(num_groups, 128)
     grid = (_div_up(M, BLOCK_ROWS), _div_up(num_groups, GROUPS_PER_BLOCK))
     _quantize_flat_blockscaled_kernel[grid](
@@ -1002,7 +1002,7 @@ def gather_quantize_and_pack_activation(
     per_batch_storage = _storage_per_batch(TK, K)
     packed_scales = torch.full((1, per_batch_storage), 127, dtype=torch.uint8, device=x.device)
 
-    BLOCK_ROWS = 32
+    BLOCK_ROWS = 2  # NCU: 101µs vs 138µs at BR=32 (TK=512, K=4096)
     grid = (_div_up(TK, BLOCK_ROWS),)
     _gather_quantize_and_pack_kernel[grid](
         x,
@@ -1055,7 +1055,7 @@ def quantize_and_pack_activation(
         (1, per_batch_storage), 127, dtype=torch.uint8, device=x.device
     )
 
-    BLOCK_ROWS = 32
+    BLOCK_ROWS = 2  # NCU: 99µs vs 137µs at BR=32 (TK=512, K=4096)
     grid = (_div_up(M, BLOCK_ROWS),)
     _quantize_and_pack_kernel[grid](
         x,
@@ -1204,7 +1204,7 @@ def pad_quantize_and_pack_activation(
     per_batch_storage = _storage_per_batch(padded_total, K)
     packed_scales = torch.zeros((1, per_batch_storage), dtype=torch.uint8, device=a.device)
 
-    BLOCK_ROWS = 32
+    BLOCK_ROWS = 2  # Consistent with other quantize kernels
     grid = (_div_up(padded_total, BLOCK_ROWS),)
     _pad_quantize_and_pack_kernel[grid](
         a,
