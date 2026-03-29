@@ -216,21 +216,23 @@ def _swiglu_fwd_quant_pack_kernel(
         sig = tl.sigmoid(gate)
         y1 = gate * sig * up
 
-        # Blockscaled quantize (per-row scale over GROUP_SIZE elements)
+        # Pure-integer E8M0 blockscaled quantize (no transcendentals)
         block_amax = tl.max(tl.abs(y1), axis=1)
-        raw_scale = block_amax / fp8_max
-        positive = raw_scale > 0
-        exponent = tl.where(positive, tl.ceil(tl.log2(tl.where(positive, raw_scale, 1.0))), 0.0)
-        quant_scale = tl.exp2(-exponent)
+        amax_bits = block_amax.to(tl.int32, bitcast=True)
+        biased_exp = (amax_bits >> 23) & 0xFF
+        mantissa_bits = amax_bits & 0x7FFFFF
+        carry = tl.where(mantissa_bits > 0x600000, 1, 0)
+        e8m0_i32 = biased_exp - 8 + carry
+        e8m0_i32 = tl.where(biased_exp > 0, e8m0_i32, 0)
+        e8m0_byte = tl.maximum(e8m0_i32, 0).to(tl.uint8)
+
+        quant_biased_exp = 254 - e8m0_i32
+        quant_biased_exp = tl.maximum(tl.minimum(quant_biased_exp, 254), 1)
+        quant_scale = (quant_biased_exp.to(tl.int32) << 23).to(tl.float32, bitcast=True)
         y1_fp8 = (y1 * quant_scale[:, None]).to(tl.float8e4nv)
 
         # Store fp8 data
         tl.store(y_row_ptrs + col_offsets[None, :], y1_fp8, mask=mask)
-
-        # Write E8M0 scale directly into ISA tile layout
-        dequant_scale = tl.exp2(exponent).to(tl.float32)
-        scale_i32 = dequant_scale.to(tl.int32, bitcast=True)
-        e8m0_byte = ((scale_i32 >> 23) & 0xFF).to(tl.uint8)
 
         k_tiles_idx = group_id // (SF_TILE_M // GROUP_SIZE)
         k_in_tile_val = group_id % (SF_TILE_M // GROUP_SIZE)
@@ -271,7 +273,7 @@ def swiglu_forward_quant_pack_triton(
         (1, per_batch_storage), 127, dtype=torch.uint8, device=z.device
     )
 
-    BLOCK_ROWS = 4
+    BLOCK_ROWS = 8
     grid = (_div_up(TK, BLOCK_ROWS),)
     _swiglu_fwd_quant_pack_kernel[grid](
         z, y1_fp8, packed_scales,
@@ -651,27 +653,28 @@ def _swiglu_bwd_quant_pack_kernel(
         y1s_out = y1 * s_vals[:, None]
         tl.store(y1s_base + pair_offs[None, :], y1s_out.to(tl.bfloat16), mask=mask)
 
-        # Blockscaled quantize dz over 32 interleaved elements
+        # Pure-integer E8M0 blockscaled quantize for dz (no transcendentals)
         amax_gate = tl.max(tl.where(pair_mask, tl.abs(d_gate), 0.0), axis=1)
         amax_up = tl.max(tl.where(pair_mask, tl.abs(d_up), 0.0), axis=1)
         amax = tl.maximum(amax_gate, amax_up)
 
-        positive = amax > 0
-        exponent = tl.where(positive,
-                            tl.ceil(tl.log2(tl.where(positive, amax / fp8_max, 1.0))),
-                            0.0)
-        quant_scale = tl.exp2(-exponent)
+        amax_bits = amax.to(tl.int32, bitcast=True)
+        biased_exp = (amax_bits >> 23) & 0xFF
+        mantissa_bits = amax_bits & 0x7FFFFF
+        carry = tl.where(mantissa_bits > 0x600000, 1, 0)
+        e8m0_i32 = biased_exp - 8 + carry
+        e8m0_i32 = tl.where(biased_exp > 0, e8m0_i32, 0)
+        e8m0_byte = tl.maximum(e8m0_i32, 0).to(tl.uint8)
+
+        quant_biased_exp = 254 - e8m0_i32
+        quant_biased_exp = tl.maximum(tl.minimum(quant_biased_exp, 254), 1)
+        quant_scale = (quant_biased_exp.to(tl.int32) << 23).to(tl.float32, bitcast=True)
 
         dg_fp8 = (d_gate * quant_scale[:, None]).to(tl.float8e4nv)
         du_fp8 = (d_up * quant_scale[:, None]).to(tl.float8e4nv)
 
         tl.store(dz_base + pair_offs[None, :] * 2, dg_fp8, mask=mask)
         tl.store(dz_base + pair_offs[None, :] * 2 + 1, du_fp8, mask=mask)
-
-        # ISA-packed scale for dz (dimension is 2I)
-        dequant_scale = tl.exp2(exponent).to(tl.float32)
-        scale_i32 = dequant_scale.to(tl.int32, bitcast=True)
-        e8m0_byte = ((scale_i32 >> 23) & 0xFF).to(tl.uint8)
 
         k_tiles_idx = group_id // (SF_TILE_M // GROUP_SIZE)
         k_in_tile_val = group_id % (SF_TILE_M // GROUP_SIZE)

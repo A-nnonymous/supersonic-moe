@@ -872,22 +872,24 @@ def _quantize_and_pack_kernel(
         src_ptrs = src_ptr + row_ids[:, None] * src_stride_row + col_offsets[None, :] * src_stride_col
         values = tl.load(src_ptrs, mask=mask, other=0.0).to(tl.float32)
 
-        # --- Compute per-row-group scale (E8M0) ---
+        # --- Pure-integer E8M0 computation (no transcendentals) ---
         block_amax = tl.max(tl.abs(values), axis=1)
-        raw_scale = block_amax / fp8_max
-        positive = raw_scale > 0
-        exponent = tl.where(positive, tl.ceil(tl.log2(tl.where(positive, raw_scale, 1.0))), 0.0)
-        quant_scale = tl.exp2(-exponent)
+        amax_bits = block_amax.to(tl.int32, bitcast=True)
+        biased_exp = (amax_bits >> 23) & 0xFF
+        mantissa_bits = amax_bits & 0x7FFFFF
+        carry = tl.where(mantissa_bits > 0x600000, 1, 0)
+        e8m0_i32 = biased_exp - 8 + carry
+        e8m0_i32 = tl.where(biased_exp > 0, e8m0_i32, 0)
+        e8m0_byte = tl.maximum(e8m0_i32, 0).to(tl.uint8)
+
+        quant_biased_exp = 254 - e8m0_i32
+        quant_biased_exp = tl.maximum(tl.minimum(quant_biased_exp, 254), 1)
+        quant_scale = (quant_biased_exp.to(tl.int32) << 23).to(tl.float32, bitcast=True)
 
         # --- Quantize to fp8 ---
         quantized = (values * quant_scale[:, None]).to(tl.float8e4nv)
         dst_ptrs = dst_fp8_ptr + row_ids[:, None] * dst_stride_row + col_offsets[None, :] * dst_stride_col
         tl.store(dst_ptrs, quantized, mask=mask)
-
-        # --- Write E8M0 scale directly into ISA tile layout ---
-        dequant_scale = tl.exp2(exponent)
-        scale_i32 = dequant_scale.to(tl.float32).to(tl.int32, bitcast=True)
-        e8m0_byte = ((scale_i32 >> 23) & 0xFF).to(tl.uint8)
 
         k_tiles_idx = group_id // (SF_TILE_M // GROUP_SIZE)
         k_in_tile = group_id % (SF_TILE_M // GROUP_SIZE)
@@ -944,21 +946,23 @@ def _gather_quantize_and_pack_kernel(
         src_ptrs = src_ptr + gather_ids[:, None] * src_stride_row + col_offsets[None, :] * src_stride_col
         values = tl.load(src_ptrs, mask=mask, other=0.0).to(tl.float32)
 
-        # Quantize
+        # Pure-integer E8M0 computation (no transcendentals)
         block_amax = tl.max(tl.abs(values), axis=1)
-        raw_scale = block_amax / fp8_max
-        positive = raw_scale > 0
-        exponent = tl.where(positive, tl.ceil(tl.log2(tl.where(positive, raw_scale, 1.0))), 0.0)
-        quant_scale = tl.exp2(-exponent)
+        amax_bits = block_amax.to(tl.int32, bitcast=True)
+        biased_exp = (amax_bits >> 23) & 0xFF
+        mantissa_bits = amax_bits & 0x7FFFFF
+        carry = tl.where(mantissa_bits > 0x600000, 1, 0)
+        e8m0_i32 = biased_exp - 8 + carry
+        e8m0_i32 = tl.where(biased_exp > 0, e8m0_i32, 0)
+        e8m0_byte = tl.maximum(e8m0_i32, 0).to(tl.uint8)
+
+        quant_biased_exp = 254 - e8m0_i32
+        quant_biased_exp = tl.maximum(tl.minimum(quant_biased_exp, 254), 1)
+        quant_scale = (quant_biased_exp.to(tl.int32) << 23).to(tl.float32, bitcast=True)
         quantized = (values * quant_scale[:, None]).to(tl.float8e4nv)
 
         dst_ptrs = dst_fp8_ptr + row_ids[:, None] * dst_stride_row + col_offsets[None, :] * dst_stride_col
         tl.store(dst_ptrs, quantized, mask=mask)
-
-        # ISA-packed scale
-        dequant_scale = tl.exp2(exponent)
-        scale_i32 = dequant_scale.to(tl.float32).to(tl.int32, bitcast=True)
-        e8m0_byte = ((scale_i32 >> 23) & 0xFF).to(tl.uint8)
 
         k_tiles_idx = group_id // (SF_TILE_M // GROUP_SIZE)
         k_in_tile_val = group_id % (SF_TILE_M // GROUP_SIZE)

@@ -299,6 +299,9 @@ def _get_cached_fp8_weight(w: torch.Tensor, tag: str) -> torch.Tensor:
     if cached is not None:
         return cached
     fp8_w = _make_fp8_weight(w, tag)
+    if len(_FP8_WEIGHT_CACHE) >= 4:
+        oldest = next(iter(_FP8_WEIGHT_CACHE))
+        del _FP8_WEIGHT_CACHE[oldest]
     _FP8_WEIGHT_CACHE[key] = fp8_w
     # Per-tensor cache is being populated again; allow future eviction.
     _PER_TENSOR_EVICTED = False
@@ -319,6 +322,9 @@ def _get_fp8_weight_orig(w: torch.Tensor) -> torch.Tensor:
     if cached is not None:
         return cached
     fp8_w = w.to(torch.float8_e4m3fn)
+    if len(_FP8_ORIG_CACHE) >= 4:
+        oldest = next(iter(_FP8_ORIG_CACHE))
+        del _FP8_ORIG_CACHE[oldest]
     _FP8_ORIG_CACHE[key] = fp8_w
     # Per-tensor cache is being populated again; allow future eviction.
     _PER_TENSOR_EVICTED = False
