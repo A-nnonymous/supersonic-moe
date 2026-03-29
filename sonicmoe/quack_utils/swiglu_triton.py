@@ -1222,7 +1222,7 @@ def swiglu_backward_from_fp8_quant_pack_triton(
     y1s = torch.empty(TK, I, dtype=torch.bfloat16, device=dy1.device)
     ds = torch.empty(TK, dtype=torch.float32, device=dy1.device)
 
-    BLOCK_ROWS = 1
+    BLOCK_ROWS = 8  # Tuned: BR=8 (119µs) vs BR=1 (460µs) vs BR=4 (125µs)
     grid = (_div_up(TK, BLOCK_ROWS),)
     _swiglu_bwd_from_fp8_quant_pack_kernel[grid](
         dy1, z_fp8, z_scales_u8, s,
