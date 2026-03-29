@@ -82,6 +82,7 @@ from ..quack_utils.swiglu_triton import (
     swiglu_backward_quant_triton,
     swiglu_forward_quant_pack_triton,
     swiglu_backward_quant_pack_triton,
+    swiglu_backward_from_fp8_triton,
     dequantize_blockscaled_fp8,
 )
 from ..quack_utils.blockscaled_fp8_gemm import (
@@ -875,8 +876,9 @@ class _DownProjection(torch.autograd.Function):
                 s_scatter_idx,
                 s_reverse_scatter_idx,
             ) = ctx.saved_tensors
-            z = dequantize_blockscaled_fp8(z_fp8, z_raw_scales.view(torch.uint8))
-            del z_fp8, z_raw_scales
+            z_raw_scales_u8 = z_raw_scales.view(torch.uint8)
+            # Defer dequantize: FP8 path uses fused kernel, others lazy-dequant
+            z = None
         else:
             (
                 z,
@@ -888,6 +890,7 @@ class _DownProjection(torch.autograd.Function):
                 s_scatter_idx,
                 s_reverse_scatter_idx,
             ) = ctx.saved_tensors
+            z_fp8 = z_raw_scales_u8 = None
 
         dw2 = torch.empty_like(w2)
         db2 = None if b2 is None else torch.empty_like(b2)
@@ -923,8 +926,15 @@ class _DownProjection(torch.autograd.Function):
                     )
                     del dout_gathered
 
-                # Step 3: SwiGLU backward in bf16 (weight-grad needs bf16 dz)
-                dz, y1s, ds = _swiglu_backward_interleaved(dy1, z, s)
+                # Step 3: SwiGLU backward
+                if z_fp8 is not None:
+                    # Fused: read fp8 z directly, skip bf16 materialization
+                    dz, y1s, ds = swiglu_backward_from_fp8_triton(
+                        dy1, z_fp8, z_raw_scales_u8, s
+                    )
+                    del z_fp8, z_raw_scales_u8
+                else:
+                    dz, y1s, ds = _swiglu_backward_interleaved(dy1, z, s)
                 del dy1
 
                 _log_stage_memory("backward:down-proj-dgated")
@@ -945,6 +955,10 @@ class _DownProjection(torch.autograd.Function):
                 _log_stage_memory("backward:down-proj-weight")
                 ds = ds[s_reverse_scatter_idx]
             else:
+                # BF16 path: needs bf16 z for gemm_dgated
+                if z is None:
+                    z = dequantize_blockscaled_fp8(z_fp8, z_raw_scales_u8)
+                    del z_fp8, z_raw_scales_u8
                 # BF16 path: cast colvec_scale to fp32 to avoid QuACK varlen
                 # alignment bug (domain_offset on bf16 ptr reduces to 16-bit
                 # alignment, but async copy requires 32-bit; fp32 is always
@@ -978,6 +992,10 @@ class _DownProjection(torch.autograd.Function):
                 _log_stage_memory("backward:down-proj-weight")
                 ds = ds[s_reverse_scatter_idx]
         else:
+            # Non-quack path: needs bf16 z
+            if z is None:
+                z = dequantize_blockscaled_fp8(z_fp8, z_raw_scales_u8)
+                del z_fp8, z_raw_scales_u8
             ds = torch.empty_like(topk_scores)
             dz = torch.empty_like(z)
 

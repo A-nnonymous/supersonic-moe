@@ -1,12 +1,12 @@
 # Blockscaled FP8 MoE — Handoff
 
-> **Last updated: 2025-07-26, Session 7+8 (1D-grid kernel optimization, SwiGLU grid opt, memory reduction)**
+> **Last updated: 2025-07-27, Session 9+10 (integer E8M0, BLOCK_ROWS=1, fused z-save)**
 
 ---
 
 ## 1. 当前状态：一句话
 
-**全链路 blockscaled FP8 (1×32 UE8M0) forward + backward 功能完成，11/11 contract tests PASS，精度 RelRMSE 5-7%。Session 7: quantize-and-pack kernels 通过 2D→1D grid 变换获得 4.4x 加速，E2E FP8 total 6.60ms vs BF16 7.46ms = **1.13x faster**。Session 8: SwiGLU fused quant kernels 同样完成 2D→1D grid 变换 (消除 backward atomic contention)，weight cache 8→2 entries (节省 ~7.2GB)，quantize_flat BLOCK_ROWS 4→32。GPU 高度争抢无法获得干净 benchmark，但所有精度测试通过。**
+**全链路 blockscaled FP8 (1×32 UE8M0) forward + backward 功能完成，11/11 contract tests PASS，精度 RelRMSE 5-7%。Session 9: integer E8M0 替代 transcendental (log2/ceil/exp2→bitwise, 40 cycles→3 cycles)。Session 10: fused z-fp8-save 进 SwiGLU kernel (z 只读一次), BLOCK_ROWS=1 universally optimal (TK=512 → 512 blocks saturate 160 SMs)。Triton kernel 总耗时 (forward): 460µs→215µs (**53% reduction**)。Estimated E2E: ~6.15ms vs BF16 7.46ms = **~1.21x faster**。**
 
 ---
 
@@ -59,6 +59,37 @@ Contract tests: **11/11 PASS**（8 small + 3 large shape，含 forward + backwar
 | **Total cache memory reduction** | **~7.2GB** |
 
 **Note**: Session 8 performance delta could not be measured due to GPU contention (other users using 130/183GB). Contract tests 11/11 PASS. ds precision confirmed: max_rel_err < 0.0001%.
+
+### Session 9+10 改进 (integer E8M0 + BLOCK_ROWS=1 + fused z-save)
+
+**核心优化三件套 (NCU verified on B200 sm_100a at production shape TK=512, K/I=4096)**
+
+| 优化 | 文件 | 效果 |
+|------|------|------|
+| Integer E8M0 (替代 log2/ceil/exp2) | 全部 4 个 quantize kernel | ~5-8% per kernel (transcendental 40→integer 3 cycles) |
+| Fused z-fp8-save into SwiGLU+quant | `swiglu_triton.py` | z 只读一次: 322→129µs (**60% faster**) |
+| BLOCK_ROWS=1 (universal optimum) | 全部 quantize/SwiGLU kernels | 512 blocks saturate 160 SMs perfectly |
+
+**Forward Triton kernel 逐项对比 (Session 7 → Session 10)**
+
+| Kernel | Session 7 | Session 10 | 加速 |
+|--------|-----------|------------|------|
+| gather_quantize_and_pack | ~125µs | **86µs** | **31%** |
+| SwiGLU+quant (or +zsave) | ~300µs* | **129µs** | **57%** |
+| **Total forward Triton** | **~460µs** | **~215µs** | **53%** |
+
+\* Session 7: swiglu_fwd_quant_pack (~190µs) + z-fp8-save (~105µs) + fill (~5µs) = ~300µs
+
+**Integer E8M0 公式 (3 cycles vs transcendental 40-60 cycles)**
+
+```python
+# Pure-integer bitwise: replaces log2(amax) → ceil → exp2
+amax_bits = block_amax.to(tl.int32, bitcast=True)
+biased_exp = (amax_bits >> 23) & 0xFF
+mantissa_bits = amax_bits & 0x7FFFFF
+carry = tl.where(mantissa_bits > 0x600000, 1, 0)  # >1.75
+e8m0_i32 = biased_exp - 8 + carry  # -8: fp8_e4m3 max=448=1.75*2^8
+```
 
 ### 显存
 

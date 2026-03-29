@@ -3,12 +3,13 @@
 The interleaved layout stores gate/up pairs as z(TK, 2I) where:
   z[:, 0::2] = gate,  z[:, 1::2] = up
 
-Provides five kernel variants:
+Provides six kernel variants:
   1. SwiGLU → bf16 (unfused, for non-fp8 paths)
   2. SwiGLU → blockscaled fp8 + raw e8m0 scales (fused forward quant)
   3. dSwiGLU → blockscaled fp8 + raw e8m0 scales (fused backward quant)
   4. SwiGLU → blockscaled fp8 + ISA-packed e8m0 scales (fused forward quant+pack)
   5. dSwiGLU → blockscaled fp8 + ISA-packed e8m0 scales (fused backward quant+pack)
+  6. dSwiGLU from FP8 z: fused dequant + backward (eliminates bf16 z materialization)
 
 Variants 4 & 5 eliminate the intermediate raw-scale tensor and
 produce scales directly in the ISA tile layout consumed by CUTLASS
@@ -555,6 +556,137 @@ def swiglu_backward_triton(
         dz, y1s, ds,
         TK, I,
         dy1.stride(0), z.stride(0), dz.stride(0), y1s.stride(0),
+        BLOCK_I=BLOCK_I,
+    )
+    return dz, y1s, ds
+
+
+# ===================================================================
+# Backward from FP8: (dy1, z_fp8, z_scales, s) → dz(bf16), y1s, ds
+# Fuses dequantize + SwiGLU backward, skipping bf16 z materialization.
+# ===================================================================
+
+@triton.jit
+def _swiglu_bwd_from_fp8_kernel(
+    DY1_ptr, Z_FP8_ptr, Z_SCALE_ptr, S_ptr,
+    DZ_ptr, Y1S_ptr, DS_ptr,
+    TK: tl.constexpr, I: tl.constexpr,
+    stride_dy_row: tl.constexpr,
+    stride_zfp8_row: tl.constexpr,
+    stride_zscale_row: tl.constexpr,
+    stride_dz_row: tl.constexpr,
+    stride_y1s_row: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_I: tl.constexpr,
+):
+    """Fused dequantize(z_fp8) + SwiGLU backward + router score weighting.
+
+    Reads z in FP8 + E8M0 scales, dequantizes on-the-fly, computes dSwiGLU.
+    Eliminates the bf16 z materialization (saves TK*2I*2 bytes DRAM + 1 kernel).
+    Also strictly more precise: fp8→f32 directly (no bf16 roundtrip).
+    """
+    row = tl.program_id(0)
+    dy_base = DY1_ptr + row * stride_dy_row
+    zfp8_base = Z_FP8_ptr + row * stride_zfp8_row
+    zscale_base = Z_SCALE_ptr + row * stride_zscale_row
+    dz_base = DZ_ptr + row * stride_dz_row
+    y1s_base = Y1S_ptr + row * stride_y1s_row
+
+    s_val = tl.load(S_ptr + row).to(tl.float32)
+    ds_acc = 0.0
+
+    HALF_GROUP: tl.constexpr = GROUP_SIZE // 2
+
+    for j_start in tl.range(0, I, BLOCK_I):
+        j_offs = j_start + tl.arange(0, BLOCK_I)
+        mask = j_offs < I
+
+        # Load z_fp8 (stride-2 gather: gate at even, up at odd columns)
+        gate_fp8 = tl.load(zfp8_base + j_offs * 2, mask=mask)
+        up_fp8 = tl.load(zfp8_base + j_offs * 2 + 1, mask=mask)
+
+        # Load per-group E8M0 scales: group_idx = j // 16
+        # (each group of 32 z columns = 16 (gate,up) pairs shares one scale)
+        scale_idx = j_offs // HALF_GROUP
+        scales_e8m0 = tl.load(zscale_base + scale_idx, mask=mask)
+        scale_f32 = (scales_e8m0.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+
+        # Dequantize fp8 → f32 (skip bf16 intermediate for better precision)
+        gate = gate_fp8.to(tl.float32) * scale_f32
+        up = up_fp8.to(tl.float32) * scale_f32
+
+        dy1_val = tl.load(dy_base + j_offs, mask=mask).to(tl.float32)
+
+        # Forward recomputation
+        sig = tl.sigmoid(gate)
+        silu_gate = gate * sig
+        y1 = silu_gate * up
+
+        # ds accumulation (before s weighting)
+        ds_acc = ds_acc + tl.sum(dy1_val * y1, axis=0)
+
+        # Apply router score to gradient
+        dy1_s = dy1_val * s_val
+
+        # Backward SwiGLU
+        d_up = dy1_s * silu_gate
+        d_gate = dy1_s * up * sig * (1.0 + gate * (1.0 - sig))
+
+        # Store dz interleaved (bf16)
+        tl.store(dz_base + j_offs * 2, d_gate.to(tl.bfloat16), mask=mask)
+        tl.store(dz_base + j_offs * 2 + 1, d_up.to(tl.bfloat16), mask=mask)
+
+        # y1s = y1 * s (for weight grad)
+        y1s_out = y1 * s_val
+        tl.store(y1s_base + j_offs, y1s_out.to(tl.bfloat16), mask=mask)
+
+    tl.store(DS_ptr + row, ds_acc)
+
+
+def swiglu_backward_from_fp8_triton(
+    dy1: torch.Tensor,
+    z_fp8: torch.Tensor,
+    z_scales_u8: torch.Tensor,
+    s: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused dequantize(z_fp8) + SwiGLU backward.
+
+    Equivalent to:
+        z = dequantize_blockscaled_fp8(z_fp8, z_scales_u8)
+        dz, y1s, ds = swiglu_backward_triton(dy1, z, s)
+    but avoids materializing bf16 z entirely (saves DRAM + 1 kernel launch).
+
+    Args:
+        dy1:         (TK, I) bf16 — gradient w.r.t. post-activation y1
+        z_fp8:       (TK, 2I) float8_e4m3fn — FP8 pre-activation
+        z_scales_u8: (TK, 2I/32) uint8 — E8M0 scale per group of 32
+        s:           (TK,) — router scores
+
+    Returns:
+        dz:  (TK, 2I) bf16 — gradient w.r.t. pre-activation
+        y1s: (TK, I) bf16 — SwiGLU(z) * s (for weight grad)
+        ds:  (TK,) f32 — gradient w.r.t. router scores
+    """
+    TK, I = dy1.shape
+    assert z_fp8.shape == (TK, 2 * I), f"z_fp8 shape {z_fp8.shape} != ({TK}, {2*I})"
+    assert z_scales_u8.shape == (TK, 2 * I // _GROUP_SIZE)
+
+    dz = torch.empty(TK, 2 * I, dtype=torch.bfloat16, device=dy1.device)
+    y1s = torch.empty(TK, I, dtype=torch.bfloat16, device=dy1.device)
+    ds = torch.empty(TK, dtype=torch.float32, device=dy1.device)
+
+    BLOCK_I = min(1024, triton.next_power_of_2(I))
+
+    _swiglu_bwd_from_fp8_kernel[(TK,)](
+        dy1, z_fp8, z_scales_u8, s,
+        dz, y1s, ds,
+        TK, I,
+        dy1.stride(0),
+        z_fp8.stride(0),
+        z_scales_u8.stride(0),
+        dz.stride(0),
+        y1s.stride(0),
+        GROUP_SIZE=_GROUP_SIZE,
         BLOCK_I=BLOCK_I,
     )
     return dz, y1s, ds
