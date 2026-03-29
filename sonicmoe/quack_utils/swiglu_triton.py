@@ -382,7 +382,7 @@ def swiglu_forward_quant_pack_triton(
         (1, per_batch_storage), 127, dtype=torch.uint8, device=z.device
     )
 
-    BLOCK_ROWS = 8
+    BLOCK_ROWS = 2  # Optimal at production shape: 22 regs, 256 blocks for 160 SMs
     grid = (_div_up(TK, BLOCK_ROWS),)
     _swiglu_fwd_quant_pack_kernel[grid](
         z, y1_fp8, packed_scales,
@@ -436,7 +436,7 @@ def swiglu_forward_quant_pack_zsave_triton(
     z_fp8 = torch.empty(TK, two_I, dtype=torch.float8_e4m3fn, device=z.device)
     z_scales = torch.empty(TK, num_z_groups, dtype=torch.uint8, device=z.device)
 
-    BLOCK_ROWS = 8
+    BLOCK_ROWS = 2  # 40 regs/thread → small BR for better wave distribution
     grid = (_div_up(TK, BLOCK_ROWS),)
     _swiglu_fwd_quant_pack_zsave_kernel[grid](
         z, y1_fp8, packed_scales, z_fp8, z_scales,
