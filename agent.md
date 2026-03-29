@@ -1,70 +1,44 @@
-# Control Plane Migration Context
+# SonicMoE FP8 Agent Handoff Context
 
-This file is the handoff context for a new A0 that needs to keep evolving the external `warp` FP8 control plane without reconstructing prior intent from scratch.
+This file provides cold-start context for any agent continuing the blockscaled FP8 optimization work.
 
-## Current Role
+## Read First
 
-- The control plane is the operator-facing runtime for backlog-aware multi-agent execution.
-- A0 is expected to behave as scheduler of record, not just a process launcher.
-- High-frequency commands are `serve`, `up`, `stop-agents`, `silent`, and `stop-all`.
+1. `reports/fp8_upgrade/HANDOFF.md` — Full project status, insights, and next steps
+2. `README.md` § "FP8 Blockscaled Status" — Quick overview
+3. `sonicmoe/quack_utils/gemm_gated.py` — Fused GEMM+SwiGLU (rewritten for quack 0.3.7)
+4. `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` — Core blockscaled FP8 infrastructure
+5. `sonicmoe/functional/__init__.py` — MoE forward/backward dispatch (lines 460-500 for FP8 forward)
 
-## Current Architecture
+## Current Blocker
 
-- Standalone repo location is expected at sibling path `../warp` unless `WARP_ROOT` overrides it.
-- Backend runtime: `../warp/runtime/control_plane.py`
-- Frontend source: `../warp/runtime/web/src`
-- Served frontend assets: `../warp/runtime/web/static`
-- Primary regression suite: `../warp/runtime/test_control_plane_integration.py`
+**TileStore + blockscaled FP8 = illegal instruction on sm_100a.**
 
-## Design Decisions To Preserve
+The decomposed path (GemmDefaultSm100, no TileStore) works perfectly after fixing `create_varlen_args`.
+Any kernel using `TileStore` epilogue op + `sf_vec_size=32` crashes.
+This blocks fused GEMM+SwiGLU which is essential for beating BF16 performance.
 
-- Settings are structured forms, not YAML-primary UX.
-- Shared config belongs in `worker_defaults`; per-worker cards should stay sparse.
-- A0 plan should be shown as the default derived state; manual overrides are exceptional and should be easy to reset.
-- `task_policies` plus backlog `task_type` metadata own task-aware routing and test-command selection.
-- `project.reference_workspace_root`, `project.reference_inputs`, and `project.prompt_context_files` replaced older task-specific reference fields.
-- Session targeting depends on per-port files like `session_state_<port>.json`; do not regress this.
+## Environment
 
-## Stability Fixes Already Landed
+```bash
+source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate
+cd /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe
+# Packages: quack-kernels==0.3.7, nvidia-cutlass-dsl==4.4.2, torch==2.9.1+cu128
+# GPU: 8x B200 (sm_100a), 183GB each, ~50GB free per GPU, all at 100% util
+# NCU profiling still possible despite GPU utilization
+```
 
-- Unknown `/api/*` routes return JSON 404 payloads instead of HTML error pages.
-- Frontend API parsing now reports request path plus non-JSON response snippets for easier diagnosis.
-- `stop-all` no longer kills the control-plane server via process-group termination; it terminates the listener PID directly while still using process-tree shutdown for worker jobs.
-- Settings save flow rehydrates from server state after section saves.
-- Worker defaults are split into common defaults and advanced defaults.
-- Worker cards expose `Reset to A0` so derived plan values can take over again.
+## Key API Facts (quack 0.3.7)
 
-## Regression Coverage That Exists Now
+- `GemmWrapperBase.create_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)` — 3 args only
+- `GemmWrapperBase.create_scheduler_args(max_active_clusters, ...)` — returns `TileSchedulerOptions`
+- `@mlir_namedtuple` replaces `ArgumentsBase` for `EpilogueArguments`
+- `_epi_ops` tuple defines composable epilogue: `TileStore`, `ColVecReduce`, `Scalar`, `RowVecLoad`, etc.
+- `mark_layout_dynamic(leading_dim=X)` requires `strides[X]==1` — use `.contiguous()` when needed
 
-The integration suite currently covers:
+## Immediate Priority
 
-- project section validate/save through `/api/config/validate-section` and `/api/config/section`
-- unknown API routes returning JSON 404 bodies
-- `stop-agents` stopping workers while leaving the listener alive
-- `silent` releasing the listener while preserving worker processes
-- `stop-all` fully reclaiming the listener and shutting down the runtime cleanly
-- launch policy behavior and multi-agent heartbeat/runtime transitions across `initial_copilot`, `selected_model`, and `elastic`
-
-## Commands To Trust During Maintenance
-
-- `python3 -m py_compile ../warp/runtime/control_plane.py ../warp/runtime/test_control_plane_integration.py`
-- `python3 ../warp/runtime/test_control_plane_integration.py`
-- `cd ../warp/runtime/web && npm run build`
-
-## Maintenance Heuristics
-
-- Prefer fewer operator inputs over more flexible but repetitive configuration.
-- If a value can be inferred safely, let A0 derive it and preserve an override path.
-- Keep docs, frontend labels, and backend behavior synchronized in the same change.
-- Validate lifecycle changes against real process behavior, not just static logic inspection.
-- When touching launch/stop behavior, think in terms of worker process trees versus listener PID scope.
-
-## Likely Next Tests Worth Adding
-
-- detached `serve`/`up` lifecycle with session recovery
-- degraded provider paths such as missing API keys or missing binaries
-- section-save coverage for `worker_defaults` and `workers` if UI logic changes there again
-
-## Delivery Convention
-
-- Default remote target for this repo is `origin main`.
+1. Fix `TileStore` + blockscaled interaction (P0)
+2. Fix `gemm_dgated.py` `BFloat16.__c_pointers__` pickle error (P0.5)
+3. Contract tests 8/8 pass (P1)
+4. NCU profiling FP8 vs BF16 (P2)

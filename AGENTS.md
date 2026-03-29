@@ -1,85 +1,62 @@
-# Control Plane Agent Context
+# SonicMoE Agent Context
 
-Use this as the cold-start context for any new agent working on the external `warp` control plane paired with this repository.
-For migration-oriented handoff context and recent runtime/testing decisions, also read `agent.md` at the repository root.
+Use this as cold-start context for any new agent working on the SonicMoE FP8 blockscaled optimization.
+For detailed handoff context and debugging history, read `agent.md` and `reports/fp8_upgrade/HANDOFF.md`.
 
 ## Scope
 
-- The FP8 control plane is the operator-facing runtime and dashboard for worker launch, stop, validation, backlog visibility, provider routing, and manager-owned merge flow.
-- Standalone repo location is expected at sibling path `../warp` unless `WARP_ROOT` overrides it.
-- Backend entry: `../warp/runtime/control_plane.py`.
-- Frontend source: `../warp/runtime/web/src`.
-- Frontend build output served in production: `../warp/runtime/web/static`.
-- Live integration test: `../warp/runtime/test_control_plane_integration.py`.
+- Full-chain blockscaled FP8 (1×32 UE8M0) MoE training on Blackwell (sm_100a)
+- Goal: fused GEMM+SwiGLU kernel with blockscaled FP8, performance far exceeding BF16 baseline
+- Key files: `sonicmoe/quack_utils/gemm_gated.py`, `blockscaled_fp8_gemm.py`, `functional/__init__.py`
 
-## Non-Negotiable Workflow Decisions
+## Non-Negotiable
 
-- Keep the high-frequency path minimal and reliable.
-- Do not drift back to dry-run-heavy, bootstrap-heavy, or YAML-primary UX unless explicitly requested.
-- `serve`, `up`, `stop-agents`, `silent`, and `stop-all` are the main operating commands and should stay easy to trust.
-- Structured settings forms replaced the old raw-YAML-first flow on purpose.
-- Shared worker config belongs in top-level `worker_defaults`; per-worker cards should stay lean by default.
-- Resource pools should use horizontal space efficiently; avoid tall sparse layouts.
-- Settings should support section-scoped validate/save so one block can change without revalidating everything.
-- Worktree paths should be auto-derived when safe, then overridable.
-- Worker roster logic should reflect real plan/runtime state, not stale sample entries.
-- A0 is the scheduler, not just a launcher. The control plane should infer task-aware worker defaults, route workers dynamically, and ask the user only for hard blockers it cannot safely resolve.
-- Stop behavior depends on per-port session files like `session_state_<port>.json`; do not regress that targeting model.
+- Follow sonic-moe's fusion philosophy: fused operators only, decomposed path is fallback only
+- Do not compromise on precision or performance for complexity reasons
+- All FP8 paths must maintain <10% RelRMSE, >0.99 correlation vs BF16
+- Use native CUTLASS/QuACK GEMM path, not Triton `tl.dot_scaled` (broken on sm_100a)
 
-## User Preferences
+## Architecture
 
-- Simplest reliable path first; advanced options later.
-- Optimize for repeated operator use, not abstract flexibility.
-- Prefer workflow improvements over cosmetic-only changes.
-- Prefer automatic defaults over repetitive manual entry.
-- Push human input down to API keys, local paths, and true policy decisions; A0 should absorb routine worker initialization and routing decisions.
-- Keep override power, but hide infrequent knobs behind advanced sections.
-- Avoid large blank areas; use horizontal space well without making laptop layouts fragile.
-- Keep UI labels, comments, README guidance, and runtime behavior aligned.
-- When workflow changes, update docs in the same pass.
+- QuACK (quack-kernels 0.3.7) wraps CUTLASS DSL (nvidia-cutlass-dsl 4.4.2) for Blackwell SM100
+- `GemmGatedSm100` = fused GEMM+SwiGLU with composable epilogue (`TileStore` + `_halve_epi_tile`)
+- `GemmDefaultSm100` = plain GEMM (decomposed fallback, currently working with blockscaled)
+- Blockscaled FP8 uses ISA-packed E8M0 scales with `sf_vec_size=32`
+- Weight layout: interleaved gate/value columns `[g0, v0, g1, v1, ...]`
 
-## Architecture Facts
+## Environment
 
-- Config supports top-level `worker_defaults`, merged into each worker for validation and launch.
-- Runtime now derives task-aware branch names, test commands, and resource-pool recommendations/locks from explicit backlog `task_type` metadata plus config-driven `task_policies`, not backend keyword matching.
-- Backlog/runtime files are part of the planning model. Use `../warp/state/backlog.yaml` and `../warp/state/agent_runtime.yaml` when deriving or syncing worker roster.
-- Provider-quality history is part of live scheduling. Preserve and use persisted quality signals instead of treating every restart like a blank slate.
-- Project-level shared references should flow through `project.reference_workspace_root`, `project.reference_inputs`, and `project.prompt_context_files` instead of task-specific field names in the runtime.
-- Missing-but-plausible worktree paths are acceptable if runtime can create the worktree at launch time.
-- Default deployment assumption is a Hopper/Blackwell Linux machine with a provisioned SonicMoE environment; the `uv --no-project` path is fallback only.
-- SonicMoE public path is still BF16-first; FP8 work is integration-heavy, and QuACK / Blackwell paths already exist behind `USE_QUACK_GEMM`.
+```bash
+source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate
+cd /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe
+# See /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/env.md for cluster details
+```
 
-## Default Implementation Heuristics
+## Validation
 
-- First decide whether a new setting belongs in `project`, `worker_defaults`, or a per-worker override.
-- If a value can be inferred safely, auto-fill it and leave override room instead of forcing manual entry.
-- Prefer A0-managed defaults for task ID, branch, worktree path, test command, and default resource-pool routing.
-- Keep worker cards focused on identity, routing, and common controls; treat env/test/sync/submit/git overrides as advanced.
-- When a task type strongly matches a provider, encode that in `task_policies` or backlog `task_type` data and let A0 lock that pool by default if availability and quality signals support it.
-- Preserve the merge model between defaults and workers in both validation and launch.
-- If docs mention commands, lead with the high-frequency path and move optional flags later.
+```bash
+# Contract tests
+CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
+  python -m pytest tests/fp8_large_project_contract_test.py -v -k "not large_shape"
+
+# Quick decomposed FP8 GEMM smoke test
+CUDA_VISIBLE_DEVICES=0 python -c "
+from sonicmoe.quack_utils.blockscaled_fp8_gemm import blockscaled_fp8_gemm_varlen
+from sonicmoe.functional.fp8_protocol import FP8Protocol
+import torch
+E,K,N = 8,1024,2048; tpe=64; T=E*tpe
+a = torch.randn(T,K,device='cuda',dtype=torch.bfloat16)
+w = torch.randn(N,K,E,device='cuda',dtype=torch.bfloat16)
+cu = torch.arange(0,T+1,tpe,device='cuda',dtype=torch.int32)
+out = blockscaled_fp8_gemm_varlen(a,w,cu,protocol=FP8Protocol())
+torch.cuda.synchronize(); print('OK', out.shape)
+"
+```
 
 ## Read First
 
-- `../warp/README.md`
-- `../warp/governance/worker_launch_playbook.md`
-- `../warp/governance/control_plane_playbook.md`
-- `../warp/runtime/control_plane.py`
-- `../warp/runtime/config_template.yaml`
-- `../warp/runtime/web/src/App.tsx`
-- `../warp/runtime/web/src/api.ts`
-- `../warp/runtime/web/src/types.ts`
-- `../warp/runtime/web/src/styles.css`
-
-## Validation Expectations
-
-- For backend changes, run Python compile checks on touched runtime/test files when feasible.
-- For frontend changes, rebuild `../warp/runtime/web` and keep `runtime/web/static` in sync.
-- For meaningful workflow changes, run the live control-plane integration test when feasible.
-- If pre-commit reformats files, restage and continue.
-
-## Operating Principle
-
-- Reconstruct workflow intent before changing behavior.
-- Prefer root-cause workflow fixes over cosmetic patches.
-- Optimize for fewer steps, fewer repeated fields, fewer stale docs, and fewer surprises.
+1. `reports/fp8_upgrade/HANDOFF.md` — Complete status and debugging history
+2. `agent.md` — Quick handoff context
+3. `sonicmoe/quack_utils/gemm_gated.py` — Fused forward kernel
+4. `sonicmoe/quack_utils/gemm_dgated.py` — Fused backward kernel
+5. `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` — Core FP8 infrastructure

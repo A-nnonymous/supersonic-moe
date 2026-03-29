@@ -2,36 +2,31 @@
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
 
-import operator
-from dataclasses import dataclass
 from functools import partial
-from typing import Callable, Optional, Tuple, Type
+from typing import Callable, NamedTuple, Optional
 
 import cutlass
 import cutlass.cute as cute
 import cutlass.torch as cutlass_torch
-import cutlass.utils.blackwell_helpers as sm100_utils
 import quack.activation
 import quack.layout_utils as layout_utils
-import quack.sm90_utils as sm90_utils
 import quack.utils as utils
 import torch
 from cutlass import Float32, Int32, const_expr
 from cutlass.cute.runtime import from_dlpack
 from quack.cute_dsl_utils import (
-    ArgumentsBase,
     ParamsBase,
     get_device_capacity,
     get_max_active_clusters,
+    mlir_namedtuple,
     torch2cute_dtype_map,
 )
+from quack.epi_ops import ColVecReduce, TileStore
 from quack.gemm_act import GemmActMixin
 from quack.gemm_default_epi import GemmDefaultEpiMixin
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
 from quack.gemm_wrapper_utils import GemmWrapperBase
-from quack.sm90_utils import partition_for_epilogue
-from quack.varlen_utils import VarlenManager
 from torch import Tensor
 
 
@@ -63,135 +58,44 @@ def _make_cute_tensor_dynamic(tensor: Tensor, leading_dim: int) -> cute.Tensor:
 class GemmDGatedMixin(GemmActMixin):
     # Different from GemmActMixin, here act_bwd_fn must take in 3 arguments (x, y, dout)
     # and return 3 arguments (dx, dy, out)
-    @dataclass
-    class EpilogueArguments(ArgumentsBase):
+    _epi_ops = (*GemmDefaultEpiMixin._epi_ops, TileStore("mPostAct"), ColVecReduce("mColVecReduce"))
+    _extra_param_fields = (
+        ("act_bwd_fn", cutlass.Constexpr, None),
+        ("implicit_dtype", cutlass.Constexpr, None),
+    )
+
+    @mlir_namedtuple
+    class EpilogueArguments(NamedTuple):
         mPostAct: cute.Tensor
-        act_bwd_fn: cutlass.Constexpr[Callable]
-        implicit_dtype: Type[cutlass.Numeric] = cute.BFloat16
-        # We don't use alpha, beta, mRowVecBroadcast for now
+        act_bwd_fn: cutlass.Constexpr[Callable] = None
+        implicit_dtype: cutlass.Constexpr[type] = cutlass.BFloat16
         alpha: Optional[Float32 | cute.Tensor] = None
         beta: Optional[Float32 | cute.Tensor] = None
         mRowVecBroadcast: Optional[cute.Tensor] = None
         mColVecBroadcast: Optional[cute.Tensor] = None
         mColVecReduce: Optional[cute.Tensor] = None
+        rounding_mode: cutlass.Constexpr[int] = 0  # RoundingMode.RN
+        sr_seed: Optional[Int32 | cute.Tensor] = None
 
-    @dataclass
-    class EpilogueParams(ParamsBase):
-        tma_atom_postact: cute.CopyAtom
-        mPostAct_mnl: cute.Tensor
-        epi_postact_smem_layout_staged: cute.ComposedLayout
-        epi_tile_postact: cute.Tile
-        act_bwd_fn: cutlass.Constexpr[Callable]
-        implicit_dtype: Type[cutlass.Numeric]
-        alpha: Optional[Float32 | cute.Tensor] = None
-        beta: Optional[Float32 | cute.Tensor] = None
-        mRowVecBroadcast: Optional[cute.Tensor] = None
-        mColVecBroadcast: Optional[cute.Tensor] = None
-        mColVecReduce: Optional[cute.Tensor] = None
+    # EpilogueParams auto-generated from _epi_ops + _extra_param_fields
 
-    def epi_to_underlying_arguments(self, args: EpilogueArguments, *, loc=None, ip=None) -> EpilogueParams:
+    def epi_to_underlying_arguments(self, args, *, loc=None, ip=None):
+        self.rounding_mode = getattr(args, "rounding_mode", 0)
         self.postact_dtype = args.mPostAct.element_type
         self.postact_layout = cutlass.utils.LayoutEnum.from_tensor(args.mPostAct)
-        # C and D are implicitly 2 16-bit elements packed into 32 bits, simply for the purpose
-        # for reusing the existing load/store code.
         assert args.implicit_dtype.width == 16, "GemmDGated only supports 16bit for now"
         assert self.d_dtype.width == 32, "D storage type must be 32 bit"
         assert self.c_dtype.width == 32, "C storage type must be 32 bit"
-
         self.cta_tile_shape_postact_mn = self.cta_tile_shape_mnk[:2]
-        epi_tile_postact = self.epi_tile
-        utils_cls = sm100_utils if self.arch == 100 else sm90_utils
-        epi_postact_smem_layout_staged = utils_cls.make_smem_layout_epi(
-            self.postact_dtype, self.postact_layout, epi_tile_postact, self.epi_stage
-        )
-        tma_atom_postact, tma_tensor_postact = self._make_tma_epi_atoms_and_tensors(
-            args.mPostAct,
-            epi_postact_smem_layout_staged,
-            epi_tile_postact,
-            op_type="store",
-        )
-        # Assume all strides are divisible by 32 bits except the last stride
-        new_stride = lambda t: tuple(
-            cute.assume(s, divby=32 // t.element_type.width) if not cute.is_static(s) else s for s in t.stride
-        )
-        mRowVecBroadcast, mColVecBroadcast, mColVecReduce = [
-            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t))) if t is not None else None
-            for t in (args.mRowVecBroadcast, args.mColVecBroadcast, args.mColVecReduce)
-        ]
-        return self.EpilogueParams(
-            tma_atom_postact,
-            tma_tensor_postact,
-            epi_postact_smem_layout_staged,
-            epi_tile_postact,
-            args.act_bwd_fn,
-            args.implicit_dtype,
-            alpha=args.alpha,
-            beta=args.beta,
-            mRowVecBroadcast=mRowVecBroadcast,
-            mColVecBroadcast=mColVecBroadcast,
-            mColVecReduce=mColVecReduce,
-        )
+        d = self._epi_ops_to_params_dict(args)
+        d["act_bwd_fn"] = args.act_bwd_fn
+        d["implicit_dtype"] = args.implicit_dtype
+        return self.EpilogueParams(**d)
 
     @cute.jit
-    def epi_begin(
-        self,
-        params: EpilogueParams,
-        epi_smem_tensors: Tuple[cute.Tensor, ...],
-        epi_tile: cute.Tile,
-        tiled_copy_t2r: Optional[cute.TiledCopy],
-        tiled_copy_r2s: cute.TiledCopy,
-        tile_coord_mnkl: cute.Coord,
-        varlen_manager: VarlenManager,
-        epilogue_barrier: cutlass.pipeline.NamedBarrier,
-        tidx: Int32,
-    ) -> Tuple[cute.Tensor, ...]:
-        epi_tensors = GemmDefaultEpiMixin.epi_begin(
-            self,
-            params,
-            epi_smem_tensors,
-            epi_tile,
-            tiled_copy_t2r,
-            tiled_copy_r2s,
-            tile_coord_mnkl,
-            varlen_manager,
-            epilogue_barrier,
-            tidx,
-        )
-        partition_for_epilogue_fn = partial(
-            partition_for_epilogue,
-            epi_tile=epi_tile,
-            tiled_copy=tiled_copy_t2r if tiled_copy_t2r is not None else tiled_copy_r2s,
-            tidx=tidx,
-            reference_src=tiled_copy_t2r is None,
-        )
-        tDrColVecReduce = None
-        if const_expr(params.mColVecReduce is not None):
-            colvec_mma_layout = cute.make_layout(self.cta_tile_shape_mnk[:2], stride=(1, 0))
-            tDrColVec_layout = partition_for_epilogue_fn(cute.make_rmem_tensor(colvec_mma_layout, Float32)).layout
-            tDrColVecReduce = cute.make_rmem_tensor(tDrColVec_layout, Float32)
-            cute.filter_zeros(tDrColVecReduce).fill(0.0)
-        return (*epi_tensors, tDrColVecReduce)
-
-    def epi_begin_loop(self, params: EpilogueParams, epi_tensors, epi_coord: cute.Coord):
-        epi_tensors, tDrColVecReduce = epi_tensors[:-1], epi_tensors[-1]
-        epi_loop_tensors = super().epi_begin_loop(params, epi_tensors, epi_coord)
-        tDrColVecReduce_cur = None
-        if const_expr(tDrColVecReduce is not None):
-            tDrColVecReduce_cur = cute.group_modes(tDrColVecReduce, 3, cute.rank(tDrColVecReduce))[
-                None, None, None, epi_coord
-            ]
-        return (*epi_loop_tensors, tDrColVecReduce_cur)
-
-    @cute.jit
-    def epi_visit_subtile(
-        self,
-        params: EpilogueParams,
-        epi_loop_tensors: Tuple[cute.Tensor, ...],
-        tRS_rD: cute.Tensor,
-        tRS_rC: Optional[cute.Tensor] = None,
-    ) -> Optional[cute.Tensor]:
-        alpha, beta, tDrRowVec, tDrColVec, tDrColVecReduce = epi_loop_tensors
-        assert alpha is None and beta is None and tDrRowVec is None  # We don't use these for now
+    def epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None):
+        tDrColVec = epi_loop_tensors["mColVecBroadcast"]
+        tDrColVecReduce = epi_loop_tensors["mColVecReduce"]
         assert tRS_rC is not None
         implicit_dtype = params.implicit_dtype
         assert implicit_dtype.width == 16, "GemmDGatedMixin only supports 16bit for now"
@@ -270,65 +174,12 @@ class GemmDGatedMixin(GemmActMixin):
                             (tRS_rOut_mn[m, 2 * n], tRS_rOut_mn[m, 2 * n + 1]),
                             (tDrColVec_mn[m, 0], tDrColVec_mn[m, 0]),
                         )
-        # Type conversion
+        # Write dXY (packed f16x2 as f32) back to D
         tRS_rdXY_f16x2 = cute.make_rmem_tensor(tRS_rdXY_f32x2.layout, implicit_dtype)
         tRS_rdXY_f16x2.store(tRS_rdXY_f32x2.load().to(implicit_dtype))
         tRS_rD.store(cute.recast_tensor(tRS_rdXY_f16x2, Float32).load())
-        tRS_rOut_cvt = cute.make_rmem_tensor_like(tRS_rOut, self.postact_dtype)
-        tRS_rOut_cvt.store(tRS_rOut.load().to(self.postact_dtype))
-        return tRS_rOut_cvt
-
-    @cute.jit
-    def epi_end(
-        self,
-        params: EpilogueParams,
-        epi_tensors: Tuple[cute.Tensor, ...],
-        epi_tile: cute.Tile,
-        tiled_copy_t2r: Optional[cute.TiledCopy],
-        tiled_copy_r2s: cute.TiledCopy,
-        tile_coord_mnkl: cute.Coord,
-        varlen_manager: VarlenManager,
-        tidx: Int32,
-    ) -> None:
-        partition_for_epilogue_fn = partial(
-            partition_for_epilogue,
-            epi_tile=epi_tile,
-            tiled_copy=tiled_copy_t2r if tiled_copy_t2r is not None else tiled_copy_r2s,
-            tidx=tidx,
-            reference_src=tiled_copy_t2r is None,
-        )
-        tDrColVecReduce = epi_tensors[-1]
-        tile_M, tile_N = self.cta_tile_shape_mnk[:2]
-        if const_expr(params.mColVecReduce is not None):
-            tDrCVR_flt = cute.filter_zeros(tDrColVecReduce)
-            if const_expr(self.arch != 100):
-                for i in cutlass.range(cute.size(tDrCVR_flt), unroll_full=True):
-                    tDrCVR_flt[i] = cute.arch.warp_reduction(tDrCVR_flt[i], operator.add, threads_in_group=4)
-            else:
-                # Don't need warp_reduce since we load from tmem with one thread per row
-                assert self.d_layout.is_n_major_c(), "GemmDGated only supports n-major output for now"
-            batch_idx = tile_coord_mnkl[3]
-            limit_n = params.mColVecReduce.shape[2] if not varlen_manager.varlen_m else params.mColVecReduce.shape[1]
-            if tile_coord_mnkl[1] < limit_n:
-                if const_expr(not varlen_manager.varlen_m):
-                    mColVec = params.mColVecReduce[batch_idx, None, tile_coord_mnkl[1]]
-                else:
-                    mColVec = cute.domain_offset(
-                        (varlen_manager.params.cu_seqlens_m[batch_idx],),
-                        params.mColVecReduce[None, tile_coord_mnkl[1]],
-                    )
-                gColVec = cute.local_tile(mColVec, (tile_M,), (tile_coord_mnkl[0],))
-                limit_m = min(varlen_manager.len_m(batch_idx) - tile_coord_mnkl[0] * tile_M, tile_M)
-                tDcCV = partition_for_epilogue_fn(cute.make_identity_tensor((tile_M, tile_N)))
-                tDrColVecReduce_m = layout_utils.convert_layout_zero_stride(tDrColVecReduce, tDrColVecReduce.layout)[
-                    None, 0
-                ]
-                tDcCV_m = layout_utils.convert_layout_zero_stride(tDcCV, tDrColVecReduce.layout)[None, 0]
-                if tDcCV_m[0][1] == 0:
-                    for m in cutlass.range(cute.size(tDcCV_m, mode=[0])):
-                        row_idx = tDcCV_m[m][0]
-                        if row_idx < limit_m:
-                            gColVec[row_idx] = tDrColVecReduce_m[m]
+        # Return PostAct in acc_dtype; conversion happens in epi_convert_postact
+        return tRS_rOut
 
 
 class GemmDGatedSm90(GemmDGatedMixin, GemmSm90):
@@ -474,11 +325,6 @@ def gemm_dgated(
         cu_seqlens_m,
         None,  # cu_seqlens_k
         A_idx,
-        max_active_clusters,
-        cluster_shape_mnk,
-        tensor_infos,
-        GemmCls.num_epi_tensormaps,
-        pingpong,
     )
 
     current_stream = cutlass_torch.current_stream()

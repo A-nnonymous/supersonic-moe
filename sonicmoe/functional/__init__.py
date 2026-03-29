@@ -466,25 +466,26 @@ class _UpProjection(torch.autograd.Function):
             assert not torch.compiler.is_compiling()
             assert is_glu_activation, "QuACK GEMM does not support non GLU activation yet"
             if _fp8_enabled():
-                # Blockscaled FP8 up-proj: non-gated GEMM + manual SwiGLU.
-                # GemmGatedSm100 with blockscaled FP8 is broken in CUTLASS DSL
-                # (illegal instruction / zero output), so we decompose into
-                # a working GemmDefaultSm100 varlen GEMM + separate activation.
-                # Activations stay bf16 (function quantizes internally) to avoid
-                # padding-path dequantization issues; weights are pre-quantized & cached.
+                # Fused blockscaled FP8 up-proj: GEMM + SwiGLU in single CUTLASS kernel.
+                # Pre-gather + quantize activation, then pass to fused gemm_gated
+                # which handles both matmul and gated activation in one kernel launch.
                 _evict_per_tensor_caches_once()
                 x_gathered = x[x_gather_idx]  # (TK, H) expert-sorted
-                w1_fp8, w1_scales = precompute_weight_fp8(w1)
-                z = blockscaled_fp8_gemm_varlen(
-                    x_gathered, w1, expert_frequency_offset,
-                    w_fp8=w1_fp8, w_scales=w1_scales,
+                x_fp8, x_scales = quantize_and_pack_activation_varlen(
+                    x_gathered, expert_frequency_offset
+                )
+                w1_fp8, w1_scales = precompute_weight_fp8_for_fused_gated(w1)
+                z, y1 = gemm_gated(
+                    x_fp8,
+                    w1_fp8,
+                    activation="swiglu",
+                    cu_seqlens_m=expert_frequency_offset,
                     out_dtype=torch.bfloat16,
-                )  # (TK, 2I) bf16 pre-activation — interleaved [gate0,val0,gate1,val1,...]
-                gate = z[:, 0::2]   # even cols = gate (QuACK weight layout)
-                value = z[:, 1::2]  # odd cols = value
-                y1 = F.silu(gate) * value  # (TK, I)
-                if use_low_precision_postact_buffer:
-                    y1 = y1.to(torch.float8_e4m3fn)
+                    postact_dtype=(torch.float8_e4m3fn if use_low_precision_postact_buffer else torch.bfloat16),
+                    dynamic_scheduler=False,
+                    a_scales=x_scales,
+                    b_scales=w1_scales,
+                )
             else:
                 z, y1 = gemm_gated(
                     x,
@@ -785,44 +786,28 @@ class _DownProjection(torch.autograd.Function):
 
             s = topk_scores[s_scatter_idx]
             if _fp8_enabled():
-                # Decomposed FP8 backward: non-gated GEMM + manual SwiGLU backward.
-                # GemmDgatedSm100 with blockscaled FP8 is broken in CUTLASS DSL,
-                # so we decompose into working GemmDefaultSm100 + manual epilogue.
-
-                # Step 1: FP8 GEMM — dout_gathered × w2^T → (TK, I)
+                # Fused blockscaled FP8 backward: GEMM + dSwiGLU in single CUTLASS kernel.
+                # Pre-gather + quantize dout, then pass to fused gemm_dgated which
+                # computes matmul, backward activation, and router gradient in one launch.
                 dout_gathered = dout[x_gather_idx]  # (TK, H)
-                # w2 is (H, I, E); for GEMM output (TK, I) need (I, H, E)
-                w2_perm = w2.permute(1, 0, 2)
-                w2_perm_fp8, w2_perm_scales = precompute_weight_fp8(w2_perm)
-                dy = blockscaled_fp8_gemm_varlen(
-                    dout_gathered, w2_perm, expert_frequency_offset,
-                    w_fp8=w2_perm_fp8, w_scales=w2_perm_scales,
-                    out_dtype=torch.bfloat16,
-                )  # (TK, I)
+                dout_fp8, dout_scales = quantize_and_pack_activation_varlen(
+                    dout_gathered, expert_frequency_offset
+                )
                 del dout_gathered
-
-                # Step 2: SwiGLU forward for post-activation and router gradient
-                # z has interleaved columns: [gate0,val0,gate1,val1,...] (QuACK weight layout)
-                gate = z[:, 0::2]   # even cols = gate
-                value = z[:, 1::2]  # odd cols = value
-                sig = torch.sigmoid(gate.float())
-                silu_gate = gate.float() * sig
-                y1_forward = (silu_gate * value.float()).to(z.dtype)  # (TK, I)
-
-                # Step 3: Router score gradient (using UNscaled dy, per CUTLASS epilogue)
-                ds = (y1_forward.float() * dy.float()).sum(dim=-1)  # (TK,)
-
-                # Step 4: Scale GEMM output by router weight, then SwiGLU backward
-                s_f = s.float().unsqueeze(-1)
-                dy_scaled = dy.float() * s_f
-                d_gate = (dy_scaled * value.float() * sig * (1.0 + gate.float() * (1.0 - sig))).to(z.dtype)
-                d_value = (dy_scaled * silu_gate).to(z.dtype)
-                dz[:, 0::2] = d_gate   # interleaved: even cols = gate grad
-                dz[:, 1::2] = d_value  # odd cols = value grad
-                del dy_scaled, d_gate, d_value, sig, silu_gate, gate, value
-
-                # Step 5: Scale post-activation by router weight (for weight-grad)
-                y1s = y1_forward * s.unsqueeze(-1)
+                w2_fp8, w2_scales = precompute_weight_fp8_for_fused_dgated(w2)
+                _, y1s, ds = gemm_dgated(
+                    dout_fp8,
+                    w2_fp8,
+                    PreAct=z,
+                    activation="swiglu",
+                    dx_out=dz,
+                    colvec_scale=s.float(),
+                    colvec_reduce=True,
+                    cu_seqlens_m=expert_frequency_offset,
+                    dynamic_scheduler=False,
+                    a_scales=dout_scales,
+                    b_scales=w2_scales,
+                )
 
                 _log_stage_memory("backward:down-proj-dgated")
                 _reset_stage_memory_probe()

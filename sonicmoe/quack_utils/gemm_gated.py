@@ -15,13 +15,14 @@ import torch
 from cutlass import const_expr
 from cutlass.cute.runtime import from_dlpack
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
+from quack.epi_ops import TileStore
 from quack.gemm_act import GemmActMixin
 from quack.gemm_default_epi import GemmDefaultEpiMixin
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
 from quack.gemm_wrapper_utils import GemmTensorInfo, GemmWrapperBase
 from quack.layout_utils import permute_gated_Cregs_b16
-from quack.tile_scheduler import TileSchedulerArguments, VarlenMTileSchedulerArguments
+
 from torch import Tensor
 
 
@@ -50,11 +51,18 @@ def _make_cute_tensor_dynamic(tensor: Tensor, leading_dim: int) -> cute.Tensor:
     return from_dlpack(tensor.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=leading_dim)
 
 
-class GemmGatedMixin(GemmActMixin):
-    EpilogueArguments = GemmActMixin.EpilogueArguments
-    EpilogueParams = GemmActMixin.EpilogueParams
+def _halve_epi_tile(gemm, epi_tile):
+    """Halve the N-dimension of the epilogue tile for gated activations."""
+    if isinstance(epi_tile[1], cute.Layout):
+        return (epi_tile[0], cute.recast_layout(2, 1, epi_tile[1]))
+    return (epi_tile[0], epi_tile[1] // 2)
 
-    def epi_to_underlying_arguments(self, args: EpilogueArguments, *, loc=None, ip=None) -> EpilogueParams:
+
+class GemmGatedMixin(GemmActMixin):
+    _epi_ops = (*GemmActMixin._epi_ops[:-1], TileStore("mPostAct", epi_tile_fn=_halve_epi_tile))
+
+    def epi_to_underlying_arguments(self, args, *, loc=None, ip=None):
+        self.rounding_mode = args.rounding_mode
         self.postact_dtype = args.mPostAct.element_type
         self.postact_layout = cutlass.utils.LayoutEnum.from_tensor(args.mPostAct)
         assert self.postact_dtype.width in {8, 16}, "GemmGated only supports 8bit or 16bit postact for now"
@@ -62,118 +70,15 @@ class GemmGatedMixin(GemmActMixin):
         assert self.postact_layout.is_n_major_c()
         if self.arch == 90:
             assert self.cta_tile_shape_mnk[1] % 32 == 0, "GemmGatedSm90 requires tileN to be divisible by 32"
-
-        self.cta_tile_shape_postact_mn = (
-            self.cta_tile_shape_mnk[0],
-            self.cta_tile_shape_mnk[1] // 2,
-        )
-        if isinstance(self.epi_tile[1], cute.Layout):
-            epi_tile_postact_1 = cute.recast_layout(2, 1, self.epi_tile[1])
-        else:
-            epi_tile_postact_1 = self.epi_tile[1] // 2
-        epi_tile_postact = (self.epi_tile[0], epi_tile_postact_1)
-        utils_cls = sm100_utils if self.arch == 100 else sm90_utils
-        epi_postact_smem_layout_staged = utils_cls.make_smem_layout_epi(
-            self.postact_dtype, self.postact_layout, epi_tile_postact, self.epi_stage
-        )
-        tma_atom_postact, tma_tensor_postact = self._make_tma_epi_atoms_and_tensors(
-            args.mPostAct,
-            epi_postact_smem_layout_staged,
-            epi_tile_postact,
-            op_type="store",
-        )
-        # Assume all strides are divisible by 32 bits except the last stride
-        new_stride = lambda t: tuple(
-            cute.assume(s, divby=32 // t.element_type.width) if not cute.is_static(s) else s for s in t.stride
-        )
-        mRowVecBroadcast, mColVecBroadcast = [
-            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t))) if t is not None else None
-            for t in (args.mRowVecBroadcast, args.mColVecBroadcast)
-        ]
-        return self.EpilogueParams(
-            tma_atom_postact,
-            tma_tensor_postact,
-            epi_postact_smem_layout_staged,
-            epi_tile_postact,
-            args.act_fn,
-            alpha=args.alpha,
-            beta=args.beta,
-            mRowVecBroadcast=mRowVecBroadcast,
-            mColVecBroadcast=mColVecBroadcast,
-        )
-
-    def get_scheduler_arguments(
-        self,
-        mA: cute.Tensor,
-        mB: cute.Tensor,
-        mD: Optional[cute.Tensor],
-        scheduler_args,
-        varlen_args,
-    ):
-        """Allow gather-A inference kernels to omit preact_out/D while keeping varlen scheduling."""
-        if const_expr(varlen_args.mCuSeqlensM is None):
-            num_problems = (
-                mD.shape[2]
-                if mD is not None
-                else (
-                    mB.shape[2]
-                    if varlen_args.mCuSeqlensK is None
-                    else varlen_args.mCuSeqlensK.shape[0] - 1
-                )
-            )
-            problem_shape_ntile_mnl = (
-                cute.ceil_div(mA.shape[0], self.cta_tile_shape_mnk[0]),
-                cute.ceil_div(mB.shape[0], self.cta_tile_shape_mnk[1]),
-                num_problems,
-            )
-            return TileSchedulerArguments(
-                problem_shape_ntile_mnl=problem_shape_ntile_mnl,
-                raster_order=scheduler_args.raster_order,
-                group_size=scheduler_args.max_swizzle_size,
-                cluster_shape_mnk=self.cluster_shape_mnk,
-                tile_count_semaphore=scheduler_args.tile_count_semaphore,
-                batch_idx_permute=scheduler_args.batch_idx_permute,
-                is_persistent=self.is_persistent,
-            )
-
-        total_m = mD.shape[0] if mD is not None else varlen_args.mAIdx.shape[0]
-        problem_shape_ntile_mnl = (
-            None,
-            cute.ceil_div(mB.shape[0], self.cta_tile_shape_mnk[1]),
-            varlen_args.mCuSeqlensM.shape[0] - 1,
-        )
-        return VarlenMTileSchedulerArguments(
-            problem_shape_ntile_mnl=problem_shape_ntile_mnl,
-            total_m=total_m,
-            cu_seqlens_m=varlen_args.mCuSeqlensM,
-            raster_order=scheduler_args.raster_order,
-            group_size=scheduler_args.max_swizzle_size,
-            tile_shape_mn=self.cta_tile_shape_mnk[:2],
-            cluster_shape_mnk=self.cluster_shape_mnk,
-            tile_count_semaphore=scheduler_args.tile_count_semaphore,
-            is_persistent=self.is_persistent,
-        )
-
-    @staticmethod
-    def epi_smem_bytes_per_stage(
-        args: EpilogueArguments, cta_tile_shape_mnk: Tuple[int, int, int], epi_tile: cute.Tile
-    ) -> int:
-        postact_dtype = args.mPostAct.element_type
-        postact_bytes_per_stage = (cute.size(cute.shape(epi_tile)) // 2) * (postact_dtype.width // 8)
-        rowvec_colvec_bytes = GemmDefaultEpiMixin.epi_smem_bytes_per_stage(args, cta_tile_shape_mnk, epi_tile)
-        return postact_bytes_per_stage + rowvec_colvec_bytes
+        self.cta_tile_shape_postact_mn = (self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1] // 2)
+        d = self._epi_ops_to_params_dict(args)
+        d["act_fn"] = args.act_fn
+        return self.EpilogueParams(**d)
 
     @cute.jit
-    def epi_visit_subtile(
-        self,
-        params: EpilogueParams,
-        epi_loop_tensors: Tuple[cute.Tensor, ...],
-        tRS_rD: cute.Tensor,
-        tRS_rC: Optional[cute.Tensor] = None,
-    ) -> Optional[cute.Tensor]:
+    def epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None):
         GemmDefaultEpiMixin.epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC)
         tRS_rPostAct_layout = cute.recast_layout(2, 1, tRS_rD.layout)
-        # If we don't have .shape here, the compiler generates local stores and loads
         tRS_rPostAct = cute.make_rmem_tensor(tRS_rPostAct_layout.shape, self.acc_dtype)
         if const_expr(self.arch < 100):
             for i in cutlass.range(cute.size(tRS_rPostAct), unroll_full=True):
@@ -183,11 +88,14 @@ class GemmGatedMixin(GemmActMixin):
                 tRS_rPostAct[2 * i], tRS_rPostAct[2 * i + 1] = params.act_fn(
                     (tRS_rD[4 * i], tRS_rD[4 * i + 2]), (tRS_rD[4 * i + 1], tRS_rD[4 * i + 3])
                 )
-        # Type conversion
-        tRS_rPostAct_out = cute.make_rmem_tensor_like(tRS_rPostAct, self.postact_dtype)
-        tRS_rPostAct_out.store(tRS_rPostAct.load().to(self.postact_dtype))
+        return tRS_rPostAct
+
+    @cute.jit
+    def epi_convert_postact(self, tRS_rPostAct, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx):
+        tRS_rPostAct_out = GemmActMixin.epi_convert_postact(
+            self, tRS_rPostAct, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+        )
         if const_expr(self.arch == 90):
-            # Only need this if we're using STSM
             permute_gated_Cregs_b16(tRS_rPostAct_out)
         return tRS_rPostAct_out
 
@@ -329,11 +237,6 @@ def gemm_gated(
         cu_seqlens_m,
         None,  # cu_seqlens_k
         A_idx,
-        max_active_clusters,
-        cluster_shape_mnk,
-        tensor_infos,
-        GemmCls.num_epi_tensormaps,
-        pingpong,
     )
 
     current_stream = cutlass_torch.current_stream()

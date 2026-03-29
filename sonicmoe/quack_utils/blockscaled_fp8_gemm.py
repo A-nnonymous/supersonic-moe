@@ -1469,11 +1469,6 @@ def _run_cutlass_blockscaled_gemm(
         cu_seqlens_m,
         cu_seqlens_k=None,
         A_idx=None,
-        max_active_clusters=max_active_clusters,
-        cluster_shape_mnk=cluster_shape_mnk,
-        tensors=tensor_infos,
-        num_epi_tensormaps=GemmDefaultSm100.num_epi_tensormaps,
-        pingpong=config.pingpong,
     )
 
     epi_args = GemmDefaultSm100.EpilogueArguments()

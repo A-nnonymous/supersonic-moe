@@ -56,7 +56,7 @@ def gemm_gated_tuned(
         assert not config.swap_ab, "Variable-length sequences not supported with swap_ab"
     if A.ndim == 2 and not varlen_m:
         A = A.unsqueeze(0)  # (1, M, K)
-    B = B.mT  # (N, K) or (L, N, K)
+    B = B.mT.contiguous()  # (N, K) or (L, N, K), contiguous for CUTLASS DSL
     if B.ndim == 2:
         B = B.unsqueeze(0)  # (1, N, K)
     if C is not None and C.ndim == 2 and not varlen_m:
@@ -136,7 +136,7 @@ def gemm_dgated_tuned(
     og_ndim_2 = A.ndim == 2 and not varlen_m
     if A.ndim == 2 and not varlen_m:
         A = A.unsqueeze(0)  # (1, M, K)
-    B = B.mT  # (N, K) or (L, N, K)
+    B = B.mT.contiguous()  # (N, K) or (L, N, K), contiguous for CUTLASS DSL
     if B.ndim == 2:
         B = B.unsqueeze(0)  # (1, N, K)
     if PreAct.ndim == 2 and not varlen_m:
