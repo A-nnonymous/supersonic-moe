@@ -33,8 +33,22 @@ Contract tests: **11/11 PASS**（8 small + 3 large shape，含 forward + backwar
 | FP8 Session 5 (old) | 3.38 | 5.66 | 9.04 | 0.82x |
 | FP8 Session 6 (fused pad+quant) | 2.52 | 4.68 | 7.20 | 1.03x |
 | **FP8 Session 7 (1D-grid quant, z-fp8 on)** | **2.26** | **4.34** | **6.60** | **1.13x** |
-| **FP8 Session 7 (z-fp8 off, estimated)** | **~2.08** | **~4.14** | **~6.22** | **~1.20x** |
+| **FP8 Session 11 (NCU estimated)** | **~2.01** | **~4.15** | **~6.16** | **~1.21x** |
 | FP8 aligned (production routing) | ~1.0 | ~3.5 (est.) | ~4.5 | **~1.65x** |
+
+### Session 13 实测 E2E (contended B200, E=8 K=1 H=4096 I=1024 T=4096)
+
+**全集群 128 GPUs 100% occupied，实测在高争抢下进行。FP8 的内存带宽优势在争抢下被放大。**
+
+|  | P10 | P50 | Min | Max |
+|--|-----|-----|-----|-----|
+| BF16 | 13.90ms | 13.95ms | 13.83ms | 138.02ms |
+| **FP8 blockscaled** | **6.40ms** | **13.96ms** | **5.93ms** | **14.34ms** |
+| **Speedup (P10)** | **2.17x** | | **2.33x (min)** | |
+
+**分析**: FP8 使用 fp8 (1B) 数据传输 vs BF16 (2B)，内存带宽需求减半。在 GPU 争抢下，
+带宽是主要瓶颈，FP8 因此获得 2x+ 加速。P50 持平是因为大部分时间 GPU preemption/scheduling
+噪声主导。Min 5.93ms 接近 NCU 估算的 6.16ms。
 
 ### Session 7 改进幅度 (quantize kernel 4.4x acceleration)
 
