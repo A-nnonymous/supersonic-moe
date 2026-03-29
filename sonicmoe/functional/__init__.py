@@ -676,13 +676,26 @@ class _UpProjection(torch.autograd.Function):
                 )
 
                 # Act grad: native blockscaled FP8 GEMM (dz × w1^T → dx_expanded)
+                # Use pre-quantized dz from fused SwiGLU backward if available.
                 w1T_fp8, w1T_scales = precompute_weight_fp8(w1.permute(1, 0, 2))
-                dx_expanded = blockscaled_fp8_gemm_varlen(
-                    dz_bf16, w1.permute(1, 0, 2), expert_frequency_offset,
-                    w_fp8=w1T_fp8, w_scales=w1T_scales,
-                    out_dtype=torch.bfloat16,
-                    assume_aligned=_ALIGNMENT_ASSUMED,
-                )
+                prequant_dz = _PREQUANTIZED_SCALES.pop("bwd", None)
+                if prequant_dz is not None and prequant_dz[0] is dz:
+                    _, dz_fp8, dz_packed_scales = prequant_dz
+                    dx_expanded = blockscaled_fp8_gemm_varlen(
+                        dz_fp8, w1.permute(1, 0, 2), expert_frequency_offset,
+                        a_scales=dz_packed_scales,
+                        w_fp8=w1T_fp8, w_scales=w1T_scales,
+                        out_dtype=torch.bfloat16,
+                        assume_aligned=True,
+                    )
+                    del dz_fp8, dz_packed_scales
+                else:
+                    dx_expanded = blockscaled_fp8_gemm_varlen(
+                        dz_bf16, w1.permute(1, 0, 2), expert_frequency_offset,
+                        w_fp8=w1T_fp8, w_scales=w1T_scales,
+                        out_dtype=torch.bfloat16,
+                        assume_aligned=_ALIGNMENT_ASSUMED,
+                    )
                 del dz_bf16
             else:
                 gemm(
@@ -949,10 +962,23 @@ class _DownProjection(torch.autograd.Function):
 
                 # Step 3: SwiGLU backward
                 if z_fp8 is not None:
-                    # Fused: read fp8 z directly, skip bf16 materialization
-                    dz, y1s, ds = swiglu_backward_from_fp8_triton(
-                        dy1, z_fp8, z_raw_scales_u8, s
-                    )
+                    if aligned and _use_fused_swiglu_quant():
+                        # Fused: z-fp8 dequant + dSwiGLU + dz-fp8-quant + ISA-pack.
+                        # Produces dz in both bf16 (for weight grad) and
+                        # fp8+ISA-packed (for act-grad GEMM in up-proj backward),
+                        # eliminating a separate quantize_and_pack kernel.
+                        from sonicmoe.quack_utils.swiglu_triton import swiglu_backward_from_fp8_quant_pack_triton
+                        dz, dz_fp8, dz_packed_scales, y1s, ds = (
+                            swiglu_backward_from_fp8_quant_pack_triton(
+                                dy1, z_fp8, z_raw_scales_u8, s
+                            )
+                        )
+                        _PREQUANTIZED_SCALES["bwd"] = (dz, dz_fp8, dz_packed_scales)
+                    else:
+                        # Fused: read fp8 z directly, skip bf16 materialization
+                        dz, y1s, ds = swiglu_backward_from_fp8_triton(
+                            dy1, z_fp8, z_raw_scales_u8, s
+                        )
                     del z_fp8, z_raw_scales_u8
                 else:
                     dz, y1s, ds = _swiglu_backward_interleaved(dy1, z, s)
