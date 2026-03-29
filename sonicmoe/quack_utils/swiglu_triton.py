@@ -242,6 +242,115 @@ def _swiglu_fwd_quant_pack_kernel(
         tl.store(PACKED_SCALE_ptr + packed_offset, e8m0_byte, mask=row_mask)
 
 
+@triton.jit
+def _swiglu_fwd_quant_pack_zsave_kernel(
+    Z_ptr, Y1_FP8_ptr, PACKED_SCALE_ptr, Z_FP8_ptr, Z_SCALE_ptr,
+    rows, I_dim: tl.constexpr,
+    stride_z_row: tl.constexpr,
+    stride_y_row: tl.constexpr,
+    stride_zfp8_row: tl.constexpr,
+    stride_zscale_row: tl.constexpr,
+    k_tiles,
+    fp8_max: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    SF_TILE_M: tl.constexpr,
+    SF_TILE_STORAGE: tl.constexpr,
+):
+    """Fused SwiGLU + y1 quantize/ISA-pack + z-fp8 save.
+
+    Reads z ONCE, writes both y1_fp8+ISA scales and z_fp8+flat scales.
+    Eliminates the separate quantize_activation_blockscaled_fast(z) call.
+    """
+    row_base = tl.program_id(0) * BLOCK_ROWS
+    row_ids = row_base + tl.arange(0, BLOCK_ROWS)
+    row_mask = row_ids < rows
+
+    z_row_ptrs = Z_ptr + row_ids[:, None] * stride_z_row
+    y_row_ptrs = Y1_FP8_ptr + row_ids[:, None] * stride_y_row
+    zfp8_row_ptrs = Z_FP8_ptr + row_ids[:, None] * stride_zfp8_row
+    row_tiles = row_ids // SF_TILE_M
+    row_in_tile = row_ids % SF_TILE_M
+    row_base_offset = (row_in_tile % 32) * 16 + (row_in_tile // 32) * 4
+
+    for group_id in tl.range(0, NUM_GROUPS):
+        col_offsets = group_id * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+        col_mask = col_offsets[None, :] < I_dim
+        mask = row_mask[:, None] & col_mask
+
+        # Load interleaved gate/up from z
+        gate = tl.load(z_row_ptrs + col_offsets[None, :] * 2, mask=mask, other=0.0).to(tl.float32)
+        up = tl.load(z_row_ptrs + col_offsets[None, :] * 2 + 1, mask=mask, other=0.0).to(tl.float32)
+
+        # SwiGLU: y1 = silu(gate) * up
+        sig = tl.sigmoid(gate)
+        y1 = gate * sig * up
+
+        # --- y1 quantize: ISA-packed scales for down-proj GEMM ---
+        y1_amax = tl.max(tl.abs(y1), axis=1)
+        y1_bits = y1_amax.to(tl.int32, bitcast=True)
+        y1_bexp = (y1_bits >> 23) & 0xFF
+        y1_mant = y1_bits & 0x7FFFFF
+        y1_e8m0 = y1_bexp - 8 + tl.where(y1_mant > 0x600000, 1, 0)
+        y1_e8m0 = tl.where(y1_bexp > 0, y1_e8m0, 0)
+        y1_e8m0 = tl.maximum(y1_e8m0, 0)
+
+        y1_qbexp = tl.maximum(tl.minimum(254 - y1_e8m0, 254), 1)
+        y1_qscale = (y1_qbexp.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+        y1_fp8 = (y1 * y1_qscale[:, None]).to(tl.float8e4nv)
+        tl.store(y_row_ptrs + col_offsets[None, :], y1_fp8, mask=mask)
+
+        k_tiles_idx = group_id // (SF_TILE_M // GROUP_SIZE)
+        k_in_tile_val = group_id % (SF_TILE_M // GROUP_SIZE)
+        tile_base = (row_tiles * k_tiles + k_tiles_idx) * SF_TILE_STORAGE
+        packed_offset = tile_base + row_base_offset + k_in_tile_val
+        tl.store(PACKED_SCALE_ptr + packed_offset, y1_e8m0.to(tl.uint8), mask=row_mask)
+
+        # --- z quantize: flat scales for backward dequantize ---
+        # Each y1 group (32 cols) spans 64 z cols = 2 flat z groups.
+        # z_group_lo: gate[0:16]+up[0:16], z_group_hi: gate[16:32]+up[16:32]
+        half: tl.constexpr = GROUP_SIZE // 2  # 16
+        lane = tl.arange(0, GROUP_SIZE)
+        z_abs = tl.maximum(tl.abs(gate), tl.abs(up))  # (BLOCK_ROWS, 32)
+
+        z_abs_lo = tl.where(lane[None, :] < half, z_abs, 0.0)
+        z_abs_hi = tl.where(lane[None, :] >= half, z_abs, 0.0)
+        z_amax_lo = tl.max(z_abs_lo, axis=1)
+        z_amax_hi = tl.max(z_abs_hi, axis=1)
+
+        # Integer E8M0 for lo group
+        z_lo_bits = z_amax_lo.to(tl.int32, bitcast=True)
+        z_lo_bexp = (z_lo_bits >> 23) & 0xFF
+        z_lo_mant = z_lo_bits & 0x7FFFFF
+        z_lo_e8m0 = z_lo_bexp - 8 + tl.where(z_lo_mant > 0x600000, 1, 0)
+        z_lo_e8m0 = tl.where(z_lo_bexp > 0, z_lo_e8m0, 0)
+        z_lo_e8m0 = tl.maximum(z_lo_e8m0, 0)
+
+        # Integer E8M0 for hi group
+        z_hi_bits = z_amax_hi.to(tl.int32, bitcast=True)
+        z_hi_bexp = (z_hi_bits >> 23) & 0xFF
+        z_hi_mant = z_hi_bits & 0x7FFFFF
+        z_hi_e8m0 = z_hi_bexp - 8 + tl.where(z_hi_mant > 0x600000, 1, 0)
+        z_hi_e8m0 = tl.where(z_hi_bexp > 0, z_hi_e8m0, 0)
+        z_hi_e8m0 = tl.maximum(z_hi_e8m0, 0)
+
+        # Quant scales: select lo for lanes [0..15], hi for [16..31]
+        z_lo_qbexp = tl.maximum(tl.minimum(254 - z_lo_e8m0, 254), 1)
+        z_lo_qscale = (z_lo_qbexp.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+        z_hi_qbexp = tl.maximum(tl.minimum(254 - z_hi_e8m0, 254), 1)
+        z_hi_qscale = (z_hi_qbexp.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+        z_qscale = tl.where(lane[None, :] < half, z_lo_qscale[:, None], z_hi_qscale[:, None])
+
+        z_gate_fp8 = (gate * z_qscale).to(tl.float8e4nv)
+        z_up_fp8 = (up * z_qscale).to(tl.float8e4nv)
+
+        tl.store(zfp8_row_ptrs + col_offsets[None, :] * 2, z_gate_fp8, mask=mask)
+        tl.store(zfp8_row_ptrs + col_offsets[None, :] * 2 + 1, z_up_fp8, mask=mask)
+        tl.store(Z_SCALE_ptr + row_ids * stride_zscale_row + 2 * group_id, z_lo_e8m0.to(tl.uint8), mask=row_mask)
+        tl.store(Z_SCALE_ptr + row_ids * stride_zscale_row + 2 * group_id + 1, z_hi_e8m0.to(tl.uint8), mask=row_mask)
+
+
 def swiglu_forward_quant_pack_triton(
     z: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -288,6 +397,66 @@ def swiglu_forward_quant_pack_triton(
         SF_TILE_STORAGE=_SF_TILE_STORAGE,
     )
     return y1_fp8, packed_scales.view(torch.float8_e8m0fnu)
+
+
+def swiglu_forward_quant_pack_zsave_triton(
+    z: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused SwiGLU forward + y1 quantize + z-fp8 save in one kernel.
+
+    Reads z(TK, 2I) only ONCE, producing:
+      - y1_fp8 + ISA-packed scales (for down-proj GEMM)
+      - z_fp8 + flat scales (for backward z dequantize)
+
+    Saves ~128MB DRAM reads vs separate SwiGLU+quant + z-fp8-save.
+
+    Args:
+        z: (TK, 2I) bf16 pre-activation (interleaved gate/up).
+
+    Returns:
+        y1_fp8:       (TK, I) float8_e4m3fn
+        packed_scales: (1, packed_size) float8_e8m0fnu — ISA-packed y1 scales.
+        z_fp8:        (TK, 2I) float8_e4m3fn — z quantized for backward.
+        z_scales:     (TK, num_z_groups) float8_e8m0fnu — flat z scales.
+    """
+    TK, two_I = z.shape
+    assert two_I % 2 == 0
+    I = two_I // 2
+    assert I % 32 == 0, f"I={I} must be multiple of 32 for blockscaled"
+
+    num_groups = I // 32  # groups for y1 (I columns, 32 each)
+    num_z_groups = two_I // 32  # groups for z (2I columns, 32 each)
+    k_tiles = _div_up(I, _SF_TILE_K)
+
+    y1_fp8 = torch.empty(TK, I, dtype=torch.float8_e4m3fn, device=z.device)
+    per_batch_storage = _storage_per_batch(TK, I)
+    packed_scales = torch.full(
+        (1, per_batch_storage), 127, dtype=torch.uint8, device=z.device
+    )
+    z_fp8 = torch.empty(TK, two_I, dtype=torch.float8_e4m3fn, device=z.device)
+    z_scales = torch.empty(TK, num_z_groups, dtype=torch.uint8, device=z.device)
+
+    BLOCK_ROWS = 8
+    grid = (_div_up(TK, BLOCK_ROWS),)
+    _swiglu_fwd_quant_pack_zsave_kernel[grid](
+        z, y1_fp8, packed_scales, z_fp8, z_scales,
+        TK, I,
+        z.stride(0), y1_fp8.stride(0),
+        z_fp8.stride(0), z_scales.stride(0),
+        k_tiles,
+        fp8_max=float(torch.finfo(torch.float8_e4m3fn).max),
+        GROUP_SIZE=32,
+        BLOCK_ROWS=BLOCK_ROWS,
+        NUM_GROUPS=num_groups,
+        SF_TILE_M=_SF_TILE_M,
+        SF_TILE_STORAGE=_SF_TILE_STORAGE,
+    )
+    return (
+        y1_fp8,
+        packed_scales.view(torch.float8_e8m0fnu),
+        z_fp8,
+        z_scales.view(torch.float8_e8m0fnu),
+    )
 
 
 # ===================================================================

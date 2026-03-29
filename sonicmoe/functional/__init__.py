@@ -539,7 +539,15 @@ class _UpProjection(torch.autograd.Function):
 
                 # Fused SwiGLU+quant only when down-proj won't need padding
                 if aligned and _use_fused_swiglu_quant():
-                    y1_fp8, y1_packed_scales = swiglu_forward_quant_pack_triton(z)
+                    if _save_z_fp8():
+                        # Fused SwiGLU+y1_quant+z_save: read z ONCE
+                        from sonicmoe.quack_utils.swiglu_triton import swiglu_forward_quant_pack_zsave_triton
+                        y1_fp8, y1_packed_scales, z_fp8, z_raw_scales = (
+                            swiglu_forward_quant_pack_zsave_triton(z)
+                        )
+                        _PREQUANTIZED_SCALES["z_fp8"] = (z_fp8, z_raw_scales)
+                    else:
+                        y1_fp8, y1_packed_scales = swiglu_forward_quant_pack_triton(z)
                     _PREQUANTIZED_SCALES["fwd"] = (y1_fp8, y1_packed_scales)
                     y1 = y1_fp8
                 else:
@@ -812,7 +820,11 @@ class _DownProjection(torch.autograd.Function):
         ctx._z_is_fp8 = z_is_fp8
 
         if z_is_fp8:
-            z_fp8, z_raw_scales = quantize_activation_blockscaled_fast(z)
+            precomputed_z_fp8 = _PREQUANTIZED_SCALES.pop("z_fp8", None)
+            if precomputed_z_fp8 is not None:
+                z_fp8, z_raw_scales = precomputed_z_fp8
+            else:
+                z_fp8, z_raw_scales = quantize_activation_blockscaled_fast(z)
             ctx.save_for_backward(
                 z_fp8,
                 z_raw_scales,
