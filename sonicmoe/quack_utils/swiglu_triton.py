@@ -1028,7 +1028,7 @@ def swiglu_backward_quant_pack_triton(
     y1s = torch.empty(TK, I, dtype=torch.bfloat16, device=z.device)
     ds = torch.empty(TK, dtype=torch.float32, device=z.device)
 
-    BLOCK_ROWS = 4
+    BLOCK_ROWS = 8  # Production-shape: 0.157ms (BR=8) vs 0.190ms (BR=4), 1.2x faster
     grid = (_div_up(TK, BLOCK_ROWS),)
     _swiglu_bwd_quant_pack_kernel[grid](
         dy1, z, s,
