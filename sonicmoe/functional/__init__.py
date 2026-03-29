@@ -466,26 +466,20 @@ class _UpProjection(torch.autograd.Function):
             assert not torch.compiler.is_compiling()
             assert is_glu_activation, "QuACK GEMM does not support non GLU activation yet"
             if _fp8_enabled():
-                # Fused blockscaled FP8 up-proj: GEMM + SwiGLU in single CUTLASS kernel.
-                # Pre-gather + quantize activation, then pass to fused gemm_gated
-                # which handles both matmul and gated activation in one kernel launch.
+                # Decomposed blockscaled FP8 up-proj: GEMM + SwiGLU.
+                # Fused GemmGatedSm100 + blockscaled crashes due to CUTLASS DSL
+                # epi_visit_subtile accumulator recast incompatibility with
+                # blockscaled MMA register layout — a deep codegen bug.
+                # Decomposed: blockscaled_fp8_gemm_varlen → z, SwiGLU → y1.
                 _evict_per_tensor_caches_once()
                 x_gathered = x[x_gather_idx]  # (TK, H) expert-sorted
-                x_fp8, x_scales = quantize_and_pack_activation_varlen(
-                    x_gathered, expert_frequency_offset
-                )
-                w1_fp8, w1_scales = precompute_weight_fp8_for_fused_gated(w1)
-                z, y1 = gemm_gated(
-                    x_fp8,
-                    w1_fp8,
-                    activation="swiglu",
-                    cu_seqlens_m=expert_frequency_offset,
+                w1_fp8, w1_scales = precompute_weight_fp8(w1)
+                z = blockscaled_fp8_gemm_varlen(
+                    x_gathered, w1, expert_frequency_offset,
+                    w_fp8=w1_fp8, w_scales=w1_scales,
                     out_dtype=torch.bfloat16,
-                    postact_dtype=(torch.float8_e4m3fn if use_low_precision_postact_buffer else torch.bfloat16),
-                    dynamic_scheduler=False,
-                    a_scales=x_scales,
-                    b_scales=w1_scales,
                 )
+                y1 = _swiglu_forward_interleaved(z)
             else:
                 z, y1 = gemm_gated(
                     x,
@@ -777,7 +771,6 @@ class _DownProjection(torch.autograd.Function):
 
         dw2 = torch.empty_like(w2)
         db2 = None if b2 is None else torch.empty_like(b2)
-        dz = torch.empty_like(z)
         _reset_stage_memory_probe()
 
         if use_quack_gemm:
@@ -786,33 +779,24 @@ class _DownProjection(torch.autograd.Function):
 
             s = topk_scores[s_scatter_idx]
             if _fp8_enabled():
-                # Fused blockscaled FP8 backward: GEMM + dSwiGLU in single CUTLASS kernel.
-                # Pre-gather + quantize dout, then pass to fused gemm_dgated which
-                # computes matmul, backward activation, and router gradient in one launch.
+                # Decomposed blockscaled FP8 backward: GEMM + dSwiGLU.
+                # Same CUTLASS DSL codegen bug prevents fused gemm_dgated.
                 dout_gathered = dout[x_gather_idx]  # (TK, H)
-                dout_fp8, dout_scales = quantize_and_pack_activation_varlen(
-                    dout_gathered, expert_frequency_offset
+                w2_actgrad = w2.permute(1, 0, 2)  # (I, H, E)
+                w2_fp8, w2_scales = precompute_weight_fp8(w2_actgrad)
+                dy1 = blockscaled_fp8_gemm_varlen(
+                    dout_gathered, w2_actgrad, expert_frequency_offset,
+                    w_fp8=w2_fp8, w_scales=w2_scales,
+                    out_dtype=torch.bfloat16,
                 )
                 del dout_gathered
-                w2_fp8, w2_scales = precompute_weight_fp8_for_fused_dgated(w2)
-                _, y1s, ds = gemm_dgated(
-                    dout_fp8,
-                    w2_fp8,
-                    PreAct=z,
-                    activation="swiglu",
-                    dx_out=dz,
-                    colvec_scale=s.float(),
-                    colvec_reduce=True,
-                    cu_seqlens_m=expert_frequency_offset,
-                    dynamic_scheduler=False,
-                    a_scales=dout_scales,
-                    b_scales=w2_scales,
-                )
+                dz, y1s, ds = _swiglu_backward_interleaved(dy1, z, s)
+                del dy1
 
                 _log_stage_memory("backward:down-proj-dgated")
                 _reset_stage_memory_probe()
 
-                # Weight-grad: BF16 varlen GEMM (bandwidth-bound, FP8 overhead > benefit)
+                # Weight-grad: BF16 varlen GEMM
                 y1s_wgrad = y1s if y1s.dtype == torch.bfloat16 else y1s.to(torch.bfloat16)
                 gemm(
                     dout.T,
@@ -831,6 +815,7 @@ class _DownProjection(torch.autograd.Function):
                 # alignment bug (domain_offset on bf16 ptr reduces to 16-bit
                 # alignment, but async copy requires 32-bit; fp32 is always
                 # 32-bit aligned after any integer offset)
+                dz = torch.empty_like(z)
                 _, y1s, ds = gemm_dgated(
                     dout,
                     w2.permute(2, 0, 1),
@@ -860,6 +845,7 @@ class _DownProjection(torch.autograd.Function):
                 ds = ds[s_reverse_scatter_idx]
         else:
             ds = torch.empty_like(topk_scores)
+            dz = torch.empty_like(z)
 
             I = w2.size(1)
             TK = x_gather_idx.size(0)

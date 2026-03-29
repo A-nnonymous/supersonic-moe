@@ -40,7 +40,46 @@ def apply_fp8_quack_patch() -> None:
 
     GemmWrapperBase.create_cute_tensor = staticmethod(_fp8_create_cute_tensor)
 
-    # 3. Fix CUTLASS DSL alignment bug: varlen + colvec_scale.
+    # 3. Fix get_c_pointers / get_mlir_types crash on CUTLASS dtype classes.
+    #    When a NamedTuple (EpilogueArguments) contains a CUTLASS dtype class
+    #    (e.g. cutlass.BFloat16) as a Constexpr field, the recursive traversal
+    #    calls BFloat16.__c_pointers__() / __get_mlir_types__() — instance
+    #    methods — without an instance, causing TypeError.
+    #    Fix: wrap both functions to detect and skip bare CUTLASS dtype classes.
+    import cutlass.base_dsl.typing as _typing_mod
+    _original_get_c_pointers = _typing_mod.get_c_pointers
+    _original_get_mlir_types = _typing_mod.get_mlir_types
+
+    def _safe_get_c_pointers(obj):
+        if isinstance(obj, type) and hasattr(obj, "__c_pointers__"):
+            return []
+        return _original_get_c_pointers(obj)
+
+    def _safe_get_mlir_types(obj):
+        if isinstance(obj, type) and hasattr(obj, "__get_mlir_types__"):
+            return []
+        return _original_get_mlir_types(obj)
+
+    _typing_mod.get_c_pointers = _safe_get_c_pointers
+    _typing_mod.get_mlir_types = _safe_get_mlir_types
+
+    # Also patch the jit_executor / dsl imports (they may have cached the refs)
+    for _mod_name in [
+        "cutlass.base_dsl.jit_executor",
+        "cutlass.base_dsl.dsl",
+        "cutlass.cutlass_dsl.cutlass",
+    ]:
+        try:
+            import importlib
+            _mod = importlib.import_module(_mod_name)
+            if hasattr(_mod, "get_c_pointers"):
+                _mod.get_c_pointers = _safe_get_c_pointers
+            if hasattr(_mod, "get_mlir_types"):
+                _mod.get_mlir_types = _safe_get_mlir_types
+        except (ImportError, AttributeError):
+            pass
+
+    # 4. Fix CUTLASS DSL alignment bug: varlen + colvec_scale.
     #    QuACK's gemm_default_epi.py line 127-129 uses domain_offset with a
     #    dynamic cu_seqlens_m[batch_idx] on a bf16 colvec pointer, reducing
     #    alignment from 32-bit to 16-bit. The async copy atom requires 32-bit.

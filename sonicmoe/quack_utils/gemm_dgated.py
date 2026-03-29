@@ -64,6 +64,46 @@ class GemmDGatedMixin(GemmActMixin):
         ("implicit_dtype", cutlass.Constexpr, None),
     )
 
+    def epi_setup_postact(
+        self,
+        params,
+        epi_smem_tensors,
+        tiled_copy_r2s,
+        tiled_copy_t2r,
+        tile_coord_mnkl,
+        varlen_manager,
+        tidx,
+    ):
+        """Override: force CopyUniversalOp for postact R2S when blockscaled.
+
+        Same fix as GemmGatedMixin — avoids StMatrix/smem layout mismatch
+        in blockscaled mode.
+        """
+        if const_expr(self.blockscaled):
+            sPostAct = epi_smem_tensors[self._epi_smem_map["mPostAct"]]
+            copy_atom_postact_r2s = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(), self.postact_dtype
+            )
+            tiled_copy_postact_r2s = cute.make_tiled_copy_S(
+                copy_atom_postact_r2s, tiled_copy_r2s
+            )
+            tRS_sPostAct = tiled_copy_postact_r2s.get_slice(tidx).partition_D(sPostAct)
+            batch_idx = tile_coord_mnkl[3]
+            copy_postact, _, _ = self.epilog_gmem_copy_and_partition(
+                params.tma_atom_mPostAct,
+                varlen_manager.offset_batch_epi(params.mPostAct, batch_idx),
+                self.cta_tile_shape_postact_mn,
+                params.epi_tile_mPostAct,
+                sPostAct,
+                tile_coord_mnkl,
+            )
+            return tiled_copy_postact_r2s, tRS_sPostAct, copy_postact
+        else:
+            return GemmActMixin.epi_setup_postact(
+                self, params, epi_smem_tensors, tiled_copy_r2s,
+                tiled_copy_t2r, tile_coord_mnkl, varlen_manager, tidx,
+            )
+
     @mlir_namedtuple
     class EpilogueArguments(NamedTuple):
         mPostAct: cute.Tensor
@@ -155,7 +195,7 @@ class GemmDGatedMixin(GemmActMixin):
                         (tRS_rD_mn[m, 0], tRS_rD_mn[m, 1]), (tRS_rOut_mn[m, 0], tRS_rOut_mn[m, 1])
                     )
                     for n in cutlass.range(1, cute.size(tDrColVecReduce_mn, mode=[1]) // 2, unroll_full=True):
-                        row_sum = utils.fma_packed_f32x2(
+                        row_sum = cute.arch.fma_packed_f32x2(
                             (tRS_rD_mn[m, 2 * n], tRS_rD_mn[m, 2 * n + 1]),
                             (tRS_rOut_mn[m, 2 * n], tRS_rOut_mn[m, 2 * n + 1]),
                             row_sum,

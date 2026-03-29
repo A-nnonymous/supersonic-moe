@@ -122,13 +122,14 @@ The reporting policy for every FP8 step is:
 
 ## 🔥 FP8 Blockscaled Status (2025-03-29)
 
-**Full-chain blockscaled FP8 (1×32 UE8M0) for Blackwell SM100.** Upgraded to quack-kernels 0.3.7 + nvidia-cutlass-dsl 4.4.2. Decomposed FP8 GEMM working; fused GEMM+SwiGLU kernel blocked by TileStore+blockscaled codegen issue.
+**Full-chain blockscaled FP8 (1×32 UE8M0) for Blackwell SM100.** 11/11 contract tests pass. Forward + backward fully functional via decomposed CUTLASS blockscaled GEMM + Triton SwiGLU. Fused kernel blocked by CUTLASS DSL codegen bug (accumulator recast incompatible with blockscaled MMA register layout).
 
 | Resource | Path |
 |----------|------|
 | **Handoff** (start here) | `reports/fp8_upgrade/HANDOFF.md` |
-| Agent context | `agent.md`, `AGENTS.md` |
 | Contract tests | `tests/fp8_large_project_contract_test.py` |
+| Smoke test | `tools/_smoke_test.py` |
+| Benchmarks | `tools/_benchmark.py`, `tools/_benchmark_split.py` |
 
 ### Quick start
 
@@ -136,27 +137,26 @@ The reporting policy for every FP8 step is:
 source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate
 cd /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe
 
-# Contract tests (currently 1/2 pass due to backward dgated regression)
+# All 11 contract tests (11/11 pass)
 CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
-  python -m pytest tests/fp8_large_project_contract_test.py -v -k "not large_shape"
+  python -m pytest tests/fp8_large_project_contract_test.py -v
 ```
 
 ### Current state
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| Decomposed FP8 GEMM (forward) | ✅ Working | 3.77% RelRMSE, 0.999 corr |
-| Fused GEMM+SwiGLU (forward) | 🔴 Crash | TileStore + blockscaled issue |
+| FP8 forward (decomposed) | ✅ Working | 6.56% RelRMSE, 0.998 corr |
+| FP8 backward (decomposed) | ✅ Working | dx 6.54%, dw2 5.35% RelRMSE |
 | BF16 fused forward | ✅ Working | |
-| BF16 backward (dgated) | 🔴 Broken | `BFloat16.__c_pointers__` pickle error |
-| FP8 backward | ⬜ Not tested | Depends on dgated fix |
+| BF16 fused backward (dgated) | ✅ Working | `__c_pointers__` fix + `fma_packed_f32x2` fix |
+| Fused FP8 GEMM+SwiGLU | 🔴 Blocked | CUTLASS DSL codegen bug in accumulator recast |
 
 ### Next steps
 
-1. **P0**: Fix `TileStore` + blockscaled FP8 codegen crash → enables fused kernel → expected 2x+ speedup
-2. **P0.5**: Fix `gemm_dgated.py` `implicit_dtype` pickle error → restore backward
-3. **P1**: Contract tests 8/8 pass
-4. **P2**: NCU profiling + performance iteration until FP8 decisively beats BF16
+1. **P0**: Forward FP8 performance (3.38ms vs BF16 1.74ms) — CUDA Graph / fused Triton / wait for quack fix
+2. **P1**: Memory optimization — save z in FP8, fused SwiGLU+quantize
+3. **P2**: NCU profiling + kernel-level performance iteration
 
 ### Example usage
 - SonicMoE with TC top-K choice routing (SwiGLU activation) on Hopper GPUs

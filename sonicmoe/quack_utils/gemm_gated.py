@@ -61,6 +61,48 @@ def _halve_epi_tile(gemm, epi_tile):
 class GemmGatedMixin(GemmActMixin):
     _epi_ops = (*GemmActMixin._epi_ops[:-1], TileStore("mPostAct", epi_tile_fn=_halve_epi_tile))
 
+    def epi_setup_postact(
+        self,
+        params,
+        epi_smem_tensors,
+        tiled_copy_r2s,
+        tiled_copy_t2r,
+        tile_coord_mnkl,
+        varlen_manager,
+        tidx,
+    ):
+        """Override: force CopyUniversalOp for postact R2S when blockscaled.
+
+        NOTE: The fused GemmGated + blockscaled FP8 path crashes due to a
+        deeper issue in epi_visit_subtile's accumulator recast. This override
+        alone is insufficient — the decomposed path is used instead.
+        Kept as documentation of the attempted fix.
+        """
+        if const_expr(self.blockscaled):
+            sPostAct = epi_smem_tensors[self._epi_smem_map["mPostAct"]]
+            copy_atom_postact_r2s = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(), self.postact_dtype
+            )
+            tiled_copy_postact_r2s = cute.make_tiled_copy_S(
+                copy_atom_postact_r2s, tiled_copy_r2s
+            )
+            tRS_sPostAct = tiled_copy_postact_r2s.get_slice(tidx).partition_D(sPostAct)
+            batch_idx = tile_coord_mnkl[3]
+            copy_postact, _, _ = self.epilog_gmem_copy_and_partition(
+                params.tma_atom_mPostAct,
+                varlen_manager.offset_batch_epi(params.mPostAct, batch_idx),
+                self.cta_tile_shape_postact_mn,
+                params.epi_tile_mPostAct,
+                sPostAct,
+                tile_coord_mnkl,
+            )
+            return tiled_copy_postact_r2s, tRS_sPostAct, copy_postact
+        else:
+            return GemmActMixin.epi_setup_postact(
+                self, params, epi_smem_tensors, tiled_copy_r2s,
+                tiled_copy_t2r, tile_coord_mnkl, varlen_manager, tidx,
+            )
+
     def epi_to_underlying_arguments(self, args, *, loc=None, ip=None):
         self.rounding_mode = args.rounding_mode
         self.postact_dtype = args.mPostAct.element_type
