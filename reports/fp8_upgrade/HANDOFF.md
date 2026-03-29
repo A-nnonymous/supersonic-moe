@@ -1,12 +1,12 @@
 # Blockscaled FP8 MoE — Handoff
 
-> **Last updated: 2025-07-28, Session 13 (zero-sync execution, assume_aligned, code cleanup)**
+> **Last updated: 2025-07-28, Session 15-16 (BLOCK_ROWS tuning + GEMM fast-path cache → 1.76x forward speedup over BF16)**
 
 ---
 
 ## 1. 当前状态：一句话
 
-**全链路 blockscaled FP8 (1×32 UE8M0) forward + backward 功能完成，8/8 contract tests PASS，精度 RelRMSE 5-7%。Session 13: 实现 zero-sync execution — 对齐路径下 ZERO D2H syncs。NCU estimated E2E: FP8 ~6.16ms vs BF16 ~7.46ms = **1.21x faster**。所有 Triton kernel 已达极限 (406µs)，GEMM 占 87%。GemmGated+blockscaled FP8 融合受 CUTLASS DSL accumulator recast 限制，无法实现（需 quack ≥ 0.4.0 或 CUTLASS 基础设施变更）。**
+**全链路 blockscaled FP8 (1×32 UE8M0) forward + backward 功能完成，11/11 contract tests PASS，精度 RelRMSE 5-7%。Session 15-16: BLOCK_ROWS production tuning + GEMM fast-path cache → **FP8 forward 0.821ms vs BF16 1.438ms = 1.76x faster**。Session 9-10 的 BLOCK_ROWS=1 在 512×1024 profiling shape 最优，但在 32768×4096 production shape 灾难性慢 (7.5-8.2x)。改为 BR=16 (quantize) / BR=8 (SwiGLU)。GemmGated+blockscaled FP8 融合受 CUTLASS DSL accumulator recast 限制，无法实现（需 quack ≥ 0.4.0 或 CUTLASS 基础设施变更）。**
 
 ---
 
@@ -168,6 +168,48 @@ e8m0_i32 = biased_exp - 8 + carry  # -8: fp8_e4m3 max=448=1.75*2^8
 | **Backward Triton total** | | **191µs** | |
 | **All Triton total** | | **406µs** | GEMM 占 87% (~3400µs) |
 
+### Session 15-16: 1.76x Forward Speedup over BF16 (BLOCK_ROWS tuning + GEMM fast-path cache)
+
+**核心发现: BLOCK_ROWS=1 在 production shape 灾难性慢**
+
+Session 9-10 的 BLOCK_ROWS=1 是在 NCU profiling 的小 shape (512×1024) 上调优的。Production shape (32768×4096) 需要更高 BLOCK_ROWS 以充分利用 SM occupancy。小 shape 下 512 blocks 即可饱和 160 SMs，大 shape 下每个 block 需要处理更多行。
+
+**BLOCK_ROWS 调优结果 (TK=32768, K=4096):**
+
+| Kernel | BR 旧→新 | 旧延迟 | 新延迟 | 加速 |
+|--------|----------|--------|--------|------|
+| `_quantize_and_pack_kernel` | 1→16 | 0.858ms | 0.115ms | **7.5x** |
+| `_gather_quantize_and_pack_kernel` | 1→16 | 0.809ms | 0.099ms | **8.2x** |
+| `_quantize_flat_blockscaled_kernel` | 1→16 | — | — | — |
+| `_pad_quantize_and_pack_kernel` | 1→16 | — | — | — |
+| `_swiglu_fwd_quant_pack_kernel` | 1→8 | 0.290ms | 0.109ms | **2.7x** |
+| `_swiglu_fwd_quant_pack_zsave_kernel` | 1→8 | 0.559ms | 0.230ms | **2.4x** |
+| `_swiglu_bwd_quant_pack_kernel` | 4→8 | 0.190ms | 0.157ms | **1.2x** |
+
+**GEMM Fast-Path Cache:**
+
+`_GEMM_FAST_PATH` dict in `_run_cutlass_blockscaled_gemm()` — caches compiled function, scheduler_args, epi_args keyed on shape/dtype. Hot path: only 5× cute tensor creation + kernel launch. Saves ~55µs/forward (18% of Python dispatch).
+
+**Forward Pipeline Breakdown (T=4096, H=4096, I=1024, E=128, K=8, TK=32768):**
+
+```
+gather+quantize:   0.109ms (13%)
+GEMM1 (prequant):  0.266ms (32%)
+SwiGLU+quant+zsave: 0.234ms (29%)
+GEMM2 (prequant):  0.212ms (26%)
+TOTAL FP8:         0.821ms
+BF16 fused:        1.438ms
+Speedup:           1.76x
+```
+
+**E2E Forward Performance Summary (updated):**
+
+| Config | Fwd (ms) | vs BF16 |
+|--------|----------|---------|
+| BF16 fused baseline | 1.438 | 1.00x |
+| FP8 Session 13 (NCU estimated) | ~2.01 | ~0.72x |
+| **FP8 Session 15-16 (measured)** | **0.821** | **1.76x** |
+
 ### 显存
 
 | Config | Peak Memory | 相对 BF16 |
@@ -296,6 +338,18 @@ tRS_rPostAct_layout = cute.recast_layout(2, 1, tRS_rD.layout)
 | quantize_flat BLOCK_ROWS 4→32 | `blockscaled_fp8_gemm.py` | 16K→2K blocks for `quantize_activation_blockscaled_fast` |
 | Weight cache size 8→2 | `blockscaled_fp8_gemm.py` | `_WEIGHT_CACHE`, `_FUSED_WEIGHT_CACHE` (×3 functions) — saves ~7.2GB |
 
+### Session 15-16 优化 (BLOCK_ROWS production tuning + GEMM fast-path cache)
+
+| 优化 | 文件 | 说明 |
+|------|------|------|
+| BLOCK_ROWS=16 for all quantize kernels | `blockscaled_fp8_gemm.py` | `_quantize_and_pack_kernel`, `_gather_quantize_and_pack_kernel`, `_quantize_flat_blockscaled_kernel`, `_pad_quantize_and_pack_kernel` — BR 1→16 for production shapes (7.5-8.2x faster) |
+| BLOCK_ROWS=8 for all SwiGLU kernels | `swiglu_triton.py` | `_swiglu_fwd_quant_pack_kernel`, `_swiglu_fwd_quant_pack_zsave_kernel` BR 1→8, `_swiglu_bwd_quant_pack_kernel` BR 4→8 (1.2-2.7x faster) |
+| GEMM fast-path cache | `blockscaled_fp8_gemm.py` | `_GEMM_FAST_PATH` dict caching compiled fn + scheduler/epi args keyed on shape/dtype. Saves ~55µs/forward (18% Python dispatch) |
+
+**Commits:**
+- `f008e7f`: perf: BLOCK_ROWS tuning + GEMM fast-path cache → 1.80x over BF16
+- `8a5a1a4`: perf: tune backward SwiGLU+quant BLOCK_ROWS 4→8
+
 ---
 
 ## 7. 关键代码文件
@@ -376,10 +430,18 @@ python tools/cluster_idle_launch.py launch --gpu-count 1 --command "..."
 14. **D2H sync 是 GPU contention 下的性能杀手** — 单次 .tolist() 在 100% GPU 利用率下可能阻塞 1-10ms+，将 NCU-estimated 1.21x speedup 变为 8.6x slowdown。解决方案: streak-based alignment assumption + assume_aligned GEMM parameter 实现 zero-sync。
 15. **Tensor-attribute caching 是最轻量的 cache** — `cu_seqlens._cached_cpu_tuple` 直接在 tensor 上附加 Python attribute，O(1) lookup，无 WeakRef/dict overhead，且随 tensor GC 自动回收。
 16. **GemmGated + blockscaled FP8 融合不可行** — CUTLASS DSL CollectiveBuilder 将 blockscaled epilogue 硬编码，不支持 post-descale custom epilogue。需要 CUTLASS 基础设施变更或 Triton MXFP8 kernel。
+17. **Always benchmark kernel config at production shapes, not just small test shapes.** BLOCK_ROWS=1 was optimal for NCU profiling at 512×1024 shapes but catastrophically wrong for 32768×4096 production shapes (7.5-8.2x slower). The difference is SM occupancy: small shapes saturate 160 SMs with many blocks, large shapes need fewer blocks doing more work each.
 
 ---
 
 ## 10. 下一步规划
+
+### P0: Remaining Work (Session 15-16 identified)
+
+1. **GemmGated + blockscaled FP8 fusion** — still unfixable at CUTLASS DSL level (recast_layout + MmaMXF8Op)
+2. **Token rounding in routing** — needed for aligned segments in production
+3. **Backward performance measurement** — should be measured with aligned segments
+4. **SwiGLU+quant+zsave kernel (0.234ms)** — compute-bound, hard to optimize further
 
 ### P0: E2E 性能验证 (需要干净 GPU)
 

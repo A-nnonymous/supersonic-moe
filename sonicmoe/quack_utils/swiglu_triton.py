@@ -829,28 +829,31 @@ def swiglu_backward_quant_triton(
 @triton.jit
 def _dequant_blockscaled_fp8_kernel(
     FP8_ptr, SCALES_ptr, OUT_ptr,
+    rows,
     stride_fp8_row, stride_scale_row, stride_out_row,
     D: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
 ):
-    """Dequantize one row of blockscaled FP8 data to bfloat16.
+    """Dequantize multiple rows of blockscaled FP8 data to bfloat16.
 
     Each group of GROUP_SIZE fp8 elements shares one e8m0 scale.
     Actual value = fp8_raw * 2^(e8m0 - 127).
     """
-    row = tl.program_id(0)
+    row_base = tl.program_id(0) * BLOCK_ROWS
+    row_ids = row_base + tl.arange(0, BLOCK_ROWS)
+    row_mask = row_ids < rows
     num_groups: tl.constexpr = D // GROUP_SIZE
 
     for g in range(num_groups):
-        e8m0_val = tl.load(SCALES_ptr + row * stride_scale_row + g)
-        # Reconstruct float32 scale from e8m0: place exponent bits in IEEE754
-        scale_f32 = (e8m0_val.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+        e8m0_vals = tl.load(SCALES_ptr + row_ids * stride_scale_row + g, mask=row_mask, other=0)
+        scale_f32 = (e8m0_vals.to(tl.int32) << 23).to(tl.float32, bitcast=True)
 
         col_offs = g * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
-        mask = col_offs < D
-        fp8_vals = tl.load(FP8_ptr + row * stride_fp8_row + col_offs, mask=mask)
-        bf16_vals = (fp8_vals.to(tl.float32) * scale_f32).to(tl.bfloat16)
-        tl.store(OUT_ptr + row * stride_out_row + col_offs, bf16_vals, mask=mask)
+        mask = row_mask[:, None] & (col_offs[None, :] < D)
+        fp8_vals = tl.load(FP8_ptr + row_ids[:, None] * stride_fp8_row + col_offs[None, :], mask=mask, other=0.0)
+        bf16_vals = (fp8_vals.to(tl.float32) * scale_f32[:, None]).to(tl.bfloat16)
+        tl.store(OUT_ptr + row_ids[:, None] * stride_out_row + col_offs[None, :], bf16_vals, mask=mask)
 
 
 def dequantize_blockscaled_fp8(
@@ -869,10 +872,12 @@ def dequantize_blockscaled_fp8(
     TK, D = fp8_data.shape
     assert D % _GROUP_SIZE == 0, f"D={D} must be multiple of {_GROUP_SIZE}"
     out = torch.empty(TK, D, dtype=torch.bfloat16, device=fp8_data.device)
-    _dequant_blockscaled_fp8_kernel[(TK,)](
+    BLOCK_ROWS = 16
+    _dequant_blockscaled_fp8_kernel[(_div_up(TK, BLOCK_ROWS),)](
         fp8_data, scales_uint8, out,
+        TK,
         fp8_data.stride(0), scales_uint8.stride(0), out.stride(0),
-        D=D, GROUP_SIZE=_GROUP_SIZE,
+        D=D, GROUP_SIZE=_GROUP_SIZE, BLOCK_ROWS=BLOCK_ROWS,
     )
     return out
 
@@ -886,11 +891,13 @@ def dequantize_blockscaled_fp8(
 def _swiglu_bwd_quant_pack_kernel(
     DY1_ptr, Z_ptr, S_ptr,
     DZ_FP8_ptr, DZ_PACKED_SCALE_ptr, Y1S_ptr, DS_ptr,
+    DZ_BF16_ptr,
     rows, I_dim: tl.constexpr,
     stride_dy_row: tl.constexpr,
     stride_z_row: tl.constexpr,
     stride_dz_row: tl.constexpr,
     stride_y1s_row: tl.constexpr,
+    stride_dzbf16_row: tl.constexpr,
     k_tiles_dz,
     fp8_max: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
@@ -899,6 +906,7 @@ def _swiglu_bwd_quant_pack_kernel(
     NUM_GROUPS: tl.constexpr,
     SF_TILE_M: tl.constexpr,
     SF_TILE_STORAGE: tl.constexpr,
+    WRITE_DZ_BF16: tl.constexpr = False,
 ):
     """Fused dSwiGLU + router score + blockscaled fp8 quantize + ISA pack.
 
@@ -956,6 +964,12 @@ def _swiglu_bwd_quant_pack_kernel(
         y1s_out = y1 * s_vals[:, None]
         tl.store(y1s_base + pair_offs[None, :], y1s_out.to(tl.bfloat16), mask=mask)
 
+        # Optionally write dz in bf16 (for weight-grad GEMMs in decomposed path)
+        if WRITE_DZ_BF16:
+            dzbf16_base = DZ_BF16_ptr + row_ids[:, None] * stride_dzbf16_row
+            tl.store(dzbf16_base + pair_offs[None, :] * 2, d_gate.to(tl.bfloat16), mask=mask)
+            tl.store(dzbf16_base + pair_offs[None, :] * 2 + 1, d_up.to(tl.bfloat16), mask=mask)
+
         # Pure-integer E8M0 blockscaled quantize for dz (no transcendentals)
         amax_gate = tl.max(tl.where(pair_mask, tl.abs(d_gate), 0.0), axis=1)
         amax_up = tl.max(tl.where(pair_mask, tl.abs(d_up), 0.0), axis=1)
@@ -994,7 +1008,8 @@ def swiglu_backward_quant_pack_triton(
     dy1: torch.Tensor,
     z: torch.Tensor,
     s: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return_dz_bf16: bool = False,
+):
     """Fused SwiGLU backward + blockscaled fp8 quantize + ISA pack for dz.
 
     Single kernel produces dz_fp8 with ISA-packed scales, y1s(bf16), ds.
@@ -1030,11 +1045,25 @@ def swiglu_backward_quant_pack_triton(
 
     BLOCK_ROWS = 8  # Production-shape: 0.157ms (BR=8) vs 0.190ms (BR=4), 1.2x faster
     grid = (_div_up(TK, BLOCK_ROWS),)
+
+    # Check if caller wants dz_bf16 output (for decomposed backward path)
+    write_dz_bf16 = return_dz_bf16
+    if write_dz_bf16:
+        dz_bf16 = torch.empty(TK, two_I, dtype=torch.bfloat16, device=z.device)
+        dz_bf16_ptr = dz_bf16
+        stride_dzbf16 = dz_bf16.stride(0)
+    else:
+        dz_bf16 = None
+        dz_bf16_ptr = dz_fp8  # dummy, won't be written
+        stride_dzbf16 = 0
+
     _swiglu_bwd_quant_pack_kernel[grid](
         dy1, z, s,
         dz_fp8, dz_packed_scales, y1s, ds,
+        dz_bf16_ptr,
         TK, I,
         dy1.stride(0), z.stride(0), dz_fp8.stride(0), y1s.stride(0),
+        stride_dzbf16,
         k_tiles_dz,
         fp8_max=float(torch.finfo(torch.float8_e4m3fn).max),
         GROUP_SIZE=GROUP_SIZE,
@@ -1043,7 +1072,10 @@ def swiglu_backward_quant_pack_triton(
         NUM_GROUPS=num_groups,
         SF_TILE_M=_SF_TILE_M,
         SF_TILE_STORAGE=_SF_TILE_STORAGE,
+        WRITE_DZ_BF16=write_dz_bf16,
     )
+    if write_dz_bf16:
+        return dz_fp8, dz_packed_scales.view(torch.float8_e8m0fnu), y1s, ds, dz_bf16
     return dz_fp8, dz_packed_scales.view(torch.float8_e8m0fnu), y1s, ds
 
 
