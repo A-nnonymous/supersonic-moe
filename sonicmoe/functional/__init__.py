@@ -88,7 +88,6 @@ from ..quack_utils.swiglu_triton import (
 from ..quack_utils.blockscaled_fp8_gemm import (
     pack_blockscaled_1x32_scales,
     quantize_activation_blockscaled_fast,
-    quantize_and_pack_activation,
 )
 
 
@@ -678,28 +677,12 @@ class _UpProjection(torch.autograd.Function):
 
                 # Act grad: native blockscaled FP8 GEMM (dz × w1^T → dx_expanded)
                 w1T_fp8, w1T_scales = precompute_weight_fp8(w1.permute(1, 0, 2))
-                if _ALIGNMENT_ASSUMED:
-                    # Pre-quantize dz to skip the _get_padding_plan sync
-                    # inside blockscaled_fp8_gemm_varlen (safe because we've
-                    # verified alignment for N consecutive iterations).
-                    dz_fp8, dz_scales = quantize_and_pack_activation(
-                        dz_bf16.contiguous(), group_size=32
-                    )
-                    dx_expanded = blockscaled_fp8_gemm_varlen(
-                        dz_fp8, w1.permute(1, 0, 2), expert_frequency_offset,
-                        a_scales=dz_scales,
-                        w_fp8=w1T_fp8, w_scales=w1T_scales,
-                        out_dtype=torch.bfloat16,
-                        assume_aligned=True,
-                    )
-                    del dz_fp8, dz_scales
-                else:
-                    dx_expanded = blockscaled_fp8_gemm_varlen(
-                        dz_bf16, w1.permute(1, 0, 2), expert_frequency_offset,
-                        w_fp8=w1T_fp8, w_scales=w1T_scales,
-                        out_dtype=torch.bfloat16,
-                        assume_aligned=False,
-                    )
+                dx_expanded = blockscaled_fp8_gemm_varlen(
+                    dz_bf16, w1.permute(1, 0, 2), expert_frequency_offset,
+                    w_fp8=w1T_fp8, w_scales=w1T_scales,
+                    out_dtype=torch.bfloat16,
+                    assume_aligned=_ALIGNMENT_ASSUMED,
+                )
                 del dz_bf16
             else:
                 gemm(
