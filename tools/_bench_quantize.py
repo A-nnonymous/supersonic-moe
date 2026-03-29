@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Microbenchmark for blockscaled quantize-and-pack kernels."""
+"""Microbenchmark for blockscaled quantize-and-pack kernels.
+
+Tests different BLOCK_ROWS and kernel variants.
+"""
 import torch
 import time
 import os, sys
@@ -48,11 +51,26 @@ def main():
     padded_total = min(padded_total, int(M * 1.25))
     padded_total = _div_up(padded_total, _SF_TILE_M) * _SF_TILE_M
     dst_idx = torch.arange(M, device=device, dtype=torch.int64)
-    # scatter into padded positions (skip every 5th 128-block)
     dst_idx = dst_idx + (dst_idx // (_SF_TILE_M * 4)) * _SF_TILE_M
     dst_idx = dst_idx[:M].clamp(max=padded_total - 1)
     t = bench(lambda: pad_quantize_and_pack_activation(x, padded_total, dst_idx))
     print(f"pad_quantize_and_pack_activation:    {t:.3f}ms  (padded_total={padded_total})")
+
+    # 4. SwiGLU fused quant kernels
+    from sonicmoe.quack_utils.swiglu_triton import (
+        swiglu_forward_quant_pack_triton,
+        swiglu_backward_quant_pack_triton,
+    )
+    TK, I = M, K // 4  # I=1024 for K=4096, z has 2I=2048 cols
+    z = torch.randn(TK, 2 * I, device=device, dtype=torch.bfloat16)
+    dy1 = torch.randn(TK, I, device=device, dtype=torch.bfloat16)
+    s = torch.rand(TK, device=device, dtype=torch.float32)
+
+    t = bench(lambda: swiglu_forward_quant_pack_triton(z))
+    print(f"swiglu_fwd_quant_pack:               {t:.3f}ms")
+
+    t = bench(lambda: swiglu_backward_quant_pack_triton(dy1, z, s))
+    print(f"swiglu_bwd_quant_pack:               {t:.3f}ms")
 
 if __name__ == "__main__":
     main()

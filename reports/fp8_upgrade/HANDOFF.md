@@ -1,12 +1,12 @@
 # Blockscaled FP8 MoE — Handoff
 
-> **Last updated: 2025-07-26, Session 6 (fused pad+quantize, alignment-gated optimization, z-in-FP8)**
+> **Last updated: 2025-07-26, Session 7+8 (1D-grid kernel optimization, SwiGLU grid opt, memory reduction)**
 
 ---
 
 ## 1. 当前状态：一句话
 
-**全链路 blockscaled FP8 (1×32 UE8M0) forward + backward 功能完成，11/11 contract tests PASS，精度 RelRMSE 5-7%。性能上 FP8 backward 已 1.22x 超越 BF16 (4.68ms vs 5.70ms)；FP8 forward 因 fused GemmGated+blockscaled 有 CUTLASS DSL 深层 codegen bug 无法使用仍慢于 BF16 fused。Session 6 新增：fused pad+quantize 内核 (forward 3.44→2.52ms)、alignment-gated 优化 (aligned 场景 FP8 ~1.0ms vs BF16 1.75ms = 1.75x)、z-in-FP8 内存优化 (113MB/layer 节省)。**
+**全链路 blockscaled FP8 (1×32 UE8M0) forward + backward 功能完成，11/11 contract tests PASS，精度 RelRMSE 5-7%。Session 7: quantize-and-pack kernels 通过 2D→1D grid 变换获得 4.4x 加速，E2E FP8 total 6.60ms vs BF16 7.46ms = **1.13x faster**。Session 8: SwiGLU fused quant kernels 同样完成 2D→1D grid 变换 (消除 backward atomic contention)，weight cache 8→2 entries (节省 ~7.2GB)，quantize_flat BLOCK_ROWS 4→32。GPU 高度争抢无法获得干净 benchmark，但所有精度测试通过。**
 
 ---
 
@@ -23,38 +23,42 @@ Contract tests: **11/11 PASS**（8 small + 3 large shape，含 forward + backwar
 
 ---
 
-## 3. 性能（Session 6 优化后）
+## 3. 性能（Session 7+8 优化后）
 
 ### E2E Latency (fwd+bwd, T=4096 H=4096 I=1024 E=128 K=8, B200 sm_100a)
 
 | Config | Fwd (ms) | Bwd (ms) | Total (ms) | 相对 BF16 |
 |--------|----------|----------|------------|-----------|
-| BF16 fused baseline | 1.72 | 5.70 | 7.42 | 1.00x |
+| BF16 fused baseline | 1.76 | 5.70 | 7.46 | 1.00x |
 | FP8 Session 5 (old) | 3.38 | 5.66 | 9.04 | 0.82x |
-| FP8 Session 6 (fused pad+quant, z-bf16) | 2.52 | 4.68 | 7.20 | **1.03x** |
-| FP8 Session 6 (+ z-in-fp8) | 2.67 | 4.94 | 7.61 | 0.98x |
+| FP8 Session 6 (fused pad+quant) | 2.52 | 4.68 | 7.20 | 1.03x |
+| **FP8 Session 7 (1D-grid quant, z-fp8 on)** | **2.26** | **4.34** | **6.60** | **1.13x** |
+| **FP8 Session 7 (z-fp8 off, estimated)** | **~2.08** | **~4.14** | **~6.22** | **~1.20x** |
 | FP8 aligned (production routing) | ~1.0 | ~3.5 (est.) | ~4.5 | **~1.65x** |
 
-### Session 6 改进幅度
+### Session 7 改进幅度 (quantize kernel 4.4x acceleration)
 
-| 优化 | Forward 影响 | Backward 影响 |
-|------|-------------|--------------|
-| Fused pad+quantize kernel | 3.44→2.52ms (**-27%**) | 5.80→4.68ms (**-19%**) |
-| z-in-FP8 memory opt | +0.15ms (quant cost) | +0.26ms (dequant cost) |
-| Alignment-gated pre-quantize | 0 (unaligned benchmark) | 0 (unaligned benchmark) |
+| 优化 | 影响 |
+|------|------|
+| quantize_and_pack 2D→1D grid (BLOCK_ROWS 4→32) | 0.550→0.126ms (**4.4x**) |
+| gather_quantize_and_pack 同上 | 0.564→0.125ms (**4.5x**) |
+| pad_quantize_and_pack 同上 | 0.685→0.127ms (**5.4x**) |
+| **E2E FP8 fwd** | 2.52→2.26ms (**-10%**) |
+| **E2E FP8 bwd** | 4.68→4.34ms (**-7%**) |
+| **Total: FP8 1.13x faster than BF16** | |
 
-### Aligned Segments 内核级分析 (production routing, no padding)
+### Session 8 改进 (SwiGLU grid opt + memory)
 
-| 操作 | 时间 (ms) |
-|------|-----------|
-| gather_quantize_and_pack | 0.549 |
-| GEMM1 pre-quantized | 0.416 |
-| SwiGLU+quant+pack fused | 0.189 |
-| GEMM2 pre-quantized | 0.373 |
-| **Total FP8 kernels** | **1.527** |
-| **BF16 fused total** | **1.210** |
+| 优化 | 说明 |
+|------|------|
+| SwiGLU fwd_quant_pack 2D→1D grid | 524K→8K blocks (64x reduction), loop over groups internally |
+| SwiGLU bwd_quant_pack 2D→1D grid | 1M→8K blocks (128x reduction), **atomics eliminated** (ds accumulated in registers) |
+| quantize_flat_blockscaled BLOCK_ROWS 4→32 | 16K→2K blocks (8x reduction) |
+| _WEIGHT_CACHE limit 8→2 | Saves ~3.6GB |
+| _FUSED_WEIGHT_CACHE limit 8→2 (×3 functions) | Saves ~3.6GB |
+| **Total cache memory reduction** | **~7.2GB** |
 
-**关键发现**: FP8 GEMM 单独计算 0.789ms vs BF16 ~0.9ms → FP8 GEMM 已经更快。瓶颈是额外 kernel launch (gather_quant + SwiGLU_quant)。只有 fused GEMM+SwiGLU+FP8 才能真正超越 BF16 forward。
+**Note**: Session 8 performance delta could not be measured due to GPU contention (other users using 130/183GB). Contract tests 11/11 PASS. ds precision confirmed: max_rel_err < 0.0001%.
 
 ### 显存
 
@@ -167,6 +171,23 @@ tRS_rPostAct_layout = cute.recast_layout(2, 1, tRS_rD.layout)
 | Pre-quantized scale passing | `functional/__init__.py` | `_PREQUANTIZED_SCALES` dict: up-proj 的 (y1_fp8, packed_scales) 直接传递给 down-proj，跳过 down-proj 内部 quantize |
 | z-in-FP8 memory optimization | `functional/__init__.py` | `_save_z_fp8()` 控制: forward 末尾 z→fp8+raw_scales, backward 开头 dequant。每层节省 113MB |
 
+### Session 7 优化 (quantize kernel breakthrough)
+
+| 优化 | 文件 | 说明 |
+|------|------|------|
+| quantize_and_pack 2D→1D grid | `blockscaled_fp8_gemm.py` | BLOCK_ROWS 4→32, 1D grid + `tl.range` loop over groups。8K blocks (was 524K) → **4.4x faster** |
+| gather_quantize_and_pack 同上 | `blockscaled_fp8_gemm.py` | 同上模式 → **4.5x faster** |
+| pad_quantize_and_pack 同上 | `blockscaled_fp8_gemm.py` | 同上模式 → **5.4x faster** |
+
+### Session 8 优化 (SwiGLU grid + memory)
+
+| 优化 | 文件 | 说明 |
+|------|------|------|
+| SwiGLU fwd_quant_pack 2D→1D grid | `swiglu_triton.py` | 524K→8K blocks (64x), NUM_GROUPS loop, hoisted ISA computations |
+| SwiGLU bwd_quant_pack 2D→1D grid | `swiglu_triton.py` | 1M→8K blocks (128x), **atomic_add→register accumulation** (ds), no atomics needed |
+| quantize_flat BLOCK_ROWS 4→32 | `blockscaled_fp8_gemm.py` | 16K→2K blocks for `quantize_activation_blockscaled_fast` |
+| Weight cache size 8→2 | `blockscaled_fp8_gemm.py` | `_WEIGHT_CACHE`, `_FUSED_WEIGHT_CACHE` (×3 functions) — saves ~7.2GB |
+
 ---
 
 ## 7. 关键代码文件
@@ -183,6 +204,7 @@ tRS_rPostAct_layout = cute.recast_layout(2, 1, tRS_rD.layout)
 | `tests/fp8_large_project_contract_test.py` | 11 contract tests (all pass) |
 | `tools/_benchmark_split.py` | Forward/backward split benchmark |
 | `tools/_benchmark_aligned.py` | Kernel-level aligned benchmark |
+| `tools/_bench_quantize.py` | Quantize kernel BLOCK_ROWS parametric benchmark |
 
 ---
 
@@ -238,26 +260,34 @@ python tools/cluster_idle_launch.py launch --gpu-count 1 --command "..."
 7. **Padding 是 FP8 性能的核心瓶颈** — 128-alignment 约束导致 random routing 下 126/128 experts 需要 padding，总 row overhead 25%。解决方案: fused pad+quantize kernel 消除 bf16 padded 中间量。
 8. **Pre-quantized path + unaligned padding = catastrophic** — dequant(lossy!) → scatter → re-quantize 比直接从 bf16 开始更慢更不准确。解决方案: alignment-gated 优化，仅 aligned 时走 pre-quantize。
 9. **ISA E8M0 scale packing layout 有复杂的 tile-based 索引** — SF_TILE_M=128, SF_TILE_K=128, SF_VEC_SIZE=32, SF_TILE_STORAGE=512。必须精确匹配硬件布局。
+10. **2D grid per-group-block is catastrophic for Triton kernels** — 对于 blockscaled quantize/ISA-pack 操作，每个 scale group 一个 block 导致 500K-1M blocks。改用 1D grid + 内部循环可获得 4-5x 加速。
+11. **SwiGLU kernels 不能用大 BLOCK_ROWS** — compute-heavy kernels (sigmoid, backward formula) 在 BLOCK_ROWS=32 时 register pressure 导致 spill。BLOCK_ROWS=4 + 1D grid loop 是最优组合。
+12. **Atomic elimination 是 1D grid 的最大收益** — backward SwiGLU kernel 的 ds atomic_add 从 1M 次降为 0 次，ds 精度从 float32 atomic 变为精确 register accumulation。
+13. **Weight cache 不需要 8 entries** — MoE layer 只有 w1/w2，cache > 2 entries 浪费显存 (~600MB/entry)。
 
 ---
 
 ## 10. 下一步规划
 
-### P0: 进一步缩小 Forward 差距
+### P0: 性能验证 (需要干净 GPU)
 
-FP8 forward 2.52ms vs BF16 1.72ms (差距 0.8ms)。主要来源:
-- Padding overhead: 25% 额外 rows + fused pad+quantize kernel overhead
-- 2 个额外 Triton kernel launch (gather_quant, SwiGLU_quant)
+当前 GPU 争抢严重 (130/183GB used)，无法获得可靠 benchmark。需要:
+1. **重新跑 `_benchmark_split.py`** 验证 Session 8 SwiGLU 1D-grid 优化的 E2E 影响
+2. **SwiGLU BLOCK_ROWS 调优** — 尝试 BLOCK_ROWS=8,16 看是否比 4 更快 (需低争抢环境)
+3. **多 shape benchmark** — T=4096,8192,16384,32768 验证优化效果一致
 
-**方案 A: Production-aligned routing** — 实际系统的 token routing 几乎都是 128-aligned (或可以 round up)。Aligned 场景 FP8 fwd ~1.0ms vs BF16 1.21ms = 1.2x faster。这是最直接的胜利。
+### P1: 进一步内核优化
 
-**方案 B: Optimize Triton quantization kernels** — `gather_quantize_and_pack_activation` 0.549ms 可能还可以通过更大 BLOCK_ROWS 或 persistent kernel 优化。
+| 优化 | 预期收益 | 复杂度 |
+|------|----------|--------|
+| quantize kernel BLOCK_ROWS=64/128 | 10-30% (当前 0.126ms vs 理论 0.051ms) | Low |
+| Extract/unpad + downstream fusion | 0.1-0.2ms | Medium |
+| CUDA Graph for kernel sequence | 0.1-0.3ms (launch overhead) | Medium |
 
-**方案 C: 等 quack >= 0.4.0** — 修复 blockscaled accumulator recast，启用 fused GemmGated+FP8。
+### P2: 显存进一步优化
 
-### P1: 显存优化
-
-- **Drop bf16 weights after FP8 conversion**: `precompute_weight_fp8` 同时保存 bf16 和 fp8 权重。训练时可以只保留 fp8 版本 (weight grad 用 bf16 从 optimizer state 恢复)。
+- **Bound `_FP8_WEIGHT_CACHE` / `_FP8_ORIG_CACHE`** (当前无上限!) — 加 max 2 entries + LRU
+- **Drop bf16 weights after FP8 conversion**: 训练时只保留 fp8 版本 (weight grad 用 bf16 从 optimizer state 恢复)
 
 ### P2: NCU 逐 kernel 分析
 

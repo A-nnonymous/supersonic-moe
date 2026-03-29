@@ -182,61 +182,62 @@ def _swiglu_fwd_quant_pack_kernel(
     fp8_max: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
     SF_TILE_M: tl.constexpr,
     SF_TILE_STORAGE: tl.constexpr,
 ):
     """Fused SwiGLU + blockscaled fp8 quantize + ISA scale pack.
 
-    Each program processes BLOCK_ROWS rows × one scale group (GROUP_SIZE cols).
-    Reads interleaved (gate, up) from z, computes SwiGLU, quantizes to fp8,
-    and writes scales directly into ISA tile layout — zero intermediate tensors.
+    1D grid: each program processes BLOCK_ROWS rows × ALL scale groups,
+    looping over groups internally. Hoists row-dependent ISA layout
+    computations outside the group loop.
     """
     row_base = tl.program_id(0) * BLOCK_ROWS
-    group_id = tl.program_id(1)
-
     row_ids = row_base + tl.arange(0, BLOCK_ROWS)
     row_mask = row_ids < rows
 
-    col_offsets = group_id * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
-    col_mask = col_offsets[None, :] < I_dim
-    mask = row_mask[:, None] & col_mask
-
-    # Load interleaved gate/up from z
+    # Hoist row-dependent ISA layout computations outside loop
     z_row_ptrs = Z_ptr + row_ids[:, None] * stride_z_row
-    gate = tl.load(z_row_ptrs + col_offsets[None, :] * 2, mask=mask, other=0.0).to(tl.float32)
-    up = tl.load(z_row_ptrs + col_offsets[None, :] * 2 + 1, mask=mask, other=0.0).to(tl.float32)
-
-    # SwiGLU: y1 = silu(gate) * up = gate * sigmoid(gate) * up
-    sig = tl.sigmoid(gate)
-    y1 = gate * sig * up
-
-    # Blockscaled quantize (per-row scale over GROUP_SIZE elements)
-    block_amax = tl.max(tl.abs(y1), axis=1)
-    raw_scale = block_amax / fp8_max
-    positive = raw_scale > 0
-    exponent = tl.where(positive, tl.ceil(tl.log2(tl.where(positive, raw_scale, 1.0))), 0.0)
-    quant_scale = tl.exp2(-exponent)
-    y1_fp8 = (y1 * quant_scale[:, None]).to(tl.float8e4nv)
-
-    # Store fp8 data
-    y_ptrs = Y1_FP8_ptr + row_ids[:, None] * stride_y_row + col_offsets[None, :]
-    tl.store(y_ptrs, y1_fp8, mask=mask)
-
-    # Write E8M0 scale directly into ISA tile layout
-    dequant_scale = tl.exp2(exponent).to(tl.float32)
-    scale_i32 = dequant_scale.to(tl.int32, bitcast=True)
-    e8m0_byte = ((scale_i32 >> 23) & 0xFF).to(tl.uint8)
-
+    y_row_ptrs = Y1_FP8_ptr + row_ids[:, None] * stride_y_row
     row_tiles = row_ids // SF_TILE_M
     row_in_tile = row_ids % SF_TILE_M
-    k_tiles_idx = group_id // (SF_TILE_M // GROUP_SIZE)
-    k_in_tile_val = group_id % (SF_TILE_M // GROUP_SIZE)
-
-    tile_base = (row_tiles * k_tiles + k_tiles_idx) * SF_TILE_STORAGE
     row_base_offset = (row_in_tile % 32) * 16 + (row_in_tile // 32) * 4
-    packed_offset = tile_base + row_base_offset + k_in_tile_val
 
-    tl.store(PACKED_SCALE_ptr + packed_offset, e8m0_byte, mask=row_mask)
+    for group_id in tl.range(0, NUM_GROUPS):
+        col_offsets = group_id * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+        col_mask = col_offsets[None, :] < I_dim
+        mask = row_mask[:, None] & col_mask
+
+        # Load interleaved gate/up from z
+        gate = tl.load(z_row_ptrs + col_offsets[None, :] * 2, mask=mask, other=0.0).to(tl.float32)
+        up = tl.load(z_row_ptrs + col_offsets[None, :] * 2 + 1, mask=mask, other=0.0).to(tl.float32)
+
+        # SwiGLU: y1 = silu(gate) * up = gate * sigmoid(gate) * up
+        sig = tl.sigmoid(gate)
+        y1 = gate * sig * up
+
+        # Blockscaled quantize (per-row scale over GROUP_SIZE elements)
+        block_amax = tl.max(tl.abs(y1), axis=1)
+        raw_scale = block_amax / fp8_max
+        positive = raw_scale > 0
+        exponent = tl.where(positive, tl.ceil(tl.log2(tl.where(positive, raw_scale, 1.0))), 0.0)
+        quant_scale = tl.exp2(-exponent)
+        y1_fp8 = (y1 * quant_scale[:, None]).to(tl.float8e4nv)
+
+        # Store fp8 data
+        tl.store(y_row_ptrs + col_offsets[None, :], y1_fp8, mask=mask)
+
+        # Write E8M0 scale directly into ISA tile layout
+        dequant_scale = tl.exp2(exponent).to(tl.float32)
+        scale_i32 = dequant_scale.to(tl.int32, bitcast=True)
+        e8m0_byte = ((scale_i32 >> 23) & 0xFF).to(tl.uint8)
+
+        k_tiles_idx = group_id // (SF_TILE_M // GROUP_SIZE)
+        k_in_tile_val = group_id % (SF_TILE_M // GROUP_SIZE)
+        tile_base = (row_tiles * k_tiles + k_tiles_idx) * SF_TILE_STORAGE
+        packed_offset = tile_base + row_base_offset + k_in_tile_val
+
+        tl.store(PACKED_SCALE_ptr + packed_offset, e8m0_byte, mask=row_mask)
 
 
 def swiglu_forward_quant_pack_triton(
@@ -271,7 +272,7 @@ def swiglu_forward_quant_pack_triton(
     )
 
     BLOCK_ROWS = 4
-    grid = (_div_up(TK, BLOCK_ROWS), num_groups)
+    grid = (_div_up(TK, BLOCK_ROWS),)
     _swiglu_fwd_quant_pack_kernel[grid](
         z, y1_fp8, packed_scales,
         TK, I,
@@ -280,6 +281,7 @@ def swiglu_forward_quant_pack_triton(
         fp8_max=float(torch.finfo(torch.float8_e4m3fn).max),
         GROUP_SIZE=32,
         BLOCK_ROWS=BLOCK_ROWS,
+        NUM_GROUPS=num_groups,
         SF_TILE_M=_SF_TILE_M,
         SF_TILE_STORAGE=_SF_TILE_STORAGE,
     )
@@ -589,96 +591,97 @@ def _swiglu_bwd_quant_pack_kernel(
     GROUP_SIZE: tl.constexpr,
     PAIRS_PER_GROUP: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
     SF_TILE_M: tl.constexpr,
     SF_TILE_STORAGE: tl.constexpr,
 ):
     """Fused dSwiGLU + router score + blockscaled fp8 quantize + ISA pack.
 
-    Each program processes BLOCK_ROWS rows × one dz scale group (32 elements
-    = 16 interleaved (d_gate, d_up) pairs).
-
-    ds accumulation is partial per-group; a separate reduce-sum pass handles it.
-    y1s is written in bf16 for weight grads.
+    1D grid: each program processes BLOCK_ROWS rows × ALL dz scale groups,
+    looping over groups internally. ds is accumulated in registers across
+    all groups and written once — no atomic operations needed.
     """
     row_base = tl.program_id(0) * BLOCK_ROWS
-    group_id = tl.program_id(1)
-
     row_ids = row_base + tl.arange(0, BLOCK_ROWS)
     row_mask = row_ids < rows
 
-    # This group covers pairs [pair_start, pair_start + PAIRS_PER_GROUP)
-    pair_start = group_id * PAIRS_PER_GROUP
-    pair_offs = pair_start + tl.arange(0, PAIRS_PER_GROUP)
-    pair_mask = pair_offs[None, :] < I_dim
-    mask = row_mask[:, None] & pair_mask
-
-    # Load router scores
+    # Load router scores once (used by all groups)
     s_vals = tl.load(S_ptr + row_ids, mask=row_mask, other=0.0).to(tl.float32)
 
-    # Load inputs
+    # Hoist row-dependent ISA layout computations outside loop
     z_base = Z_ptr + row_ids[:, None] * stride_z_row
-    gate = tl.load(z_base + pair_offs[None, :] * 2, mask=mask, other=0.0).to(tl.float32)
-    up = tl.load(z_base + pair_offs[None, :] * 2 + 1, mask=mask, other=0.0).to(tl.float32)
-
     dy_base = DY1_ptr + row_ids[:, None] * stride_dy_row
-    dy1_val = tl.load(dy_base + pair_offs[None, :], mask=mask, other=0.0).to(tl.float32)
-
-    # Forward recomputation
-    sig = tl.sigmoid(gate)
-    silu_gate = gate * sig
-    y1 = silu_gate * up
-
-    # Partial ds accumulation for this group
-    ds_partial = tl.sum(dy1_val * y1, axis=1)
-
-    # Apply router score to gradient
-    dy1_s = dy1_val * s_vals[:, None]
-
-    # Backward SwiGLU
-    d_up = dy1_s * silu_gate
-    d_gate = dy1_s * up * sig * (1.0 + gate * (1.0 - sig))
-
-    # y1s = y1 * s (for weight grad)
-    y1s_out = y1 * s_vals[:, None]
-    y1s_base = Y1S_ptr + row_ids[:, None] * stride_y1s_row
-    tl.store(y1s_base + pair_offs[None, :], y1s_out.to(tl.bfloat16), mask=mask)
-
-    # Blockscaled quantize dz over 32 interleaved elements
-    amax_gate = tl.max(tl.where(pair_mask, tl.abs(d_gate), 0.0), axis=1)
-    amax_up = tl.max(tl.where(pair_mask, tl.abs(d_up), 0.0), axis=1)
-    amax = tl.maximum(amax_gate, amax_up)
-
-    positive = amax > 0
-    exponent = tl.where(positive,
-                        tl.ceil(tl.log2(tl.where(positive, amax / fp8_max, 1.0))),
-                        0.0)
-    quant_scale = tl.exp2(-exponent)
-
-    dg_fp8 = (d_gate * quant_scale[:, None]).to(tl.float8e4nv)
-    du_fp8 = (d_up * quant_scale[:, None]).to(tl.float8e4nv)
-
     dz_base = DZ_FP8_ptr + row_ids[:, None] * stride_dz_row
-    tl.store(dz_base + pair_offs[None, :] * 2, dg_fp8, mask=mask)
-    tl.store(dz_base + pair_offs[None, :] * 2 + 1, du_fp8, mask=mask)
-
-    # ISA-packed scale for dz (dimension is 2I)
-    dequant_scale = tl.exp2(exponent).to(tl.float32)
-    scale_i32 = dequant_scale.to(tl.int32, bitcast=True)
-    e8m0_byte = ((scale_i32 >> 23) & 0xFF).to(tl.uint8)
-
+    y1s_base = Y1S_ptr + row_ids[:, None] * stride_y1s_row
     row_tiles = row_ids // SF_TILE_M
     row_in_tile = row_ids % SF_TILE_M
-    k_tiles_idx = group_id // (SF_TILE_M // GROUP_SIZE)
-    k_in_tile_val = group_id % (SF_TILE_M // GROUP_SIZE)
-
-    tile_base = (row_tiles * k_tiles_dz + k_tiles_idx) * SF_TILE_STORAGE
     row_base_offset = (row_in_tile % 32) * 16 + (row_in_tile // 32) * 4
-    packed_offset = tile_base + row_base_offset + k_in_tile_val
 
-    tl.store(DZ_PACKED_SCALE_ptr + packed_offset, e8m0_byte, mask=row_mask)
+    # Accumulate ds across ALL groups in registers (no atomics!)
+    ds_acc = tl.zeros([BLOCK_ROWS], dtype=tl.float32)
 
-    # Atomically accumulate partial ds
-    tl.atomic_add(DS_ptr + row_ids, ds_partial, mask=row_mask)
+    for group_id in tl.range(0, NUM_GROUPS):
+        # This group covers pairs [pair_start, pair_start + PAIRS_PER_GROUP)
+        pair_start = group_id * PAIRS_PER_GROUP
+        pair_offs = pair_start + tl.arange(0, PAIRS_PER_GROUP)
+        pair_mask = pair_offs[None, :] < I_dim
+        mask = row_mask[:, None] & pair_mask
+
+        # Load inputs
+        gate = tl.load(z_base + pair_offs[None, :] * 2, mask=mask, other=0.0).to(tl.float32)
+        up = tl.load(z_base + pair_offs[None, :] * 2 + 1, mask=mask, other=0.0).to(tl.float32)
+        dy1_val = tl.load(dy_base + pair_offs[None, :], mask=mask, other=0.0).to(tl.float32)
+
+        # Forward recomputation
+        sig = tl.sigmoid(gate)
+        silu_gate = gate * sig
+        y1 = silu_gate * up
+
+        # ds accumulation in registers
+        ds_acc += tl.sum(dy1_val * y1, axis=1)
+
+        # Apply router score to gradient
+        dy1_s = dy1_val * s_vals[:, None]
+
+        # Backward SwiGLU
+        d_up = dy1_s * silu_gate
+        d_gate = dy1_s * up * sig * (1.0 + gate * (1.0 - sig))
+
+        # y1s = y1 * s (for weight grad)
+        y1s_out = y1 * s_vals[:, None]
+        tl.store(y1s_base + pair_offs[None, :], y1s_out.to(tl.bfloat16), mask=mask)
+
+        # Blockscaled quantize dz over 32 interleaved elements
+        amax_gate = tl.max(tl.where(pair_mask, tl.abs(d_gate), 0.0), axis=1)
+        amax_up = tl.max(tl.where(pair_mask, tl.abs(d_up), 0.0), axis=1)
+        amax = tl.maximum(amax_gate, amax_up)
+
+        positive = amax > 0
+        exponent = tl.where(positive,
+                            tl.ceil(tl.log2(tl.where(positive, amax / fp8_max, 1.0))),
+                            0.0)
+        quant_scale = tl.exp2(-exponent)
+
+        dg_fp8 = (d_gate * quant_scale[:, None]).to(tl.float8e4nv)
+        du_fp8 = (d_up * quant_scale[:, None]).to(tl.float8e4nv)
+
+        tl.store(dz_base + pair_offs[None, :] * 2, dg_fp8, mask=mask)
+        tl.store(dz_base + pair_offs[None, :] * 2 + 1, du_fp8, mask=mask)
+
+        # ISA-packed scale for dz (dimension is 2I)
+        dequant_scale = tl.exp2(exponent).to(tl.float32)
+        scale_i32 = dequant_scale.to(tl.int32, bitcast=True)
+        e8m0_byte = ((scale_i32 >> 23) & 0xFF).to(tl.uint8)
+
+        k_tiles_idx = group_id // (SF_TILE_M // GROUP_SIZE)
+        k_in_tile_val = group_id % (SF_TILE_M // GROUP_SIZE)
+        tile_base = (row_tiles * k_tiles_dz + k_tiles_idx) * SF_TILE_STORAGE
+        packed_offset = tile_base + row_base_offset + k_in_tile_val
+
+        tl.store(DZ_PACKED_SCALE_ptr + packed_offset, e8m0_byte, mask=row_mask)
+
+    # Write ds once — no atomics needed
+    tl.store(DS_ptr + row_ids, ds_acc, mask=row_mask)
 
 
 def swiglu_backward_quant_pack_triton(
@@ -717,10 +720,10 @@ def swiglu_backward_quant_pack_triton(
         (1, per_batch_storage), 127, dtype=torch.uint8, device=z.device
     )
     y1s = torch.empty(TK, I, dtype=torch.bfloat16, device=z.device)
-    ds = torch.zeros(TK, dtype=torch.float32, device=z.device)
+    ds = torch.empty(TK, dtype=torch.float32, device=z.device)
 
     BLOCK_ROWS = 4
-    grid = (_div_up(TK, BLOCK_ROWS), num_groups)
+    grid = (_div_up(TK, BLOCK_ROWS),)
     _swiglu_bwd_quant_pack_kernel[grid](
         dy1, z, s,
         dz_fp8, dz_packed_scales, y1s, ds,
@@ -731,6 +734,7 @@ def swiglu_backward_quant_pack_triton(
         GROUP_SIZE=GROUP_SIZE,
         PAIRS_PER_GROUP=PAIRS_PER_GROUP,
         BLOCK_ROWS=BLOCK_ROWS,
+        NUM_GROUPS=num_groups,
         SF_TILE_M=_SF_TILE_M,
         SF_TILE_STORAGE=_SF_TILE_STORAGE,
     )
