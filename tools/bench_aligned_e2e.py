@@ -139,8 +139,13 @@ def bench(mode: str, warmup: int = WARMUP, iters: int = ITERS):
         F_mod._ALIGNMENT_ASSUMED = False
     _reset_fp8_state()
 
+    def _zero_grads():
+        for p in moe.parameters():
+            p.grad = None
+
     # Warmup (compiles kernels, populates caches)
     for _ in range(warmup):
+        _zero_grads()
         x_ = x_base.clone().requires_grad_(True)
         out, _ = moe(x_)
         out.sum().backward()
@@ -158,9 +163,10 @@ def bench(mode: str, warmup: int = WARMUP, iters: int = ITERS):
     torch.cuda.synchronize()
     fwd_ms = ev_s.elapsed_time(ev_e) / iters
 
-    # Forward + Backward
+    # Forward + Backward (with proper grad zeroing, matching training loop)
     ev_s.record()
     for _ in range(iters):
+        _zero_grads()
         x_ = x_base.clone().requires_grad_(True)
         out, _ = moe(x_)
         out.sum().backward()
