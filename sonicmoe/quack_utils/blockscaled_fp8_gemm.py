@@ -1355,7 +1355,7 @@ def precompute_weight_fp8(
     w_fp8, w_scales_raw = quantize_activation_blockwise(w_ehi, proto)
     w_scales_packed = pack_blockscaled_1x32_scales(w_scales_raw, w_ehi.size(-1))
     result = (w_fp8, w_scales_packed)
-    if len(_FUSED_WEIGHT_CACHE) > 2:
+    if len(_FUSED_WEIGHT_CACHE) > 8:
         _FUSED_WEIGHT_CACHE.clear()
     _FUSED_WEIGHT_CACHE[key] = result
     return result
@@ -1409,7 +1409,7 @@ def precompute_weight_fp8_for_fused_gated(
     # Return .mT view (E, K, N) so gemm_gated_tuned's B.mT recovers (E, N, K)
     w_fp8_ekn = w_fp8_enk.mT  # stride view — same physical memory
     result = (w_fp8_ekn, w_scales_packed)
-    if len(_FUSED_WEIGHT_CACHE) > 2:
+    if len(_FUSED_WEIGHT_CACHE) > 8:
         _FUSED_WEIGHT_CACHE.clear()
     _FUSED_WEIGHT_CACHE[key] = result
     return result
@@ -1455,7 +1455,7 @@ def precompute_weight_fp8_for_fused_dgated(
     # Return .mT view (E, K=H, N=I) so gemm_dgated_tuned's B.mT recovers (E, N=I, K=H)
     w_fp8_ekn = w_fp8_enk.mT  # stride view — same physical memory
     result = (w_fp8_ekn, w_scales_packed)
-    if len(_FUSED_WEIGHT_CACHE) > 2:
+    if len(_FUSED_WEIGHT_CACHE) > 8:
         _FUSED_WEIGHT_CACHE.clear()
     _FUSED_WEIGHT_CACHE[key] = result
     return result

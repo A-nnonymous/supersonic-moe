@@ -524,6 +524,7 @@ class _UpProjection(torch.autograd.Function):
             assert not torch.compiler.is_compiling()
             assert is_glu_activation, "QuACK GEMM does not support non GLU activation yet"
             if _fp8_enabled():
+                global _ALIGNMENT_ASSUMED
                 _evict_per_tensor_caches_once()
                 aligned = _all_segments_128_aligned(expert_frequency_offset)
                 _ALIGNMENT_ASSUMED = aligned
