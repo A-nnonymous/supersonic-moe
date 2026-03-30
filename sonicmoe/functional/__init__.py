@@ -526,9 +526,10 @@ class _UpProjection(torch.autograd.Function):
             if _fp8_enabled():
                 _evict_per_tensor_caches_once()
                 aligned = _all_segments_128_aligned(expert_frequency_offset)
-                w1_fp8, w1_scales = precompute_weight_fp8(w1)
+                _ALIGNMENT_ASSUMED = aligned
 
                 if aligned:
+                    w1_fp8, w1_scales = precompute_weight_fp8(w1)
                     # All segments 128-aligned: use fused gather+quantize
                     # and pre-quantized GEMM (no padding overhead).
                     x_fp8, x_scales = gather_quantize_and_pack_activation(
@@ -539,36 +540,38 @@ class _UpProjection(torch.autograd.Function):
                         a_scales=x_scales,
                         w_fp8=w1_fp8, w_scales=w1_scales,
                         out_dtype=torch.bfloat16,
-                        assume_aligned=aligned,
+                        assume_aligned=True,
                     )
                     del x_fp8, x_scales
-                else:
-                    # Non-aligned segments: bf16 gather, let GEMM
-                    # handle padding + quantize internally.
-                    x_gathered = x[x_gather_idx]
-                    z = blockscaled_fp8_gemm_varlen(
-                        x_gathered, w1, expert_frequency_offset,
-                        w_fp8=w1_fp8, w_scales=w1_scales,
-                        out_dtype=torch.bfloat16,
-                        assume_aligned=False,
-                    )
-                    del x_gathered
 
-                # Fused SwiGLU+quant only when down-proj won't need padding
-                if aligned and _use_fused_swiglu_quant():
-                    if _save_z_fp8():
-                        # Fused SwiGLU+y1_quant+z_save: read z ONCE
-                        from sonicmoe.quack_utils.swiglu_triton import swiglu_forward_quant_pack_zsave_triton
-                        y1_fp8, y1_packed_scales, z_fp8, z_raw_scales = (
-                            swiglu_forward_quant_pack_zsave_triton(z)
-                        )
-                        _PREQUANTIZED_SCALES["z_fp8"] = (z_fp8, z_raw_scales)
+                    # Fused SwiGLU+quant only when segments are aligned
+                    if _use_fused_swiglu_quant():
+                        if _save_z_fp8():
+                            # Fused SwiGLU+y1_quant+z_save: read z ONCE
+                            from sonicmoe.quack_utils.swiglu_triton import swiglu_forward_quant_pack_zsave_triton
+                            y1_fp8, y1_packed_scales, z_fp8, z_raw_scales = (
+                                swiglu_forward_quant_pack_zsave_triton(z)
+                            )
+                            _PREQUANTIZED_SCALES["z_fp8"] = (z_fp8, z_raw_scales)
+                        else:
+                            y1_fp8, y1_packed_scales = swiglu_forward_quant_pack_triton(z)
+                        _PREQUANTIZED_SCALES["fwd"] = (y1_fp8, y1_packed_scales)
+                        y1 = y1_fp8
                     else:
-                        y1_fp8, y1_packed_scales = swiglu_forward_quant_pack_triton(z)
-                    _PREQUANTIZED_SCALES["fwd"] = (y1_fp8, y1_packed_scales)
-                    y1 = y1_fp8
+                        y1 = _swiglu_forward_interleaved(z)
                 else:
-                    y1 = _swiglu_forward_interleaved(z)
+                    # Non-aligned: fall back to BF16 fused path (gemm_gated).
+                    # FP8-with-padding is 2-8x slower than BF16 fused due to
+                    # per-expert padding overhead (128 copy+pad+GEMM+unpad ops).
+                    z, y1 = gemm_gated(
+                        x,
+                        w1.permute(2, 1, 0),
+                        activation="swiglu",
+                        cu_seqlens_m=expert_frequency_offset,
+                        A_idx=x_gather_idx,
+                        postact_dtype=(torch.float8_e4m3fn if use_low_precision_postact_buffer else None),
+                        dynamic_scheduler=False,
+                    )
             else:
                 z, y1 = gemm_gated(
                     x,
@@ -659,7 +662,7 @@ class _UpProjection(torch.autograd.Function):
         if use_quack_gemm:
             assert not is_compiling
 
-            if _fp8_enabled():
+            if _fp8_enabled() and _ALIGNMENT_ASSUMED:
                 # Blockscaled FP8 act-grad + BF16 weight-grad.
                 # Weight-grad stays BF16: bandwidth-bound (small K = TPE).
 
@@ -694,7 +697,7 @@ class _UpProjection(torch.autograd.Function):
                         dz_bf16, w1.permute(1, 0, 2), expert_frequency_offset,
                         w_fp8=w1T_fp8, w_scales=w1T_scales,
                         out_dtype=torch.bfloat16,
-                        assume_aligned=_ALIGNMENT_ASSUMED,
+                        assume_aligned=True,
                     )
                 del dz_bf16
             else:
@@ -784,7 +787,7 @@ class _DownProjection(torch.autograd.Function):
             assert not torch.compiler.is_compiling()
 
             assert b2 is None
-            if _fp8_enabled():
+            if _fp8_enabled() and _ALIGNMENT_ASSUMED:
                 # Blockscaled FP8 down-proj: use pre-quantized y1 if available
                 # from fused SwiGLU+quant in _UpProjection.forward.
                 w2_fp8, w2_scales = precompute_weight_fp8(w2)
@@ -796,14 +799,14 @@ class _DownProjection(torch.autograd.Function):
                         a_scales=y1_packed_scales,
                         w_fp8=w2_fp8, w_scales=w2_scales,
                         out_dtype=torch.bfloat16,
-                        assume_aligned=_ALIGNMENT_ASSUMED,
+                        assume_aligned=True,
                     )
                 else:
                     y2 = blockscaled_fp8_gemm_varlen(
                         y1, w2, expert_frequency_offset,
                         w_fp8=w2_fp8, w_scales=w2_scales,
                         out_dtype=torch.bfloat16,
-                        assume_aligned=False,
+                        assume_aligned=True,
                     )
                 router_perm = s_reverse_scatter_idx
                 y2_for_router = y2
@@ -849,7 +852,7 @@ class _DownProjection(torch.autograd.Function):
 
         # Memory optimization: store z in FP8 to save ~50% of z's memory.
         z_is_fp8 = (_fp8_enabled() and use_quack_gemm and _save_z_fp8()
-                    and z.dtype == torch.bfloat16)
+                    and _ALIGNMENT_ASSUMED and z.dtype == torch.bfloat16)
         ctx._z_is_fp8 = z_is_fp8
 
         if z_is_fp8:
@@ -933,36 +936,26 @@ class _DownProjection(torch.autograd.Function):
             assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
 
             s = topk_scores[s_scatter_idx]
-            if _fp8_enabled():
-                aligned = _all_segments_128_aligned(expert_frequency_offset)
+            if _fp8_enabled() and _ALIGNMENT_ASSUMED:
+                # All segments aligned: use blockscaled FP8 path.
                 w2_actgrad = w2.permute(1, 0, 2)  # (I, H, E)
                 w2_fp8, w2_scales = precompute_weight_fp8(w2_actgrad)
 
-                if aligned:
-                    dout_fp8, dout_scales = gather_quantize_and_pack_activation(
-                        dout, x_gather_idx
-                    )
-                    dy1 = blockscaled_fp8_gemm_varlen(
-                        dout_fp8, w2_actgrad, expert_frequency_offset,
-                        a_scales=dout_scales,
-                        w_fp8=w2_fp8, w_scales=w2_scales,
-                        out_dtype=torch.bfloat16,
-                        assume_aligned=aligned,
-                    )
-                    del dout_fp8, dout_scales
-                else:
-                    dout_gathered = dout[x_gather_idx]
-                    dy1 = blockscaled_fp8_gemm_varlen(
-                        dout_gathered, w2_actgrad, expert_frequency_offset,
-                        w_fp8=w2_fp8, w_scales=w2_scales,
-                        out_dtype=torch.bfloat16,
-                        assume_aligned=False,
-                    )
-                    del dout_gathered
+                dout_fp8, dout_scales = gather_quantize_and_pack_activation(
+                    dout, x_gather_idx
+                )
+                dy1 = blockscaled_fp8_gemm_varlen(
+                    dout_fp8, w2_actgrad, expert_frequency_offset,
+                    a_scales=dout_scales,
+                    w_fp8=w2_fp8, w_scales=w2_scales,
+                    out_dtype=torch.bfloat16,
+                    assume_aligned=True,
+                )
+                del dout_fp8, dout_scales
 
                 # Step 3: SwiGLU backward
                 if z_fp8 is not None:
-                    if aligned and _use_fused_swiglu_quant():
+                    if _use_fused_swiglu_quant():
                         # Decomposed path (faster than fully-fused):
                         # 1. Dequant z_fp8 → z_bf16  (~0.046ms, BLOCK_ROWS=16)
                         # 2. dSwiGLU + quant + ISA-pack + dz_bf16  (~0.36ms, single kernel)
