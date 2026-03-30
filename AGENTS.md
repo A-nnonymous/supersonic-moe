@@ -5,8 +5,9 @@ For detailed handoff context and debugging history, read `agent.md` and `reports
 
 ## Current Status (2025-03-30)
 
-**1.57x E2E over BF16** at production shape (E=128, tpe=256, T=4096, H=4096, I=1024).
-Forward: 0.99x (bottleneck), Backward: 1.93x. 8/8 contract tests PASS.
+**1.58x E2E over BF16** at production shape (E=128, tpe=256, T=4096, H=4096, I=1024).
+Forward: 0.99x (bottleneck), Backward: 1.94x. 8/8 contract tests PASS.
+Precision: RelRMSE 5.3-6.6%, Correlation 0.998.
 
 ## Scope
 

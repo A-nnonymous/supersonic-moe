@@ -122,7 +122,7 @@ The reporting policy for every FP8 step is:
 
 ## 🔥 FP8 Blockscaled Status (2025-03-30)
 
-**Full-chain blockscaled FP8 (1×32 UE8M0) for Blackwell SM100.** Production E2E: **1.57x total speedup** over BF16 (fwd=0.99x, bwd=1.93x). 8/8 contract tests pass. Forward + backward via decomposed CUTLASS blockscaled GEMM + Triton SwiGLU. Fused GEMM+SwiGLU+FP8 blocked by CUTLASS DSL accumulator recast bug.
+**Full-chain blockscaled FP8 (1×32 UE8M0) for Blackwell SM100.** Production E2E: **1.58x total speedup** over BF16 (fwd=0.99x, bwd=1.94x). 8/8 contract tests pass. Precision: RelRMSE 5.3-6.6%, Correlation 0.998. Forward + backward via decomposed CUTLASS blockscaled GEMM + Triton SwiGLU. Fused GEMM+SwiGLU+FP8 blocked by CUTLASS DSL accumulator recast bug.
 
 | Resource | Path |
 |----------|------|
@@ -144,19 +144,19 @@ CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
 CUDA_VISIBLE_DEVICES=0 python tools/bench_aligned_e2e.py
 ```
 
-### Performance (B200 SM100a, E=128, K=8, tpe=256)
+### Performance (B200 SM100a, E=128, K=8, tpe=256, 8-GPU avg)
 
 | Mode | Forward | Backward | Total | vs BF16 |
 |------|---------|----------|-------|---------|
-| BF16 baseline | 1.130ms | 3.650ms | 4.781ms | 1.00x |
-| **FP8 aligned** | **1.142ms** | **1.894ms** | **3.036ms** | **1.57x** ⭐ |
+| BF16 baseline | 1.134ms | 3.624ms | 4.758ms | 1.00x |
+| **FP8 aligned** | **1.143ms** | **1.870ms** | **3.014ms** | **1.58x** ⭐ |
 
 ### Current state
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| FP8 forward (decomposed) | ✅ Working | 6.56% RelRMSE, 0.99x (4 kernels vs BF16's 2 fused) |
-| FP8 backward (decomposed) | ✅ Working | dx 6.54%, dw2 5.35% RelRMSE, **1.93x** |
+| FP8 forward (decomposed) | ✅ Working | 6.56% RelRMSE, 0.998 corr, 0.99x (4 kernels vs BF16's 2 fused) |
+| FP8 backward (decomposed) | ✅ Working | dx 6.54%, dw2 5.35% RelRMSE, 0.998 corr, **1.94x** |
 | BF16 fallback (non-aligned) | ✅ Working | Auto-detects alignment, zero performance penalty |
 | Fused FP8 GEMM+SwiGLU | 🔴 Blocked | CUTLASS DSL accumulator recast bug |
 
