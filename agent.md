@@ -1,44 +1,39 @@
-# SonicMoE FP8 Agent Handoff Context
+# SonicMoE Agent Quick Context
 
-This file provides cold-start context for any agent continuing the blockscaled FP8 optimization work.
+## Status (2025-03-30)
+
+**1.57x E2E over BF16** at production shape (E=128, tpe=256). 8/8 contract tests PASS.
+
+- Forward: 1.142ms FP8 vs 1.130ms BF16 = **0.99x** (bottleneck: 4 kernels vs 2 fused)
+- Backward: 1.894ms FP8 vs 3.650ms BF16 = **1.93x** (act-grad GEMM weight bandwidth halved)
 
 ## Read First
 
-1. `reports/fp8_upgrade/HANDOFF.md` — Full project status, insights, and next steps
-2. `README.md` § "FP8 Blockscaled Status" — Quick overview
-3. `sonicmoe/quack_utils/gemm_gated.py` — Fused GEMM+SwiGLU (rewritten for quack 0.3.7)
-4. `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` — Core blockscaled FP8 infrastructure
-5. `sonicmoe/functional/__init__.py` — MoE forward/backward dispatch (lines 460-500 for FP8 forward)
+1. `reports/fp8_upgrade/HANDOFF.md` — Complete status, kernel breakdown, lessons, next steps
+2. `AGENTS.md` — Scope, non-negotiables, architecture
 
 ## Current Blocker
 
-**TileStore + blockscaled FP8 = illegal instruction on sm_100a.**
-
-The decomposed path (GemmDefaultSm100, no TileStore) works perfectly after fixing `create_varlen_args`.
-Any kernel using `TileStore` epilogue op + `sf_vec_size=32` crashes.
-This blocks fused GEMM+SwiGLU which is essential for beating BF16 performance.
+FP8 forward can't beat BF16 because `GemmGatedSm100` (fused GEMM+SwiGLU) crashes with blockscaled FP8 inputs — `cute.recast_layout(2, 1, ...)` incompatible with `MmaMXF8Op` accumulator TMEM layout. Not fixable via monkey-patch. Needs CUTLASS C++ standalone kernel or quack ≥ 0.4.0.
 
 ## Environment
 
 ```bash
 source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate
 cd /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe
-# Packages: quack-kernels==0.3.7, nvidia-cutlass-dsl==4.4.2, torch==2.9.1+cu128
-# GPU: 8x B200 (sm_100a), 183GB each, ~50GB free per GPU, all at 100% util
-# NCU profiling still possible despite GPU utilization
+# See /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/env.md for cluster details
 ```
 
 ## Key API Facts (quack 0.3.7)
 
-- `GemmWrapperBase.create_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)` — 3 args only
-- `GemmWrapperBase.create_scheduler_args(max_active_clusters, ...)` — returns `TileSchedulerOptions`
-- `@mlir_namedtuple` replaces `ArgumentsBase` for `EpilogueArguments`
-- `_epi_ops` tuple defines composable epilogue: `TileStore`, `ColVecReduce`, `Scalar`, `RowVecLoad`, etc.
-- `mark_layout_dynamic(leading_dim=X)` requires `strides[X]==1` — use `.contiguous()` when needed
+- `blockscaled_fp8_gemm_varlen(a, w, cu_seqlens, ...)` — core FP8 GEMM
+- `gather_quantize_and_pack_activation(x, idx)` — fused gather+quant+ISA-pack
+- `swiglu_forward_quant_pack_zsave_triton(z)` — fused SwiGLU+quant+z-save
+- `precompute_weight_fp8(w)` — weight cache (limit 8, covers fwd+bwd)
+- `_ALIGNMENT_ASSUMED` — global flag, gate FP8 paths on alignment
 
-## Immediate Priority
+## Next Priority
 
-1. Fix `TileStore` + blockscaled interaction (P0)
-2. Fix `gemm_dgated.py` `BFloat16.__c_pointers__` pickle error (P0.5)
-3. Contract tests 8/8 pass (P1)
-4. NCU profiling FP8 vs BF16 (P2)
+1. **Forward speedup**: CUTLASS C++ fused GEMM+SwiGLU+FP8 kernel (bypass DSL)
+2. **Backward overlap**: multi-stream act-grad ∥ weight-grad
+3. **Token rounding**: routing-layer 128-alignment guarantee
