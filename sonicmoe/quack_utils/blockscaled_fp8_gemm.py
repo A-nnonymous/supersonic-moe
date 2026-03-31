@@ -278,6 +278,7 @@ def _quantize_w2_cached(
 def clear_blockscaled_fp8_weight_cache() -> None:
     _WEIGHT_CACHE.clear()
     _FUSED_WEIGHT_CACHE.clear()
+    _DIRECT_FUSED_DGATED_WEIGHT_CACHE.clear()
     _PAD_PLAN_CACHE.clear()
 
 
@@ -1080,6 +1081,7 @@ def blockscaled_fp8_wgrad_varlen_k(
     N: int,
     *,
     a_gather_idx: Optional[torch.Tensor] = None,
+    b_gather_idx: Optional[torch.Tensor] = None,
     out_dtype: torch.dtype = torch.bfloat16,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -1091,12 +1093,13 @@ def blockscaled_fp8_wgrad_varlen_k(
 
     Parameters
     ----------
-    a_src : (T_or_TK, M) bf16 — e.g., dout or x.
-    b_src : (TK, N) bf16 — e.g., y1s or dz (already expert-sorted).
+    a_src : (T_or_TK, M) bf16 — e.g., dout, dz, or x.
+    b_src : (T_or_TK, N) bf16 — e.g., y1s, dz, or x.
     cu_seqlens_k : (E+1,) int32 expert boundaries.
     M : output rows (e.g., H).
     N : output cols (e.g., I or 2*I).
     a_gather_idx : optional (TK,) int32 gather for A.
+    b_gather_idx : optional (TK,) int32 gather for B.
     out_dtype : output dtype.
     out : optional pre-allocated (E, M, N) contiguous output tensor.
 
@@ -1104,7 +1107,14 @@ def blockscaled_fp8_wgrad_varlen_k(
     -------
     dW : (E, M, N) weight gradient.
     """
-    TK = b_src.shape[0]
+    a_rows = a_gather_idx.size(0) if a_gather_idx is not None else a_src.shape[0]
+    b_rows = b_gather_idx.size(0) if b_gather_idx is not None else b_src.shape[0]
+    if a_rows != b_rows:
+        raise ValueError(
+            "effective row count must match between operands, "
+            f"got a={a_rows}, b={b_rows}"
+        )
+    TK = a_rows
     num_experts = cu_seqlens_k.shape[0] - 1
     device = b_src.device
 
@@ -1112,7 +1122,7 @@ def blockscaled_fp8_wgrad_varlen_k(
         a_src, logical_rows=M, logical_cols=TK, gather_idx=a_gather_idx,
     )
     b_fp8, b_scales = colwise_quantize_and_pack(
-        b_src, logical_rows=N, logical_cols=TK,
+        b_src, logical_rows=N, logical_cols=TK, gather_idx=b_gather_idx,
     )
 
     return _run_cutlass_blockscaled_gemm_varlen_k(
@@ -1875,6 +1885,12 @@ _FUSED_WEIGHT_CACHE: dict[
 ] = {}
 
 
+_DIRECT_FUSED_DGATED_WEIGHT_CACHE: dict[
+    tuple[int, int, tuple[int, ...], tuple[int, ...]],
+    tuple[torch.Tensor, torch.Tensor],
+] = {}
+
+
 def precompute_weight_fp8_for_fused_gated(
     w: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1966,6 +1982,45 @@ def precompute_weight_fp8_for_fused_dgated(
     if len(_FUSED_WEIGHT_CACHE) > 8:
         _FUSED_WEIGHT_CACHE.clear()
     _FUSED_WEIGHT_CACHE[key] = result
+    return result
+
+
+def precompute_weight_fp8_for_direct_fused_dgated(
+    w: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pre-quantize expert weight for direct low-level gemm_dgated blockscaled path.
+
+    Unlike precompute_weight_fp8_for_fused_dgated(), this returns the physical
+    contiguous (E, N, K) layout that the low-level gemm_dgated kernel consumes
+    directly, so the caller can bypass gemm_interface's B.mT.contiguous() copy.
+
+    Parameters
+    ----------
+    w : Tensor (H, I, E) bf16 — expert weights.
+
+    Returns
+    -------
+    w_fp8 : Tensor (E, N=I, K=H) float8_e4m3fn — contiguous physical layout.
+    w_scales : Tensor packed float8_e8m0fnu in ISA layout (scales along K=H).
+    """
+    key = (
+        w.untyped_storage().data_ptr(),
+        w._version,
+        tuple(w.shape),
+        tuple(w.stride()),
+    )
+    cached = _DIRECT_FUSED_DGATED_WEIGHT_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    w_enk = w.permute(2, 1, 0).contiguous()  # (E, N=I, K=H) contiguous
+    proto = FP8Protocol(scale_granularity=FP8ScaleGranularity.BLOCK_1X32)
+    w_fp8_enk, w_scales_raw = quantize_activation_blockwise(w_enk, proto)
+    w_scales_packed = pack_blockscaled_1x32_scales(w_scales_raw, w_enk.size(-1))
+    result = (w_fp8_enk, w_scales_packed)
+    if len(_DIRECT_FUSED_DGATED_WEIGHT_CACHE) > 8:
+        _DIRECT_FUSED_DGATED_WEIGHT_CACHE.clear()
+    _DIRECT_FUSED_DGATED_WEIGHT_CACHE[key] = result
     return result
 
 

@@ -1,339 +1,367 @@
 # Blockscaled FP8 MoE — Handoff
 
-> **Last updated: 2026-03-31, Session 21**
-> **Status: FP8 is 18% SLOWER than official BF16 baseline. Previous "1.59x speedup" was measured against inflated fork BF16. Three-way nsys comparison reveals true gap.**
+> **Last updated:** 2026-03-31
+> **Status:** aligned fused FP8 act-grad is landed, but **full-chain FP8 is still not production-ready** because the current FP8 weight-grad path is too slow and still loses on local peak memory / inference.
 
 ---
 
-## 1. 当前状态 — ⚠️ 实事求是
+## 0. One-screen summary
 
-**全链路 blockscaled FP8 (1×32 UE8M0) MoE forward + backward 功能完成。FP8 wgrad 已集成（默认关闭，需要用 SONIC_MOE_FP8_WGRAD=1 开启）。**
+If you only read one section, read this one.
 
-### ⚠️ 关键发现：此前上报的 "1.59x speedup" 是与自身 fork 的 BF16 做对比，而非与官方 BF16 baseline
-
-**三方 nsys 对比（NVTX GPU Projection，sync barriers，production shape T=4096 H=4096 I=1024 E=128 K=8）：**
-
-| Mode | Forward (µs) | Backward (µs) | Total (µs) | vs Official BF16 |
-|------|-------------|---------------|------------|-------------------|
-| **Official BF16** (quack 0.2.5) | 777 | 1698 | **2475** | 1.00x (baseline) |
-| Fork BF16 (quack 0.3.7) | 800 | 3781 | 4581 | 0.54x ❌ |
-| Fork FP8 (quack 0.3.7) | 935 | 1995 | 2930 | **0.84x** ❌ |
-
-- **FP8 比官方 BF16 慢 455µs (18%)**
-- Fork BF16 慢 1.85x 是因为 backward 有 2101µs contiguous copy overhead（详见 §3）
-- 此前 "1.59x" 数字 = 4581/2930，是拿慢了的 fork BF16 做分母，不具参考价值
-
-**nsys profile 文件**:
-- `reports/sonic_official_bf16.sqlite` — 官方 BF16 (quack 0.2.5, AUTHORITATIVE baseline)
-- `reports/sonic_fork_bf16_v4.sqlite` — Fork BF16 (quack 0.3.7)
-- `reports/sonic_fork_fp8_v4.sqlite` — Fork FP8 (quack 0.3.7)
-
-**分析工具**: `tools/nsys_full_breakdown.py` 解析 sqlite → NVTX GPU projection + kernel breakdown
+- The **old `2930us / 455us gap` story is stale**. It described the pre-fused path before the fused gated/dgated integration and before the FP8 wgrad autograd-copy fix.
+- The **current near-baseline training path** in this tree is:
+  - `USE_QUACK_GEMM=1`
+  - `SONIC_MOE_FP8_MODE=perf`
+  - `SONIC_MOE_FP8_ASSUME_ALIGNED=1`
+  - `SONIC_MOE_FP8_FUSED_GATED=1`
+  - `SONIC_MOE_FP8_WGRAD=0`
+- Under the authoritative aligned NSYS harness, that path is now only **~125us behind official BF16**.
+- The project is **still not done** because turning on `SONIC_MOE_FP8_WGRAD=1` blows training backward up badly.
+- The remaining training blocker is now **FP8 weight-grad**, not forward SwiGLU micro-optimization.
+- Current local aligned inference and peak-memory measurements are also still **worse than BF16**, so do **not** claim an inference or memory win yet.
+- Current correctness signal is good but not complete:
+  - `tests/fp8_large_project_contract_test.py`: **8 passed, 3 deselected** with `SONIC_MOE_FP8_FUSED_GATED=1 SONIC_MOE_FP8_WGRAD=1`
+  - No fresh large-shape gold report for the latest full-chain FP8 wgrad path was produced in this session.
 
 ---
 
-## 2. 精度（达标，8/8 contract tests PASS）
+## 1. Current code state
 
-| Metric | Small (T=256) | Production (T=4096) | 阈值 | 状态 |
-|--------|--------------|---------------------|------|------|
-| Forward RelRMSE | 6.56% | 6.61% | <10% | ✅ |
-| dx grad RelRMSE | 6.54% | — | <10% | ✅ |
-| dw2 RelRMSE | 5.35% | — | <10% | ✅ |
-| Correlation | 0.998 | 0.998 | >0.99 | ✅ |
-| FP8 wgrad (varlen_k) | 3.74% | 3.75% | <10% | ✅ |
+### 1.1 What landed in this session
 
-验证命令:
-```bash
-CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
-  python -m pytest tests/fp8_large_project_contract_test.py -v -k "not large_shape"
-```
+These changes are already in the working tree and were regression-tested:
 
----
+- `sonicmoe/quack_utils/gemm_interface.py`
+  - Blockscaled fused `gemm_gated` / `gemm_dgated` now bypass the unsafe autotuner path and use a safe config path.
+- `sonicmoe/functional/__init__.py`
+  - Added fused aligned blockscaled helpers for forward / backward.
+  - Wired aligned FP8 forward/backward to the fused gated path behind `SONIC_MOE_FP8_FUSED_GATED`.
+  - Added robust prequant tensor matching across autograd boundaries.
+  - Removed explicit standalone `y1` and `dz` prequant kernels from the fused path after they proved low-value.
+  - Fixed the FP8 wgrad autograd-layout issue by writing into base-layout buffers (`dw1_base`, `dw2_base`) before returning grad views.
+- `sonicmoe/quack_utils/blockscaled_fp8_gemm.py`
+  - Added direct fused-dgated weight cache helper to bypass wrapper-side `B.mT.contiguous()` copy.
+  - Extended `blockscaled_fp8_wgrad_varlen_k()` with `b_gather_idx` so `dw1` can be computed in parameter-friendly layout.
+- `sonicmoe/quack_utils/__init__.py`
+  - Exported the new direct fused-dgated helper.
 
-## 3. 三方 Kernel Breakdown（nsys NVTX GPU Projection）
+### 1.2 Practical state of feature flags
 
-### 3.1 Official BF16 Forward (777µs) — THE REAL BASELINE
-
-| Kernel | µs | % | 说明 |
-|--------|----|---|------|
-| `GemmGatedSm100` (up-proj+SwiGLU) | 418 | 53.8% | **Fused** GEMM+SwiGLU (quack 0.2.5 独有) |
-| `GemmDefaultSm100` (down-proj) | 231 | 29.7% | BF16 GEMM |
-| `token_gather_sum_kernel` | 47 | 6.0% | scatter-reduce |
-| misc | 81 | 10.4% | — |
-
-### 3.2 Official BF16 Backward (1698µs) — 无 contiguous copy
-
-| Kernel | µs | % | 说明 |
-|--------|----|---|------|
-| `GemmDefaultSm100` ×3 (dact + 2× wgrad) | 1297 | 76.4% | BF16 GEMM |
-| `GemmDGatedSm100` (fused dact+SwiGLU_bwd) | 258 | 15.2% | fused backward |
-| misc | 144 | 8.5% | — |
-
-### 3.3 Fork BF16 Backward (3781µs) — 被 contiguous copy 拖慢
-
-| Kernel | µs | % | 说明 |
-|--------|----|---|------|
-| **`elementwise_kernel` ×2** | **2101** | **55.6%** | **contiguous copy, 根因见 §3.6** |
-| `GemmDefaultSm100` ×3 | 1264 | 33.4% | BF16 GEMM |
-| `GemmDGatedSm100` | 291 | 7.7% | fused backward |
-| misc | 125 | 3.3% | — |
-
-### 3.4 Fork FP8 Forward (935µs)
-
-| Kernel | µs | % | 说明 |
-|--------|----|---|------|
-| `GemmDefaultSm100` ×2 (decomposed up+down) | 480 | 51.3% | FP8 GEMM |
-| `_swiglu_fwd_quant_pack_zsave_kernel` | 229 | 24.5% | **Triton: 优化重点 #1** |
-| `_gather_quantize_and_pack_kernel` | 98 | 10.4% | gather + FP8 quant |
-| `token_gather_sum` | 48 | 5.1% | scatter-reduce |
-| misc | 81 | 8.7% | — |
-
-### 3.5 Fork FP8 Backward (1995µs)
-
-| Kernel | µs | % | 说明 |
-|--------|----|---|------|
-| `GemmDefaultSm100` ×4 (2× FP8 act + 2× BF16 wgrad) | 1336 | 67.0% | GEMM 集合 |
-| `_swiglu_bwd_quant_pack_kernel` | 384 | 19.2% | **Triton: 优化重点 #2** |
-| `_gather_quantize_and_pack_kernel` | 97 | 4.8% | dout quant |
-| `token_gather_sum` | 46 | 2.3% | — |
-| `_dequant_blockscaled_fp8_kernel` | 39 | 1.9% | z_fp8 → bf16 |
-| misc | 94 | 4.7% | — |
-
-### 3.6 Fork BF16 Contiguous Copy 根因
-
-Fork backward 有 2101µs elementwise_kernel 而 Official 没有。原因：
-- Fork 的 gemm_dgated.py 使用 `TileStore("mPostAct")` (quack 0.3.7 接口)
-- Official 使用 dataclass-based epilogue (quack 0.2.5 接口)
-- Fork 的 TileStore 可能产生非连续 y1s 输出
-- Fork 在 `_DownProjection.backward` line 921 有 `dout = dout.contiguous()`，产生大额 copy
-- **这不是 bug，是 quack 0.3.7 的 layout 行为差异**
+- `SONIC_MOE_FP8_FUSED_GATED=1`
+  - **Recommended** for current aligned-training experiments.
+- `SONIC_MOE_FP8_WGRAD=1`
+  - **Not recommended as default**. It is functionally working, but the current kernel path is too slow.
+- `SONIC_MOE_FP8_ASSUME_ALIGNED=1`
+  - Safe only for the aligned-routing harness / production-style rounded routing.
 
 ---
 
-## 4. FP8 vs Official BF16: 455µs Gap 分析
+## 2. Source-of-truth measurements
 
-| 来源 | FP8 额外开销 (µs) | FP8 节省 (µs) | 净影响 |
-|------|-------------------|---------------|--------|
-| **前向** | | | **+158µs** |
-| 分解 GEMM 代替 fused GemmGated | +62 | — | +62 |
-| `_swiglu_fwd_quant_pack_zsave_kernel` (SwiGLU + quant) | +229 | -418 (无 fused GemmGated) | — |
-| `_gather_quantize_and_pack_kernel` | +98 | — | +98 |
-| **反向** | | | **+297µs** |
-| `_swiglu_bwd_quant_pack_kernel` | +384 | -258 (无 GemmDGated) | +126 |
-| `_gather_quantize_and_pack_kernel` | +97 | — | +97 |
-| `_dequant_blockscaled_fp8_kernel` | +39 | — | +39 |
-| FP8 GEMM 加速 (act-grad) | — | -218 | -218 |
-| wgrad 仍 BF16（无 FP8 加速） | 0 | 0 | 0 |
-| **合计** | | | **~+455µs** |
+### 2.1 Authoritative training performance
 
-**根本矛盾**: FP8 的 Triton quant/SwiGLU 开销 (~847µs) 远大于 FP8 GEMM 节省 (~218µs + fused 无法使用)
+These are the numbers to use in any serious comparison. They come from **NSYS NVTX GPU projection with sync barriers** on the aligned production shape (`T=4096 H=4096 I=1024 E=128 K=8`).
 
----
+| Path | Forward | Backward | Total | Status |
+|------|---------|----------|-------|--------|
+| **Official BF16** | `777.3us` | `1697.9us` | `2475.2us` | **Authoritative baseline** |
+| **Current fused FP8 + BF16 wgrad** | `812.1us` | `1788.2us` | `2600.3us` | Best current training path in this repo |
+| **Current fused FP8 + FP8 wgrad** | `812.0us` | `4838.4us` | `5650.4us` | Full-chain FP8 currently loses badly |
 
-## 5. FP8 wgrad varlen_k（已实现，已集成，默认关闭）
+### 2.2 Interpretation
 
-### 5.1 实现概述
+- The **aligned fused act-grad path is mostly solved**:
+  - current fused FP8 + BF16 wgrad is only `2600.3us`, about **`125.1us` behind** official BF16.
+- The **remaining training blocker is almost entirely wgrad**:
+  - enabling FP8 wgrad changes backward from `1788.2us` to `4838.4us`
+  - forward is effectively unchanged (`812.1us` vs `812.0us`)
+- So the current project frontier is **not** “keep trimming forward SwiGLU first”; it is **replace/redesign the FP8 wgrad path**.
 
-Column-wise quantize + TMA non-contiguous FP8 + CUTLASS varlen_k GEMM.
-FP8 wgrad 本身 per-op 更快（276µs vs BF16 575µs），但由于 layout permutation copy 额外 ~637µs，E2E 反而变慢。
-
-### 5.2 代码位置
-
-```
-sonicmoe/quack_utils/blockscaled_fp8_gemm.py:
-  - _colwise_quantize_and_pack_kernel  (Triton kernel)
-  - colwise_quantize_and_pack()        (Python wrapper)
-  - _run_cutlass_blockscaled_gemm_varlen_k()  (CUTLASS launch + cache)
-  - blockscaled_fp8_wgrad_varlen_k()   (All-in-one: quant + GEMM)
-
-sonicmoe/functional/__init__.py:
-  - _use_fp8_wgrad() feature flag (line ~134, 默认关闭)
-  - _DownProjection.backward (line ~1011): FP8 wgrad w2
-  - _UpProjection.backward (line ~683): FP8 wgrad w1
-
-tools/test_fp8_wgrad_varlen_k.py: (Validation test, 4/4 PASS)
-```
-
-### 5.3 为什么默认关闭
-
-FP8 wgrad GEMM 276µs vs BF16 575µs (2.08x faster per-op)。
-但 colwise quant (235µs) + layout permutation copy (~637µs) 超过了 GEMM 节省。
-**需要融合 quant 到 GEMM epilogue / 消除 permutation copy 才能获益。**
-
-### 5.4 关键发现（高价值 info）
-
-| 信息 | 来源 | 价值 |
-|------|------|------|
-| quack `gemm()` 内部执行 `B = B.mT` | `quack/gemm_interface.py:170` | B 永远非连续; TMA 处理 |
-| FP8 无 k-major 约束 | `quack/gemm_sm100.py:2089-2165` | 仅 FP4 需要 k-major |
-| `mark_layout_dynamic(leading_dim=X)` 验证 stride[X]==1 | `cutlass/cute/runtime.py:176-196` | transposed FP8 自然满足 |
-| `permute_tensors(varlen_k=True)` 只 permute D 和 C | `quack/gemm_wrapper_utils.py:168-186` | A 保持 2D |
-| FP8 对齐: contiguous dim 必须 ×16 | `quack/gemm_sm100.py:2307-2308` | H=4096, I=1024 都 OK |
-
----
-
-## 6. Fused Blockscaled 前向 — CUTLASS DSL 限制
-
-`GemmGatedSm100` + `sf_vec_size=32` → `CUDA_ERROR_ILLEGAL_INSTRUCTION`
-
-根因: `cute.recast_layout(2, 1, ...)` 不感知 blockscaled MMA 的 TMEM 物理列布局。
-需 CUTLASS C++ 或 quack ≥ 0.4.0 修复。这是前向 62µs gap 的根本来源——无法使用 fused GemmGated。
-
----
-
-## 7. quack 版本兼容性矩阵（关键约束）
-
-| Feature | PyPI 0.2.5 | PyPI 0.3.7 | Original xfer (custom build) |
-|---------|-----------|-----------|----------------------------|
-| `ArgumentsBase` | ✓ | ✗ | ✓ |
-| `mlir_namedtuple` | ✗ | ✓ | ✓ |
-| `GemmGatedSm100.num_epi_tensormaps` | ✓ | ✗ | ✓ |
-
-- **Fork 需要 `mlir_namedtuple` → 必须 quack 0.3.7**
-- **Official 需要 `ArgumentsBase` + `num_epi_tensormaps` → 必须 quack 0.2.5**
-- **两者 API 不兼容，无法同环境运行**
-- Official BF16 profile 是在 quack 临时被 0.2.5 覆盖时抓取的（之后恢复了 0.3.7）
-
----
-
-## 8. Bug 修复历史
-
-| Bug | 修复 |
-|-----|------|
-| 非对齐路由 7x 减速 | Gate FP8 on `_ALIGNMENT_ASSUMED`, fallback BF16 |
-| Weight cache thrashing (limit 2 < 4) | Increase to 8 |
-| `global _ALIGNMENT_ASSUMED` in `@staticmethod` | Explicit `global` |
-| Benchmark gradient accumulation (+1.4ms) | `p.grad = None` |
-| Per-expert FP8 wgrad 3.6x slower | Replaced with varlen_k |
-| Official baseline `.contiguous()` crash | Monkey-patched in profiler |
-
----
-
-## 9. 教训（高价值）
-
-1. **benchmark 基线必须用官方原版** — 不能拿 fork BF16 做分母，quack 版本差异导致 1.85x 膨胀
-2. **kernel-only ≠ E2E** — 永远以 nsys NVTX GPU projection (with sync barriers) 为准
-3. **benchmark 必须 zero_grad** — `p.grad = None`, 否则 +1.4ms
-4. **per-expert FP8 wgrad 是死路** — tpe=256 太小, overhead > 带宽节省
-5. **varlen_k + TMA 才是正确 wgrad 路径** — 但 layout copy 需要消除
-6. **nsys 必须加 sync barriers** — `torch.cuda.synchronize()` before/after each NVTX range
-7. **quack 0.2.5 与 0.3.7 API 不兼容** — 不要在同一 env 切换安装
-8. **ISA scale packing**: SF_TILE_M=128, SF_TILE_K=128, SF_VEC_SIZE=32, SF_TILE_STORAGE=512
-9. **Triton 的 quant/SwiGLU 开销 (~850µs) 是 FP8 路径的主要瓶颈，不是 GEMM**
-
----
-
-## 10. 环境
+### 2.3 Reproduction commands for authoritative training numbers
 
 ```bash
 source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate
 cd /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe
 
-# Contract tests (8/8 pass)
+NSYS=/tmp/nsys-cli-2025.1.1/opt/nvidia/nsight-systems-cli/2025.1.1/target-linux-x64/nsys
+
+# Current fused FP8 + BF16 wgrad
+CUDA_VISIBLE_DEVICES=0 SONIC_MOE_FP8_FUSED_GATED=1 \
+  "$NSYS" profile -t cuda,nvtx --capture-range=cudaProfilerApi \
+  --force-overwrite=true -o /tmp/sonic_fp8_current \
+  python tools/nsys_profile_comprehensive.py --mode fp8
+
+# Current fused FP8 + FP8 wgrad
+CUDA_VISIBLE_DEVICES=0 SONIC_MOE_FP8_FUSED_GATED=1 \
+  "$NSYS" profile -t cuda,nvtx --capture-range=cudaProfilerApi \
+  --force-overwrite=true -o /tmp/sonic_fp8wg_current \
+  python tools/nsys_profile_comprehensive.py --mode fp8_wgrad
+
+# Export + compare against official baseline
+"$NSYS" export --type=sqlite --output=/tmp/sonic_fp8_current.sqlite /tmp/sonic_fp8_current.nsys-rep
+"$NSYS" export --type=sqlite --output=/tmp/sonic_fp8wg_current.sqlite /tmp/sonic_fp8wg_current.nsys-rep
+python tools/nsys_full_breakdown.py \
+  reports/sonic_official_bf16.sqlite \
+  /tmp/sonic_fp8_current.sqlite \
+  /tmp/sonic_fp8wg_current.sqlite \
+  --labels official_bf16 current_fp8_bf16wgrad current_fp8_wgrad
+```
+
+### 2.4 Current local train / infer perf + memory snapshot
+
+These are **local event-based** aligned measurements. Use them for **peak-memory checks and rough local iteration trends**, not as the authoritative cross-branch baseline. On this shared machine the event timings can drift materially; the authoritative training numbers are still the NSYS ones in §2.1.
+
+Measured with `tools/measure_aligned_perf_memory.py`.
+
+#### Training (local event timing, aligned routing)
+
+| Path | Total | Peak memory |
+|------|-------|-------------|
+| BF16 | `4.894ms` | `7.051 GiB` |
+| Current fused FP8 + BF16 wgrad | `3.136ms` | `10.746 GiB` |
+| Current fused FP8 + FP8 wgrad | `3.325ms` | `10.808 GiB` |
+
+#### Inference (local event timing, aligned routing, `is_inference_mode=True`)
+
+| Path | Total | Peak memory |
+|------|-------|-------------|
+| BF16 | `1.019ms` | `7.526 GiB` |
+| Current FP8 | `4.638ms` | `9.760 GiB` |
+
+### 2.5 Real takeaway on memory / inference
+
+- **Current FP8 does not yet deliver the intended memory win** in this tree.
+- **Current FP8 inference is also slower** in the local aligned harness.
+- The likely contributors are persistent FP8 weight caches plus extra FP8/BF16 staging buffers, but this was **not** broken down with a dedicated inference-only NSYS pass in this session.
+- Treat this as an **open problem**, not a solved one.
+
+---
+
+## 3. Correctness / precision status
+
+### 3.1 What was rerun in this session
+
+```bash
 CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
+  SONIC_MOE_FP8_FUSED_GATED=1 SONIC_MOE_FP8_WGRAD=1 \
   python -m pytest tests/fp8_large_project_contract_test.py -v -k "not large_shape"
-
-# E2E benchmark
-CUDA_VISIBLE_DEVICES=0 python tools/bench_aligned_e2e.py
-
-# FP8 wgrad prototype test (4/4 pass)
-CUDA_VISIBLE_DEVICES=0 python tools/test_fp8_wgrad_varlen_k.py
-
-# nsys profiling (需要在有 nsys 的远端节点运行)
-# 远端节点: 10.51.200.142 或 10.51.196.84
-python tools/profile_official_vs_fork.py --mode fork_fp8
-python tools/nsys_full_breakdown.py reports/sonic_fork_fp8_v4.sqlite
 ```
 
-| 包 | 版本 |
-|---|------|
-| quack-kernels | 0.3.7 |
-| nvidia-cutlass-dsl | 4.4.2 |
-| torch | 2.9.1+cu128 |
-| triton | 3.5.1 |
+Result: **8 passed, 3 deselected**
+
+### 3.2 What the current evidence supports
+
+- No known correctness regression was introduced by the fused gated integration, the direct fused-dgated weight-cache path, or the FP8 wgrad grad-layout fix.
+- Existing contract coverage still supports the usual target:
+  - RelRMSE under 10%
+  - correlation over 0.99
+- Historical FP8 metrics from this repo were in the `~5.3% - 6.6%` RelRMSE range with `0.998` correlation for the aligned FP8 path.
+
+### 3.3 What is still missing
+
+- There is **no fresh production-shape full-chain FP8 wgrad gold report** after the latest grad-layout-copy fix.
+- So the honest statement is:
+  - **correctness looks healthy under current contract coverage**,
+  - but **large-shape full-chain FP8 wgrad precision should be re-characterized before anyone enables it by default**.
 
 ---
 
-## 11. 显存消耗
+## 4. High-value facts and where they came from
 
-| 组件 | BF16 | FP8 | 节省 |
-|------|------|-----|------|
-| z tensor (per layer) | 128MB | 66MB | ~50% |
-| Weight cache | 0 | ~2.4GB (global) | 额外 |
-| Peak (single layer, E=128) | ~12GB | ~10GB | ~17% |
+This is the section to preserve and reuse.
+
+### 4.1 The authoritative baseline is `reports/sonic_official_bf16.sqlite`
+
+- File: `reports/sonic_official_bf16.sqlite`
+- Analysis tool: `tools/nsys_full_breakdown.py`
+- Why it matters:
+  - old comparisons against fork BF16 were misleading because fork BF16 had its own extra overheads
+  - all future performance claims should keep official BF16 as the denominator
+
+### 4.2 Fused blockscaled gated / dgated are viable if you bypass the unsafe autotuner path
+
+- Files:
+  - `sonicmoe/quack_utils/gemm_interface.py`
+  - `sonicmoe/functional/__init__.py`
+- What we learned:
+  - the fused blockscaled path itself was not fundamentally broken
+  - the unstable part was the wrapper autotune/config path
+- Net result:
+  - aligned fused FP8 act-grad path is now viable and competitive
+
+### 4.3 The old fused backward slowdown was a wrapper copy, not a bad dgated kernel
+
+- Files:
+  - `sonicmoe/quack_utils/blockscaled_fp8_gemm.py`
+  - `sonicmoe/functional/__init__.py`
+- Root cause:
+  - wrapper-side `B.mT.contiguous()` on fused-dgated weights
+- Fix:
+  - `precompute_weight_fp8_for_direct_fused_dgated()` + low-level direct `gemm_dgated` call
+- Why it matters:
+  - this changed the story from “fused backward is broken” to “the wrapper dataflow was broken”
+
+### 4.4 The FP8 wgrad giant autograd copy is gone, but the kernel path is still not good enough
+
+- Files:
+  - `sonicmoe/functional/__init__.py`
+  - `sonicmoe/quack_utils/blockscaled_fp8_gemm.py`
+- What was fixed:
+  - backward grad now writes into base-layout buffers and returns parameter-compatible views
+- Evidence:
+  - local dense total dropped from `16.225ms` to `6.810ms`
+  - the profiler no longer showed the `[128, 2048, 4096]` `aten::copy_`
+- Why this matters:
+  - the remaining FP8 wgrad problem is now the kernel/dataflow itself, not autograd bookkeeping
+
+### 4.5 The current `blockscaled_fp8_wgrad_varlen_k()` path is still the blocker
+
+- Observed isolated timings after the copy fix:
+  - `dw1 (dz^T x)` ~ `1.44ms`
+  - `dw2` ~ `0.98ms`
+- A simple config sweep did **not** reveal a robust easy win.
+- `blockscaled_fp8_weight_grad_gemm_fast()` / grouped-fast was already shown to be much slower than varlen_k in this project and is **not** the obvious drop-in answer.
+
+### 4.6 The most concrete next direction already exists in-tree
+
+- Files:
+  - `sonicmoe/functional/backward.py`
+  - `sonicmoe/functional/moe_config.py`
+  - `sonicmoe/functional/grouped_gemm.py`
+- Key symbols:
+  - `HopperWgmma_MoE_Up_proj_WeightGrad_Bwd`
+  - `HopperWgmma_MoE_Down_proj_WeightGrad_Bwd`
+  - `HopperWgmma_MoE_kernel(..., compute_weight_gradient=True)`
+- Why this matters:
+  - the official-style specialized weight-grad kernels are already present locally
+  - current QuACK FP8 path bypasses them under `use_quack_gemm`
+  - this is the strongest concrete direction for the next agent: adapt / extend a specialized weight-grad kernel path for FP8, instead of only patching generic varlen_k wrappers
 
 ---
 
-## 12. 下一步规划（优先级排序）
+## 5. Invalidated narratives (do not repeat them)
 
-### 🔴 核心问题：FP8 比官方 BF16 慢 18%，需要消除 455µs gap
+These statements are no longer good guidance.
 
-### P0: Triton SwiGLU 内核优化 (目标: -300µs)
+### 5.1 “The problem is a 455us gap to official BF16”
 
-**当前**: `_swiglu_fwd_quant_pack_zsave_kernel` 229µs, `_swiglu_bwd_quant_pack_kernel` 384µs
+That was true for the **older split FP8 path** (`2930us`) and is now stale for the current fused act-grad branch.
 
-**分析** (来自 agent 研究):
-- Forward: 229µs vs 44µs 理论下限 = 5.2x overhead. BLOCK_ROWS=8, 32 group iterations, 重复 E8M0 编码
-- Backward: 384µs vs 49µs 理论下限 = 7.8x overhead. 64 次 sigmoid (transcendental), BLOCK_ROWS=8
+The current reality is:
+- `2600.3us` for fused FP8 + BF16 wgrad
+- `5650.4us` for fused FP8 + FP8 wgrad
 
-**优化方向**:
-1. 增大 BLOCK_ROWS (16/32) 提高 SM 占用率
-2. 减少 group loop 迭代次数（fuse reduction）
-3. Backward sigmoid 替换为多项式近似（最大 single-op 瓶颈）
-4. 设置 `num_warps` / `num_stages` autotuning
-5. 用 ncu 获取 roofline 数据，确定 compute-bound vs memory-bound
+### 5.2 “The next agent should optimize Triton SwiGLU first”
 
-### P1: Forward 恢复 fused GEMM+SwiGLU (目标: -160µs)
+That is no longer the highest-ROI training frontier.
 
-官方 BF16 用 `GemmGatedSm100` (418µs) = fused GEMM+SwiGLU
-Fork FP8 用 decomposed GEMM (263µs) + SwiGLU kernel (229µs) = 492µs
+- Forward/act-grad fusion work reduced the non-wgrad training gap to about `125us`.
+- Full-chain FP8 still loses because **wgrad** is bad.
+- Forward SwiGLU/inference/memory still matter, but **training priority #1 is now FP8 wgrad redesign**.
 
-**路径**:
-- 修复 CUTLASS DSL `recast_layout` bug 使 `GemmGatedSm100` 支持 blockscaled FP8
-- 或用 CUTLASS C++ 手写 fused kernel
-- 或升级到 quack ≥ 0.4.0 (如果上游修复了此 bug)
+### 5.3 “Current FP8 already wins on memory”
 
-### P2: Gather+Quant 优化 (目标: -40µs)
+False for the current tree.
 
-`_gather_quantize_and_pack_kernel` 98µs × 2 = 196µs. 理论下限 54µs (1.83x).
-已经比较高效，可尝试 BLOCK_ROWS={24,32} autotuning.
+Current local aligned measurements show FP8 peak memory is **higher**, not lower.
 
-### P3: FP8 wgrad 的 layout copy 消除 (目标: -637µs for wgrad path)
+### 5.4 “Current FP8 inference already wins”
 
-当前 FP8 wgrad 因 permutation copy 净亏。需要:
-- 修改 CUTLASS output layout 直接写入目标 shape
-- 或将 quant 融入 GEMM epilogue
+False for the current tree.
 
-### P4: Multi-stream Overlap
-
-act-grad 和 weight-grad 无数据依赖，可在不同 CUDA stream 并行。
+Current local aligned inference measurement is **slower** than BF16.
 
 ---
 
-## 13. Profiling 工具使用指南
+## 6. Lessons from this session
 
-| 工具 | 用途 | 用法 |
-|------|------|------|
-| `tools/bench_aligned_e2e.py` | CUDA event E2E benchmark | `CUDA_VISIBLE_DEVICES=0 python tools/bench_aligned_e2e.py` |
-| `tools/profile_official_vs_fork.py` | nsys 三方对比 profiling | `python tools/profile_official_vs_fork.py --mode {official,fork_bf16,fork_fp8}` |
-| `tools/nsys_full_breakdown.py` | 解析 nsys sqlite → kernel breakdown | `python tools/nsys_full_breakdown.py reports/xxx.sqlite` |
-| `tools/ncu_profile_kernels.py` | ncu 单 kernel profiling | `python tools/ncu_profile_kernels.py` |
-| `tools/nsys_profile_comprehensive.py` | nsys + sync barriers | `python tools/nsys_profile_comprehensive.py` |
-| `tools/test_fp8_wgrad_varlen_k.py` | FP8 wgrad 功能+精度测试 | `CUDA_VISIBLE_DEVICES=0 python tools/test_fp8_wgrad_varlen_k.py` |
-| `tools/rmse_verification.py` | 精度详细验证 | `CUDA_VISIBLE_DEVICES=0 python tools/rmse_verification.py` |
+1. **Use official BF16 as the baseline, always.**
+2. **Trust NSYS NVTX GPU projection with sync barriers over local event totals.**
+3. **One giant hidden copy can dominate the whole story.** Profile before theorizing.
+4. **Do not overfit to stale bottlenecks.** After the fused path and copy fixes, the frontier moved from SwiGLU to wgrad.
+5. **Do not claim a memory or inference win without measurements.** Current local numbers still lose.
+6. **E2E matters more than isolated per-op wins.** The current FP8 wgrad path is functionally correct and better than before, but still unacceptable in full training.
 
 ---
 
-## 14. 文件结构速查
+## 7. Recommended frontier for the next agent
 
+### 7.1 Stable starting point
+
+Start from the current near-baseline training path:
+
+```bash
+USE_QUACK_GEMM=1 \
+SONIC_MOE_FP8_MODE=perf \
+SONIC_MOE_FP8_ASSUME_ALIGNED=1 \
+SONIC_MOE_FP8_FUSED_GATED=1 \
+SONIC_MOE_FP8_WGRAD=0
 ```
-sonicmoe/functional/__init__.py      # FP8/BF16 dispatch, autograd Functions, alignment gating
-sonicmoe/quack_utils/blockscaled_fp8_gemm.py  # Core FP8 GEMM + wgrad varlen_k + quant kernels
-sonicmoe/quack_utils/swiglu_triton.py # Triton SwiGLU fwd/bwd kernels (优化重点)
-sonicmoe/quack_utils/gemm_dgated.py   # CUTLASS fused backward GEMM+SwiGLU
-sonicmoe/quack_utils/gemm_gated.py    # CUTLASS fused forward GEMM+SwiGLU (BF16 only)
-tests/fp8_large_project_contract_test.py # 8 contract tests
-reports/fp8_upgrade/HANDOFF.md        # 本文档
-reports/fp8_upgrade/BLOCKSCALED_ALIGNMENT.md # ISA scale packing 对齐说明
-reports/*.sqlite                      # nsys profiles
+
+### 7.2 What to do next
+
+1. **Redesign FP8 wgrad**, likely by adapting the specialized grouped weight-grad kernels already present in:
+   - `sonicmoe/functional/backward.py`
+   - `sonicmoe/functional/moe_config.py`
+   - `sonicmoe/functional/grouped_gemm.py`
+2. If you continue on `blockscaled_fp8_wgrad_varlen_k()`, only pursue changes that materially alter:
+   - physical operand layout
+   - quantization reuse / elimination
+   - the kernel family itself
+3. Do **not** spend the next cycle on small config nudges or tiny Triton launch tweaks unless a new profile proves they matter.
+4. Re-run the contract tests and the authoritative NSYS comparison before claiming any win.
+
+### 7.3 Read order for the next agent
+
+1. `reports/fp8_upgrade/HANDOFF.md`
+2. `reports/fp8_upgrade/engineering_log.md`
+3. `agent.md`
+4. `sonicmoe/functional/__init__.py`
+5. `sonicmoe/quack_utils/blockscaled_fp8_gemm.py`
+6. `sonicmoe/functional/backward.py`
+7. `sonicmoe/functional/moe_config.py`
+8. `sonicmoe/functional/grouped_gemm.py`
+
+---
+
+## 8. Reproduction commands
+
+### 8.1 Contract tests
+
+```bash
+source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate
+cd /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe
+
+CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
+  SONIC_MOE_FP8_FUSED_GATED=1 SONIC_MOE_FP8_WGRAD=1 \
+  python -m pytest tests/fp8_large_project_contract_test.py -v -k "not large_shape"
 ```
+
+### 8.2 Local aligned perf + memory snapshot
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python tools/measure_aligned_perf_memory.py
+```
+
+### 8.3 Local aligned BF16 vs FP8 benchmark
+
+```bash
+CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
+  SONIC_MOE_FP8_ASSUME_ALIGNED=1 SONIC_MOE_FP8_FUSED_GATED=1 SONIC_MOE_FP8_WGRAD=1 \
+  python tools/bench_aligned_e2e.py
+```
+
+### 8.4 NSYS authoritative comparison
+
+Use the commands from §2.3.
+
+---
+
+## 9. Bottom line
+
+The fused aligned FP8 act-grad branch is no longer the crisis. The crisis is narrower and cleaner:
+
+> **Full-chain FP8 is now blocked by FP8 weight-grad.**
+>
+> The next serious win will likely come from a specialized FP8 weight-grad kernel path, not from repeating the old “trim Triton SwiGLU first” loop.

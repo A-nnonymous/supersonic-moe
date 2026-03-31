@@ -122,77 +122,62 @@ The reporting policy for every FP8 step is:
 
 ## 🔥 FP8 Blockscaled Status (2026-03-31)
 
-**Full-chain blockscaled FP8 (1×32 UE8M0) for Blackwell SM100.** Forward + backward via decomposed CUTLASS blockscaled GEMM + Triton SwiGLU. 8/8 contract tests pass. Precision: RelRMSE 5.3-6.6%, Correlation 0.998.
+The repository now has a working aligned blockscaled FP8 training path for Blackwell, but the project is **not yet at the final target state**.
 
-**⚠️ Current FP8 is 18% slower than official BF16 baseline** (2930µs vs 2475µs, nsys GPU projection). The gap comes from Triton quant/SwiGLU overhead (~850µs) exceeding FP8 GEMM savings (~218µs), plus inability to use fused GemmGated with FP8. See `reports/fp8_upgrade/HANDOFF.md` for full three-way kernel breakdown and optimization roadmap.
+The old `2930µs / 455µs gap` narrative is stale for the current fused branch. After the fused gated/dgated integration and the FP8 wgrad grad-layout-copy fix, the real frontier has changed.
 
-| Resource | Path |
-|----------|------|
-| **Handoff** (start here) | `reports/fp8_upgrade/HANDOFF.md` |
-| Agent context | `agent.md` |
-| Contract tests | `tests/fp8_large_project_contract_test.py` |
-| E2E benchmark | `tools/bench_aligned_e2e.py` |
-| nsys breakdown | `tools/nsys_full_breakdown.py` |
+### Current truth
 
-### Quick start
+- Best current training path in this repo: `SONIC_MOE_FP8_FUSED_GATED=1 SONIC_MOE_FP8_WGRAD=0`
+- Full-chain FP8 (`SONIC_MOE_FP8_WGRAD=1`) is functionally working but still **too slow**
+- `tests/fp8_large_project_contract_test.py`: **8 passed, 3 deselected** with `SONIC_MOE_FP8_FUSED_GATED=1 SONIC_MOE_FP8_WGRAD=1`
+- Current local aligned inference and peak-memory measurements still lose to BF16, so do **not** claim an inference or memory win yet
+
+### Authoritative training baseline
+
+These are the numbers to use in serious comparisons. They come from **NSYS NVTX GPU projection with sync barriers** on the aligned production shape (`T=4096 H=4096 I=1024 E=128 K=8`).
+
+| Path | Forward | Backward | Total |
+|------|---------|----------|-------|
+| **Official BF16** | `777.3us` | `1697.9us` | `2475.2us` |
+| **Current fused FP8 + BF16 wgrad** | `812.1us` | `1788.2us` | `2600.3us` |
+| **Current fused FP8 + FP8 wgrad** | `812.0us` | `4838.4us` | `5650.4us` |
+
+### Local aligned perf + memory snapshot
+
+Use this for local peak-memory checks and rough trend checks only. On the shared machine, event timings can drift materially:
 
 ```bash
-source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate
-cd /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe
-
-# Contract tests (8/8 small pass)
-CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
-  python -m pytest tests/fp8_large_project_contract_test.py -v -k "not large_shape"
-
-# E2E benchmark (production shape)
-CUDA_VISIBLE_DEVICES=0 python tools/bench_aligned_e2e.py
-
-# nsys kernel breakdown analysis
-python tools/nsys_full_breakdown.py reports/sonic_fork_fp8_v4.sqlite
+CUDA_VISIBLE_DEVICES=0 python tools/measure_aligned_perf_memory.py
 ```
 
-### Performance — Three-way nsys comparison (B200 SM100a, production shape)
+Current local aligned snapshot:
 
-| Mode | Forward | Backward | Total | vs Official BF16 |
-|------|---------|----------|-------|-------------------|
-| **Official BF16** (quack 0.2.5) | 777µs | 1698µs | **2475µs** | 1.00x (baseline) |
-| Fork BF16 (quack 0.3.7) | 800µs | 3781µs | 4581µs | 0.54x ❌ |
-| Fork FP8 (quack 0.3.7) | 935µs | 1995µs | 2930µs | 0.84x ❌ |
+| Mode | Total | Peak memory |
+|------|-------|-------------|
+| Train BF16 | `4.894ms` | `7.051 GiB` |
+| Train FP8 + BF16 wgrad | `3.136ms` | `10.746 GiB` |
+| Train FP8 + FP8 wgrad | `3.325ms` | `10.808 GiB` |
+| Infer BF16 | `1.019ms` | `7.526 GiB` |
+| Infer FP8 | `4.638ms` | `9.760 GiB` |
 
-> ⚠️ Fork BF16 is inflated by 2101µs contiguous copy overhead from quack 0.3.7 layout differences. Always use official BF16 as the baseline.
+### Read first
 
-### Current state
+| Resource | Path | Why |
+|----------|------|-----|
+| **Handoff** | `reports/fp8_upgrade/HANDOFF.md` | complete current project state, authoritative metrics, lessons, next frontier |
+| Engineering log | `reports/fp8_upgrade/engineering_log.md` | cleaned milestone log with only the conclusions that still survive revalidation |
+| Agent quick-start | `agent.md` | short cold-start summary |
+| Contract tests | `tests/fp8_large_project_contract_test.py` | current correctness gate |
+| Local perf/memory helper | `tools/measure_aligned_perf_memory.py` | reproducible local train / infer perf + memory snapshot |
+| NSYS harness | `tools/nsys_profile_comprehensive.py` | authoritative aligned training profiling |
 
-| Component | Status | Notes |
-|-----------|--------|-------|
-| FP8 forward (decomposed) | ✅ Working | 6.56% RelRMSE, 0.998 corr |
-| FP8 backward (decomposed) | ✅ Working | dx 6.54%, dw2 5.35% RelRMSE, 0.998 corr |
-| BF16 fallback (non-aligned) | ✅ Working | Auto-detects alignment, zero perf penalty |
-| Fused FP8 GEMM+SwiGLU | 🔴 Blocked | CUTLASS DSL `recast_layout` bug |
-| FP8 wgrad (varlen_k) | ⚠️ Integrated | Per-op faster, but layout copy overhead → E2E regression. Default OFF |
+### Practical guidance
 
-### Next steps (priority order)
-
-1. **P0**: Triton SwiGLU kernel optimization — 5-8x headroom vs theoretical (biggest ROI)
-2. **P1**: Restore fused forward GEMM+SwiGLU for FP8 (~160µs saving)
-3. **P2**: Multi-stream overlap (act-grad ∥ weight-grad)
-4. **P3**: Eliminate FP8 wgrad layout copy overhead
-
-### Example usage
-- SonicMoE with TC top-K choice routing (SwiGLU activation) on Hopper GPUs
-```python
-python benchmarks/moe-cute.py --thiek 32768,4096,1024,128,8 --activation swiglu
-```
-
-- SonicMoE with TC top-K token-choice routing (SwiGLU activation) on Blackwell GPUs. **This feature is currently in beta and supports only SwiGLU.** Full Blackwell kernel coverage will be available in the next release.
-```python
-USE_QUACK_GEMM=1 python benchmarks/moe-cute.py --thiek 32768,4096,1024,128,8 --activation swiglu
-```
-
-- SonicMoE with token rounding routing (SwiGLU activation)
-```python
-python benchmarks/moe-token-rounding.py --routing nr --thiekq 16384,4096,1024,256,8,128
-```
+- Use **official BF16** as the only authoritative baseline.
+- Use **NSYS GPU projection** for performance claims.
+- Treat the current training frontier as **FP8 weight-grad redesign**, not another round of small forward SwiGLU tweaks.
+- Do not enable `SONIC_MOE_FP8_WGRAD=1` by default yet.
 
 ## 🤝 Contributing
 

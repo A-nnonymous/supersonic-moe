@@ -1,83 +1,48 @@
 # SonicMoE Agent Context
 
-Use this as cold-start context for any new agent working on the SonicMoE FP8 blockscaled optimization.
-For detailed handoff, debugging history, and kernel breakdowns, read `reports/fp8_upgrade/HANDOFF.md`.
+Use this as the quick cold-start summary for the next agent. For the full state, measurements, and lessons, read `reports/fp8_upgrade/HANDOFF.md` and `reports/fp8_upgrade/engineering_log.md` first.
 
-## Current Status (2026-03-31, Session 21)
+## Current Status (2026-03-31)
 
-**⚠️ FP8 is 18% SLOWER than official BF16 baseline (2930µs vs 2475µs).**
+- The **best current training path** is aligned fused FP8 with **BF16 wgrad**:
+  - `SONIC_MOE_FP8_FUSED_GATED=1`
+  - `SONIC_MOE_FP8_WGRAD=0`
+- **Authoritative training NSYS GPU projection**:
+  - official BF16: `777.3us` fwd + `1697.9us` bwd = `2475.2us`
+  - current fused FP8 + BF16 wgrad: `812.1us` fwd + `1788.2us` bwd = `2600.3us`
+  - current fused FP8 + FP8 wgrad: `812.0us` fwd + `4838.4us` bwd = `5650.4us`
+- **Meaning:** the aligned fused act-grad path is mostly landed; the remaining training blocker is **FP8 wgrad**.
+- `tests/fp8_large_project_contract_test.py`: **8 passed, 3 deselected** with `SONIC_MOE_FP8_FUSED_GATED=1 SONIC_MOE_FP8_WGRAD=1`.
+- Current local aligned inference and peak-memory measurements still lose to BF16, so do not claim an inference or memory win.
 
-Previous reports of "1.59x speedup" were misleading — they compared against fork BF16 (4581µs)
-which has 2101µs of spurious contiguous copy overhead from quack 0.3.7 layout differences.
-The TRUE baseline is official BF16 (quack 0.2.5) at 2475µs.
+## What not to waste time on first
 
-8/8 contract tests PASS. Precision: RelRMSE 5.3-6.6%, Correlation 0.998.
+- Do **not** start by repeating the old “trim Triton SwiGLU first” loop.
+- Do **not** use fork BF16 as the baseline.
+- Do **not** enable `SONIC_MOE_FP8_WGRAD=1` by default and assume the job is done.
 
-## The Core Problem
+## Best next direction
 
-FP8's Triton quant/SwiGLU overhead (~850µs total) greatly exceeds FP8 GEMM savings (~218µs).
-The forward also loses ~160µs because fused GemmGated (BF16-only) can't be used with FP8.
+Focus on **FP8 weight-grad redesign**.
 
-**To beat official BF16, the next agent must close a 455µs gap.**
+The strongest concrete path is to study and potentially adapt the specialized weight-grad kernels already in-tree:
 
-## Priority 1: Triton Kernel Optimization
+- `sonicmoe/functional/backward.py`
+- `sonicmoe/functional/moe_config.py`
+- `sonicmoe/functional/grouped_gemm.py`
 
-| Kernel | Current | Theoretical Min | Headroom |
-|--------|---------|-----------------|----------|
-| `_swiglu_fwd_quant_pack_zsave_kernel` | 229µs | 44µs | 5.2x |
-| `_swiglu_bwd_quant_pack_kernel` | 384µs | 49µs | 7.8x |
-| `_gather_quantize_and_pack_kernel` ×2 | 196µs | 107µs | 1.8x |
+Key symbols:
 
-Biggest wins: increase BLOCK_ROWS, reduce group-loop iterations, sigmoid approximation in bwd.
-Use `tools/ncu_profile_kernels.py` + ncu for roofline analysis before optimizing.
+- `HopperWgmma_MoE_Up_proj_WeightGrad_Bwd`
+- `HopperWgmma_MoE_Down_proj_WeightGrad_Bwd`
+- `HopperWgmma_MoE_kernel(..., compute_weight_gradient=True)`
 
-## Priority 2: Restore fused forward GEMM+SwiGLU
+## Read order
 
-Official uses `GemmGatedSm100` (fused GEMM+SwiGLU, 418µs).
-Fork FP8 decomposes into GEMM (263µs) + SwiGLU (229µs) = 492µs.
-Fixing CUTLASS DSL `recast_layout` bug would unlock ~74µs savings.
-
-## Non-Negotiable
-
-- All FP8 paths must maintain <10% RelRMSE, >0.99 correlation vs BF16
-- Use native CUTLASS/QuACK GEMM path, not Triton `tl.dot_scaled` (broken on sm_100a)
-- Non-aligned routing must auto-fallback to BF16 fused path (no performance penalty)
-- **Always profile with nsys NVTX GPU Projection + sync barriers, never trust CUDA events alone**
-- **Always compare against official BF16 (2475µs), never against fork BF16**
-
-## Architecture
-
-- QuACK (quack-kernels 0.3.7) wraps CUTLASS DSL for Blackwell SM100
-- `GemmGatedSm100` = fused GEMM+SwiGLU (BF16 only — crashes with blockscaled FP8)
-- `GemmDefaultSm100` = plain GEMM (works with blockscaled FP8)
-- Blockscaled FP8 uses ISA-packed E8M0 scales with `sf_vec_size=32`
-- `_ALIGNMENT_ASSUMED` gates FP8 vs BF16 fallback in `functional/__init__.py`
-
-## Environment
-
-```bash
-source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate
-cd /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe
-# See /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/env.md for cluster details
-```
-
-## Validation
-
-```bash
-# Contract tests (8/8 small pass)
-CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
-  python -m pytest tests/fp8_large_project_contract_test.py -v -k "not large_shape"
-
-# E2E benchmark (production shape)
-CUDA_VISIBLE_DEVICES=0 python tools/bench_aligned_e2e.py
-
-# nsys breakdown analysis
-python tools/nsys_full_breakdown.py reports/sonic_fork_fp8_v4.sqlite
-```
-
-## Read First
-
-1. `reports/fp8_upgrade/HANDOFF.md` — Complete status, three-way kernel breakdown, gap analysis
-2. `sonicmoe/functional/__init__.py` — FP8/BF16 dispatch, alignment gating
-3. `sonicmoe/quack_utils/swiglu_triton.py` — Triton SwiGLU kernels (optimization target)
-4. `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` — Core FP8 GEMM + quant kernels
+1. `reports/fp8_upgrade/HANDOFF.md`
+2. `reports/fp8_upgrade/engineering_log.md`
+3. `sonicmoe/functional/__init__.py`
+4. `sonicmoe/quack_utils/blockscaled_fp8_gemm.py`
+5. `sonicmoe/functional/backward.py`
+6. `sonicmoe/functional/moe_config.py`
+7. `sonicmoe/functional/grouped_gemm.py`

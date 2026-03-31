@@ -19,6 +19,10 @@ from .gemm_gated import gemm_gated as gemm_gated_sm90_sm100
 default_device_capacity = get_device_capacity(torch.device("cuda"))
 
 
+def _uses_blockscaled_runtime(a_scales: Optional[Tensor], b_scales: Optional[Tensor]) -> bool:
+    return a_scales is not None and b_scales is not None
+
+
 def prune_invalid_gated_configs(configs, named_args: dict, **kwargs):
     kwargs = named_args | kwargs
     configs = prune_invalid_gemm_configs_base(configs, named_args, **kwargs)
@@ -271,7 +275,12 @@ def gemm_gated_out(
     b_scales: Optional[Tensor] = None,
 ) -> None:
     """GEMM with gated activation and pre-allocated output tensors."""
-    fn = gemm_gated_tuned if tuned else partial(gemm_gated_tuned.fn, config=None)
+    # Blockscaled fused gated kernels run correctly with the default config on SM100,
+    # but the autotuner still explores illegal configs and can crash with
+    # CUDA_ERROR_ILLEGAL_INSTRUCTION. Keep the tuned API surface, but bypass the
+    # autotuner until config search is blockscaled-safe.
+    safe_tuned = tuned and not _uses_blockscaled_runtime(a_scales, b_scales)
+    fn = gemm_gated_tuned if safe_tuned else partial(gemm_gated_tuned.fn, config=None)
     fn(A, B, preact_out, postact_out, C, bias, activation, cu_seqlens_m, A_idx, dynamic_scheduler,
        a_scales=a_scales, b_scales=b_scales)
 
@@ -356,7 +365,8 @@ def gemm_dgated_out(
     b_scales: Optional[Tensor] = None,
 ) -> Optional[Tensor]:
     """GEMM with gated activation gradient and pre-allocated output tensors."""
-    fn = gemm_dgated_tuned if tuned else partial(gemm_dgated_tuned.fn, config=None)
+    safe_tuned = tuned and not _uses_blockscaled_runtime(a_scales, b_scales)
+    fn = gemm_dgated_tuned if safe_tuned else partial(gemm_dgated_tuned.fn, config=None)
     return fn(
         A,
         B,
