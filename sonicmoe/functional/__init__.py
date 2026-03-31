@@ -1207,21 +1207,44 @@ class _DownProjection(torch.autograd.Function):
                     if z is None:
                         z = dequantize_blockscaled_fp8(z_fp8, z_raw_scales_u8)
                         del z_fp8, z_raw_scales_u8
-                    # BF16 dgated: handles A_idx natively (no gather_quant overhead).
-                    # Saves ~53µs vs FP8 dgated (gather_quant 100µs > GEMM savings 47µs).
-                    dz = torch.empty_like(z)
-                    _, y1s, ds = gemm_dgated(
-                        dout,
-                        w2.permute(2, 0, 1),
-                        PreAct=z,
-                        activation="swiglu",
-                        dx_out=dz,
+                    # FP8 dgated with A_idx: quantize only T rows (~8µs) not TK rows,
+                    # CUTLASS gathers via A_idx during FP8 GEMM for 2× throughput.
+                    dout_fp8, dout_scales = quantize_and_pack_activation(dout)
+                    w2_fp8_enk, w2_scales = precompute_weight_fp8_for_direct_fused_dgated(w2)
+                    config = default_config(dout.device)
+                    total_m = x_gather_idx.shape[0]
+                    n = w2_fp8_enk.shape[-2]
+                    dz = torch.empty((total_m, n * 2), dtype=torch.bfloat16, device=dout.device)
+                    y1s = torch.empty((total_m, n), dtype=torch.bfloat16, device=dout.device)
+                    colvec_reduce_partial = torch.empty(
+                        (total_m, (n + config.tile_n - 1) // config.tile_n),
+                        dtype=torch.float32,
+                        device=dout.device,
+                    )
+                    gemm_dgated_kernel(
+                        dout_fp8,
+                        w2_fp8_enk,
+                        dz,
+                        z,
+                        y1s,
+                        None,
+                        "swiglu",
+                        config.tile_m,
+                        config.tile_n,
+                        config.cluster_m,
+                        config.cluster_n,
+                        config.pingpong,
+                        persistent=True,
+                        max_swizzle_size=config.max_swizzle_size,
                         colvec_scale=s.float(),
-                        colvec_reduce=True,
+                        colvec_reduce=colvec_reduce_partial,
                         cu_seqlens_m=expert_frequency_offset,
                         A_idx=x_gather_idx,
-                        dynamic_scheduler=False,
+                        a_scales=dout_scales,
+                        b_scales=w2_scales,
                     )
+                    ds = colvec_reduce_partial.sum(dim=-1)
+                    del dout_fp8, dout_scales
                     # Pre-quantize dz for FP8 actgrad while hot in L2 cache.
                     dz_fp8, dz_packed_scales = quantize_and_pack_activation(dz)
                     _PREQUANTIZED_SCALES["bwd"] = (dz, dz_fp8, dz_packed_scales)
