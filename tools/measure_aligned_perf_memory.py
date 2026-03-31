@@ -156,6 +156,16 @@ def main() -> None:
 
     orig_router = F_mod.TC_Softmax_Topk_Router_Function
     F_mod.TC_Softmax_Topk_Router_Function = _UniformRouter
+
+    # Also patch _softmax_topk_fwd used in the inference code path.
+    _orig_softmax_topk_fwd = F_mod._softmax_topk_fwd
+
+    def _uniform_softmax_topk_fwd(router_logits, topk_scores, topk_indices, E_arg, K_arg):
+        topk_scores.copy_(_SCORES)
+        topk_indices.copy_(_INDICES)
+
+    F_mod._softmax_topk_fwd = _uniform_softmax_topk_fwd
+
     try:
         train_bf16_ms, train_bf16_gb = _measure_train(moe, x_base, grad_out, mode="bf16", fused_gated=False, fp8_wgrad=False)
         train_fp8_ms, train_fp8_gb = _measure_train(moe, x_base, grad_out, mode="fp8", fused_gated=True, fp8_wgrad=False)
@@ -164,6 +174,7 @@ def main() -> None:
         infer_fp8_ms, infer_fp8_gb = _measure_infer(moe, x_base, mode="fp8", fused_gated=True)
     finally:
         F_mod.TC_Softmax_Topk_Router_Function = orig_router
+        F_mod._softmax_topk_fwd = _orig_softmax_topk_fwd
 
     print(f"TRAIN BF16 total:                {train_bf16_ms:.3f} ms, peak {train_bf16_gb:.3f} GiB")
     print(f"TRAIN FP8 + BF16 wgrad total:    {train_fp8_ms:.3f} ms, peak {train_fp8_gb:.3f} GiB")

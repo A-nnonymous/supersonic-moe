@@ -39,7 +39,11 @@
       "Bash(git status:*)",
       "Bash(git push:*)",
       "Bash(jobs:*)",
-      "Bash(chmod:*)"
+      "Bash(chmod:*)",
+      "Bash(dpkg -l)",
+      "Read(//tmp/**)",
+      "WebFetch(domain:docs.nvidia.com)",
+      "Bash(curl:*)"
     ]
   }
 }

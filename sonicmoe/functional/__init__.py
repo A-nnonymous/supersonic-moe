@@ -113,9 +113,18 @@ def _fused_blockscaled_gated_forward(
     expert_frequency_offset: torch.Tensor,
     x_gather_idx: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run blockscaled GEMM+SwiGLU in the fused CUTLASS path, then pack postact for down-proj."""
+    """Run blockscaled GEMM+SwiGLU in the fused CUTLASS path.
+
+    Optimizations vs the decomposed path:
+    - Quantize x (T rows) instead of x_gathered (TK rows) → 8× less quant data (~12µs vs ~96µs).
+    - Pass A_idx to CUTLASS GemmGated so it gathers FP8 rows during GEMM (zero overhead).
+    - Skip z FP8 save: keep z as bf16 for backward (saves ~55µs quant + ~41µs dequant).
+    - BF16 down-proj: skip y1 FP8 quant (FP8 quant cost > GEMM savings for down-proj).
+    """
     w1_fp8, w1_scales = precompute_weight_fp8_for_fused_gated(w1)
-    x_fp8, x_scales = gather_quantize_and_pack_activation(x, x_gather_idx)
+    # Quantize x without gathering — 8× less data (T=4096 vs TK=32768 rows).
+    # The CUTLASS kernel gathers via A_idx during the GEMM's G2S copy stage.
+    x_fp8, x_scales = quantize_and_pack_activation(x)
     z, y1 = gemm_gated(
         x_fp8,
         w1_fp8,
@@ -123,15 +132,13 @@ def _fused_blockscaled_gated_forward(
         out_dtype=torch.bfloat16,
         postact_dtype=torch.bfloat16,
         cu_seqlens_m=expert_frequency_offset,
+        A_idx=x_gather_idx,
         dynamic_scheduler=False,
         a_scales=x_scales,
         b_scales=w1_scales,
         tuned=False,
     )
     del x_fp8, x_scales
-
-    if _save_z_fp8():
-        _PREQUANTIZED_SCALES["z_fp8"] = quantize_activation_blockscaled_fast(z)
 
     return z, y1
 
@@ -144,7 +151,11 @@ def _fused_blockscaled_dgated_backward(
     expert_frequency_offset: torch.Tensor,
     x_gather_idx: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run blockscaled GEMM+dSwiGLU in the fused CUTLASS path, then pack dz for up-proj."""
+    """Run blockscaled GEMM+dSwiGLU in the fused CUTLASS path, then pack dz for up-proj.
+
+    Pre-quantizes dz while hot in L2 cache and stores in _PREQUANTIZED_SCALES["bwd"]
+    so that _UpProjection.backward can skip inline dz quantization.
+    """
     w2_fp8_enk, w2_scales = precompute_weight_fp8_for_direct_fused_dgated(w2)
     dout_fp8, dout_scales = gather_quantize_and_pack_activation(dout, x_gather_idx)
 
@@ -182,6 +193,10 @@ def _fused_blockscaled_dgated_backward(
     ds = colvec_reduce_partial.sum(dim=-1)
     del dout_fp8, dout_scales
 
+    # Pre-quantize dz for up-proj actgrad GEMM while dz is hot in L2 cache.
+    dz_fp8, dz_packed_scales = quantize_and_pack_activation(dz)
+    _PREQUANTIZED_SCALES["bwd"] = (dz, dz_fp8, dz_packed_scales)
+
     return dz, y1s, ds
 
 
@@ -197,6 +212,19 @@ def _save_z_fp8() -> bool:
     and dequantized at start of backward, saving ~50% of z's memory footprint.
     """
     return os.getenv("SONIC_MOE_FP8_SAVE_Z_FP8", "1").lower() in {"1", "true", "yes", "on"}
+
+
+def _fp8_lean() -> bool:
+    """Lean FP8 mode: use FP8 GEMM only where it beats BF16, skip all unnecessary quant.
+
+    When enabled, the FP8 path:
+    - Uses FP8 fused gemm_gated for up-proj (saves ~130us GEMM, costs ~99us quant = net 33us win)
+    - Skips z FP8 save (saves 56us fwd + 42us bwd dequant = 98us total)
+    - Skips y1 FP8 quant (saves 30us fwd, uses BF16 down-proj instead)
+    - Uses BF16 gemm_dgated in backward (saves 88us vs FP8 dgated + quant)
+    - Uses BF16 wgrad and actgrad (no quant overhead)
+    """
+    return os.getenv("SONIC_MOE_FP8_LEAN", "0").lower() in {"1", "true", "yes", "on"}
 
 
 def _use_fused_blockscaled_gated() -> bool:
@@ -231,6 +259,16 @@ def _use_fp8_wgrad() -> bool:
 # "fwd": _UpProjection.forward -> _DownProjection.forward
 # "bwd": _DownProjection.backward -> _UpProjection.backward
 _PREQUANTIZED_SCALES: dict[str, tuple] = {}
+
+# Side stream for overlapping wgrad with actgrad in _UpProjection.backward.
+_WGRAD_STREAM: torch.cuda.Stream | None = None
+
+
+def _get_wgrad_stream() -> torch.cuda.Stream:
+    global _WGRAD_STREAM
+    if _WGRAD_STREAM is None:
+        _WGRAD_STREAM = torch.cuda.Stream()
+    return _WGRAD_STREAM
 
 
 def _matches_prequant_tensor(lhs: torch.Tensor | None, rhs: torch.Tensor | None) -> bool:
@@ -635,7 +673,26 @@ class _UpProjection(torch.autograd.Function):
                 aligned = _all_segments_128_aligned(expert_frequency_offset)
                 _ALIGNMENT_ASSUMED = aligned
 
-                if aligned and _use_fused_blockscaled_gated():
+                if aligned and _fp8_lean():
+                    # Lean FP8: only FP8 for up-proj GEMM, skip all quant overhead.
+                    w1_fp8, w1_scales = precompute_weight_fp8_for_fused_gated(w1)
+                    x_fp8, x_scales = gather_quantize_and_pack_activation(
+                        x, x_gather_idx
+                    )
+                    z, y1 = gemm_gated(
+                        x_fp8, w1_fp8,
+                        activation="swiglu",
+                        out_dtype=torch.bfloat16,
+                        postact_dtype=torch.bfloat16,
+                        cu_seqlens_m=expert_frequency_offset,
+                        dynamic_scheduler=False,
+                        a_scales=x_scales,
+                        b_scales=w1_scales,
+                        tuned=False,
+                    )
+                    del x_fp8, x_scales
+                    # No z FP8 save, no y1 quant — keep everything BF16 downstream
+                elif aligned and _use_fused_blockscaled_gated():
                     z, y1 = _fused_blockscaled_gated_forward(
                         x, w1, expert_frequency_offset, x_gather_idx
                     )
@@ -774,34 +831,56 @@ class _UpProjection(torch.autograd.Function):
         if use_quack_gemm:
             assert not is_compiling
 
-            if _fp8_enabled() and _ALIGNMENT_ASSUMED:
+            if _fp8_lean() and _ALIGNMENT_ASSUMED:
+                # Lean FP8: BF16 actgrad + BF16 wgrad (no quant overhead)
+                gemm(
+                    x.T,
+                    dz,
+                    out=dw1_base.permute(0, 2, 1),
+                    cu_seqlens_k=expert_frequency_offset,
+                    A_idx=x_gather_idx,
+                    batch_idx_permute=None,
+                    dynamic_scheduler=False,
+                )
+                dx_expanded = gemm(dz, w1.permute(2, 0, 1), cu_seqlens_m=expert_frequency_offset, dynamic_scheduler=False)
+            elif _fp8_enabled() and _ALIGNMENT_ASSUMED:
                 # Blockscaled FP8 act-grad + weight-grad.
+                # Overlap wgrad (dz^T × x) with actgrad (dz × w1^T) on separate
+                # CUDA streams — they share read-only inputs but no write deps.
                 dz_bf16 = dz if dz.dtype == torch.bfloat16 else dz.to(torch.bfloat16)
 
-                # Weight grad: FP8 varlen_k GEMM (dz^T × x → dw1 base layout)
-                if _use_fp8_wgrad():
-                    blockscaled_fp8_wgrad_varlen_k(
-                        dz_bf16, x, expert_frequency_offset,
-                        M=dz_bf16.shape[1], N=x.shape[1],
-                        b_gather_idx=x_gather_idx,
-                        out=dw1_base,
-                    )
-                else:
-                    gemm(
-                        x.T,
-                        dz_bf16,
-                        out=dw1_base.permute(0, 2, 1),
-                        cu_seqlens_k=expert_frequency_offset,
-                        A_idx=x_gather_idx,
-                        batch_idx_permute=None,
-                        dynamic_scheduler=False,
-                    )
-
-                # Act grad: native blockscaled FP8 GEMM (dz × w1^T → dx_expanded)
-                # Use pre-quantized dz from fused SwiGLU backward if available.
+                # Prepare actgrad resources on default stream first.
                 w1T_fp8, w1T_scales = precompute_weight_fp8(w1.permute(1, 0, 2))
                 prequant_dz = _PREQUANTIZED_SCALES.pop("bwd", None)
-                if prequant_dz is not None and _matches_prequant_tensor(prequant_dz[0], dz):
+                has_prequant = (
+                    prequant_dz is not None
+                    and _matches_prequant_tensor(prequant_dz[0], dz)
+                )
+
+                # Launch wgrad on side stream (runs in parallel with actgrad).
+                _ws = _get_wgrad_stream()
+                _ws.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(_ws):
+                    if _use_fp8_wgrad():
+                        blockscaled_fp8_wgrad_varlen_k(
+                            dz_bf16, x, expert_frequency_offset,
+                            M=dz_bf16.shape[1], N=x.shape[1],
+                            b_gather_idx=x_gather_idx,
+                            out=dw1_base,
+                        )
+                    else:
+                        gemm(
+                            x.T,
+                            dz_bf16,
+                            out=dw1_base.permute(0, 2, 1),
+                            cu_seqlens_k=expert_frequency_offset,
+                            A_idx=x_gather_idx,
+                            batch_idx_permute=None,
+                            dynamic_scheduler=False,
+                        )
+
+                # Actgrad on default stream (parallel with wgrad above).
+                if has_prequant:
                     _, dz_fp8, dz_packed_scales = prequant_dz
                     dx_expanded = blockscaled_fp8_gemm_varlen(
                         dz_fp8, w1.permute(1, 0, 2), expert_frequency_offset,
@@ -818,6 +897,9 @@ class _UpProjection(torch.autograd.Function):
                         out_dtype=torch.bfloat16,
                         assume_aligned=True,
                     )
+
+                # Ensure wgrad completes before returning gradients.
+                torch.cuda.current_stream().wait_stream(_ws)
                 del dz_bf16
             else:
                 gemm(
@@ -906,27 +988,36 @@ class _DownProjection(torch.autograd.Function):
             assert not torch.compiler.is_compiling()
 
             assert b2 is None
-            if _fp8_enabled() and _ALIGNMENT_ASSUMED:
-                # Blockscaled FP8 down-proj: use pre-quantized y1 if available
-                # from fused SwiGLU+quant in _UpProjection.forward.
-                w2_fp8, w2_scales = precompute_weight_fp8(w2)
-                prequant = _PREQUANTIZED_SCALES.pop("fwd", None)
-                if prequant is not None and _matches_prequant_tensor(prequant[0], y1):
-                    y1_fp8, y1_packed_scales = prequant
-                    y2 = blockscaled_fp8_gemm_varlen(
-                        y1_fp8, w2, expert_frequency_offset,
-                        a_scales=y1_packed_scales,
-                        w_fp8=w2_fp8, w_scales=w2_scales,
-                        out_dtype=torch.bfloat16,
-                        assume_aligned=True,
-                    )
+            if _fp8_lean() and _ALIGNMENT_ASSUMED:
+                # Lean FP8: BF16 down-proj (no y1 quant overhead)
+                y2 = gemm(y1, w2.permute(2, 1, 0), cu_seqlens_m=expert_frequency_offset)
+                router_perm = s_reverse_scatter_idx
+                y2_for_router = y2
+            elif _fp8_enabled() and _ALIGNMENT_ASSUMED:
+                if _use_fused_blockscaled_gated():
+                    # Fused gated path: BF16 down-proj (FP8 quant cost 29µs > GEMM savings 10µs)
+                    y2 = gemm(y1, w2.permute(2, 1, 0), cu_seqlens_m=expert_frequency_offset)
                 else:
-                    y2 = blockscaled_fp8_gemm_varlen(
-                        y1, w2, expert_frequency_offset,
-                        w_fp8=w2_fp8, w_scales=w2_scales,
-                        out_dtype=torch.bfloat16,
-                        assume_aligned=True,
-                    )
+                    # Blockscaled FP8 down-proj: use pre-quantized y1 if available
+                    # from fused SwiGLU+quant in _UpProjection.forward.
+                    w2_fp8, w2_scales = precompute_weight_fp8(w2)
+                    prequant = _PREQUANTIZED_SCALES.pop("fwd", None)
+                    if prequant is not None and _matches_prequant_tensor(prequant[0], y1):
+                        y1_fp8, y1_packed_scales = prequant
+                        y2 = blockscaled_fp8_gemm_varlen(
+                            y1_fp8, w2, expert_frequency_offset,
+                            a_scales=y1_packed_scales,
+                            w_fp8=w2_fp8, w_scales=w2_scales,
+                            out_dtype=torch.bfloat16,
+                            assume_aligned=True,
+                        )
+                    else:
+                        y2 = blockscaled_fp8_gemm_varlen(
+                            y1, w2, expert_frequency_offset,
+                            w_fp8=w2_fp8, w_scales=w2_scales,
+                            out_dtype=torch.bfloat16,
+                            assume_aligned=True,
+                        )
                 router_perm = s_reverse_scatter_idx
                 y2_for_router = y2
             else:
@@ -970,8 +1061,12 @@ class _DownProjection(torch.autograd.Function):
         ctx.use_quack_gemm = use_quack_gemm
 
         # Memory optimization: store z in FP8 to save ~50% of z's memory.
-        z_is_fp8 = (_fp8_enabled() and use_quack_gemm and _save_z_fp8()
-                    and _ALIGNMENT_ASSUMED and z.dtype == torch.bfloat16)
+        # Lean mode skips z FP8 save entirely (saves 56us fwd quant + 42us bwd dequant).
+        # Fused gated path skips z FP8 save: z is kept as bf16 to eliminate the
+        # quant+dequant round-trip (~96us savings with negligible memory impact).
+        z_is_fp8 = (_fp8_enabled() and not _fp8_lean() and use_quack_gemm and _save_z_fp8()
+                    and _ALIGNMENT_ASSUMED and z.dtype == torch.bfloat16
+                    and not _use_fused_blockscaled_gated())
         ctx._z_is_fp8 = z_is_fp8
 
         if z_is_fp8:
@@ -1056,20 +1151,64 @@ class _DownProjection(torch.autograd.Function):
             assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
 
             s = topk_scores[s_scatter_idx]
-            if _fp8_enabled() and _ALIGNMENT_ASSUMED:
+            if _fp8_lean() and _ALIGNMENT_ASSUMED:
+                # Lean FP8: BF16 dgated + BF16 wgrad (no quant overhead)
+                # z was saved as BF16 (not FP8), so use directly
+                assert z is not None, "lean mode should have BF16 z"
+                dz = torch.empty_like(z)
+                _, y1s, ds = gemm_dgated(
+                    dout,
+                    w2.permute(2, 0, 1),
+                    PreAct=z,
+                    activation="swiglu",
+                    dx_out=dz,
+                    colvec_scale=s.float(),
+                    colvec_reduce=True,
+                    cu_seqlens_m=expert_frequency_offset,
+                    A_idx=x_gather_idx,
+                    dynamic_scheduler=False,
+                )
+                _log_stage_memory("backward:down-proj-dgated")
+                _reset_stage_memory_probe()
+
+                # BF16 wgrad dw2
+                y1s_wgrad = y1s if y1s.dtype == torch.bfloat16 else y1s.to(torch.bfloat16)
+                gemm(
+                    dout.T,
+                    y1s_wgrad,
+                    out=dw2_base,
+                    cu_seqlens_k=expert_frequency_offset,
+                    A_idx=x_gather_idx,
+                    batch_idx_permute=None,
+                    dynamic_scheduler=False,
+                )
+                del y1s_wgrad
+                _log_stage_memory("backward:down-proj-weight")
+                ds = ds[s_reverse_scatter_idx]
+            elif _fp8_enabled() and _ALIGNMENT_ASSUMED:
                 # All segments aligned: use blockscaled FP8 path.
                 if _use_fused_blockscaled_gated():
                     if z is None:
                         z = dequantize_blockscaled_fp8(z_fp8, z_raw_scales_u8)
                         del z_fp8, z_raw_scales_u8
-                    dz, y1s, ds = _fused_blockscaled_dgated_backward(
+                    # BF16 dgated: handles A_idx natively (no gather_quant overhead).
+                    # Saves ~53µs vs FP8 dgated (gather_quant 100µs > GEMM savings 47µs).
+                    dz = torch.empty_like(z)
+                    _, y1s, ds = gemm_dgated(
                         dout,
-                        z,
-                        w2,
-                        s,
-                        expert_frequency_offset,
-                        x_gather_idx,
+                        w2.permute(2, 0, 1),
+                        PreAct=z,
+                        activation="swiglu",
+                        dx_out=dz,
+                        colvec_scale=s.float(),
+                        colvec_reduce=True,
+                        cu_seqlens_m=expert_frequency_offset,
+                        A_idx=x_gather_idx,
+                        dynamic_scheduler=False,
                     )
+                    # Pre-quantize dz for FP8 actgrad while hot in L2 cache.
+                    dz_fp8, dz_packed_scales = quantize_and_pack_activation(dz)
+                    _PREQUANTIZED_SCALES["bwd"] = (dz, dz_fp8, dz_packed_scales)
                 else:
                     w2_actgrad = w2.permute(1, 0, 2)  # (I, H, E)
                     w2_fp8, w2_scales = precompute_weight_fp8(w2_actgrad)
@@ -1270,7 +1409,31 @@ def _moe_tc_softmax_topk_layer_quack_inference(
         _log_stage_memory("forward:router-metadata")
 
         needs_preact = fp8_protocol is not None and _upproj_epilogue_precision() == "fp8"
-        if _fp8_enabled():
+        # Inference routing is independent of training: always do a real
+        # alignment check instead of trusting _ALIGNMENT_ASSUMED.
+        if _fp8_enabled() and _use_fused_blockscaled_gated():
+            _vals = _get_cu_seqlens_cpu(expert_frequency_offset)
+            aligned = all((_vals[i + 1] - _vals[i]) % 128 == 0 for i in range(len(_vals) - 1))
+        else:
+            aligned = False
+        if _fp8_enabled() and _use_fused_blockscaled_gated() and aligned:
+            # Blockscaled FP8 path: reuse the same CUTLASS kernel as training.
+            w1_fp8, w1_scales = precompute_weight_fp8_for_fused_gated(w1)
+            x_fp8, x_scales = gather_quantize_and_pack_activation(x, x_gather_idx)
+            z, y1 = gemm_gated(
+                x_fp8,
+                w1_fp8,
+                activation="swiglu",
+                out_dtype=torch.bfloat16,
+                postact_dtype=torch.bfloat16,
+                cu_seqlens_m=expert_frequency_offset,
+                dynamic_scheduler=False,
+                a_scales=x_scales,
+                b_scales=w1_scales,
+                tuned=False,
+            )
+            del x_fp8, x_scales
+        elif _fp8_enabled():
             x_fp8 = x if x.dtype == torch.float8_e4m3fn else x.to(torch.float8_e4m3fn)
             w1_fp8 = _get_cached_fp8_weight(w1, "w1_ekh")
             z, y1 = gemm_gated(
@@ -1350,7 +1513,18 @@ def _moe_tc_softmax_topk_layer_quack_inference(
             )
             y2_for_router = y2.view(-1, H)
         else:
-            if _fp8_enabled():
+            if _fp8_enabled() and _use_fused_blockscaled_gated() and aligned:
+                # Blockscaled FP8 down-proj: same path as training.
+                y1_fp8, y1_scales = quantize_and_pack_activation(y1)
+                w2_fp8, w2_scales = precompute_weight_fp8(w2)
+                y2 = blockscaled_fp8_gemm_varlen(
+                    y1_fp8, w2, expert_frequency_offset,
+                    a_scales=y1_scales,
+                    w_fp8=w2_fp8, w_scales=w2_scales,
+                    out_dtype=torch.bfloat16,
+                    assume_aligned=True,
+                )
+            elif _fp8_enabled():
                 y1_fp8 = y1 if y1.dtype == torch.float8_e4m3fn else y1.to(torch.float8_e4m3fn)
                 w2_fp8 = _get_fp8_weight_orig(w2)
                 y2 = gemm(y1_fp8, w2_fp8.permute(2, 1, 0),

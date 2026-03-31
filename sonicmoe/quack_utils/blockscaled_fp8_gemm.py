@@ -1389,12 +1389,13 @@ def _quantize_and_pack_kernel(
     NUM_GROUPS: tl.constexpr,
     SF_TILE_M: tl.constexpr,
     SF_TILE_STORAGE: tl.constexpr,
+    GROUPS_PER_K_TILE: tl.constexpr = 4,
 ):
     """Fused blockscaled quantize + ISA scale pack in a single kernel.
 
     Each program handles BLOCK_ROWS rows × ALL scale groups (loop over K).
-    1D grid: one block per BLOCK_ROWS row chunk. Dramatically reduces grid
-    size from M/4 × K/32 (~1M) to M/32 (~1K), cutting launch overhead.
+    Packs GROUPS_PER_K_TILE (4) scale bytes into uint32 for 4× fewer,
+    4× wider scale writes — reduces ISA-packed scale write overhead.
     """
     row_base = tl.program_id(0) * BLOCK_ROWS
     row_ids = row_base + tl.arange(0, BLOCK_ROWS)
@@ -1405,40 +1406,45 @@ def _quantize_and_pack_kernel(
     row_in_tile = row_ids % SF_TILE_M
     row_base_offset = (row_in_tile % 32) * 16 + (row_in_tile // 32) * 4
 
-    for group_id in tl.range(0, NUM_GROUPS):
-        col_offsets = group_id * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
-        col_mask = col_offsets[None, :] < cols
-        mask = row_mask_1d[:, None] & col_mask
+    # Iterate over k-tiles (each containing GROUPS_PER_K_TILE groups)
+    for k_tile_idx in tl.range(0, k_tiles):
+        packed_scale_i32 = tl.zeros([BLOCK_ROWS], dtype=tl.int32)
 
-        # --- Load bf16 values ---
-        src_ptrs = src_ptr + row_ids[:, None] * src_stride_row + col_offsets[None, :] * src_stride_col
-        values = tl.load(src_ptrs, mask=mask, other=0.0).to(tl.float32)
+        for g in tl.range(0, GROUPS_PER_K_TILE):
+            group_id = k_tile_idx * GROUPS_PER_K_TILE + g
+            col_offsets = group_id * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+            col_mask = col_offsets[None, :] < cols
+            mask = row_mask_1d[:, None] & col_mask
 
-        # --- Pure-integer E8M0 computation (no transcendentals) ---
-        block_amax = tl.max(tl.abs(values), axis=1)
-        amax_bits = block_amax.to(tl.int32, bitcast=True)
-        biased_exp = (amax_bits >> 23) & 0xFF
-        mantissa_bits = amax_bits & 0x7FFFFF
-        carry = tl.where(mantissa_bits > 0x600000, 1, 0)
-        e8m0_i32 = biased_exp - 8 + carry
-        e8m0_i32 = tl.where(biased_exp > 0, e8m0_i32, 0)
-        e8m0_byte = tl.maximum(e8m0_i32, 0).to(tl.uint8)
+            src_ptrs = src_ptr + row_ids[:, None] * src_stride_row + col_offsets[None, :] * src_stride_col
+            values = tl.load(src_ptrs, mask=mask, other=0.0).to(tl.float32)
 
-        quant_biased_exp = 254 - e8m0_i32
-        quant_biased_exp = tl.maximum(tl.minimum(quant_biased_exp, 254), 1)
-        quant_scale = (quant_biased_exp.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+            # Pure-integer E8M0 computation
+            block_amax = tl.max(tl.abs(values), axis=1)
+            amax_bits = block_amax.to(tl.int32, bitcast=True)
+            biased_exp = (amax_bits >> 23) & 0xFF
+            mantissa_bits = amax_bits & 0x7FFFFF
+            carry = tl.where(mantissa_bits > 0x600000, 1, 0)
+            e8m0_i32 = biased_exp - 8 + carry
+            e8m0_i32 = tl.where(biased_exp > 0, e8m0_i32, 0)
+            e8m0_clamped = tl.maximum(e8m0_i32, 0)
 
-        # --- Quantize to fp8 ---
-        quantized = (values * quant_scale[:, None]).to(tl.float8e4nv)
-        dst_ptrs = dst_fp8_ptr + row_ids[:, None] * dst_stride_row + col_offsets[None, :] * dst_stride_col
-        tl.store(dst_ptrs, quantized, mask=mask)
+            quant_biased_exp = 254 - e8m0_i32
+            quant_biased_exp = tl.maximum(tl.minimum(quant_biased_exp, 254), 1)
+            quant_scale = (quant_biased_exp.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+            quantized = (values * quant_scale[:, None]).to(tl.float8e4nv)
 
-        k_tiles_idx = group_id // (SF_TILE_M // GROUP_SIZE)
-        k_in_tile = group_id % (SF_TILE_M // GROUP_SIZE)
-        tile_base = (row_tiles * k_tiles + k_tiles_idx) * SF_TILE_STORAGE
-        packed_offset = tile_base + row_base_offset + k_in_tile
+            dst_ptrs = dst_fp8_ptr + row_ids[:, None] * dst_stride_row + col_offsets[None, :] * dst_stride_col
+            tl.store(dst_ptrs, quantized, mask=mask)
 
-        tl.store(dst_packed_scale_ptr + packed_offset, e8m0_byte, mask=row_mask_1d)
+            # Pack scale byte into uint32 (little-endian: byte 0 at bits[0:8])
+            packed_scale_i32 = packed_scale_i32 | ((e8m0_clamped & 0xFF) << (g * 8))
+
+        # Write 4 scale bytes as single uint32 (row_base_offset is always 4-byte aligned)
+        tile_base = (row_tiles * k_tiles + k_tile_idx) * SF_TILE_STORAGE
+        packed_offset_i32 = (tile_base + row_base_offset) // 4
+        scale_ptr_i32 = dst_packed_scale_ptr.to(tl.pointer_type(tl.int32))
+        tl.store(scale_ptr_i32 + packed_offset_i32, packed_scale_i32, mask=row_mask_1d)
 
 
 @triton.jit
@@ -1597,7 +1603,8 @@ def quantize_and_pack_activation(
         (1, per_batch_storage), 127, dtype=torch.uint8, device=x.device
     )
 
-    BLOCK_ROWS = 16  # Production-shape: 0.115ms (BR=16) vs 0.858ms (BR=1), 7.5x faster
+    BLOCK_ROWS = 16
+    groups_per_k_tile = _SF_TILE_K // group_size  # 4 for default SF_TILE_K=128, GROUP_SIZE=32
     grid = (_div_up(M, BLOCK_ROWS),)
     _quantize_and_pack_kernel[grid](
         x,
@@ -1616,6 +1623,7 @@ def quantize_and_pack_activation(
         NUM_GROUPS=num_groups,
         SF_TILE_M=_SF_TILE_M,
         SF_TILE_STORAGE=_SF_TILE_STORAGE,
+        GROUPS_PER_K_TILE=groups_per_k_tile,
     )
     return fp8_out, packed_scales.view(torch.float8_e8m0fnu)
 
