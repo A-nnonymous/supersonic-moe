@@ -1598,10 +1598,16 @@ def quantize_and_pack_activation(
     fp8_out = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=x.device)
 
     per_batch_storage = _storage_per_batch(M, K)
-    # Initialize to 127 (E8M0 encoding of scale=1.0: exponent bias 127)
-    packed_scales = torch.full(
-        (1, per_batch_storage), 127, dtype=torch.uint8, device=x.device
-    )
+    # When M and K are tile-aligned, every scale byte is written by the kernel.
+    # Skip expensive torch.full fill kernel — use torch.empty instead.
+    if M % _SF_TILE_M == 0 and K % _SF_TILE_K == 0:
+        packed_scales = torch.empty(
+            (1, per_batch_storage), dtype=torch.uint8, device=x.device
+        )
+    else:
+        packed_scales = torch.full(
+            (1, per_batch_storage), 127, dtype=torch.uint8, device=x.device
+        )
 
     BLOCK_ROWS = 16
     groups_per_k_tile = _SF_TILE_K // group_size  # 4 for default SF_TILE_K=128, GROUP_SIZE=32
