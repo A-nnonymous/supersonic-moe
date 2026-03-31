@@ -995,8 +995,24 @@ class _DownProjection(torch.autograd.Function):
                 y2_for_router = y2
             elif _fp8_enabled() and _ALIGNMENT_ASSUMED:
                 if _use_fused_blockscaled_gated():
-                    # Fused gated path: BF16 down-proj (FP8 quant cost 29µs > GEMM savings 10µs)
-                    y2 = gemm(y1, w2.permute(2, 1, 0), cu_seqlens_m=expert_frequency_offset)
+                    # Adaptive FP8 down-proj: use FP8 when I (GEMM K-dim) is large
+                    # enough that GEMM savings exceed quantization cost.
+                    # At I=1024: quant ~29µs > GEMM savings ~10µs → BF16
+                    # At I≥2048: GEMM savings grow with K² while quant grows with K → FP8
+                    _fp8_downproj_threshold = int(os.getenv("SONIC_MOE_FP8_DOWNPROJ_THRESHOLD", "2048"))
+                    if I >= _fp8_downproj_threshold:
+                        w2_fp8, w2_scales = precompute_weight_fp8(w2)
+                        y1_fp8, y1_scales = quantize_and_pack_activation(y1)
+                        y2 = blockscaled_fp8_gemm_varlen(
+                            y1_fp8, w2, expert_frequency_offset,
+                            a_scales=y1_scales,
+                            w_fp8=w2_fp8, w_scales=w2_scales,
+                            out_dtype=torch.bfloat16,
+                            assume_aligned=True,
+                        )
+                        del y1_fp8, y1_scales
+                    else:
+                        y2 = gemm(y1, w2.permute(2, 1, 0), cu_seqlens_m=expert_frequency_offset)
                 else:
                     # Blockscaled FP8 down-proj: use pre-quantized y1 if available
                     # from fused SwiGLU+quant in _UpProjection.forward.
