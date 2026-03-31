@@ -37,7 +37,9 @@
       "Read(//root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe/$TASK_DIR/**)",
       "Bash(TASK_DIR=\"/tmp/claude-0/-root-paddlejob-share-storage-gpfs-system-public-panzhaowu-lab-sonic-moe/36d8b50c-3df8-4037-be28-f598dbd76a65/tasks\"\ncat \"$TASK_DIR/bwpkphcyo.output\" 2>/dev/null | tail -120)",
       "Bash(git status:*)",
-      "Bash(git push:*)"
+      "Bash(git push:*)",
+      "Bash(jobs:*)",
+      "Bash(chmod:*)"
     ]
   }
 }

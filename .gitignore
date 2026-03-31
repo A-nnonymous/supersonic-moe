@@ -210,3 +210,9 @@ __marimo__/
 core.*
 tools/_nsys_*
 tools/*.sqlite
+
+# nsys/ncu profiling artifacts
+reports/*.sqlite
+reports/*.nsys-rep
+reports/*.ncu-rep
+tools/_archive/

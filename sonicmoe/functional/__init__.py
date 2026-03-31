@@ -88,6 +88,7 @@ from ..quack_utils.swiglu_triton import (
 from ..quack_utils.blockscaled_fp8_gemm import (
     pack_blockscaled_1x32_scales,
     quantize_activation_blockscaled_fast,
+    blockscaled_fp8_wgrad_varlen_k,
 )
 
 
@@ -128,6 +129,17 @@ def _use_fused_blockscaled_gated() -> bool:
     This provides ~1.8x speedup over BF16 fused at production shapes.
     """
     return os.getenv("SONIC_MOE_FP8_FUSED_GATED", "1").lower() in {"1", "true", "yes", "on"}
+
+
+def _use_fp8_wgrad() -> bool:
+    """Check if FP8 weight-gradient via varlen_k GEMM is enabled (default: disabled).
+
+    When enabled, weight gradients (dw1, dw2) use blockscaled FP8 column-wise
+    quantize + CUTLASS varlen_k GEMM instead of BF16 GEMM.  The FP8 GEMM is
+    faster per-op, but the unavoidable layout permutation copy (~637µs for 3GB
+    at production shapes) currently exceeds the GEMM savings.
+    """
+    return os.getenv("SONIC_MOE_FP8_WGRAD", "0").lower() in {"1", "true", "yes", "on"}
 
 
 # Transfer pre-packed blockscaled scales between autograd Function boundaries.
@@ -664,20 +676,28 @@ class _UpProjection(torch.autograd.Function):
             assert not is_compiling
 
             if _fp8_enabled() and _ALIGNMENT_ASSUMED:
-                # Blockscaled FP8 act-grad + BF16 weight-grad.
-                # Weight-grad stays BF16: bandwidth-bound (small K = TPE).
-
-                # Weight grad: BF16 varlen GEMM (x^T × dz → dw1 per expert)
+                # Blockscaled FP8 act-grad + weight-grad.
                 dz_bf16 = dz if dz.dtype == torch.bfloat16 else dz.to(torch.bfloat16)
-                gemm(
-                    x.T,
-                    dz_bf16,
-                    out=dw1.permute(2, 1, 0),
-                    cu_seqlens_k=expert_frequency_offset,
-                    A_idx=x_gather_idx,
-                    batch_idx_permute=None,
-                    dynamic_scheduler=False,
-                )
+
+                # Weight grad: FP8 varlen_k GEMM (x^T × dz → dw1 per expert)
+                if _use_fp8_wgrad():
+                    dw1_result = blockscaled_fp8_wgrad_varlen_k(
+                        x, dz_bf16, expert_frequency_offset,
+                        M=x.shape[1], N=dz_bf16.shape[1],
+                        a_gather_idx=x_gather_idx,
+                    )
+                    # (E, H, 2I) → (2I, H, E) zero-copy view
+                    dw1 = dw1_result.permute(2, 1, 0)
+                else:
+                    gemm(
+                        x.T,
+                        dz_bf16,
+                        out=dw1.permute(2, 1, 0),
+                        cu_seqlens_k=expert_frequency_offset,
+                        A_idx=x_gather_idx,
+                        batch_idx_permute=None,
+                        dynamic_scheduler=False,
+                    )
 
                 # Act grad: native blockscaled FP8 GEMM (dz × w1^T → dx_expanded)
                 # Use pre-quantized dz from fused SwiGLU backward if available.
@@ -986,17 +1006,26 @@ class _DownProjection(torch.autograd.Function):
                 _log_stage_memory("backward:down-proj-dgated")
                 _reset_stage_memory_probe()
 
-                # Weight-grad: BF16 varlen GEMM
+                # Weight-grad: FP8 or BF16 varlen GEMM
                 y1s_wgrad = y1s if y1s.dtype == torch.bfloat16 else y1s.to(torch.bfloat16)
-                gemm(
-                    dout.T,
-                    y1s_wgrad,
-                    out=dw2.permute(2, 0, 1),
-                    cu_seqlens_k=expert_frequency_offset,
-                    A_idx=x_gather_idx,
-                    batch_idx_permute=None,
-                    dynamic_scheduler=False,
-                )
+                if _use_fp8_wgrad():
+                    dw2_result = blockscaled_fp8_wgrad_varlen_k(
+                        dout, y1s_wgrad, expert_frequency_offset,
+                        M=dout.shape[1], N=y1s_wgrad.shape[1],
+                        a_gather_idx=x_gather_idx,
+                    )
+                    # (E, H, I) → (H, I, E) zero-copy view
+                    dw2 = dw2_result.permute(1, 2, 0)
+                else:
+                    gemm(
+                        dout.T,
+                        y1s_wgrad,
+                        out=dw2.permute(2, 0, 1),
+                        cu_seqlens_k=expert_frequency_offset,
+                        A_idx=x_gather_idx,
+                        batch_idx_permute=None,
+                        dynamic_scheduler=False,
+                    )
                 del y1s_wgrad
                 _log_stage_memory("backward:down-proj-weight")
                 ds = ds[s_reverse_scatter_idx]

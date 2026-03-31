@@ -120,15 +120,19 @@ The reporting policy for every FP8 step is:
 - memory baseline: official bf16
 - performance baselines: previous commit and official bf16
 
-## 🔥 FP8 Blockscaled Status (2025-03-30)
+## 🔥 FP8 Blockscaled Status (2026-03-31)
 
-**Full-chain blockscaled FP8 (1×32 UE8M0) for Blackwell SM100.** Production E2E: **1.58x total speedup** over BF16 (fwd=0.99x, bwd=1.94x). 8/8 contract tests pass. Precision: RelRMSE 5.3-6.6%, Correlation 0.998. Forward + backward via decomposed CUTLASS blockscaled GEMM + Triton SwiGLU. Fused GEMM+SwiGLU+FP8 blocked by CUTLASS DSL accumulator recast bug.
+**Full-chain blockscaled FP8 (1×32 UE8M0) for Blackwell SM100.** Forward + backward via decomposed CUTLASS blockscaled GEMM + Triton SwiGLU. 8/8 contract tests pass. Precision: RelRMSE 5.3-6.6%, Correlation 0.998.
+
+**⚠️ Current FP8 is 18% slower than official BF16 baseline** (2930µs vs 2475µs, nsys GPU projection). The gap comes from Triton quant/SwiGLU overhead (~850µs) exceeding FP8 GEMM savings (~218µs), plus inability to use fused GemmGated with FP8. See `reports/fp8_upgrade/HANDOFF.md` for full three-way kernel breakdown and optimization roadmap.
 
 | Resource | Path |
 |----------|------|
 | **Handoff** (start here) | `reports/fp8_upgrade/HANDOFF.md` |
+| Agent context | `agent.md` |
 | Contract tests | `tests/fp8_large_project_contract_test.py` |
 | E2E benchmark | `tools/bench_aligned_e2e.py` |
+| nsys breakdown | `tools/nsys_full_breakdown.py` |
 
 ### Quick start
 
@@ -142,29 +146,37 @@ CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
 
 # E2E benchmark (production shape)
 CUDA_VISIBLE_DEVICES=0 python tools/bench_aligned_e2e.py
+
+# nsys kernel breakdown analysis
+python tools/nsys_full_breakdown.py reports/sonic_fork_fp8_v4.sqlite
 ```
 
-### Performance (B200 SM100a, E=128, K=8, tpe=256, 8-GPU avg)
+### Performance — Three-way nsys comparison (B200 SM100a, production shape)
 
-| Mode | Forward | Backward | Total | vs BF16 |
-|------|---------|----------|-------|---------|
-| BF16 baseline | 1.134ms | 3.624ms | 4.758ms | 1.00x |
-| **FP8 aligned** | **1.143ms** | **1.870ms** | **3.014ms** | **1.58x** ⭐ |
+| Mode | Forward | Backward | Total | vs Official BF16 |
+|------|---------|----------|-------|-------------------|
+| **Official BF16** (quack 0.2.5) | 777µs | 1698µs | **2475µs** | 1.00x (baseline) |
+| Fork BF16 (quack 0.3.7) | 800µs | 3781µs | 4581µs | 0.54x ❌ |
+| Fork FP8 (quack 0.3.7) | 935µs | 1995µs | 2930µs | 0.84x ❌ |
+
+> ⚠️ Fork BF16 is inflated by 2101µs contiguous copy overhead from quack 0.3.7 layout differences. Always use official BF16 as the baseline.
 
 ### Current state
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| FP8 forward (decomposed) | ✅ Working | 6.56% RelRMSE, 0.998 corr, 0.99x (4 kernels vs BF16's 2 fused) |
-| FP8 backward (decomposed) | ✅ Working | dx 6.54%, dw2 5.35% RelRMSE, 0.998 corr, **1.94x** |
-| BF16 fallback (non-aligned) | ✅ Working | Auto-detects alignment, zero performance penalty |
-| Fused FP8 GEMM+SwiGLU | 🔴 Blocked | CUTLASS DSL accumulator recast bug |
+| FP8 forward (decomposed) | ✅ Working | 6.56% RelRMSE, 0.998 corr |
+| FP8 backward (decomposed) | ✅ Working | dx 6.54%, dw2 5.35% RelRMSE, 0.998 corr |
+| BF16 fallback (non-aligned) | ✅ Working | Auto-detects alignment, zero perf penalty |
+| Fused FP8 GEMM+SwiGLU | 🔴 Blocked | CUTLASS DSL `recast_layout` bug |
+| FP8 wgrad (varlen_k) | ⚠️ Integrated | Per-op faster, but layout copy overhead → E2E regression. Default OFF |
 
-### Next steps
+### Next steps (priority order)
 
-1. **P0**: Forward speedup — CUTLASS C++ fused GEMM+SwiGLU+FP8 kernel (4-6 weeks, needs expert)
-2. **P1**: Backward multi-stream overlap (act-grad ∥ weight-grad)
-3. **P2**: Token rounding in routing layer (guarantee 128-alignment)
+1. **P0**: Triton SwiGLU kernel optimization — 5-8x headroom vs theoretical (biggest ROI)
+2. **P1**: Restore fused forward GEMM+SwiGLU for FP8 (~160µs saving)
+3. **P2**: Multi-stream overlap (act-grad ∥ weight-grad)
+4. **P3**: Eliminate FP8 wgrad layout copy overhead
 
 ### Example usage
 - SonicMoE with TC top-K choice routing (SwiGLU activation) on Hopper GPUs
