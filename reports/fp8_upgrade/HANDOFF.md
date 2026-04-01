@@ -273,11 +273,12 @@ CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
 3. **BF16 wgrad** — 1239µs (37.3% of CUDA time) is the dominant remaining cost. FP8 wgrad is proven net-negative (colwise quant SM contention). Irreducible on current hardware.
 
 4. **Optimization completeness assessment:**
-   - Memory: ✅ FP8 0.398× of BF16 (60% savings) — well beyond "大幅优于"
+   - Memory: ✅ FP8 0.699× peak (30% savings), 0.284× persistent (72% savings)
    - Performance: ✅ Estimated 1.20-1.30× faster (needs idle-GPU validation)
    - Precision: ✅ 20/20 tests, <10% RelRMSE, >0.99 correlation
-   - Remaining overheads (quant 4.1%, scale_gather 1.6%, token_gather 4.3%) are near-minimal
+   - Remaining overheads (quant 5.6%, scale_gather 2.5%, token_gather 4.3%) are near-minimal
    - The only large component is BF16 wgrad (37.3%), which is proven irreducible
+   - Peak memory is bounded by autograd retaining input z (384MB) during _DownProjection forward — cannot be freed without breaking gradient flow
 
 ---
 
