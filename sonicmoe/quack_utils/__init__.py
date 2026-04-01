@@ -12,6 +12,7 @@ from .blockscaled_fp8_gemm import (
     clear_blockscaled_fp8_weight_cache,
     evict_fp8_weight_cache_entry,
     colwise_quantize_and_pack,
+    fast_gather_quantize_and_pack_activation,
     gather_quantize_and_pack_activation,
     make_blockscaled_grouped_reverse_scatter_idx,
     pack_blockscaled_1x32_scales,

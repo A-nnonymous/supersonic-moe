@@ -30,7 +30,7 @@ from ..functional.fp8_quant import quantize_activation_blockwise, round_scale_to
 
 
 # ---------------------------------------------------------------------------
-# Rank-aware tile_atom_to_shape_SF
+# Rank-aware tile_atom_to_shape_SF with gather_A SFA override
 # ---------------------------------------------------------------------------
 # The upstream CUTLASS DSL function ``tile_atom_to_shape_SF`` hardcodes a
 # 3-element order ``(2, 1, 3)`` which assumes rank-3 tensor shapes.  The
@@ -42,7 +42,27 @@ from ..functional.fp8_quant import quantize_activation_blockwise, round_scale_to
 # upstream module namespace so that ``GemmDefaultSm100.__call__`` (which
 # references ``blockscaled_utils.tile_atom_to_shape_SF``) picks it up at
 # kernel-tracing time.
+#
+# Additionally, when gather_A + blockscaled is active, the SFA M-dimension
+# must be TK (not T). A thread-local override allows callers to temporarily
+# replace the M-dimension in the Shape passed to this function.
 # ---------------------------------------------------------------------------
+
+import threading as _threading
+
+_SFA_M_OVERRIDE = _threading.local()
+
+
+def set_sfa_m_override(m_override: int | None) -> None:
+    """Set a thread-local M-dimension override for SFA layout derivation.
+
+    When set, the next call to tile_atom_to_shape_SF will use this value
+    for the M-dimension instead of the one in Shape. Automatically cleared
+    after one use.
+    """
+    _SFA_M_OVERRIDE.value = m_override
+    _SFA_M_OVERRIDE.call_count = 0
+
 
 @dsl_user_op
 def _tile_atom_to_shape_SF_rank_aware(
@@ -882,6 +902,189 @@ def _colwise_quantize_and_pack_kernel(
     tl.store(scale_ptrs, e8m0_byte, mask=dim_mask)
 
 
+# ---------------------------------------------------------------------------
+# Fused transpose + rowwise quantize for wgrad operands
+# ---------------------------------------------------------------------------
+# Instead of colwise quant on (TK, dim) → scattered access,
+# we transpose + rowwise quant in a single kernel:
+#   Read (TK, dim) bf16 → SMEM transpose → write (dim, TK) FP8 + ISA scales
+# This converts the cache-hostile colwise pattern into cache-friendly rowwise.
+
+@triton.jit
+def _fused_transpose_rowquant_kernel(
+    src_ptr,              # (TK, dim) bf16 source, row-major
+    gather_idx_ptr,       # (TK,) int32 gather indices (or dummy)
+    dst_fp8_ptr,          # (dim, TK) fp8 output, row-major
+    dst_packed_scale_ptr, # ISA-packed scales for (dim, TK) layout
+    TK,                   # total K dimension
+    dim,                  # H or I dimension
+    src_stride_row,       # stride of source along TK
+    src_stride_col,       # stride of source along dim
+    dst_stride_row,       # stride of output along dim (= TK)
+    dst_stride_col,       # stride of output along TK (= 1)
+    k_tiles,              # ceil(TK / SF_TILE_K) for ISA layout
+    HAS_GATHER: tl.constexpr,
+    TILE_TK: tl.constexpr,   # tile size along TK (e.g. 128)
+    TILE_DIM: tl.constexpr,  # tile size along dim (e.g. 32)
+    GROUP_SIZE: tl.constexpr, # 32 for blockscaled
+    SF_TILE_M: tl.constexpr,
+    SF_TILE_STORAGE: tl.constexpr,
+    GROUPS_PER_TILE: tl.constexpr,  # TILE_TK // GROUP_SIZE (e.g. 4)
+):
+    """Fused transpose + rowwise blockscaled quantize.
+
+    Grid: (dim_tiles, tk_tiles)
+    Each block reads a (TILE_TK, TILE_DIM) tile from src,
+    transposes to (TILE_DIM, TILE_TK), then rowwise-quantizes
+    with groups of GROUP_SIZE along TK, writing FP8 + ISA-packed scales.
+
+    The output is (dim, TK) row-major FP8 with ISA-packed scales
+    for the (dim, TK) logical layout — exactly what wgrad CUTLASS needs.
+    """
+    pid_dim = tl.program_id(0)   # which dim tile
+    pid_tk = tl.program_id(1)    # which TK tile
+
+    dim_offs = pid_dim * TILE_DIM + tl.arange(0, TILE_DIM)
+    tk_offs = pid_tk * TILE_TK + tl.arange(0, TILE_TK)
+    dim_mask = dim_offs < dim
+    tk_mask = tk_offs < TK
+
+    # Load (TILE_TK, TILE_DIM) tile from src with optional gather
+    if HAS_GATHER:
+        src_rows = tl.load(gather_idx_ptr + tk_offs, mask=tk_mask, other=0).to(tl.int64)
+    else:
+        src_rows = tk_offs.to(tl.int64)
+
+    src_ptrs = src_ptr + src_rows[:, None] * src_stride_row + dim_offs[None, :] * src_stride_col
+    mask_2d = tk_mask[:, None] & dim_mask[None, :]
+    values = tl.load(src_ptrs, mask=mask_2d, other=0.0).to(tl.float32)
+    # values shape: (TILE_TK, TILE_DIM) in registers
+
+    # Transpose: now process as (TILE_DIM, TILE_TK) — each "row" is one dim element
+    # For rowwise quant, we need amax over groups of GROUP_SIZE along TK axis
+    # Reshape values to (TILE_DIM, TILE_TK) by transposing
+    # Triton: values[tk, d] → transposed[d, tk]
+    # We process group-by-group along TK within this tile
+
+    # ISA layout for output (dim, TK): dim is M-axis, TK is K-axis
+    dst_row_tiles = dim_offs // SF_TILE_M
+    dst_row_in_tile = dim_offs % SF_TILE_M
+    dst_row_base_offset = (dst_row_in_tile % 32) * 16 + (dst_row_in_tile // 32) * 4
+
+    packed_scale_i32 = tl.zeros([TILE_DIM], dtype=tl.int32)
+
+    for g in tl.range(0, GROUPS_PER_TILE):
+        group_tk_start = g * GROUP_SIZE
+        group_tk_offs = group_tk_start + tl.arange(0, GROUP_SIZE)
+        group_mask = (pid_tk * TILE_TK + group_tk_offs) < TK
+
+        # Extract the (GROUP_SIZE, TILE_DIM) sub-tile from values
+        # values[group_tk_offs, :] → (GROUP_SIZE, TILE_DIM)
+        subtile = tl.load(
+            src_ptr + (src_rows[group_tk_start:group_tk_start + GROUP_SIZE] if HAS_GATHER
+                       else (pid_tk * TILE_TK + group_tk_offs).to(tl.int64))[:, None] * src_stride_row
+            + dim_offs[None, :] * src_stride_col,
+            mask=group_mask[:, None] & dim_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+
+        # Amax along GROUP_SIZE (axis=0) → per-dim-element scale
+        block_amax = tl.max(tl.abs(subtile), axis=0)  # (TILE_DIM,)
+
+        # Pure-integer E8M0 computation
+        amax_bits = block_amax.to(tl.int32, bitcast=True)
+        biased_exp = (amax_bits >> 23) & 0xFF
+        mantissa_bits = amax_bits & 0x7FFFFF
+        carry = tl.where(mantissa_bits > 0x600000, 1, 0)
+        e8m0_i32 = biased_exp - 8 + carry
+        e8m0_i32 = tl.where(biased_exp > 0, e8m0_i32, 0)
+        e8m0_clamped = tl.maximum(e8m0_i32, 0)
+
+        quant_biased_exp = 254 - e8m0_i32
+        quant_biased_exp = tl.maximum(tl.minimum(quant_biased_exp, 254), 1)
+        quant_scale = (quant_biased_exp.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+
+        # Quantize: scale then cast
+        quantized = (subtile * quant_scale[None, :]).to(tl.float8e4nv)
+        # quantized shape: (GROUP_SIZE, TILE_DIM)
+
+        # Write transposed: dst[dim, tk] = quantized^T
+        # Output row = dim_offs, output col = actual_tk_offs
+        actual_tk_offs = pid_tk * TILE_TK + group_tk_offs
+        out_ptrs = dst_fp8_ptr + dim_offs[None, :] * dst_stride_row + actual_tk_offs[:, None] * dst_stride_col
+        # But we need to write (GROUP_SIZE, TILE_DIM) transposed as (TILE_DIM, GROUP_SIZE)
+        # Use swapped indexing:
+        out_ptrs_t = dst_fp8_ptr + dim_offs[:, None] * dst_stride_row + actual_tk_offs[None, :] * dst_stride_col
+        tl.store(out_ptrs_t, tl.trans(quantized), mask=dim_mask[:, None] & group_mask[None, :])
+
+        # Pack scale bytes into uint32 (4 groups per TILE_TK=128)
+        packed_scale_i32 = packed_scale_i32 | ((e8m0_clamped & 0xFF) << (g * 8))
+
+    # Write packed uint32 ISA scales
+    global_group_idx = pid_tk  # which k-tile (each TILE_TK = SF_TILE_K = 128)
+    tile_base = (dst_row_tiles * k_tiles + global_group_idx) * SF_TILE_STORAGE
+    packed_offset_i32 = (tile_base + dst_row_base_offset) // 4
+    scale_ptr_i32 = dst_packed_scale_ptr.to(tl.pointer_type(tl.int32))
+    tl.store(scale_ptr_i32 + packed_offset_i32, packed_scale_i32, mask=dim_mask)
+
+
+def fused_transpose_quantize_and_pack(
+    src: torch.Tensor,
+    logical_rows: int,
+    logical_cols: int,
+    *,
+    gather_idx: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused transpose + rowwise blockscaled quantize for wgrad operands.
+
+    Replaces colwise_quantize_and_pack with ~3-5x better performance by
+    converting the cache-hostile column-wise access pattern into row-wise.
+
+    Input: (TK, dim) bf16 row-major
+    Output: (dim, TK) fp8 row-major + ISA-packed scales for (dim, TK) layout
+
+    Parameters are identical to colwise_quantize_and_pack.
+    """
+    H = logical_rows   # dim
+    TK = logical_cols
+    GROUP_SIZE = _SF_VEC_SIZE  # 32
+    TILE_TK = _SF_TILE_K       # 128 (= SF_TILE_K, matches ISA tile)
+    TILE_DIM = 32              # process 32 dim rows per block
+
+    # Output: (dim, TK) row-major FP8
+    fp8_out = torch.empty(H, TK, dtype=torch.float8_e4m3fn, device=src.device)
+
+    # ISA-packed scales for (dim, TK) layout
+    per_batch_storage = _storage_per_batch(H, TK)
+    if H % _SF_TILE_M == 0 and TK % _SF_TILE_K == 0:
+        packed_scales = torch.empty((1, per_batch_storage), dtype=torch.uint8, device=src.device)
+    else:
+        packed_scales = torch.full((1, per_batch_storage), 127, dtype=torch.uint8, device=src.device)
+
+    k_tiles = _div_up(TK, _SF_TILE_K)
+    grid = (_div_up(H, TILE_DIM), _div_up(TK, TILE_TK))
+    groups_per_tile = TILE_TK // GROUP_SIZE  # 4
+
+    has_gather = gather_idx is not None
+    gather_ptr = gather_idx if has_gather else src
+
+    _fused_transpose_rowquant_kernel[grid](
+        src, gather_ptr, fp8_out, packed_scales,
+        TK, H,
+        src.stride(0), src.stride(1),
+        fp8_out.stride(0), fp8_out.stride(1),
+        k_tiles,
+        HAS_GATHER=has_gather,
+        TILE_TK=TILE_TK,
+        TILE_DIM=TILE_DIM,
+        GROUP_SIZE=GROUP_SIZE,
+        SF_TILE_M=_SF_TILE_M,
+        SF_TILE_STORAGE=_SF_TILE_STORAGE,
+        GROUPS_PER_TILE=groups_per_tile,
+    )
+    return fp8_out, packed_scales.view(torch.float8_e8m0fnu)
+
+
 def colwise_quantize_and_pack(
     src: torch.Tensor,
     logical_rows: int,
@@ -1658,6 +1861,133 @@ def quantize_and_pack_activation(
         GROUPS_PER_K_TILE=groups_per_k_tile,
     )
     return fp8_out, packed_scales.view(torch.float8_e8m0fnu)
+
+
+# ---------------------------------------------------------------------------
+# Three-step optimized gather: T-quant → fp8_gather → scale_gather
+# ---------------------------------------------------------------------------
+# Replaces the monolithic gather_quantize_and_pack_activation when the source
+# tensor T is small enough to fit in L2 cache (e.g., T=4096..8192, K≤4096).
+# 1. quantize_and_pack_activation(x) on (T, K) — ~2-8µs for small T
+# 2. fp8 data gather via index_select — ~15-25µs (L2-resident reads)
+# 3. ISA-packed scale gather — ~3-8µs (very small I/O)
+# Total ~20-40µs vs ~96-99µs for gather_quantize_and_pack_activation.
+# Numerically identical: scale for row r is computed from x[r, :] regardless.
+
+@triton.jit
+def _gather_isa_packed_scales_kernel(
+    src_scale_ptr,     # ISA-packed scales for T rows (uint8)
+    gather_idx_ptr,    # (TK,) int32/int64 gather indices
+    dst_scale_ptr,     # ISA-packed scales for TK rows (uint8)
+    TK,                # number of destination rows
+    src_k_tiles: tl.constexpr,   # ceil(K / SF_TILE_K) for T layout
+    dst_k_tiles: tl.constexpr,   # ceil(K / SF_TILE_K) for TK layout (same value)
+    SF_TILE_M: tl.constexpr,
+    SF_TILE_STORAGE: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    GROUPS_PER_K_TILE: tl.constexpr,
+):
+    """Gather ISA-packed scales from T-sized layout to TK-sized layout.
+
+    2D grid: (row_blocks, k_tiles).
+    Each block processes BLOCK_ROWS destination rows × 1 k-tile (4 scale groups).
+    Reads 4 source scale bytes as uint32, writes 4 dest scale bytes as uint32.
+    """
+    row_base = tl.program_id(0) * BLOCK_ROWS
+    k_tile_idx = tl.program_id(1)
+    row_ids = row_base + tl.arange(0, BLOCK_ROWS)
+    row_mask = row_ids < TK
+
+    # Load gather indices
+    gather_ids = tl.load(gather_idx_ptr + row_ids, mask=row_mask, other=0)
+
+    # Source row ISA offsets (T-layout)
+    src_row_tiles = gather_ids // SF_TILE_M
+    src_row_in_tile = gather_ids % SF_TILE_M
+    src_row_base_offset = (src_row_in_tile % 32) * 16 + (src_row_in_tile // 32) * 4
+    src_tile_base = (src_row_tiles * src_k_tiles + k_tile_idx) * SF_TILE_STORAGE
+
+    # Dest row ISA offsets (TK-layout)
+    dst_row_tiles = row_ids // SF_TILE_M
+    dst_row_in_tile = row_ids % SF_TILE_M
+    dst_row_base_offset = (dst_row_in_tile % 32) * 16 + (dst_row_in_tile // 32) * 4
+    dst_tile_base = (dst_row_tiles * dst_k_tiles + k_tile_idx) * SF_TILE_STORAGE
+
+    # Read 4 scale bytes as uint32 from source, write to dest
+    src_offset_i32 = (src_tile_base + src_row_base_offset) // 4
+    dst_offset_i32 = (dst_tile_base + dst_row_base_offset) // 4
+
+    src_ptr_i32 = src_scale_ptr.to(tl.pointer_type(tl.int32))
+    dst_ptr_i32 = dst_scale_ptr.to(tl.pointer_type(tl.int32))
+
+    packed_val = tl.load(src_ptr_i32 + src_offset_i32, mask=row_mask, other=0)
+    tl.store(dst_ptr_i32 + dst_offset_i32, packed_val, mask=row_mask)
+
+
+def fast_gather_quantize_and_pack_activation(
+    x: torch.Tensor,
+    gather_idx: torch.Tensor,
+    group_size: int = _SF_VEC_SIZE,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Three-step optimized gather+quantize: T-quant → fp8_gather → scale_gather.
+
+    Numerically identical to gather_quantize_and_pack_activation, but 3-5x
+    faster when T << TK (common in MoE with high top-K).
+
+    Step 1: quantize_and_pack_activation on small T-sized tensor (~2-8µs)
+    Step 2: gather fp8 data via index_select (~15-25µs, L2-resident source)
+    Step 3: gather ISA-packed scales via Triton kernel (~3-8µs)
+
+    Parameters
+    ----------
+    x : Tensor (T, K) bf16 — original activation (NOT gathered).
+    gather_idx : Tensor (TK,) int32/int64 — token gather indices.
+
+    Returns
+    -------
+    fp8_data : Tensor (TK, K) float8_e4m3fn
+    packed_scales : Tensor (1, packed_size) float8_e8m0fnu in ISA layout
+    """
+    TK = gather_idx.shape[0]
+    T, K = x.shape
+    k_tiles = _div_up(K, _SF_TILE_K)
+
+    # Step 1: quantize small T-sized tensor
+    x_fp8_t, scales_t = quantize_and_pack_activation(x, group_size)
+
+    # Step 2: gather fp8 data (source is T-sized, fits in L2 for typical T)
+    gather_idx_i64 = gather_idx.long()
+    fp8_out = x_fp8_t.index_select(0, gather_idx_i64)
+
+    # Step 3: gather ISA-packed scales
+    per_batch_storage_tk = _storage_per_batch(TK, K)
+    if TK % _SF_TILE_M == 0 and K % _SF_TILE_K == 0:
+        packed_scales_tk = torch.empty(
+            (1, per_batch_storage_tk), dtype=torch.uint8, device=x.device
+        )
+    else:
+        packed_scales_tk = torch.full(
+            (1, per_batch_storage_tk), 127, dtype=torch.uint8, device=x.device
+        )
+
+    BLOCK_ROWS = 32
+    grid = (_div_up(TK, BLOCK_ROWS), k_tiles)
+    groups_per_k_tile = _SF_TILE_K // group_size  # typically 4
+    _gather_isa_packed_scales_kernel[grid](
+        scales_t.view(torch.uint8),
+        gather_idx,
+        packed_scales_tk,
+        TK,
+        src_k_tiles=k_tiles,
+        dst_k_tiles=k_tiles,
+        SF_TILE_M=_SF_TILE_M,
+        SF_TILE_STORAGE=_SF_TILE_STORAGE,
+        BLOCK_ROWS=BLOCK_ROWS,
+        GROUPS_PER_K_TILE=groups_per_k_tile,
+    )
+
+    del x_fp8_t, scales_t
+    return fp8_out, packed_scales_tk.view(torch.float8_e8m0fnu)
 
 
 @triton.jit

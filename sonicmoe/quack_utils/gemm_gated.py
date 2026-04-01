@@ -231,7 +231,15 @@ def gemm_gated(
 
     device_capacity = get_device_capacity(A.device)
     assert device_capacity[0] in [9, 10], "Only SM90 and SM100 are supported"
-    GemmCls = GemmGatedSm100 if device_capacity[0] > 9 else GemmGatedSm90
+    # Use zero-materialization kernel when gather_A + blockscaled (FP8 with A_idx)
+    blockscaled_runtime = a_scales is not None and b_scales is not None
+    if device_capacity[0] > 9 and gather_A and blockscaled_runtime:
+        from .gemm_sm100_fp8_zeromat import GemmGatedSm100ZeroMat
+        GemmCls = GemmGatedSm100ZeroMat
+    elif device_capacity[0] > 9:
+        GemmCls = GemmGatedSm100
+    else:
+        GemmCls = GemmGatedSm90
 
     acc_dtype = cutlass.Float32
     tile_shape_mn = (tile_M, tile_N)

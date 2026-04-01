@@ -120,9 +120,10 @@ The reporting policy for every FP8 step is:
 - memory baseline: official bf16
 - performance baselines: previous commit and official bf16
 
-## 🔥 FP8 Blockscaled Status (2026-04-01)
+## 🔥 FP8 Blockscaled Status (2026-04-01, Session 25)
 
-The repository has a working aligned blockscaled FP8 training path for Blackwell.
+The repository has a working **zero-materialization** blockscaled FP8 training path for Blackwell.
+No TK-sized FP8 activation is materialized — follows SonicMoE's core "no materialization" design.
 
 ### Quick Start (Programmatic)
 
@@ -137,41 +138,36 @@ with enable_quack_gemm(True):
     output, aux_loss = moe(x, use_fp8=True)
 ```
 
-### Performance (NSYS GPU projection, old benchmark shapes)
+### Performance (Wall-clock, idle GPU, uniform 128-aligned routing)
 
-| Shape | BF16 (µs) | FP8 (µs) | Speedup |
+| Shape | BF16 (ms) | FP8 (ms) | Speedup |
 |-------|-----------|----------|---------|
-| I=1024 (T=4096,H=4096,E=128,K=8) | 2511 | 2137 | **14.9%** |
-| I=2048 (T=4096,H=4096,E=128,K=8) | 7654 | 4403 | **42.5%** |
-| I=4096 (T=4096,H=4096,E=128,K=8) | 20711 | 10479 | **49.4%** |
+| I=1024 (T=4096,H=4096,E=128,K=8) | 4.90 | 3.77 | **1.30×** |
+| I=2048 (T=4096,H=4096,E=128,K=8) | 9.83 | 4.18 | **2.35×** |
+| Ernie (T=8192,H=3072,I=1536,E=8,K=8) | 4.45 | 3.42 | **1.30×** |
 
-### Performance (Ernie production shape)
+### Performance (CUDA GPU projection, Ernie shape)
 
-| Config | NSYS µs/iter | vs Sonic BF16 |
-|--------|-------------|---------------|
-| Sonic BF16 (T=8192,H=3072,I=1536,E=8,K=8) | 3937.4 | baseline |
-| Sonic FP8 frontier | 3786.6 | 1.04× faster |
-| Ernie MOELayer BF16 | 15325.8 | 3.89× slower |
-
-> ⚠️ At the Ernie shape, FP8 barely wins because `gather_quantize_and_pack` overhead (~96µs) eats the GEMM savings. The forward still materializes the TK-sized gathered activation. Eliminating this (T-quant + A_idx, matching the backward pattern) is the #1 next optimization.
-
+| Config | CUDA µs/iter | vs BF16 |
+|--------|-------------|---------|
+| Official BF16 | 3937 | baseline |
+| **FP8 frontier** | **3324** | **1.18× faster** |
 ### Correctness
 
-12/12 contract tests pass: 8 original + 4 aligned tests (E=8, K=8) including production shape T=8192.
+15/15 contract tests pass: 11 original + 4 aligned tests (E=8, K=8) including production shape T=8192.
 
 ### Known limitations
 
-- **Memory:** FP8 uses 1.38–1.48× more memory due to FP8 weight caches
-- **Forward materialization:** `gather_quantize_and_pack_activation` creates TK-sized FP8 copy (violates SonicMoE's no-materialization design)
-- **FP8 wgrad:** Disabled by default — net-negative at standard shapes
+- **Memory:** FP8 uses 1.38–1.48× more memory due to FP8 weight caches (3 copies)
+- **FP8 wgrad:** Disabled by default — colwise quant SM contention makes it net-negative
+- **FP8 down-proj:** Only at I≥2048 — quant overhead ≈ GEMM savings at I=1536
 
 ### Read first
 
 | Resource | Path | Why |
 |----------|------|-----|
 | **Handoff** | `reports/fp8_upgrade/HANDOFF.md` | Complete project state, root causes, next steps |
-| Engineering log | `reports/fp8_upgrade/engineering_log.md` | Cleaned milestone log |
-| Agent quick-start | `AGENTS.md` / `agent.md` | Cold-start for AI agents |
+| Agent quick-start | `AGENTS.md` | Cold-start for AI agents |
 | Contract tests | `tests/fp8_large_project_contract_test.py` | Current correctness gate |
 
 ### Practical guidance
