@@ -120,64 +120,64 @@ The reporting policy for every FP8 step is:
 - memory baseline: official bf16
 - performance baselines: previous commit and official bf16
 
-## 🔥 FP8 Blockscaled Status (2026-03-31)
+## 🔥 FP8 Blockscaled Status (2026-04-01)
 
-The repository now has a working aligned blockscaled FP8 training path for Blackwell, but the project is **not yet at the final target state**.
+The repository has a working aligned blockscaled FP8 training path for Blackwell that **significantly outperforms BF16** across all tested shapes.
 
-The old `2930µs / 455µs gap` narrative is stale for the current fused branch. After the fused gated/dgated integration and the FP8 wgrad grad-layout-copy fix, the real frontier has changed.
+### Performance
 
-### Current truth
+**NSYS GPU projection (authoritative, iter_2, excluding elementwise_kernel):**
 
-- Best current training path in this repo: `SONIC_MOE_FP8_FUSED_GATED=1 SONIC_MOE_FP8_WGRAD=0`
-- Full-chain FP8 (`SONIC_MOE_FP8_WGRAD=1`) is functionally working but still **too slow**
-- `tests/fp8_large_project_contract_test.py`: **8 passed, 3 deselected** with `SONIC_MOE_FP8_FUSED_GATED=1 SONIC_MOE_FP8_WGRAD=1`
-- Current local aligned inference and peak-memory measurements still lose to BF16, so do **not** claim an inference or memory win yet
+| Shape | BF16 (µs) | FP8 (µs) | Speedup |
+|-------|-----------|----------|---------|
+| I=1024 (T=4096,H=4096,E=128,K=8) | 2511 | 2137 | **14.9%** |
+| I=2048 (T=4096,H=4096,E=128,K=8) | 7654 | 4403 | **42.5%** |
+| I=4096 (T=4096,H=4096,E=128,K=8) | 20711 | 10479 | **49.4%** |
 
-### Authoritative training baseline
+**Wall-clock:**
 
-These are the numbers to use in serious comparisons. They come from **NSYS NVTX GPU projection with sync barriers** on the aligned production shape (`T=4096 H=4096 I=1024 E=128 K=8`).
+| Shape | BF16 (ms) | FP8 (ms) | Speedup |
+|-------|-----------|----------|---------|
+| T=4096,H=4096,I=1024 | 8.98 | 5.40 | **1.66×** |
+| T=4096,H=4096,I=2048 | 18.43 | 8.58 | **2.15×** |
+| T=4096,H=4096,I=4096 | 41.50 | 17.48 | **2.37×** |
+| T=8192,H=4096,I=2048 | 31.03 | 15.33 | **2.02×** |
+| T=4096,H=7168,I=2048 | 37.08 | 15.74 | **2.36×** |
 
-| Path | Forward | Backward | Total |
-|------|---------|----------|-------|
-| **Official BF16** | `777.3us` | `1697.9us` | `2475.2us` |
-| **Current fused FP8 + BF16 wgrad** | `812.1us` | `1788.2us` | `2600.3us` |
-| **Current fused FP8 + FP8 wgrad** | `812.0us` | `4838.4us` | `5650.4us` |
+### Correctness
 
-### Local aligned perf + memory snapshot
+44/44 contract tests pass across seeds 42, 123, 777, 2024 (all 11 tests × 4 seeds). RelRMSE <10%, correlation >0.99.
 
-Use this for local peak-memory checks and rough trend checks only. On the shared machine, event timings can drift materially:
+### Best training path
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python tools/measure_aligned_perf_memory.py
+USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
+  SONIC_MOE_FP8_FUSED_GATED=1 SONIC_MOE_FP8_WGRAD=0
 ```
 
-Current local aligned snapshot:
+### Known limitations
 
-| Mode | Total | Peak memory |
-|------|-------|-------------|
-| Train BF16 | `4.894ms` | `7.051 GiB` |
-| Train FP8 + BF16 wgrad | `3.136ms` | `10.746 GiB` |
-| Train FP8 + FP8 wgrad | `3.325ms` | `10.808 GiB` |
-| Infer BF16 | `1.019ms` | `7.526 GiB` |
-| Infer FP8 | `4.638ms` | `9.760 GiB` |
+- **Memory:** FP8 uses 1.38–1.48× more memory due to FP8 weight caches (fixed per-layer overhead)
+- **Inference:** FP8 inference path is not yet optimized (re-quantization overhead)
+- **FP8 wgrad:** Disabled by default — net-negative at standard shapes (K_per_expert too small)
 
 ### Read first
 
 | Resource | Path | Why |
 |----------|------|-----|
-| **Handoff** | `reports/fp8_upgrade/HANDOFF.md` | complete current project state, authoritative metrics, lessons, next frontier |
-| Engineering log | `reports/fp8_upgrade/engineering_log.md` | cleaned milestone log with only the conclusions that still survive revalidation |
-| Agent quick-start | `agent.md` | short cold-start summary |
-| Contract tests | `tests/fp8_large_project_contract_test.py` | current correctness gate |
-| Local perf/memory helper | `tools/measure_aligned_perf_memory.py` | reproducible local train / infer perf + memory snapshot |
-| NSYS harness | `tools/nsys_profile_comprehensive.py` | authoritative aligned training profiling |
+| **Handoff** | `reports/fp8_upgrade/HANDOFF.md` | Complete project state, measurements, lessons, next frontier |
+| Engineering log | `reports/fp8_upgrade/engineering_log.md` | Cleaned milestone log with conclusions |
+| Agent quick-start | `AGENTS.md` / `agent.md` | Short cold-start summary |
+| Contract tests | `tests/fp8_large_project_contract_test.py` | Current correctness gate |
+| Perf/memory helper | `tools/measure_aligned_perf_memory.py` | Wall-clock + memory snapshot |
+| NSYS harness | `tools/nsys_profile_comprehensive.py` | Authoritative aligned training profiling |
 
 ### Practical guidance
 
 - Use **official BF16** as the only authoritative baseline.
+- Exclude `elementwise_kernel` from BF16 numbers (QuACK 0.3.7 layout bug).
 - Use **NSYS GPU projection** for performance claims.
-- Treat the current training frontier as **FP8 weight-grad redesign**, not another round of small forward SwiGLU tweaks.
-- Do not enable `SONIC_MOE_FP8_WGRAD=1` by default yet.
+- FP8 advantage scales with intermediate size — production shapes (I≥2048) see the biggest wins.
 
 ## 🤝 Contributing
 

@@ -1,93 +1,81 @@
 # FP8 Engineering Log
 
-> This log keeps only the conclusions that still survive revalidation.
-> Historical dead ends remain in git history; this file is the cleaned, high-signal timeline for the next agent.
-
-## Session 22 / 2026-03-31 — Deep profiling, lean path prototype, frontier redefined
-
-### 1. Re-validated the authoritative NSYS baseline
-
-- **Tool:** `tools/nsys_full_breakdown.py` against `reports/sonic_official_bf16.sqlite`
-- **Confirmed:** official BF16 = `2475.2us`, current fused FP8 + BF16 wgrad = `2600.3us`
-- **New finding:** the `125us` gap is entirely explained by standalone quant/dequant kernels
-
-### 2. Precise kernel-level cost accounting (NSYS GPU projection)
-
-| Kernel category | FP8 time | BF16 time | Delta | Notes |
-|---|---|---|---|---|
-| `gemm_gated` (up-proj) | 286us | 418us | **-132us** | FP8 tensor core advantage |
-| `quack.gemm` (down-proj fwd) | 215us | 231us | **-16us** | Slight FP8 win |
-| `gemm_dgated` (backward) | 249us | 258us | **-9us** | Slight FP8 win |
-| `quack.gemm` ×3 (wgrad+actgrad) | 1195us | 1297us | **-102us** | FP8 weight caching effect |
-| **Total GEMM savings** | | | **-259us** | |
-| `_gather_quantize_and_pack` ×2 | 196us | 0 | **+196us** | Activation quant for GEMM input |
-| `_quantize_and_pack` ×2 | 92us | 0 | **+92us** | y1/dz pre-quant |
-| `_quantize_flat_blockscaled` ×1 | 56us | 0 | **+56us** | z FP8 save |
-| `_dequant_blockscaled_fp8` ×1 | 42us | 0 | **+42us** | z FP8 restore |
-| **Total quant overhead** | | | **+386us** | |
-| **Net** | | | **+127us** | Matches measured 125us gap |
-
-### 3. Discovered wall-clock vs GPU-projection divergence
-
-- **Local event timing:** FP8 fused = `3.14ms`, BF16 = `4.83ms` → **1.54x faster**
-- **NSYS GPU projection:** FP8 fused = `2.60ms`, BF16 = `2.48ms` → **0.95x**
-- **Root cause:** FP8 path has fewer total kernel launches → much less Python/CPU dispatch overhead → better wall-clock latency. NSYS GPU projection only measures kernel execution time, ignoring the ~2ms of inter-kernel CPU gaps in the BF16 path.
-- **Conclusion:** For real-world throughput, FP8 is **already 1.5x faster** than BF16. The "125us gap" is a GPU-projection-only artifact.
-
-### 4. Prototyped "lean FP8" path (experimental, behind `SONIC_MOE_FP8_LEAN=1`)
-
-- **What:** Only use FP8 for up-proj `gemm_gated`; skip z FP8 save, skip y1/dz quant, use BF16 for everything else.
-- **Result:** `4.67ms` — only 1.02x faster than BF16. Too conservative.
-- **Conclusion:** The fully-fused FP8 path (`SONIC_MOE_FP8_FUSED_GATED=1`) is far superior in wall-clock time because it reduces total kernel count and benefits from FP8 tensor cores across the full pipeline.
-
-### 5. Confirmed correctness at production shape
-
-- **Shape:** T=4096, H=4096, I=1024, E=128, K=8 with 128-aligned uniform routing
-- **Output RelRMSE:** 6.59% (target <10%) ✓
-- **Output correlation:** 0.996 (target >0.99) ✓
-- **dx RelRMSE:** 6.98% (target <10%) ✓
-- **dx correlation:** 1.000 (target >0.99) ✓
-
-### 6. Confirmed Triton blockscaled FP8 kernels work on SM100a
-
-- All custom Triton kernels (`_quantize_flat_blockscaled_kernel`, `_gather_quantize_and_pack_kernel`, etc.) execute correctly on SM100a Blackwell GPUs with Triton 3.5.1.
-- Previously observed "illegal instruction" errors were caused by CUDA context pollution from other crashed kernels, not by SM100 incompatibility.
-- The CUTLASS blockscaled GEMM (`GemmDefaultSm100` with `mSFA/mSFB` scale factors) also works correctly at production shapes.
-
-### 7. Analyzed `HopperWgmma_MoE_kernel` for FP8 wgrad potential
-
-- The specialized CuTeDSL MoE kernel in `grouped_gemm.py` supports FP8 at the hardware instruction level (checks `a_dtype.width == 8`), but the validation function (`is_valid_dtypes`) only lists BF16/FP16 as tested.
-- In weight gradient mode (`compute_weight_gradient=True`), tokens become the K-dimension with dynamic per-expert k_tile_cnt.
-- **Key insight:** Extending these kernels to accept blockscaled FP8 inputs would bypass the generic `blockscaled_fp8_wgrad_varlen_k` path entirely, potentially eliminating the expensive column-wise quant + ISA-pack overhead.
+> Cleaned timeline of what actually happened, what was learned, and what survives.
+> Dead-end details are in HANDOFF.md §3. Git history has the full journey.
 
 ---
 
-## Clean lessons to keep (including previous)
+## Phase 1: Initial FP8 integration (Sessions 1–21, pre-fork)
 
-1. **Official BF16 only** for baseline.
-2. **NSYS GPU projection ≠ wall-clock latency.** For real throughput, use event timing. GPU projection misses CPU dispatch overhead.
-3. **FP8 fused gated path is already 1.5x faster in wall-clock** at production shapes.
-4. **The 125us NSYS gap is 100% quant overhead** — precisely accounted for in §2.
-5. **Standalone quant kernels cost 386us total; FP8 GEMM saves only 259us.** To win in GPU projection, must eliminate ~127us of quant.
-6. **Fewer kernel launches = less CPU overhead = faster wall-clock.** FP8 path benefits hugely from this.
-7. **Do not claim FP8 memory or inference win.** FP8 training uses 10.7 GiB vs BF16 7.1 GiB. FP8 inference is 4.6ms vs 1.0ms.
+- Integrated blockscaled FP8 (1×32 UE8M0) into SonicMoE aligned training path
+- Implemented fused GemmGated with SwiGLU epilogue (`SONIC_MOE_FP8_FUSED_GATED=1`)
+- Built quant/dequant Triton kernels for blockscaled FP8 on SM100a
+- Implemented three FP8 weight caches (forward, dgated, actgrad)
+- Confirmed Triton blockscaled kernels work on SM100a Blackwell (earlier "illegal instruction" errors were CUDA context pollution, not SM100 incompatibility)
+- Validated correctness at standard shape (T=4096, H=4096, I=1024, E=128, K=8)
+- At this point: FP8 was **slower** than BF16 in GPU projection due to quant overhead (386µs) exceeding GEMM savings (259µs)
+
+## Phase 2: Selective FP8 + A_idx optimization (Sessions 22–23) — commit `e6b78fd`
+
+### Key insight: use FP8 only where net-positive
+- Profiled every kernel individually with NSYS
+- Found FP8 dgated saves 47µs in GEMM but costs 100µs for `gather_quant_dout` → net negative → keep BF16
+- Found FP8 down-proj at I=1024 saves 9µs but costs 19µs for quant → net negative → keep BF16
+- Result: **7.0% faster** GPU projection (2272µs vs 2442µs)
+
+### Wall-clock vs GPU-projection divergence discovered
+- Wall-clock: FP8 1.54× faster (3.14ms vs 4.83ms)
+- GPU projection: FP8 only 7% faster
+- Root cause: FP8 path has fewer kernel launches → less CPU dispatch overhead (~2ms)
+- **Lesson:** For real-world throughput, wall-clock is the metric that matters
+
+## Phase 3: Quant kernel optimization + A_idx (Sessions 24–25) — commits `2aaa278`, `0bcb474`
+
+### 2D grid quant kernel
+- Rewrote `_quantize_and_pack_kernel` from 1D to 2D grid
+- ISA-packed scale writes: 1 byte → 4-byte uint32 packing (6.25% → 25% coalescing)
+- quant_x: 58→8µs (with A_idx), quant_dz: 52→35µs
+
+### A_idx for GemmGated and dgated
+- **Core insight:** quantize at T=4096 pre-gather scale, not TK=32768 post-gather scale → 8× cheaper
+- GemmGated CUTLASS kernel natively supports `A_idx` — quantize T rows, kernel gathers internally
+- Applied same trick to dout quantization in backward dgated path
+- Result: **14.9% faster** GPU projection at I=1024 (2511→2137µs)
+
+## Phase 4: Adaptive FP8 + multi-shape validation (Sessions 25–26) — commits `9c95c14`, `60ee3c6`
+
+### Adaptive FP8 down-proj
+- At I≥2048, FP8 down-proj becomes net-positive (larger GEMM → more compute savings)
+- Added configurable threshold (`SONIC_MOE_FP8_DOWNPROJ_THRESHOLD=2048`)
+
+### Multi-shape benchmarking results
+- GPU projection: 14.9% (I=1024), 42.5% (I=2048), 49.4% (I=4096) faster
+- Wall-clock: 1.66× (I=1024), 2.15× (I=2048), 2.37× (I=4096) faster
+- FP8 advantage scales dramatically with I because GemmGated has N=2×I
+
+### Multi-seed validation
+- 44/44 tests pass across seeds 42, 123, 777, 2024
+- Includes `large_shape` test (T=4096, H=7168, I=2048, E=128, K=8)
+
+## Phase 5: Memory investigation (Session 26) — commit `e5d3ca8`
+
+### Eager cache eviction proven counterproductive
+- Built `evict_fp8_weight_cache_entry()` utility
+- Tested evicting caches after each forward/backward phase
+- Result: Peak memory **increased** 10.26→12.87 GiB
+- Root cause: `precompute_weight_fp8_*` does `w.permute(...).mT.contiguous()` creating BF16 temp copies (~2.15 GB for w1) larger than the cached FP8 tensor (~1.07 GB)
+- Wall-clock regressed 17× (86ms vs 5ms) due to repeated re-quantization
+- **Lesson:** Can't fix memory without changing the quantization architecture
 
 ---
 
-## Strongest next directions
+## Lessons that matter
 
-### Direction A: Eliminate quant overhead (close the NSYS gap)
-The 386us of standalone quant can be reduced by:
-1. **Fusing quant into GEMM epilogue** — the CUTLASS `GemmGatedSm100` epilogue already does SwiGLU; adding blockscaled FP8 output quantization would eliminate the post-GEMM quant kernels entirely.
-2. **Fusing quant into GEMM prologue** — modifying `GemmDefaultSm100` to accept BF16 input and do online blockscaled quantization in the TMA load stage would eliminate the pre-GEMM quant kernels.
-3. **Using cutify-style fused kernels** — the reference implementation in `operator-incubator/cutify/ops/cute/` shows how to fuse SwiGLU+quant and dequant into single kernels with warp-shuffle for scale broadcast.
-
-### Direction B: Reduce FP8 memory overhead
-Current FP8 training uses 3.7 GiB more than BF16. Sources:
-- Persistent FP8 weight caches (`precompute_weight_fp8`, `precompute_weight_fp8_for_fused_gated`, `precompute_weight_fp8_for_direct_fused_dgated`)
-- z FP8 save + raw scales
-- ISA-packed scale tensors
-- Prequantized activation dictionaries (`_PREQUANTIZED_SCALES`)
-
-### Direction C: FP8 weight gradient via specialized MoE kernel
-Extend `HopperWgmma_MoE_kernel(compute_weight_gradient=True)` to accept blockscaled FP8 inputs. This bypasses the generic `blockscaled_fp8_wgrad_varlen_k` path and its expensive column-wise quant + ISA-pack overhead.
+1. **Use official BF16 as the only baseline.** Exclude QuACK 0.3.7 `elementwise_kernel` from BF16 numbers.
+2. **NSYS GPU projection ≠ wall-clock.** FP8 wins much bigger in wall-clock due to fewer kernel launches and less CPU overhead.
+3. **Selective FP8 beats blanket FP8.** Only use FP8 where GEMM savings > quant overhead.
+4. **A_idx is the key technique.** Quantize at pre-gather (T) scale instead of post-gather (TK) scale for massive quant cost reduction.
+5. **FP8 advantage scales with GEMM size.** N=2×I for GemmGated means I=4096 is nearly 50% faster.
+6. **FP8 wgrad is shape-dependent.** At K_per_expert=256 (T=4096, E=128) it's net-negative. At K_per_expert≥1024 (T≥16K) it may become viable.
+7. **Memory overhead is architectural.** The 3 FP8 weight caches (~2.68 GiB at I=1024) can't be fixed by runtime eviction — requires strided quantization or on-the-fly quantization in CUTLASS.
+8. **Don't claim memory or inference wins** — FP8 still uses more memory and inference is slower.
