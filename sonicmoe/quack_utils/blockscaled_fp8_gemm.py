@@ -299,7 +299,6 @@ def clear_blockscaled_fp8_weight_cache() -> None:
     _WEIGHT_CACHE.clear()
     _VARLEN_WEIGHT_CACHE.clear()
     _FUSED_WEIGHT_CACHE.clear()
-    _DIRECT_FUSED_DGATED_WEIGHT_CACHE.clear()
     _PAD_PLAN_CACHE.clear()
 
 
@@ -321,7 +320,6 @@ def evict_fp8_weight_cache_entry(w: torch.Tensor) -> None:
     _FUSED_WEIGHT_CACHE.pop(key, None)
     _VARLEN_WEIGHT_CACHE.pop(key, None)
     _WEIGHT_CACHE.pop(key, None)
-    _DIRECT_FUSED_DGATED_WEIGHT_CACHE.pop(key, None)
 
 
 def _get_cu_seqlens_cpu(cu_seqlens: torch.Tensor) -> tuple:
@@ -2258,12 +2256,6 @@ _VARLEN_WEIGHT_CACHE: dict[
 
 
 _FUSED_WEIGHT_CACHE: dict[
-    tuple[int, int, tuple[int, ...], tuple[int, ...]],
-    tuple[torch.Tensor, torch.Tensor],
-] = {}
-
-
-_DIRECT_FUSED_DGATED_WEIGHT_CACHE: dict[
     tuple[int, int, tuple[int, ...], tuple[int, ...]],
     tuple[torch.Tensor, torch.Tensor],
 ] = {}

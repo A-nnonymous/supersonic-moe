@@ -603,7 +603,6 @@ class FP8AlignedContractTest(TestCommons):
         self.set_seed(42)
         from sonicmoe.quack_utils.blockscaled_fp8_gemm import (
             _FUSED_WEIGHT_CACHE,
-            _DIRECT_FUSED_DGATED_WEIGHT_CACHE,
             precompute_weight_fp8_for_fused_dgated,
             precompute_weight_fp8_for_direct_fused_dgated,
             clear_blockscaled_fp8_weight_cache,
@@ -617,10 +616,9 @@ class FP8AlignedContractTest(TestCommons):
         w_view, scales_view = precompute_weight_fp8_for_fused_dgated(w)
         self.assertEqual(len(_FUSED_WEIGHT_CACHE), 1)
 
-        # Call direct_fused_dgated — should reuse from _FUSED_WEIGHT_CACHE
+        # Call direct_fused_dgated — should reuse from _FUSED_WEIGHT_CACHE (no new entry)
         w_cont, scales_cont = precompute_weight_fp8_for_direct_fused_dgated(w)
-        # Should NOT have added to _DIRECT_FUSED_DGATED_WEIGHT_CACHE
-        self.assertEqual(len(_DIRECT_FUSED_DGATED_WEIGHT_CACHE), 0,
+        self.assertEqual(len(_FUSED_WEIGHT_CACHE), 1,
                         "direct_fused_dgated should reuse fused_dgated cache, not create duplicate")
         # Data must match (same physical storage, different views)
         self.assertEqual(w_cont.data_ptr(), w_view.data_ptr(),

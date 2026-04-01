@@ -299,18 +299,6 @@ def _get_cu_seqlens_cpu(cu_seqlens: torch.Tensor) -> tuple:
     return cpu_tuple
 
 
-def _min_expert_segment(expert_frequency_offset: torch.Tensor) -> int:
-    """Return minimum active expert segment length from cu_seqlens.
-
-    Pure Python arithmetic on cached CPU values — zero GPU sync after first call.
-    """
-    if torch.cuda.is_current_stream_capturing():
-        return 0
-    vals = _get_cu_seqlens_cpu(expert_frequency_offset)
-    active = [vals[i + 1] - vals[i] for i in range(len(vals) - 1) if vals[i + 1] > vals[i]]
-    return min(active) if active else 0
-
-
 _ALIGNMENT_STREAK: int = 0
 _ALIGNMENT_ASSUMED: bool = (
     os.getenv("SONIC_MOE_FP8_ASSUME_ALIGNED", "").lower() in {"1", "true", "yes", "on"}
