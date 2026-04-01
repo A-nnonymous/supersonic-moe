@@ -16,6 +16,7 @@ from ..quack_utils import (
     blockscaled_fp8_weight_grad_gemm,
     clear_raw_weight_cache,
     clear_sgl_weight_cache,
+    evict_fp8_weight_cache_entry,
     gather_quantize_and_pack_activation,
     gemm_dgated,
     gemm_gated,

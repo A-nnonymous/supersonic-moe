@@ -282,6 +282,26 @@ def clear_blockscaled_fp8_weight_cache() -> None:
     _PAD_PLAN_CACHE.clear()
 
 
+def evict_fp8_weight_cache_entry(w: torch.Tensor) -> None:
+    """Remove cached FP8 data for *w* from all blockscaled weight caches.
+
+    Call this right after a cached FP8 weight has been consumed to release
+    GPU memory eagerly instead of waiting for the global cache clear at the
+    next optimizer step.  In training the cache would miss anyway (because
+    ``w._version`` increments on each in-place update), so the eviction
+    adds zero overhead.
+    """
+    key = (
+        w.untyped_storage().data_ptr(),
+        w._version,
+        tuple(w.shape),
+        tuple(w.stride()),
+    )
+    _FUSED_WEIGHT_CACHE.pop(key, None)
+    _WEIGHT_CACHE.pop(key, None)
+    _DIRECT_FUSED_DGATED_WEIGHT_CACHE.pop(key, None)
+
+
 def _get_cu_seqlens_cpu(cu_seqlens: torch.Tensor) -> tuple:
     """Return cu_seqlens values as a Python tuple, cached on the tensor object.
 
