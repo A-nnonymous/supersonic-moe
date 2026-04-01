@@ -668,3 +668,26 @@ class FP8AlignedContractTest(TestCommons):
         self.assertGreater(fwd_corr, 0.99, f"downproj-prequant fwd corr {fwd_corr:.4f}")
         self.assertLess(bwd_rrmse, 0.10, f"downproj-prequant bwd RRMSE {bwd_rrmse:.4f}")
         self.assertGreater(bwd_corr, 0.99, f"downproj-prequant bwd corr {bwd_corr:.4f}")
+
+    def test_multi_iteration_cache_consistency(self) -> None:
+        """Multiple fwd+bwd iterations don't corrupt weight cache layouts.
+
+        Regression test: precompute_weight_fp8 (row-major for varlen) and
+        precompute_weight_fp8_for_fused_dgated (col-major for dgated) must use
+        separate caches.  A shared cache causes stride mismatch on iteration 2+.
+        """
+        self._require_blackwell()
+        self._reset_fp8_state()
+        torch.manual_seed(42)
+        moe = self._make_moe()
+        x, dout = self._make_sample()
+
+        with enable_quack_gemm(True):
+            for i in range(3):
+                moe.zero_grad(set_to_none=True)
+                xi = x.clone().detach().requires_grad_(True)
+                out, _ = moe(xi, use_fp8=True)
+                out.backward(dout)
+                # If cache collision exists, iteration ≥1 crashes with
+                # RuntimeError: Expected strides[leading_dim] == 1
+                torch.cuda.synchronize()

@@ -297,6 +297,7 @@ def _quantize_w2_cached(
 
 def clear_blockscaled_fp8_weight_cache() -> None:
     _WEIGHT_CACHE.clear()
+    _VARLEN_WEIGHT_CACHE.clear()
     _FUSED_WEIGHT_CACHE.clear()
     _DIRECT_FUSED_DGATED_WEIGHT_CACHE.clear()
     _PAD_PLAN_CACHE.clear()
@@ -318,6 +319,7 @@ def evict_fp8_weight_cache_entry(w: torch.Tensor) -> None:
         tuple(w.stride()),
     )
     _FUSED_WEIGHT_CACHE.pop(key, None)
+    _VARLEN_WEIGHT_CACHE.pop(key, None)
     _WEIGHT_CACHE.pop(key, None)
     _DIRECT_FUSED_DGATED_WEIGHT_CACHE.pop(key, None)
 
@@ -2216,8 +2218,8 @@ def precompute_weight_fp8(
     """Pre-quantize a 3D expert weight to blockscaled FP8 with ISA-packed scales (cached).
 
     Converts (dim0, dim1, E) bf16 weights to (E, dim0, dim1) fp8 + packed scales.
-    Uses the same storage-identity cache as the fused variants so repeated
-    calls with the same weight tensor are free.
+    Uses a dedicated cache (NOT shared with fused_dgated variants which quantize
+    in transposed layout with scales along a different dimension).
 
     Parameters
     ----------
@@ -2225,7 +2227,7 @@ def precompute_weight_fp8(
 
     Returns
     -------
-    w_fp8 : Tensor (E, dim0, dim1) float8_e4m3fn
+    w_fp8 : Tensor (E, dim0, dim1) float8_e4m3fn — contiguous row-major.
     w_scales : Tensor packed float8_e8m0fnu in ISA layout
     """
     key = (
@@ -2234,7 +2236,7 @@ def precompute_weight_fp8(
         tuple(w.shape),
         tuple(w.stride()),
     )
-    cached = _FUSED_WEIGHT_CACHE.get(key)
+    cached = _VARLEN_WEIGHT_CACHE.get(key)
     if cached is not None:
         return cached
 
@@ -2243,10 +2245,16 @@ def precompute_weight_fp8(
     w_fp8, w_scales_raw = quantize_activation_blockwise(w_ehi, proto)
     w_scales_packed = pack_blockscaled_1x32_scales(w_scales_raw, w_ehi.size(-1))
     result = (w_fp8, w_scales_packed)
-    if len(_FUSED_WEIGHT_CACHE) > 8:
-        _FUSED_WEIGHT_CACHE.clear()
-    _FUSED_WEIGHT_CACHE[key] = result
+    if len(_VARLEN_WEIGHT_CACHE) > 8:
+        _VARLEN_WEIGHT_CACHE.clear()
+    _VARLEN_WEIGHT_CACHE[key] = result
     return result
+
+
+_VARLEN_WEIGHT_CACHE: dict[
+    tuple[int, int, tuple[int, ...], tuple[int, ...]],
+    tuple[torch.Tensor, torch.Tensor],
+] = {}
 
 
 _FUSED_WEIGHT_CACHE: dict[

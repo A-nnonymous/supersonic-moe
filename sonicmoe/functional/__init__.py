@@ -2,6 +2,7 @@
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
 
+import collections
 import os
 
 import torch
@@ -249,7 +250,7 @@ def _use_fp8_wgrad() -> bool:
 _PREQUANTIZED_SCALES: dict[str, tuple] = {}
 
 # Counter for pre-quantization hits (testing/diagnostics).
-_PREQUANT_HIT_COUNT: dict[str, int] = {"fwd": 0, "bwd": 0}
+_PREQUANT_HIT_COUNT: dict[str, int] = collections.defaultdict(int)
 
 # Side stream for overlapping wgrad with actgrad in _UpProjection.backward.
 _WGRAD_STREAM: torch.cuda.Stream | None = None
