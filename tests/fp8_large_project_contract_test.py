@@ -3,7 +3,7 @@ import os
 import torch
 
 import sonicmoe.functional as functional
-from sonicmoe import KernelBackendMoE, MoE, enable_quack_gemm, get_default_fp8_protocol, moe_general_routing_inputs
+from sonicmoe import KernelBackendMoE, MoE, enable_fp8, enable_quack_gemm, get_default_fp8_protocol, moe_general_routing_inputs
 from sonicmoe.enums import ActivationType
 
 from .fp8_operator_options import (
@@ -350,3 +350,174 @@ class FP8LargeProjectContractTest(TestCommons):
             cand_dx, cand_dw1, cand_dw2 = self._collect_all_grads(moe, x_cand, dout, protocol_enabled=True)
             torch.testing.assert_close(cand_dw2.float(), gold_dw2.float(), rtol=5e-2, atol=5e-2)
             torch.testing.assert_close(cand_dx.float(), gold_dx.float(), rtol=5e-2, atol=5e-2)
+
+
+class FP8AlignedContractTest(TestCommons):
+    """Contract tests using 128-aligned shapes that ACTUALLY exercise the FP8 GEMM path.
+
+    The original contract tests (FP8LargeProjectContractTest) use shapes where
+    tokens_per_expert is 16 or 64 — NOT multiples of 128 — so the FP8 code path
+    falls through to BF16 gemm_gated and the tests effectively compare BF16 vs BF16.
+
+    These tests use E=8, K=8 so that tokens_per_expert = T*K/E = T,
+    guaranteeing 128-alignment for T that is a multiple of 128.
+    """
+
+    # Aligned shape: T=1024, E=8, K=8 → tpe=1024 (128-aligned ✓)
+    _ALIGNED_T = 1024
+    _ALIGNED_H = 3072
+    _ALIGNED_I = 1536
+    _ALIGNED_E = 8
+    _ALIGNED_K = 8
+    _SEEDS = [42, 123, 777]
+
+    def _require_blackwell(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required")
+        major, _ = torch.cuda.get_device_capability()
+        if major < 10:
+            self.skipTest("Blackwell-only test requires SM100+")
+
+    def _reset_fp8_state(self) -> None:
+        """Reset all FP8 global state to prevent cross-test pollution."""
+        functional.clear_all_fp8_weight_caches()
+        functional._ALIGNMENT_ASSUMED = False
+        functional._ALIGNMENT_STREAK = 0
+
+    def _make_moe(self) -> MoE:
+        return MoE(
+            num_experts=self._ALIGNED_E,
+            num_experts_per_tok=self._ALIGNED_K,
+            hidden_size=self._ALIGNED_H,
+            intermediate_size=self._ALIGNED_I,
+            activation_function=ActivationType.SWIGLU,
+            add_bias=False,
+            std=0.02,
+        ).to(device="cuda", dtype=torch.bfloat16)
+
+    def _make_sample(self) -> tuple[torch.Tensor, torch.Tensor]:
+        x = (0.02 * torch.randn(self._ALIGNED_T, self._ALIGNED_H, device="cuda", dtype=torch.bfloat16)).detach().requires_grad_()
+        dout = 0.02 * torch.randn_like(x)
+        return x, dout
+
+    def _rrmse(self, a: torch.Tensor, b: torch.Tensor) -> float:
+        return ((a.float() - b.float()).norm() / b.float().norm()).item()
+
+    def _corr(self, a: torch.Tensor, b: torch.Tensor) -> float:
+        return torch.corrcoef(torch.stack([a.float().flatten(), b.float().flatten()]))[0, 1].item()
+
+    def test_use_fp8_forward_precision_multi_seed(self) -> None:
+        """use_fp8=True forward output matches BF16 within <10% RRMSE across seeds."""
+        self._require_blackwell()
+        for seed in self._SEEDS:
+            with self.subTest(seed=seed):
+                self._reset_fp8_state()
+                self.set_seed(seed)
+                moe = self._make_moe()
+                x, _ = self._make_sample()
+
+                with enable_quack_gemm(True):
+                    out_bf16, _ = moe(x)
+
+                self._reset_fp8_state()
+
+                with enable_quack_gemm(True):
+                    out_fp8, _ = moe(x, use_fp8=True)
+
+                rrmse = self._rrmse(out_fp8, out_bf16)
+                corr = self._corr(out_fp8, out_bf16)
+                self.assertLess(rrmse, 0.10, f"seed={seed}: fwd RRMSE {rrmse:.4f} >= 10%")
+                self.assertGreater(corr, 0.99, f"seed={seed}: fwd corr {corr:.4f} < 0.99")
+
+    def test_use_fp8_backward_precision_multi_seed(self) -> None:
+        """use_fp8=True backward gradients match BF16 within <10% RRMSE across seeds."""
+        self._require_blackwell()
+        for seed in self._SEEDS:
+            with self.subTest(seed=seed):
+                self._reset_fp8_state()
+                self.set_seed(seed)
+                moe = self._make_moe()
+                x, dout = self._make_sample()
+
+                with enable_quack_gemm(True):
+                    out_bf16, _ = moe(x)
+                out_bf16.backward(dout)
+                dx_bf16 = x.grad.clone()
+                dw1_bf16 = moe.c_fc.weight.grad.clone()
+                dw2_bf16 = moe.c_proj.weight.grad.clone()
+
+                x.grad = None
+                moe.zero_grad(set_to_none=True)
+                self._reset_fp8_state()
+
+                with enable_quack_gemm(True):
+                    out_fp8, _ = moe(x, use_fp8=True)
+                out_fp8.backward(dout)
+                dx_fp8 = x.grad.clone()
+                dw1_fp8 = moe.c_fc.weight.grad.clone()
+                dw2_fp8 = moe.c_proj.weight.grad.clone()
+
+                for name, fp8_g, bf16_g in [("dx", dx_fp8, dx_bf16), ("dw1", dw1_fp8, dw1_bf16), ("dw2", dw2_fp8, dw2_bf16)]:
+                    rrmse = self._rrmse(fp8_g, bf16_g)
+                    corr = self._corr(fp8_g, bf16_g)
+                    self.assertLess(rrmse, 0.10, f"seed={seed} {name}: RRMSE {rrmse:.4f} >= 10%")
+                    self.assertGreater(corr, 0.99, f"seed={seed} {name}: corr {corr:.4f} < 0.99")
+
+    def test_enable_fp8_context_manager(self) -> None:
+        """enable_fp8() context manager produces identical results to use_fp8=True."""
+        self._require_blackwell()
+        self._reset_fp8_state()
+        self.set_seed(42)
+        moe = self._make_moe()
+        x, _ = self._make_sample()
+
+        with enable_quack_gemm(True):
+            out_use_fp8, _ = moe(x, use_fp8=True)
+
+        self._reset_fp8_state()
+
+        with enable_fp8():
+            out_ctx, _ = moe(x)
+
+        torch.testing.assert_close(out_ctx, out_use_fp8, rtol=0, atol=0)
+
+    def test_use_fp8_production_shape(self) -> None:
+        """FP8 precision at production shape: seqlen=8192, H=3072, I=1536, E=8, K=8."""
+        self._require_blackwell()
+        self._reset_fp8_state()
+        self.set_seed(42)
+        moe = MoE(
+            num_experts=8,
+            num_experts_per_tok=8,
+            hidden_size=3072,
+            intermediate_size=1536,
+            activation_function=ActivationType.SWIGLU,
+            add_bias=False,
+            std=0.02,
+        ).to(device="cuda", dtype=torch.bfloat16)
+        x = (0.02 * torch.randn(8192, 3072, device="cuda", dtype=torch.bfloat16)).detach().requires_grad_()
+        dout = 0.02 * torch.randn_like(x)
+
+        with enable_quack_gemm(True):
+            out_bf16, _ = moe(x)
+        out_bf16.backward(dout)
+        dx_bf16 = x.grad.clone()
+        x.grad = None
+        moe.zero_grad(set_to_none=True)
+
+        self._reset_fp8_state()
+
+        with enable_quack_gemm(True):
+            out_fp8, _ = moe(x, use_fp8=True)
+        out_fp8.backward(dout)
+        dx_fp8 = x.grad.clone()
+
+        fwd_rrmse = self._rrmse(out_fp8, out_bf16)
+        fwd_corr = self._corr(out_fp8, out_bf16)
+        bwd_rrmse = self._rrmse(dx_fp8, dx_bf16)
+        bwd_corr = self._corr(dx_fp8, dx_bf16)
+
+        self.assertLess(fwd_rrmse, 0.10, f"fwd RRMSE {fwd_rrmse:.4f}")
+        self.assertGreater(fwd_corr, 0.99, f"fwd corr {fwd_corr:.4f}")
+        self.assertLess(bwd_rrmse, 0.10, f"bwd RRMSE {bwd_rrmse:.4f}")
+        self.assertGreater(bwd_corr, 0.99, f"bwd corr {bwd_corr:.4f}")

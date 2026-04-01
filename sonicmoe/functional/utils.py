@@ -23,3 +23,42 @@ def enable_quack_gemm(enable: bool = True):
 
 def is_using_quack_gemm() -> bool:
     return _IS_USING_QUACK_GEMM
+
+
+# ---------------------------------------------------------------------------
+# FP8 mode — single switch for the best-performing FP8 configuration.
+#
+# ``enable_fp8()`` activates the fork's blockscaled FP8 GEMM path with all
+# optimal defaults (fused gated, fused SwiGLU+quant, FP8 z-save, BF16 wgrad).
+# It also auto-enables QuACK GEMM which is required for the FP8 path.
+#
+# The env-var ``SONIC_MOE_FP8_MODE=perf`` is still respected for backward
+# compatibility; ``enable_fp8()`` takes precedence.
+# ---------------------------------------------------------------------------
+_IS_FP8_ACTIVE = os.getenv("SONIC_MOE_FP8_MODE", "").strip().lower() in ("perf", "mem")
+
+
+@contextmanager
+def enable_fp8(enable: bool = True):
+    """Context manager to enable/disable the FP8 fast path.
+
+    When enabled, also activates QuACK GEMM (required for FP8).
+    All optimal sub-flags are built into the defaults, so no extra
+    environment variables are needed.
+    """
+    global _IS_FP8_ACTIVE, _IS_USING_QUACK_GEMM
+
+    prev_fp8 = _IS_FP8_ACTIVE
+    prev_quack = _IS_USING_QUACK_GEMM
+    _IS_FP8_ACTIVE = enable
+    if enable:
+        _IS_USING_QUACK_GEMM = True
+
+    yield
+
+    _IS_FP8_ACTIVE = prev_fp8
+    _IS_USING_QUACK_GEMM = prev_quack
+
+
+def is_fp8_active() -> bool:
+    return _IS_FP8_ACTIVE

@@ -3,6 +3,7 @@
 # ********************************************************************************
 
 from typing import Callable
+from contextlib import ExitStack
 
 import torch
 import torch.nn as nn
@@ -11,6 +12,7 @@ import torch.nn.functional as F
 from .count_cumsum import count_cumsum
 from .enums import ActivationType, KernelBackendMoE, is_glu
 from .functional import FP8Protocol, moe_TC_softmax_topk_layer, clear_all_fp8_weight_caches
+from .functional.utils import enable_fp8
 from .quack_utils import (
     clear_blockscaled_fp8_weight_cache,
     prefetch_blockscaled_w2_fp8,
@@ -259,40 +261,45 @@ class MoE(nn.Module):
         kernel_backend_moe: KernelBackendMoE = KernelBackendMoE.sonicmoe,
         is_inference_mode: bool = False,
         fp8_protocol: FP8Protocol | None = None,
+        use_fp8: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         original_shape = hidden_states.shape
 
         # hidden_states -> (batch_size, query_length, hidden_size)
         hidden_states = hidden_states.view(-1, self.hidden_size)
 
-        if kernel_backend_moe == KernelBackendMoE.sonicmoe and self.num_experts <= 32768:
-            hidden_states, router_logits, expert_frequency = moe_TC_softmax_topk_layer(
-                hidden_states,
-                self.router.weight,
-                self.c_fc.weight.permute(1, 2, 0),
-                self.c_fc.bias,
-                self.c_proj.weight.permute(1, 2, 0),
-                self.c_proj.bias,
-                self.top_k,
-                self.stream_id,
-                self.activation_function,
-                is_inference_mode or not self.training,
-                fp8_protocol,
-            )
-        else:
-            # hidden_states -> (total_q, hidden_size)
-            router_logits, router_weights, selected_experts = self._compute_routing_weights(hidden_states)
+        with ExitStack() as stack:
+            if use_fp8:
+                stack.enter_context(enable_fp8())
 
-            # router_logits -> (total_q, num_experts)
-            # router_weights -> (total_q, top_k)
-            # selected_experts -> (total_q, top_k)
+            if kernel_backend_moe == KernelBackendMoE.sonicmoe and self.num_experts <= 32768:
+                hidden_states, router_logits, expert_frequency = moe_TC_softmax_topk_layer(
+                    hidden_states,
+                    self.router.weight,
+                    self.c_fc.weight.permute(1, 2, 0),
+                    self.c_fc.bias,
+                    self.c_proj.weight.permute(1, 2, 0),
+                    self.c_proj.bias,
+                    self.top_k,
+                    self.stream_id,
+                    self.activation_function,
+                    is_inference_mode or not self.training,
+                    fp8_protocol,
+                )
+            else:
+                # hidden_states -> (total_q, hidden_size)
+                router_logits, router_weights, selected_experts = self._compute_routing_weights(hidden_states)
 
-            hidden_states, expert_frequency = self._compute_experts(
-                hidden_states,
-                router_weights,
-                selected_experts,
-                kernel_backend_moe=kernel_backend_moe,
-            )
+                # router_logits -> (total_q, num_experts)
+                # router_weights -> (total_q, top_k)
+                # selected_experts -> (total_q, top_k)
+
+                hidden_states, expert_frequency = self._compute_experts(
+                    hidden_states,
+                    router_weights,
+                    selected_experts,
+                    kernel_backend_moe=kernel_backend_moe,
+                )
 
         hidden_states = hidden_states.view(original_shape)
 

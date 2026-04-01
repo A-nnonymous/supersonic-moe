@@ -122,11 +122,22 @@ The reporting policy for every FP8 step is:
 
 ## 🔥 FP8 Blockscaled Status (2026-04-01)
 
-The repository has a working aligned blockscaled FP8 training path for Blackwell that **significantly outperforms BF16** across all tested shapes.
+The repository has a working aligned blockscaled FP8 training path for Blackwell.
 
-### Performance
+### Quick Start (Programmatic)
 
-**NSYS GPU projection (authoritative, iter_2, excluding elementwise_kernel):**
+```python
+from sonicmoe import MoE, enable_fp8, enable_quack_gemm
+
+moe = MoE(num_experts=8, num_experts_per_tok=8, hidden_size=3072,
+           intermediate_size=1536, activation_function=ActivationType.SWIGLU,
+           add_bias=False, std=0.02).to(device="cuda", dtype=torch.bfloat16)
+
+with enable_quack_gemm(True):
+    output, aux_loss = moe(x, use_fp8=True)
+```
+
+### Performance (NSYS GPU projection, old benchmark shapes)
 
 | Shape | BF16 (µs) | FP8 (µs) | Speedup |
 |-------|-----------|----------|---------|
@@ -134,50 +145,41 @@ The repository has a working aligned blockscaled FP8 training path for Blackwell
 | I=2048 (T=4096,H=4096,E=128,K=8) | 7654 | 4403 | **42.5%** |
 | I=4096 (T=4096,H=4096,E=128,K=8) | 20711 | 10479 | **49.4%** |
 
-**Wall-clock:**
+### Performance (Ernie production shape)
 
-| Shape | BF16 (ms) | FP8 (ms) | Speedup |
-|-------|-----------|----------|---------|
-| T=4096,H=4096,I=1024 | 8.98 | 5.40 | **1.66×** |
-| T=4096,H=4096,I=2048 | 18.43 | 8.58 | **2.15×** |
-| T=4096,H=4096,I=4096 | 41.50 | 17.48 | **2.37×** |
-| T=8192,H=4096,I=2048 | 31.03 | 15.33 | **2.02×** |
-| T=4096,H=7168,I=2048 | 37.08 | 15.74 | **2.36×** |
+| Config | NSYS µs/iter | vs Sonic BF16 |
+|--------|-------------|---------------|
+| Sonic BF16 (T=8192,H=3072,I=1536,E=8,K=8) | 3937.4 | baseline |
+| Sonic FP8 frontier | 3786.6 | 1.04× faster |
+| Ernie MOELayer BF16 | 15325.8 | 3.89× slower |
+
+> ⚠️ At the Ernie shape, FP8 barely wins because `gather_quantize_and_pack` overhead (~96µs) eats the GEMM savings. The forward still materializes the TK-sized gathered activation. Eliminating this (T-quant + A_idx, matching the backward pattern) is the #1 next optimization.
 
 ### Correctness
 
-44/44 contract tests pass across seeds 42, 123, 777, 2024 (all 11 tests × 4 seeds). RelRMSE <10%, correlation >0.99.
-
-### Best training path
-
-```bash
-USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
-  SONIC_MOE_FP8_FUSED_GATED=1 SONIC_MOE_FP8_WGRAD=0
-```
+12/12 contract tests pass: 8 original + 4 aligned tests (E=8, K=8) including production shape T=8192.
 
 ### Known limitations
 
-- **Memory:** FP8 uses 1.38–1.48× more memory due to FP8 weight caches (fixed per-layer overhead)
-- **Inference:** FP8 inference path is not yet optimized (re-quantization overhead)
-- **FP8 wgrad:** Disabled by default — net-negative at standard shapes (K_per_expert too small)
+- **Memory:** FP8 uses 1.38–1.48× more memory due to FP8 weight caches
+- **Forward materialization:** `gather_quantize_and_pack_activation` creates TK-sized FP8 copy (violates SonicMoE's no-materialization design)
+- **FP8 wgrad:** Disabled by default — net-negative at standard shapes
 
 ### Read first
 
 | Resource | Path | Why |
 |----------|------|-----|
-| **Handoff** | `reports/fp8_upgrade/HANDOFF.md` | Complete project state, measurements, lessons, next frontier |
-| Engineering log | `reports/fp8_upgrade/engineering_log.md` | Cleaned milestone log with conclusions |
-| Agent quick-start | `AGENTS.md` / `agent.md` | Short cold-start summary |
+| **Handoff** | `reports/fp8_upgrade/HANDOFF.md` | Complete project state, root causes, next steps |
+| Engineering log | `reports/fp8_upgrade/engineering_log.md` | Cleaned milestone log |
+| Agent quick-start | `AGENTS.md` / `agent.md` | Cold-start for AI agents |
 | Contract tests | `tests/fp8_large_project_contract_test.py` | Current correctness gate |
-| Perf/memory helper | `tools/measure_aligned_perf_memory.py` | Wall-clock + memory snapshot |
-| NSYS harness | `tools/nsys_profile_comprehensive.py` | Authoritative aligned training profiling |
 
 ### Practical guidance
 
 - Use **official BF16** as the only authoritative baseline.
 - Exclude `elementwise_kernel` from BF16 numbers (QuACK 0.3.7 layout bug).
 - Use **NSYS GPU projection** for performance claims.
-- FP8 advantage scales with intermediate size — production shapes (I≥2048) see the biggest wins.
+- FP8 advantage scales with intermediate size — I≥2048 sees the biggest wins.
 
 ## 🤝 Contributing
 

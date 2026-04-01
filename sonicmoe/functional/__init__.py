@@ -67,7 +67,7 @@ from .fp8_reference import (
 )
 from .forward import _down_projection_forward, _router_forward, _softmax_topk_fwd, _up_projection_forward
 from .triton_kernels import TC_topk_router_metadata_triton
-from .utils import enable_quack_gemm, is_using_quack_gemm
+from .utils import enable_fp8, enable_quack_gemm, is_fp8_active, is_using_quack_gemm
 
 
 # ---------------------------------------------------------------------------
@@ -116,16 +116,12 @@ def _fused_blockscaled_gated_forward(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run blockscaled GEMM+SwiGLU in the fused CUTLASS path.
 
-    Optimizations vs the decomposed path:
-    - Quantize x (T rows) instead of x_gathered (TK rows) → 8× less quant data (~12µs vs ~96µs).
-    - Pass A_idx to CUTLASS GemmGated so it gathers FP8 rows during GEMM (zero overhead).
-    - Skip z FP8 save: keep z as bf16 for backward (saves ~55µs quant + ~41µs dequant).
-    - BF16 down-proj: skip y1 FP8 quant (FP8 quant cost > GEMM savings for down-proj).
+    Uses gather_quantize_and_pack_activation to fuse the token gather with
+    FP8 quantization, ensuring blockscaled scales are aligned with the
+    gathered (TK) rows that the GEMM actually reads.
     """
     w1_fp8, w1_scales = precompute_weight_fp8_for_fused_gated(w1)
-    # Quantize x without gathering — 8× less data (T=4096 vs TK=32768 rows).
-    # The CUTLASS kernel gathers via A_idx during the GEMM's G2S copy stage.
-    x_fp8, x_scales = quantize_and_pack_activation(x)
+    x_fp8, x_scales = gather_quantize_and_pack_activation(x, x_gather_idx)
     z, y1 = gemm_gated(
         x_fp8,
         w1_fp8,
@@ -133,7 +129,6 @@ def _fused_blockscaled_gated_forward(
         out_dtype=torch.bfloat16,
         postact_dtype=torch.bfloat16,
         cu_seqlens_m=expert_frequency_offset,
-        A_idx=x_gather_idx,
         dynamic_scheduler=False,
         a_scales=x_scales,
         b_scales=w1_scales,
@@ -229,15 +224,14 @@ def _fp8_lean() -> bool:
 
 
 def _use_fused_blockscaled_gated() -> bool:
-    """Check if fused gemm_gated + blockscaled FP8 is enabled (default: disabled).
+    """Check if fused gemm_gated + blockscaled FP8 is enabled (default: enabled).
 
     When enabled, the blockscaled FP8 path uses fused gemm_gated/gemm_dgated
     (single CUTLASS kernel: GEMM + SwiGLU + blockscaled descale) instead of
-    separate blockscaled_fp8_gemm_varlen + standalone SwiGLU. The fused path
-    currently uses the safe non-autotuned kernel configuration on SM100 and is
-    kept behind an opt-in flag until its end-to-end packing overhead is removed.
+    separate blockscaled_fp8_gemm_varlen + standalone SwiGLU.  This is the
+    best-performing FP8 up-proj path on Blackwell and is enabled by default.
     """
-    return os.getenv("SONIC_MOE_FP8_FUSED_GATED", "0").lower() in {"1", "true", "yes", "on"}
+    return os.getenv("SONIC_MOE_FP8_FUSED_GATED", "1").lower() in {"1", "true", "yes", "on"}
 
 
 def _use_fp8_wgrad() -> bool:
@@ -406,7 +400,13 @@ def _use_mixed_dtype_downproj_dw2() -> bool:
 
 
 def _fp8_mode() -> str:
-    """Return FP8 mode: 'off', 'perf' (cache+speed), or 'mem' (no-cache+savings)."""
+    """Return FP8 mode: 'off', 'perf' (cache+speed), or 'mem' (no-cache+savings).
+
+    Checks the programmatic ``enable_fp8()`` flag first, then falls back to
+    the ``SONIC_MOE_FP8_MODE`` environment variable.
+    """
+    if is_fp8_active():
+        return "perf"
     mode = os.getenv("SONIC_MOE_FP8_MODE", "").strip().lower()
     if mode in ("perf", "mem"):
         return mode

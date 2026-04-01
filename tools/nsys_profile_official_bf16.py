@@ -1,26 +1,21 @@
-"""Comprehensive nsys profiling: BF16 vs FP8 with NVTX markers.
+"""NSYS profiling script for official SonicMoE BF16 baseline.
 
-Captures all GPU activity: kernels, malloc, memset, memcpy, NVTX ranges.
-Uses the same uniform routing as bench_aligned_e2e.py for production shapes.
+Requires the official_bf16 virtualenv with quack-kernels 0.2.x (PyTorch main branch).
 
-Usage (on remote node):
-    nsys profile -t cuda,nvtx --cuda-memory-usage=true \
-        -o /tmp/sonic_bf16 --force-overwrite=true \
-        python tools/nsys_profile_comprehensive.py --mode bf16
+Run via nsys:
+    source .../envs/official_bf16/bin/activate
+    cd .../lab/official/sonic-moe
+    CUDA_VISIBLE_DEVICES=0 nsys profile -t cuda,nvtx --gpu-metrics-devices=0 \
+        --cuda-memory-usage=false --cuda-event-trace=false -f true \
+        -o /path/to/output --export=sqlite \
+        python /path/to/nsys_profile_official_bf16.py
 
-    nsys profile -t cuda,nvtx --cuda-memory-usage=true \
-        -o /tmp/sonic_fp8 --force-overwrite=true \
-        python tools/nsys_profile_comprehensive.py --mode fp8
-
-    nsys profile -t cuda,nvtx --cuda-memory-usage=true \
-        -o /tmp/sonic_fp8wg --force-overwrite=true \
-        python tools/nsys_profile_comprehensive.py --mode fp8_wgrad
+Shape: T=4096, H=4096, I=1024, E=128, K=8 (uniform 128-aligned routing)
 """
-import argparse
 import os
 import sys
 
-# Must set env before any sonicmoe import
+# Must set env before imports
 os.environ["USE_QUACK_GEMM"] = "1"
 for _k in [
     "PADDLE_ELASTIC_JOB_ID", "PADDLE_TRAINER_ENDPOINTS",
@@ -30,36 +25,24 @@ for _k in [
     os.environ.pop(_k, None)
 os.environ["NNODES"] = "1"
 os.environ["PADDLE_TRAINERS_NUM"] = "1"
+# Ensure no FP8 flags leak
+for _k in ["SONIC_MOE_FP8_MODE", "SONIC_MOE_FP8_FUSED_GATED",
+            "SONIC_MOE_FP8_WGRAD", "SONIC_MOE_FP8_ASSUME_ALIGNED",
+            "SONIC_MOE_FP8_FUSED_SWIGLU_QUANT", "SONIC_MOE_FP8_SAVE_Z_FP8"]:
+    os.environ.pop(_k, None)
+
+# Use official sonic-moe (must be pip installed or on sys.path)
+OFFICIAL_PATH = "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/official/sonic-moe"
+if OFFICIAL_PATH not in sys.path:
+    sys.path.insert(0, OFFICIAL_PATH)
 
 import torch
 import torch.cuda.nvtx as nvtx
 
-# ====================== Shape ======================
 T, H, I, E, K = 4096, 4096, 1024, 128, 8
 TK = T * K
-tpe = TK // E
-assert tpe % 128 == 0
-
 WARMUP = 5
 PROFILE_ITERS = 3
-
-
-def setup_mode(mode: str):
-    if mode in ("fp8", "fp8_wgrad"):
-        os.environ["SONIC_MOE_FP8_MODE"] = "perf"
-        os.environ["SONIC_MOE_FP8_FUSED_SWIGLU_QUANT"] = "1"
-        os.environ["SONIC_MOE_FP8_SAVE_Z_FP8"] = "1"
-        os.environ["SONIC_MOE_FP8_ASSUME_ALIGNED"] = "1"
-        if mode == "fp8_wgrad":
-            os.environ["SONIC_MOE_FP8_WGRAD"] = "1"
-        else:
-            os.environ["SONIC_MOE_FP8_WGRAD"] = "0"
-    else:
-        os.environ["SONIC_MOE_FP8_MODE"] = "off"
-        os.environ.pop("SONIC_MOE_FP8_ASSUME_ALIGNED", None)
-        os.environ.pop("SONIC_MOE_FP8_FUSED_SWIGLU_QUANT", None)
-        os.environ.pop("SONIC_MOE_FP8_SAVE_Z_FP8", None)
-        os.environ.pop("SONIC_MOE_FP8_WGRAD", None)
 
 
 def build_uniform_routing(device):
@@ -71,17 +54,8 @@ def build_uniform_routing(device):
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["bf16", "fp8", "fp8_wgrad"], required=True)
-    args = parser.parse_args()
-    setup_mode(args.mode)
-
-    from sonicmoe import MoE, enable_quack_gemm
+    from sonicmoe import MoE, enable_quack_gemm, KernelBackendMoE
     from sonicmoe.enums import ActivationType
-    from sonicmoe.functional import clear_all_fp8_weight_caches
-    from sonicmoe.quack_utils.blockscaled_fp8_gemm import (
-        _COMPILE_CACHE, clear_blockscaled_fp8_weight_cache,
-    )
     import sonicmoe.functional as F_mod
 
     torch.manual_seed(42)
@@ -90,12 +64,8 @@ def main():
         intermediate_size=I, activation_function=ActivationType.SWIGLU,
         add_bias=False, std=0.02,
     ).to("cuda", torch.bfloat16)
-    enable_quack_gemm()
 
-    x_base = torch.randn(T, H, device="cuda", dtype=torch.bfloat16)
-
-    # Uniform routing patch
-    _scores, _indices = build_uniform_routing(x_base.device)
+    _scores, _indices = build_uniform_routing(torch.device("cuda"))
 
     class _UniformRouter(torch.autograd.Function):
         @staticmethod
@@ -111,8 +81,7 @@ def main():
     orig_router = F_mod.TC_Softmax_Topk_Router_Function
     F_mod.TC_Softmax_Topk_Router_Function = _UniformRouter
 
-    if args.mode != "bf16":
-        F_mod._ALIGNMENT_ASSUMED = True
+    x_base = torch.randn(T, H, device="cuda", dtype=torch.bfloat16)
 
     def zero_grads():
         for p in moe.parameters():
@@ -121,20 +90,21 @@ def main():
     # Pre-allocate grad output (avoid stride-0 from sum().backward())
     grad_out = torch.ones(T, H, device="cuda", dtype=torch.bfloat16)
 
-    # Warmup (JIT compile everything)
-    print(f"Warming up {args.mode} mode ({WARMUP} iters)...")
+    # Warmup with QuACK enabled
+    print(f"Warming up official BF16 ({WARMUP} iters)...")
     for _ in range(WARMUP):
         zero_grads()
         x_ = x_base.clone().requires_grad_(True)
-        out, _ = moe(x_)
+        with enable_quack_gemm(True):
+            out, _ = moe(x_, kernel_backend_moe=KernelBackendMoE.sonicmoe)
         out.backward(grad_out)
     torch.cuda.synchronize()
     print("Warmup done.")
 
-    # Profiled iterations with fine-grained NVTX
+    # Profile
     torch.cuda.cudart().cudaProfilerStart()
     for i in range(PROFILE_ITERS):
-        nvtx.range_push(f"{args.mode}_iter_{i}")
+        nvtx.range_push(f"official_bf16_iter_{i}")
 
         nvtx.range_push("zero_grad")
         zero_grads()
@@ -144,10 +114,10 @@ def main():
         x_ = x_base.clone().requires_grad_(True)
         nvtx.range_pop()
 
-        # Sync before forward to ensure clean GPU state
         torch.cuda.synchronize()
         nvtx.range_push("forward")
-        out, _ = moe(x_)
+        with enable_quack_gemm(True):
+            out, _ = moe(x_, kernel_backend_moe=KernelBackendMoE.sonicmoe)
         torch.cuda.synchronize()
         nvtx.range_pop()
 
@@ -161,7 +131,7 @@ def main():
     torch.cuda.cudart().cudaProfilerStop()
 
     F_mod.TC_Softmax_Topk_Router_Function = orig_router
-    print(f"Profiling complete: mode={args.mode}, {PROFILE_ITERS} iters, shape T={T} H={H} I={I} E={E} K={K}")
+    print(f"Official BF16 profiling complete: {PROFILE_ITERS} iters, T={T} H={H} I={I} E={E} K={K}")
 
 
 if __name__ == "__main__":
