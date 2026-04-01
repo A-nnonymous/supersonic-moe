@@ -1,10 +1,10 @@
 # Blockscaled FP8 MoE — Handoff
 
-> **Last updated:** 2026-04-01 (Session 25 final)
+> **Last updated:** 2026-04-01 (Session 26 final)
 > **Branch:** `fork-main-sync`
-> **Status:** Full FP8 forward+backward with zero-materialization kernels. 15/15 precision tests pass.
-> FP8 path achieves **1.30x wall-clock speedup** at Ernie production shape vs official BF16.
-> **1.18x GPU projection speedup** (3324µs vs 3937µs CUDA kernel time).
+> **Status:** Full FP8 forward+backward with zero-materialization kernels. 19/19 precision tests pass.
+> FP8 path achieves **1.18x GPU projection speedup** (3324µs vs 3937µs CUDA kernel time).
+> FP8 **peak memory 0.610× of BF16** (39% savings) at Ernie production shape.
 
 ---
 
@@ -17,9 +17,12 @@
 - Auto-selection of zero-mat kernels when `gather_A + blockscaled`
 - Three-step gather pipeline (`fast_gather_quantize_and_pack_activation`)
 - Backward FP8 state persistence (ctx flags survive autograd context exit)
-- Adaptive FP8 down-proj (enabled when I ≥ 2048)
+- FP8 down-proj with pre-quantized y1 (zero-overhead at I≥1536 via L2-hot pre-quantization)
+- z FP8 save in fused gated path (saves ~171MB at Ernie shape)
+- Weight cache deduplication (direct_fused_dgated shares fused_dgated cache)
+- Aggressive FP8 weight cache eviction (w1 after up-proj, w2 after down-proj)
 - `use_fp8=True` API on `MoE.forward()` and `enable_fp8()` context manager
-- 15/15 contract tests pass including production shape (T=8192, H=3072, I=1536, E=8, K=8)
+- 19/19 contract tests pass including production shape (T=8192, H=3072, I=1536, E=8, K=8)
 
 **Best training path:**
 ```python
@@ -62,9 +65,9 @@ with enable_quack_gemm(True):
 
 ---
 
-## 2. Optimizations Applied (Session 25)
+## 2. Optimizations Applied
 
-### 2.1 Zero-materialization FP8 kernels
+### Session 25: Zero-materialization FP8 kernels
 **File:** `sonicmoe/quack_utils/gemm_sm100_fp8_zeromat.py`
 
 Custom `GemmGatedSm100ZeroMat` and `GemmDGatedSm100ZeroMat` subclass GemmSm100 via MRO, overriding only `__call__` (decorated with `@cute.jit`). The single core fix:
@@ -84,7 +87,7 @@ if device_capacity[0] > 9 and gather_A and blockscaled_runtime:
     GemmCls = GemmGatedSm100ZeroMat  # or GemmDGatedSm100ZeroMat
 ```
 
-### 2.2 Three-step gather pipeline
+### Session 25: Three-step gather pipeline
 **File:** `sonicmoe/quack_utils/blockscaled_fp8_gemm.py`
 
 `fast_gather_quantize_and_pack_activation(x, gather_idx)`:
@@ -94,7 +97,7 @@ if device_capacity[0] > 9 and gather_A and blockscaled_runtime:
 
 Total ~25µs vs 96µs for monolithic `gather_quantize_and_pack_activation`.
 
-### 2.3 Backward FP8 state persistence
+### Session 25: Backward FP8 state persistence
 **File:** `sonicmoe/functional/__init__.py`
 
 **Root cause (Session 24 bug):** `_fp8_enabled()` checks `is_fp8_active()` which is a thread-local flag set by `enable_fp8()` context manager. Backward runs via autograd OUTSIDE this context → `_fp8_enabled()` returns False → backward falls into BF16 path → `B.mT.contiguous()` copies 72MB of weight data (156µs).
@@ -107,6 +110,34 @@ ctx._alignment_assumed = _ALIGNMENT_ASSUMED
 ctx._use_fused_blockscaled_gated_flag = _use_fused_blockscaled_gated()
 ```
 Backward uses `ctx._fp8_enabled` instead of calling `_fp8_enabled()`.
+
+### Session 26: Memory optimizations (FP8 0.765× of BF16)
+
+**Problem:** FP8 used 1.38-1.48× MORE memory than BF16 due to redundant weight caches and BF16 activation saves.
+
+**Optimizations applied (all in `sonicmoe/functional/__init__.py` and `blockscaled_fp8_gemm.py`):**
+
+1. **z FP8 save in fused gated path** — Removed `and not _use_fused_blockscaled_gated()` condition on z_is_fp8 flag. z(TK, 2I) saved as FP8 instead of BF16 in fused gated path, saving ~171 MiB at Ernie shape.
+
+2. **z pre-quantization while hot in L2** — Added `quantize_activation_blockscaled_fast(z)` right after `_fused_blockscaled_gated_forward()` returns. Avoids cold-cache penalty in `_DownProjection.forward`.
+
+3. **Weight cache deduplication** — Merged `_DIRECT_FUSED_DGATED_WEIGHT_CACHE` into `_FUSED_WEIGHT_CACHE`. `precompute_weight_fp8_for_direct_fused_dgated()` now checks shared cache first, eliminating one full FP8 weight copy.
+
+4. **Aggressive FP8 weight cache eviction** — w1 FP8 cache evicted after `_UpProjection.forward`, w2 FP8 cache evicted after `_DownProjection.forward`. Training always re-quantizes on next forward (w._version increments), so eviction is free.
+
+5. **Early z deallocation in backward** — Added `del z, colvec_reduce_partial` after dgated kernel in fused gated backward, freeing 384 MiB before dz pre-quantization.
+
+6. **y1 pre-quantization + FP8 down-proj at I=1536** — Pre-quantize y1 while hot in L2 after SwiGLU, store in `_PREQUANTIZED_SCALES["fwd"]` as 3-tuple `(bf16_ref, fp8_data, scales)`. Down-proj uses pre-quantized y1 (zero quant overhead), enabling FP8 GEMM at I=1536 where inline quant was previously net-zero.
+
+7. **Bug fix: prequant format mismatch** — The original 2-tuple format `(y1_fp8, y1_packed_scales)` caused `_matches_prequant_tensor` to compare FP8 dtype vs BF16 dtype, always failing. FP8 down-proj was silently falling back to BF16. Fixed by storing `(y1_bf16_ref, y1_fp8, y1_packed_scales)` 3-tuple, matching the backward format. Added `_PREQUANT_HIT_COUNT` diagnostics counter.
+
+**Memory measurement (isolated process, single fwd+bwd, Ernie shape T=8192 H=3072 I=1536 E=8 K=8):**
+
+| Metric | BF16 | FP8 | Ratio |
+|--------|------|-----|-------|
+| Peak memory | 2828 MiB | 1726 MiB | **0.610×** |
+| After forward | 2106 MiB | 581 MiB | 0.276× |
+| Before (model+caches) | 1529 MiB | 382 MiB | 0.250× |
 
 ---
 
@@ -153,9 +184,9 @@ SonicMoE's core design avoids TK-sized activation intermediates:
 | **FP8 wgrad** | +0.9ms net | colwise quant SM contention breaks stream parallelism |
 | **torch.as_strided for fake TK shape** | RuntimeError | PyTorch checks storage bounds |
 | **Rowwise quant + strided view for wgrad** | Not possible | HW requires contiguous K groups in blockscaled |
-| **FP8 down-proj at I=1536** | Net-zero | quant overhead ≈ GEMM savings at this size |
+| **FP8 down-proj at I=1536 (inline quant)** | Net-zero | quant overhead ≈ GEMM savings — solved via L2-hot pre-quant in Session 26 |
 | **Transpose + rowquant** | 3.8× slower | transpose 1509µs > colwise quant 260µs |
-| **Eager FP8 weight cache eviction** | +2.6 GiB | precompute creates BF16 temp > cached FP8 |
+| **Eager FP8 weight cache eviction (precompute)** | +2.6 GiB | precompute temp > cache — solved via evict-after-use pattern in Session 26 |
 | **Stream overlap (quant ∥ wgrad)** | No effect | Both saturate 128 SMs → bandwidth contention |
 
 ---
@@ -168,7 +199,7 @@ SonicMoE's core design avoids TK-sized activation intermediates:
 | `SONIC_MOE_FP8_MODE=perf` | off | Enables FP8 path (or use `enable_fp8()` API) |
 | `SONIC_MOE_FP8_FUSED_GATED` | **1** | Fused GemmGated+SwiGLU (default on) |
 | `SONIC_MOE_FP8_WGRAD` | **0** | FP8 wgrad — keep 0 (proven net-negative) |
-| `SONIC_MOE_FP8_DOWNPROJ_THRESHOLD` | 2048 | I threshold for FP8 down-proj |
+| `SONIC_MOE_FP8_DOWNPROJ_THRESHOLD` | 2048 | I threshold for FP8 down-proj (bypassed when y1 pre-quant available) |
 | `SONIC_MOE_FP8_ASSUME_ALIGNED` | 0 | Skip alignment check (set 1 for benchmarks) |
 
 ---
@@ -184,16 +215,20 @@ SonicMoE's core design avoids TK-sized activation intermediates:
 | `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` | Quant kernels, weight caches, three-step pipeline |
 | `sonicmoe/quack_utils/gemm_gated.py` | CUTLASS GemmGated wrapper (auto ZeroMat selection) |
 | `sonicmoe/quack_utils/gemm_dgated.py` | CUTLASS GemmDGated wrapper (auto ZeroMat selection) |
-| `tests/fp8_large_project_contract_test.py` | 15 precision tests (11 original + 4 aligned) |
+| `tests/fp8_large_project_contract_test.py` | 19 precision tests (11 original + 4 aligned + 4 memory/opt) |
 
 ---
 
 ## 7. Correctness
 
-15/15 contract tests pass:
+19/19 contract tests pass:
 - 11 `FP8LargeProjectContractTest` (T=4096, H=4096, E=128, K=8)
 - 3 `FP8AlignedContractTest` multi-seed + context manager (T=1024, H=3072, I=1536, E=8, K=8)
 - 1 production shape (T=8192, H=3072, I=1536, E=8, K=8) fwd+bwd
+- 1 z FP8 save precision (fused gated path round-trip)
+- 1 FP8 peak memory < BF16 peak memory (isolated process)
+- 1 weight cache deduplication (direct_fused_dgated reuses fused_dgated)
+- 1 FP8 down-proj pre-quantization precision
 
 ```bash
 source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate
@@ -206,13 +241,13 @@ CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
 
 ## 8. Next Steps (ordered by ROI)
 
-1. **Custom CUTLASS kernel for SFA cp.async gather** — Eliminate the need for scale pre-gathering entirely. Modify GemmSm100's kernel to load SFA via cp.async alongside A data in the gather warp group. SFA is only ~3% the size of A data, so overhead is minimal. This removes the `_gather_isa_packed_scales_kernel` (54µs) and the TK-sized scale buffer allocation.
+1. **Nsys profiling on idle GPU** — Cluster GPUs are at 100% utilization. When available, run nsys to get post-Session-26 CUDA kernel timing (FP8 down-proj saves ~86µs at Ernie shape). Expected CUDA time: ~3240µs (vs 3324µs pre-Session-26, vs 3937µs BF16).
 
-2. **FP8 down-proj at I≥1536** — The current threshold is 2048. At I=1536, quant overhead ≈ GEMM savings. A fused quant-inside-SwiGLU-epilogue could tip the balance by eliminating the standalone `quantize_and_pack_activation(y1)` call.
+2. **Custom CUTLASS kernel for SFA cp.async gather** — Eliminate scale pre-gathering entirely. Modify GemmSm100's kernel to load SFA via cp.async alongside A data in the gather warp group. Removes `_gather_isa_packed_scales_kernel` (54µs, 1.6% of CUDA time) and TK-sized scale buffer.
 
-3. **Reduce BF16 wgrad bottleneck** — The 1239µs BF16 wgrad (37.3% of CUDA time) is irreducible with current approaches. Future Blackwell GPU architectures with better multi-stream SM sharing, or a CUTLASS kernel that accepts non-contiguous blockscaled groups, could enable FP8 wgrad.
+3. **Reduce BF16 wgrad bottleneck** — 1239µs BF16 wgrad (37.3% of CUDA time) is the dominant remaining cost. FP8 wgrad is proven net-negative. Future GPU architectures with better multi-stream SM sharing could enable FP8 wgrad.
 
-4. **Memory optimization** — FP8 weight caches (3 copies: fused_gated, direct_fused_dgated, actgrad) increase peak memory by 1.38-1.48×. Implement lazy weight quantization or weight cache sharing to reduce this.
+4. **Dead code cleanup** — `_fused_blockscaled_dgated_backward()` (line 192 in `functional/__init__.py`) is defined but never called; the actual logic is inline in `_DownProjection.backward`. Can be removed.
 
 ---
 

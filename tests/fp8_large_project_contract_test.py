@@ -521,3 +521,150 @@ class FP8AlignedContractTest(TestCommons):
         self.assertGreater(fwd_corr, 0.99, f"fwd corr {fwd_corr:.4f}")
         self.assertLess(bwd_rrmse, 0.10, f"bwd RRMSE {bwd_rrmse:.4f}")
         self.assertGreater(bwd_corr, 0.99, f"bwd corr {bwd_corr:.4f}")
+
+    def test_z_fp8_save_precision(self) -> None:
+        """z FP8 save in fused gated path preserves precision within contract bounds."""
+        self._require_blackwell()
+        self._reset_fp8_state()
+        self.set_seed(42)
+        moe = self._make_moe()
+        x, dout = self._make_sample()
+
+        # BF16 baseline
+        with enable_quack_gemm(True):
+            out_bf16, _ = moe(x)
+        out_bf16.backward(dout)
+        dx_bf16 = x.grad.clone()
+        x.grad = None
+        moe.zero_grad(set_to_none=True)
+        self._reset_fp8_state()
+
+        # FP8 with z save (default: SONIC_MOE_FP8_SAVE_Z_FP8=1)
+        os.environ["SONIC_MOE_FP8_SAVE_Z_FP8"] = "1"
+        with enable_quack_gemm(True):
+            out_fp8, _ = moe(x, use_fp8=True)
+        out_fp8.backward(dout)
+        dx_fp8 = x.grad.clone()
+
+        fwd_rrmse = self._rrmse(out_fp8, out_bf16)
+        fwd_corr = self._corr(out_fp8, out_bf16)
+        bwd_rrmse = self._rrmse(dx_fp8, dx_bf16)
+        bwd_corr = self._corr(dx_fp8, dx_bf16)
+        self.assertLess(fwd_rrmse, 0.10, f"z-fp8-save fwd RRMSE {fwd_rrmse:.4f}")
+        self.assertGreater(fwd_corr, 0.99, f"z-fp8-save fwd corr {fwd_corr:.4f}")
+        self.assertLess(bwd_rrmse, 0.10, f"z-fp8-save bwd RRMSE {bwd_rrmse:.4f}")
+        self.assertGreater(bwd_corr, 0.99, f"z-fp8-save bwd corr {bwd_corr:.4f}")
+
+    def test_fp8_memory_less_than_bf16(self) -> None:
+        """FP8 peak memory must be <= BF16 peak memory at production shape."""
+        import gc
+        self._require_blackwell()
+        self._reset_fp8_state()
+        self.set_seed(42)
+
+        T, H, I, E, K = 8192, 3072, 1536, 8, 8
+        moe = MoE(num_experts=E, num_experts_per_tok=K, hidden_size=H,
+                  intermediate_size=I, activation_function=ActivationType.SWIGLU,
+                  add_bias=False, std=0.02).to(device="cuda", dtype=torch.bfloat16)
+
+        # FP8 peak
+        x = (0.02 * torch.randn(T, H, device="cuda", dtype=torch.bfloat16)).detach().requires_grad_()
+        self._reset_fp8_state()
+        gc.collect(); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
+        with enable_quack_gemm(True):
+            out, _ = moe(x, use_fp8=True)
+            out.sum().backward()
+        torch.cuda.synchronize()
+        fp8_peak = torch.cuda.max_memory_allocated()
+        del out, x
+        moe.zero_grad(set_to_none=True)
+        self._reset_fp8_state()
+        gc.collect(); torch.cuda.empty_cache()
+
+        # BF16 peak
+        x = (0.02 * torch.randn(T, H, device="cuda", dtype=torch.bfloat16)).detach().requires_grad_()
+        torch.cuda.reset_peak_memory_stats()
+        with enable_quack_gemm(True):
+            out, _ = moe(x, use_fp8=False)
+            out.sum().backward()
+        torch.cuda.synchronize()
+        bf16_peak = torch.cuda.max_memory_allocated()
+
+        ratio = fp8_peak / bf16_peak
+        self.assertLessEqual(
+            ratio, 1.0,
+            f"FP8 peak ({fp8_peak/1024**2:.0f}MiB) must be <= BF16 peak ({bf16_peak/1024**2:.0f}MiB), got ratio={ratio:.3f}",
+        )
+
+    def test_weight_cache_dedup(self) -> None:
+        """Weight cache dedup: direct_fused_dgated reuses fused_dgated cache."""
+        self._require_blackwell()
+        self._reset_fp8_state()
+        self.set_seed(42)
+        from sonicmoe.quack_utils.blockscaled_fp8_gemm import (
+            _FUSED_WEIGHT_CACHE,
+            _DIRECT_FUSED_DGATED_WEIGHT_CACHE,
+            precompute_weight_fp8_for_fused_dgated,
+            precompute_weight_fp8_for_direct_fused_dgated,
+            clear_blockscaled_fp8_weight_cache,
+        )
+        clear_blockscaled_fp8_weight_cache()
+
+        w = torch.randn(self._ALIGNED_H, self._ALIGNED_I, self._ALIGNED_E,
+                        device="cuda", dtype=torch.bfloat16)
+
+        # Call fused_dgated first — populates _FUSED_WEIGHT_CACHE
+        w_view, scales_view = precompute_weight_fp8_for_fused_dgated(w)
+        self.assertEqual(len(_FUSED_WEIGHT_CACHE), 1)
+
+        # Call direct_fused_dgated — should reuse from _FUSED_WEIGHT_CACHE
+        w_cont, scales_cont = precompute_weight_fp8_for_direct_fused_dgated(w)
+        # Should NOT have added to _DIRECT_FUSED_DGATED_WEIGHT_CACHE
+        self.assertEqual(len(_DIRECT_FUSED_DGATED_WEIGHT_CACHE), 0,
+                        "direct_fused_dgated should reuse fused_dgated cache, not create duplicate")
+        # Data must match (same physical storage, different views)
+        self.assertEqual(w_cont.data_ptr(), w_view.data_ptr(),
+                        "direct and fused dgated should share physical storage")
+
+    def test_fp8_downproj_prequant_precision(self) -> None:
+        """FP8 down-proj with pre-quantized y1 preserves precision at I=1536."""
+        self._require_blackwell()
+        self._reset_fp8_state()
+        self.set_seed(42)
+        moe = self._make_moe()
+        x, dout = self._make_sample()
+
+        # BF16 baseline
+        with enable_quack_gemm(True):
+            out_bf16, _ = moe(x)
+        out_bf16.backward(dout)
+        dx_bf16 = x.grad.clone()
+        x.grad = None
+        moe.zero_grad(set_to_none=True)
+        self._reset_fp8_state()
+
+        # Reset prequant hit counters
+        from sonicmoe.functional import _PREQUANT_HIT_COUNT
+        _PREQUANT_HIT_COUNT["fwd"] = 0
+        _PREQUANT_HIT_COUNT["bwd"] = 0
+
+        # FP8 with pre-quantized y1 down-proj (default path)
+        with enable_quack_gemm(True):
+            out_fp8, _ = moe(x, use_fp8=True)
+        out_fp8.backward(dout)
+        dx_fp8 = x.grad.clone()
+
+        # Verify prequant was actually consumed (not silently falling back to BF16)
+        self.assertGreater(_PREQUANT_HIT_COUNT["fwd"], 0,
+                           "FP8 down-proj prequant was never consumed — matching bug?")
+        self.assertGreater(_PREQUANT_HIT_COUNT["bwd"], 0,
+                           "FP8 bwd prequant (dz) was never consumed — matching bug?")
+
+        fwd_rrmse = self._rrmse(out_fp8, out_bf16)
+        fwd_corr = self._corr(out_fp8, out_bf16)
+        bwd_rrmse = self._rrmse(dx_fp8, dx_bf16)
+        bwd_corr = self._corr(dx_fp8, dx_bf16)
+        self.assertLess(fwd_rrmse, 0.10, f"downproj-prequant fwd RRMSE {fwd_rrmse:.4f}")
+        self.assertGreater(fwd_corr, 0.99, f"downproj-prequant fwd corr {fwd_corr:.4f}")
+        self.assertLess(bwd_rrmse, 0.10, f"downproj-prequant bwd RRMSE {bwd_rrmse:.4f}")
+        self.assertGreater(bwd_corr, 0.99, f"downproj-prequant bwd corr {bwd_corr:.4f}")

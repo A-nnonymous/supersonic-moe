@@ -1,5 +1,7 @@
 # FP8 Engineering Log
 
+> ⚠️ **Historical reference only.** See [`HANDOFF.md`](HANDOFF.md) for current implementation state.
+>
 > Cleaned timeline of what happened, what was learned, and the current state.
 > Dead-end details are in HANDOFF.md §4. Git history has the full journey.
 

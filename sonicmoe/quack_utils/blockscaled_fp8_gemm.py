@@ -2360,9 +2360,9 @@ def precompute_weight_fp8_for_direct_fused_dgated(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pre-quantize expert weight for direct low-level gemm_dgated blockscaled path.
 
-    Unlike precompute_weight_fp8_for_fused_dgated(), this returns the physical
-    contiguous (E, N, K) layout that the low-level gemm_dgated kernel consumes
-    directly, so the caller can bypass gemm_interface's B.mT.contiguous() copy.
+    Reuses the fused_dgated cache — identical physical (E, N, K) contiguous layout.
+    Returns the contiguous tensor (not .mT view) that the low-level kernel consumes
+    directly, bypassing gemm_interface's B.mT.contiguous() copy.
 
     Parameters
     ----------
@@ -2379,19 +2379,26 @@ def precompute_weight_fp8_for_direct_fused_dgated(
         tuple(w.shape),
         tuple(w.stride()),
     )
-    cached = _DIRECT_FUSED_DGATED_WEIGHT_CACHE.get(key)
+    # Check unified fused cache first (shared with precompute_weight_fp8_for_fused_dgated)
+    cached = _FUSED_WEIGHT_CACHE.get(key)
     if cached is not None:
-        return cached
+        w_fp8_view, w_scales = cached
+        # fused_dgated stores .mT view (E, H, I); we need contiguous (E, I, H)
+        if not w_fp8_view.is_contiguous():
+            return w_fp8_view.mT, w_scales  # .mT of .mT = contiguous original
+        return w_fp8_view, w_scales
 
     w_enk = w.permute(2, 1, 0).contiguous()  # (E, N=I, K=H) contiguous
     proto = FP8Protocol(scale_granularity=FP8ScaleGranularity.BLOCK_1X32)
     w_fp8_enk, w_scales_raw = quantize_activation_blockwise(w_enk, proto)
     w_scales_packed = pack_blockscaled_1x32_scales(w_scales_raw, w_enk.size(-1))
-    result = (w_fp8_enk, w_scales_packed)
-    if len(_DIRECT_FUSED_DGATED_WEIGHT_CACHE) > 8:
-        _DIRECT_FUSED_DGATED_WEIGHT_CACHE.clear()
-    _DIRECT_FUSED_DGATED_WEIGHT_CACHE[key] = result
-    return result
+    # Store contiguous in fused cache; fused_dgated will create .mT view from it
+    result_contiguous = (w_fp8_enk, w_scales_packed)
+    result_view = (w_fp8_enk.mT, w_scales_packed)
+    if len(_FUSED_WEIGHT_CACHE) > 8:
+        _FUSED_WEIGHT_CACHE.clear()
+    _FUSED_WEIGHT_CACHE[key] = result_view  # Store .mT view (fused_dgated convention)
+    return result_contiguous  # Return contiguous (direct convention)
 
 
 def blockscaled_fp8_gemm_varlen(
