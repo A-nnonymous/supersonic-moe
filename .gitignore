@@ -216,3 +216,8 @@ reports/*.sqlite
 reports/*.nsys-rep
 reports/*.ncu-rep
 tools/_archive/
+*.nsys-rep
+*.sqlite
+*.ncu-rep
+*.nsys-rep
+*.qdrep
