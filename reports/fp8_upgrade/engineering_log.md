@@ -52,14 +52,30 @@
 - **CUTLASS constraint discovered**: GemmDGated requires bf16 PreAct (cannot feed FP8 z directly)
 - 5 new precision tests → 31/31 total
 
+## Phase 8: Authoritative Benchmarks (Session 33)
+
+- **Fully idle node 0342** (8/8 GPUs idle, 0% utilization) — first clean measurement
+- **Corrected performance**: BF16 3932µs/iter → FP8 3690µs/iter = **1.066× faster**
+  - Previous 0344 data (6609 vs 6290µs) had GPU contention artifacts
+  - GEMM savings: 764µs (21.1%), FP8 overhead: 532µs, net: 232µs
+- **Corrected memory**: FP8 peak 1913.8 MiB > BF16 peak 1411.8 MiB (+502 MiB)
+  - Weight caches (~650 MiB) outweigh Z FP8 savings (~186 MiB)
+  - Previous claim "FP8 peak ≤ BF16" was wrong at production shape
+- **Profiling runner**: `tools/_profiling_runner.sh` with `nsys_official_bf16`, `nsys_fp8_frontier`, `mem_fp8`, `mem_bf16`, `test` modes
+- nsys install: `dpkg -i .../NsightSystems-linux-cli-public-2025.1.1.131-3554042.deb` on remote nodes
+- 31/31 tests pass (verified on node 0342)
+
 ---
 
 ## Lessons
 
-1. **CUTLASS PreAct constraint is the bottleneck** — `assert PreAct.element_size() == 2` blocks the highest-value optimization (eliminating z-dequant 124µs). Requires CUTLASS DSL epilogue work.
+1. **CUTLASS PreAct constraint is the bottleneck** — `assert PreAct.element_size() == 2` blocks the highest-value optimization (eliminating z-dequant 130µs). Requires CUTLASS DSL epilogue work.
 2. **2D grids beat 1D grids for SM utilization** — the fused quant 1D grid (2048 blocks) was slower than separate 2D kernels. 2D grid (40960 blocks) matches separate kernel parallelism.
 3. **Packed int32 scale writes fix coalescing** — accumulate 4 group bytes into uint32 before writing. Reduces excess sectors by 4×.
 4. **TMA has overhead for small/fine-grained access** — descriptor creation costs dominate when data volume < ~100MB. Only beneficial for large structured GEMM tiles.
 5. **nsys GPU projection is the only trustworthy metric** — wall-clock includes 40-60% CPU overhead on contested nodes.
 6. **Official BF16 needs `z.backward(dout)`** not `z.sum().backward()` — the latter produces non-contiguous gradients that fail quack assertions.
-7. **Stream parallelism has diminishing returns** — z-dequant (124µs) overlaps with dout-quant+gather (83µs), saving ~47µs. But adding more work to the overlap window (s.float() 28µs) only hides, doesn't save.
+7. **Stream parallelism has diminishing returns** — z-dequant (130µs) overlaps with dout-quant+gather (83µs), saving ~47µs. But adding more work to the overlap window (s.float() 28µs) only hides, doesn't save.
+8. **GPU contention invalidates profiling data** — node 0344 (4/8 idle) showed 6609µs BF16 per-iter; same workload on fully idle 0342 was 3932µs (1.68× inflation). Always use `cluster_idle_launch.py scan` and pick 8/8 idle nodes.
+9. **FP8 weight caches dominate memory overhead** — 3 caches × 3 weights × ~72MB each ≈ 650 MiB, outweighing Z FP8 savings (186 MiB). At production Ernie shape, FP8 peak > BF16 peak by 502 MiB.
+10. **nsys needs manual install on remote nodes** — `dpkg -i .../NsightSystems-linux-cli-public-2025.1.1.131-3554042.deb` required before profiling.

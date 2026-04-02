@@ -120,7 +120,7 @@ The reporting policy for every FP8 step is:
 - memory baseline: official bf16
 - performance baselines: previous commit and official bf16
 
-## 🔥 FP8 Blockscaled Status (2026-04-02, Session 32)
+## 🔥 FP8 Blockscaled Status (2026-04-02, Session 33)
 
 The repository has a working **zero-materialization** blockscaled FP8 training path for Blackwell.
 No TK-sized FP8 activation is materialized — follows SonicMoE's core "no materialization" design.
@@ -143,10 +143,10 @@ with enable_quack_gemm(True), enable_fp8():
 
 | Config | CUDA µs/iter | vs Official BF16 |
 |--------|-------------|-----------------|
-| Official BF16 (quack 0.2.5) | 6609 | baseline |
-| **FP8 frontier (quack 0.3.7)** | **6290** | **1.05× faster** |
+| Official BF16 (quack 0.2.5) | 3932 | baseline |
+| **FP8 frontier (quack 0.3.7)** | **3690** | **1.066× faster** |
 
-> Measured on node 0344 with partial contention. Earlier fully-idle measurements show 1.11–1.18×.
+> Measured on fully idle node 0342 (8/8 GPUs, 0% utilization). GEMM savings 21%, FP8 overhead 532µs/iter.
 
 ### Correctness
 
@@ -154,7 +154,11 @@ with enable_quack_gemm(True), enable_fp8():
 
 ### Memory
 
-FP8 peak ≤ BF16 peak. Z saved as FP8 (192MB vs 384MB bf16 = 186 MiB saved per forward).
+| Metric | BF16 | FP8 | Delta |
+|--------|------|-----|-------|
+| Peak (FWD+BWD) | 1411.8 MiB | 1913.8 MiB | +502 MiB |
+
+FP8 peak is higher due to weight caches (~650 MiB). Z FP8 save reduces activation memory by 186 MiB.
 
 ### Read first
 
@@ -163,7 +167,8 @@ FP8 peak ≤ BF16 peak. Z saved as FP8 (192MB vs 384MB bf16 = 186 MiB saved per 
 | **Handoff** | `reports/fp8_upgrade/HANDOFF.md` | Complete project state, performance, architecture, next steps |
 | Engineering log | `reports/fp8_upgrade/engineering_log.md` | Historical milestone timeline |
 | Contract tests | `tests/fp8_large_project_contract_test.py` | 31-test correctness gate |
-| Profiling | `tools/profile_both.py` | Dual-env BF16+FP8 nsys profiling |
+| Profiling runner | `tools/_profiling_runner.sh` | Unified SSH profiling (nsys, memory, tests) |
+| Profiling script | `tools/profile_both.py` | Dual-env BF16+FP8 nsys profiling |
 
 ## 🤝 Contributing
 
