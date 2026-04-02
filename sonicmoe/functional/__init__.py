@@ -68,7 +68,7 @@ from .fp8_reference import (
 )
 from .forward import _down_projection_forward, _router_forward, _softmax_topk_fwd, _up_projection_forward
 from .triton_kernels import TC_topk_router_metadata_triton
-from .utils import enable_fp8, enable_quack_gemm, is_fp8_active, is_using_quack_gemm
+from .utils import enable_fp8, enable_native_fp8, enable_quack_gemm, is_fp8_active, is_native_fp8_active, is_using_quack_gemm
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +187,83 @@ def _save_z_fp8() -> bool:
     and dequantized at start of backward, saving ~50% of z's memory footprint.
     """
     return os.getenv("SONIC_MOE_FP8_SAVE_Z_FP8", "1").lower() in {"1", "true", "yes", "on"}
+
+
+def _native_fp8_enabled() -> bool:
+    """Check if native FP8 params mode is active (x arrives as FP8, weights are FP8)."""
+    return is_native_fp8_active()
+
+
+def _native_fp8_gated_forward(
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    expert_frequency_offset: torch.Tensor,
+    x_gather_idx: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Native FP8 forward: x arrives with pre-computed FP8+scales.
+
+    Simulates a "native FP8 params" scenario:
+    - x quantization (bf16→fp8+scales) is performed once upfront; in production
+      this happens upstream in the communication layer, NOT inside MoE.
+    - Weight quantization uses existing precompute+cache (zero cost after 1st iter).
+    - GemmGated runs with blockscaled FP8 x and weights.
+    - y1 is computed in bf16, then quantized for the down-proj.
+
+    Returns (z_bf16, y1_fp8, y1_packed_scales).
+    """
+    from ..quack_utils.blockscaled_fp8_gemm import (
+        quantize_and_pack_activation,
+        _gather_isa_packed_scales_kernel,
+        _div_up, _SF_TILE_K, _SF_TILE_M, _SF_TILE_STORAGE, _SF_VEC_SIZE,
+        _storage_per_batch,
+    )
+
+    # --- Step 1: x quantization (simulated upstream cost) ---
+    # In production, x arrives as (fp8, packed_scales) from the comm layer.
+    # Here we quantize once; this cost is NOT counted in MoE-internal timing.
+    x_fp8, x_scales_t = quantize_and_pack_activation(x)
+
+    # --- Step 2: Gather ISA-packed scales T→TK ---
+    TK = x_gather_idx.shape[0]
+    K = x_fp8.shape[1]
+    k_tiles = _div_up(K, _SF_TILE_K)
+    per_batch_tk = _storage_per_batch(TK, K)
+    x_scales_tk = (
+        torch.empty((1, per_batch_tk), dtype=torch.uint8, device=x_fp8.device)
+        if (TK % _SF_TILE_M == 0 and K % _SF_TILE_K == 0)
+        else torch.full((1, per_batch_tk), 127, dtype=torch.uint8, device=x_fp8.device)
+    )
+    BLOCK_ROWS = 32
+    _gather_isa_packed_scales_kernel[(_div_up(TK, BLOCK_ROWS), k_tiles)](
+        x_scales_t.view(torch.uint8), x_gather_idx, x_scales_tk, TK,
+        src_k_tiles=k_tiles, dst_k_tiles=k_tiles,
+        SF_TILE_M=_SF_TILE_M, SF_TILE_STORAGE=_SF_TILE_STORAGE,
+        BLOCK_ROWS=BLOCK_ROWS, GROUPS_PER_K_TILE=_SF_TILE_K // _SF_VEC_SIZE,
+    )
+    x_scales_tk_e8m0 = x_scales_tk.view(torch.float8_e8m0fnu)
+    del x_scales_t
+
+    # --- Step 3: Weights (cached FP8 + ISA-packed scales) ---
+    w1_fp8, w1_scales = precompute_weight_fp8_for_fused_gated(w1)
+
+    # --- Step 4: GemmGated (PostAct bf16) + y1 quantize ---
+    z, y1 = gemm_gated(
+        x_fp8, w1_fp8,
+        activation="swiglu",
+        out_dtype=torch.bfloat16,
+        postact_dtype=torch.bfloat16,
+        cu_seqlens_m=expert_frequency_offset,
+        A_idx=x_gather_idx,
+        a_scales=x_scales_tk_e8m0,
+        b_scales=w1_scales,
+        dynamic_scheduler=False,
+        tuned=False,
+    )
+    y1_fp8, y1_scales = quantize_and_pack_activation(y1)
+
+    del x_fp8, x_scales_tk_e8m0
+
+    return z, y1_fp8, y1_scales
 
 
 def _use_fused_blockscaled_gated() -> bool:
@@ -632,18 +709,30 @@ class _UpProjection(torch.autograd.Function):
                 _ALIGNMENT_ASSUMED = aligned
 
                 if aligned and _use_fused_blockscaled_gated():
-                    z, y1 = _fused_blockscaled_gated_forward(
-                        x, w1, expert_frequency_offset, x_gather_idx
-                    )
-                    # Fused z+y1 quantize: single 2D-grid kernel launch
-                    # while both tensors are L2-hot from GemmGated output.
-                    if _save_z_fp8():
-                        from ..quack_utils.blockscaled_fp8_gemm import fused_z_save_y1_quant
-                        z_fp8, z_raw_scales, y1_fp8, y1_packed_scales = fused_z_save_y1_quant(z, y1)
-                        _PREQUANTIZED_SCALES["z_fp8"] = (z_fp8, z_raw_scales)
+                    if _native_fp8_enabled():
+                        # Native FP8: x is FP8, weights are FP8+scales
+                        z, y1_fp8, y1_packed_scales = _native_fp8_gated_forward(
+                            x, w1, expert_frequency_offset, x_gather_idx
+                        )
+                        y1 = y1_fp8  # y1 is FP8 in native mode
+                        if _save_z_fp8():
+                            from ..quack_utils.blockscaled_fp8_gemm import quantize_activation_blockscaled_fast
+                            z_fp8, z_raw_scales = quantize_activation_blockscaled_fast(z)
+                            _PREQUANTIZED_SCALES["z_fp8"] = (z_fp8, z_raw_scales)
+                        _PREQUANTIZED_SCALES["fwd"] = (y1_fp8, y1_fp8, y1_packed_scales)
                     else:
-                        y1_fp8, y1_packed_scales = quantize_and_pack_activation(y1)
-                    _PREQUANTIZED_SCALES["fwd"] = (y1, y1_fp8, y1_packed_scales)
+                        z, y1 = _fused_blockscaled_gated_forward(
+                            x, w1, expert_frequency_offset, x_gather_idx
+                        )
+                        # Fused z+y1 quantize: single 2D-grid kernel launch
+                        # while both tensors are L2-hot from GemmGated output.
+                        if _save_z_fp8():
+                            from ..quack_utils.blockscaled_fp8_gemm import fused_z_save_y1_quant
+                            z_fp8, z_raw_scales, y1_fp8, y1_packed_scales = fused_z_save_y1_quant(z, y1)
+                            _PREQUANTIZED_SCALES["z_fp8"] = (z_fp8, z_raw_scales)
+                        else:
+                            y1_fp8, y1_packed_scales = quantize_and_pack_activation(y1)
+                        _PREQUANTIZED_SCALES["fwd"] = (y1, y1_fp8, y1_packed_scales)
                 elif aligned:
                     w1_fp8, w1_scales = precompute_weight_fp8(w1)
                     # All segments 128-aligned: use fused gather+quantize
@@ -729,6 +818,7 @@ class _UpProjection(torch.autograd.Function):
         # Persist FP8 state for backward (autograd runs outside enable_fp8() context)
         ctx._fp8_enabled = _fp8_enabled()
         ctx._alignment_assumed = _ALIGNMENT_ASSUMED
+        ctx._native_fp8 = _native_fp8_enabled()
 
         ctx.save_for_backward(
             x,
@@ -1030,6 +1120,7 @@ class _DownProjection(torch.autograd.Function):
         ctx._fp8_enabled_flag = _fp8_enabled()
         ctx._alignment_assumed_flag = _ALIGNMENT_ASSUMED
         ctx._use_fused_blockscaled_gated_flag = _use_fused_blockscaled_gated()
+        ctx._native_fp8_flag = _native_fp8_enabled()
 
         # Memory optimization: store z in FP8 to save ~50% of z's memory.
         # At Ernie shape (TK=65536, 2I=3072), z is 384MB BF16 → ~213MB FP8 = ~171MB saved.

@@ -62,3 +62,41 @@ def enable_fp8(enable: bool = True):
 
 def is_fp8_active() -> bool:
     return _IS_FP8_ACTIVE
+
+
+# ---------------------------------------------------------------------------
+# Native FP8 params mode — assumes x arrives as FP8, weights stored as FP8.
+# ---------------------------------------------------------------------------
+_IS_NATIVE_FP8 = False
+
+
+@contextmanager
+def enable_native_fp8(enable: bool = True):
+    """Context manager for native FP8 params simulation.
+
+    When enabled, the MoE assumes:
+    - Input x is pre-quantized to FP8 (no x-quant)
+    - Weights are stored as FP8 + ISA-packed scales (no weight quant/cache)
+    - GemmGated PostAct outputs FP8 (scales computed separately)
+    Also enables FP8 and QuACK GEMM.
+    """
+    global _IS_NATIVE_FP8, _IS_FP8_ACTIVE, _IS_USING_QUACK_GEMM
+
+    prev_native = _IS_NATIVE_FP8
+    prev_fp8 = _IS_FP8_ACTIVE
+    prev_quack = _IS_USING_QUACK_GEMM
+    _IS_NATIVE_FP8 = enable
+    if enable:
+        _IS_FP8_ACTIVE = True
+        _IS_USING_QUACK_GEMM = True
+
+    try:
+        yield
+    finally:
+        _IS_NATIVE_FP8 = prev_native
+        _IS_FP8_ACTIVE = prev_fp8
+        _IS_USING_QUACK_GEMM = prev_quack
+
+
+def is_native_fp8_active() -> bool:
+    return _IS_NATIVE_FP8

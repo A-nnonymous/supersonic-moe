@@ -18,6 +18,7 @@ from .functional import (
     apply_activation_fp8_protocol,
     dequantize_activation_reference,
     enable_fp8,
+    enable_native_fp8,
     enable_quack_gemm,
     get_default_fp8_protocol,
     is_blackwell_device,

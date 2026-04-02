@@ -120,7 +120,7 @@ The reporting policy for every FP8 step is:
 - memory baseline: official bf16
 - performance baselines: previous commit and official bf16
 
-## 🔥 FP8 Blockscaled Status (2026-04-02, Session 33)
+## 🔥 FP8 Blockscaled Status (2026-04-02, Session 34)
 
 The repository has a working **zero-materialization** blockscaled FP8 training path for Blackwell.
 No TK-sized FP8 activation is materialized — follows SonicMoE's core "no materialization" design.
@@ -150,7 +150,7 @@ with enable_quack_gemm(True), enable_fp8():
 
 ### Correctness
 
-31/31 contract tests pass: 11 original + 20 aligned tests including production shape T=8192.
+31/31 frontier + 12/12 native FP8 tests pass (run separately, see below).
 
 ### Memory
 
@@ -160,15 +160,22 @@ with enable_quack_gemm(True), enable_fp8():
 
 FP8 peak is higher due to weight caches (~650 MiB). Z FP8 save reduces activation memory by 186 MiB.
 
+### Native FP8 (experimental, `native-fp8-exploration` branch)
+
+A prototype for "native FP8 params" (x arrives as FP8, weights stored as FP8) exists on the `native-fp8-exploration` branch. Current status:
+- **Forward/backward works** with `enable_native_fp8()` context manager
+- **Functionally identical** to frontier FP8 (same kernels, same performance)
+- **Not truly native** — still quantizes inside MoE. True native requires pre-quantized x input + persistent FP8 weight buffers (design plan in `.claude/plans/shiny-beaming-knuth.md`)
+
 ### Read first
 
 | Resource | Path | Why |
 |----------|------|-----|
 | **Handoff** | `reports/fp8_upgrade/HANDOFF.md` | Complete project state, performance, architecture, next steps |
 | Engineering log | `reports/fp8_upgrade/engineering_log.md` | Historical milestone timeline |
-| Contract tests | `tests/fp8_large_project_contract_test.py` | 31-test correctness gate |
-| Profiling runner | `tools/_profiling_runner.sh` | Unified SSH profiling (nsys, memory, tests) |
-| Profiling script | `tools/profile_both.py` | Dual-env BF16+FP8 nsys profiling |
+| Frontier tests | `tests/fp8_large_project_contract_test.py` | 31-test correctness gate |
+| Native FP8 tests | `tests/fp8_native_params_test.py` | 12-test precision gate (run separately) |
+| Native FP8 plan | `.claude/plans/shiny-beaming-knuth.md` | True native FP8 implementation plan |
 
 ## 🤝 Contributing
 

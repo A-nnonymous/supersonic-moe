@@ -2123,6 +2123,7 @@ def quantize_and_pack_activation(
     return fp8_out, packed_scales.view(torch.float8_e8m0fnu)
 
 
+
 # ---------------------------------------------------------------------------
 # Three-step optimized gather: T-quant → fp8_gather → scale_gather
 # ---------------------------------------------------------------------------

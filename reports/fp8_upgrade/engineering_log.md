@@ -65,6 +65,20 @@
 - nsys install: `dpkg -i .../NsightSystems-linux-cli-public-2025.1.1.131-3554042.deb` on remote nodes
 - 31/31 tests pass (verified on node 0342)
 
+## Phase 9: Native FP8 Exploration (Session 34)
+
+- **Goal**: Full-chain FP8 params — x as FP8, weights as FP8, no quantization inside MoE
+- **Implemented**: `enable_native_fp8()` context manager, `_native_fp8_gated_forward()`, forward routing, 12 precision tests, benchmark script
+- **Initial bug**: `compute_scales_from_fp8_and_pack` kernel produced numerical garbage — E8M0 scales encode BF16 magnitude, not FP8 magnitude. Mean byte error ~12.8. **Removed.**
+- **PostAct FP8 attempted**: GemmGated can output FP8 PostAct, but without blockscaled ISA scales (raw clamp-cast only). Scales must be stored alongside FP8 data, not reconstructed.
+- **FP8 wgrad blocked**: `blockscaled_fp8_gemm_varlen` only supports `cu_seqlens_m`; wgrad needs `cu_seqlens_k + A_idx`
+- **Result**: After fixing scale bug, native path is **functionally identical** to frontier (same kernels, same performance)
+  - Frontier: 3935 µs/iter, Native: 3962 µs/iter (noise)
+  - Memory: identical (2078.4 MiB both)
+  - Precision: bit-identical (RRMSE=0.0000, correlation=1.000000)
+- **Conclusion**: "Simulate native by quantizing inside MoE" approach provides zero value. True native requires pre-quantized x input + persistent FP8 weight buffers. Detailed plan written.
+- 12/12 native tests pass, 31/31 frontier tests pass (run separately)
+
 ---
 
 ## Lessons
@@ -75,7 +89,10 @@
 4. **TMA has overhead for small/fine-grained access** — descriptor creation costs dominate when data volume < ~100MB. Only beneficial for large structured GEMM tiles.
 5. **nsys GPU projection is the only trustworthy metric** — wall-clock includes 40-60% CPU overhead on contested nodes.
 6. **Official BF16 needs `z.backward(dout)`** not `z.sum().backward()` — the latter produces non-contiguous gradients that fail quack assertions.
-7. **Stream parallelism has diminishing returns** — z-dequant (130µs) overlaps with dout-quant+gather (83µs), saving ~47µs. But adding more work to the overlap window (s.float() 28µs) only hides, doesn't save.
-8. **GPU contention invalidates profiling data** — node 0344 (4/8 idle) showed 6609µs BF16 per-iter; same workload on fully idle 0342 was 3932µs (1.68× inflation). Always use `cluster_idle_launch.py scan` and pick 8/8 idle nodes.
-9. **FP8 weight caches dominate memory overhead** — 3 caches × 3 weights × ~72MB each ≈ 650 MiB, outweighing Z FP8 savings (186 MiB). At production Ernie shape, FP8 peak > BF16 peak by 502 MiB.
+7. **Stream parallelism has diminishing returns** — z-dequant (130µs) overlaps with dout-quant+gather (83µs), saving ~47µs. But adding more work to the overlap window only hides, doesn't save.
+8. **GPU contention invalidates profiling data** — node 0344 (4/8 idle) showed 6609µs BF16; same on fully idle 0342 was 3932µs (1.68× inflation). Always use 8/8 idle nodes.
+9. **FP8 weight caches dominate memory overhead** — 3 caches × 3 weights × ~72MB each ≈ 650 MiB, outweighing Z FP8 savings (186 MiB).
 10. **nsys needs manual install on remote nodes** — `dpkg -i .../NsightSystems-linux-cli-public-2025.1.1.131-3554042.deb` required before profiling.
+11. **E8M0 scales encode BF16 magnitude, NOT FP8 magnitude** — You cannot reconstruct blockscaled scales from FP8 data. Scales must be computed from the original BF16 source and stored alongside FP8 data. `compute_scales_from_fp8_and_pack` was fundamentally wrong.
+12. **PostAct FP8 from GemmGated has no ISA-packed scales** — CUTLASS clamp-casts without producing blockscaled metadata. Must still call `quantize_and_pack_activation(y1)` separately.
+13. **Test isolation matters** — `enable_native_fp8()` modifies process-global state. Native FP8 tests must run in a separate pytest invocation from frontier tests.

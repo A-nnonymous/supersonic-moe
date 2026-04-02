@@ -1,14 +1,14 @@
 # Blockscaled FP8 MoE — Handoff
 
-> **Last updated:** 2026-04-02 (Session 33 — authoritative benchmarks on fully idle node 0342)
-> **Branch:** `fork-main-sync`
-> **Status:** FP8 frontier is **1.066× faster** than official BF16 on GPU projection at Ernie production shape (fully idle node). FP8 peak memory is ~502 MiB higher than BF16 due to weight caches. Precision verified (**31/31** tests pass).
+> **Last updated:** 2026-04-02 (Session 34 — native FP8 exploration + frontier cleanup)
+> **Branches:** `fork-main-sync` (frontier FP8), `native-fp8-exploration` (native FP8 prototype + this handoff)
+> **Status:** FP8 frontier is **1.066× faster** than official BF16 on GPU projection at Ernie production shape (fully idle node). Native FP8 prototype implemented but **functionally identical** to frontier — true native FP8 requires deeper redesign. FP8 peak memory is ~502 MiB higher than BF16 due to weight caches. Precision verified (**31/31 + 12/12** tests pass).
 
 ---
 
 ## 0. One-screen summary
 
-**What works today:**
+**What works today (frontier, `fork-main-sync`):**
 - Zero-materialization FP8 forward via `GemmGatedSm100ZeroMat` (auto-selected in `gemm_gated()`)
 - Zero-materialization FP8 backward via `GemmDGatedSm100ZeroMat` (auto-selected in `gemm_dgated()`)
 - **Fused z+y1 2D-grid quant kernel** — single launch replaces 2 separate kernels (168µs combined)
@@ -18,7 +18,14 @@
 - Weight cache retention (fwd→bwd reuse, auto-invalidation via `w._version`)
 - **31/31** tests pass (11 FP8LargeProjectContractTest + 20 FP8AlignedContractTest)
 
-**Minimal flags for training:**
+**What was explored (native FP8, `native-fp8-exploration`):**
+- `enable_native_fp8()` context manager + forward path routing — **functionally works but is NOT truly native**
+- `compute_scales_from_fp8_and_pack` kernel — **fundamentally broken**, removed (see Lesson #11)
+- PostAct FP8 output from GemmGated — works but produces raw FP8 without blockscaled ISA scales
+- FP8 wgrad — **blocked** (`blockscaled_fp8_gemm_varlen` only supports `cu_seqlens_m`, wgrad needs `cu_seqlens_k + A_idx`)
+- **12/12** native FP8 tests pass (run separately from frontier tests)
+
+**Minimal flags for training (frontier):**
 ```bash
 SONIC_MOE_FP8_MODE=perf USE_QUACK_GEMM=1 python train.py
 ```
@@ -109,6 +116,41 @@ Net: 764 - 532 = 232µs → 3932→3690µs/iter (6.6% speedup on fully idle node
 
 ## 2. Cumulative Changes
 
+### Session 34: Native FP8 exploration (current branch: `native-fp8-exploration`)
+
+**Goal**: Full-chain FP8 params — x arrives as FP8, weights stored as FP8, no quantization inside MoE.
+
+**What was implemented:**
+- `enable_native_fp8()` context manager in `sonicmoe/functional/utils.py` — activates native mode + FP8 + QuACK GEMM
+- `_native_fp8_gated_forward()` in `sonicmoe/functional/__init__.py` — dedicated forward path
+- Forward routing in `_UpProjection.forward` line 712 — branches on `_native_fp8_enabled()`
+- `tools/profile_native_fp8.py` — benchmark script comparing frontier vs native FP8
+- `tests/fp8_native_params_test.py` — 12 precision/functional tests
+
+**Critical finding: current native path is functionally identical to frontier FP8.**
+The native path still calls `quantize_and_pack_activation(x)` (simulating upstream x-quant) and `precompute_weight_fp8_for_fused_gated(w1)` (cached weights). The same GEMM kernels fire. Timing comparison on fully idle node 0263 (30 warmup, 3 trials × 30 iters):
+
+| Config | µs/iter (min) | vs BF16 |
+|--------|--------------|---------|
+| BF16 QuACK | 3877 | — |
+| FP8 Frontier | 3935 | 0.985× |
+| Native FP8 | 3962 | 0.979× |
+
+Native ≈ Frontier within noise (0.993×). No meaningful latency or memory improvement.
+
+**Why the initial approach was wrong:**
+1. `compute_scales_from_fp8_and_pack` kernel was fundamentally broken — E8M0 scales encode the original BF16 magnitude range, not the clamped FP8 range. Computing scales from FP8 data produces scales off by ~12.8 bytes on average → total numerical garbage. **Removed.**
+2. PostAct FP8 from GemmGated: CUTLASS clamp-casts float32→FP8 without producing blockscaled ISA scales. The missing scales made the y1 FP8 unusable for blockscaled GEMM.
+3. x is still BF16 in MoE.forward() — we quantize inside MoE, not upstream.
+4. Weights still stored as BF16 nn.Parameters — `precompute_weight_fp8*` caches are populated, not bypassed.
+
+**True native FP8 requires (plan in `.claude/plans/shiny-beaming-knuth.md`):**
+1. `NativeFP8Params` dataclass holding pre-computed FP8 weight views for all 4 GEMM paths
+2. `MoE.prepare_native_fp8()` + `MoE.refresh_native_fp8()` for weight buffer lifecycle
+3. `MoE.forward(x_fp8_data=..., x_fp8_scales=...)` API for pre-quantized x input
+4. Thread params through call chain, skip all `precompute_weight_fp8*` and `quantize_and_pack_activation(x)` calls
+5. Estimated savings: **~60µs** (x-quant) latency, **~480 MiB** memory (eliminate weight cache overhead)
+
 ### Session 33: Authoritative benchmarks on fully idle node
 
 - **Benchmark node**: 0342 (10.51.203.75, 8/8 GPUs idle, 0% utilization)
@@ -164,6 +206,7 @@ Net: 764 - 532 = 232µs → 3932→3690µs/iter (6.6% speedup on fully idle node
 | Approach | Result | Root cause |
 |----------|--------|------------|
 | **FP8 wgrad** | +0.9ms net | Colwise quant SM contention + layout permute ~637µs |
+| **FP8 wgrad via varlen** | Blocked | `blockscaled_fp8_gemm_varlen` only supports `cu_seqlens_m`, wgrad needs `cu_seqlens_k + A_idx` |
 | **Eliminate z-dequant by feeding FP8 z to GemmDGated** | Blocked | CUTLASS asserts `PreAct.element_size()==2` (bf16 required) |
 | **Fuse dz-quant into GemmDGated epilogue** | Blocked | Same CUTLASS PreAct constraint |
 | **TMA for quant kernel scale writes** | 2.3× slower | Descriptor setup overhead > 6MB data volume |
@@ -172,6 +215,8 @@ Net: 764 - 532 = 232µs → 3932→3690µs/iter (6.6% speedup on fully idle node
 | **FP8 down-proj at I=1536** | No net win | Quant cost ≈ GEMM savings at small I |
 | **torch.as_strided for fake TK shape** | RuntimeError | PyTorch storage bounds check |
 | **Rowwise quant + strided view** | Not possible | HW requires contiguous K groups |
+| **compute_scales_from_fp8_and_pack** | Numerical garbage | E8M0 scales encode BF16 magnitude, not FP8 magnitude. Mean error ~12.8 bytes. |
+| **PostAct FP8 for blockscaled down-proj** | Scale mismatch | CUTLASS PostAct FP8 clamp-casts without producing ISA-packed blockscaled scales |
 
 ---
 
@@ -179,46 +224,40 @@ Net: 764 - 532 = 232µs → 3932→3690µs/iter (6.6% speedup on fully idle node
 
 | File | Role |
 |------|------|
-| `sonicmoe/functional/__init__.py` | Main FP8 logic — forward, backward, stream parallelism |
+| `sonicmoe/functional/__init__.py` | Main FP8 logic — forward, backward, stream parallelism, native FP8 branch |
+| `sonicmoe/functional/utils.py` | `enable_fp8()`, `enable_native_fp8()`, `enable_quack_gemm()` context managers |
 | `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` | Triton quant/dequant kernels, fused z+y1 kernel, weight caches |
 | `sonicmoe/quack_utils/gemm_sm100_fp8_zeromat.py` | Zero-mat CUTLASS kernel classes |
 | `sonicmoe/quack_utils/gemm_gated.py` | GemmGated dispatch (auto ZeroMat selection) |
 | `sonicmoe/quack_utils/gemm_dgated.py` | GemmDGated dispatch (auto ZeroMat selection) |
 | `sonicmoe/quack_utils/swiglu_triton.py` | Dequant kernel, SwiGLU fused variants |
+| `sonicmoe/moe.py` | MoE class, `prefetch_all_fp8_weights()`, `forward()` |
 | `tests/fp8_large_project_contract_test.py` | **31 tests** (11 project + 20 aligned) |
+| `tests/fp8_native_params_test.py` | **12 tests** for native FP8 (run separately) |
 | `tools/profile_both.py` | Dual-env nsys profiling (official BF16 + FP8 fork) |
+| `tools/profile_native_fp8.py` | Native FP8 vs frontier benchmark |
 | `tools/_profiling_runner.sh` | Unified SSH profiling runner (nsys, memory, tests) |
-| `tools/gpu_projection_benchmark.py` | nsys benchmark with NVTX markers |
 | `tools/cluster_idle_launch.py` | Find idle GPU nodes for clean benchmarks |
 
 ---
 
 ## 5. Validation
 
-**31/31 tests pass** (~285s on B200):
+**31/31 frontier tests + 12/12 native tests** (run separately, ~50s each on B200):
 ```bash
 source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate
 cd /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe
+
+# Frontier tests (31 tests)
 CUDA_VISIBLE_DEVICES=<gpu> USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
   python -m pytest tests/fp8_large_project_contract_test.py -v --tb=short
+
+# Native FP8 tests (12 tests — MUST run separately to avoid global state leak)
+CUDA_VISIBLE_DEVICES=<gpu> USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
+  python -m pytest tests/fp8_native_params_test.py -v --tb=short
 ```
 
-Or via the profiling runner on a remote idle node:
-```bash
-ssh <idle_node> "bash tools/_profiling_runner.sh test <gpu_id>"
-```
-
-Test coverage by optimization:
-| Optimization | Tests |
-|-------------|-------|
-| Fused z+y1 2D quant | `fused_z_save_y1_quant_matches_separate_multi_shape`, `_roundtrip_precision`, `_full_moe_forward_backward_multi_shape` |
-| Stream parallelism | `stream_parallel_backward_deterministic` |
-| s.float() pre-cast | `backward_s_float_precast_precision` |
-| Zero-mat fwd/bwd | `forward_precision`, `backward_precision`, `production_shape_all_gradients` |
-| Z FP8 save/restore | `z_fp8_save_precision`, `z_quant_blockscaled_roundtrip` |
-| Weight quant + cache | `triton_weight_quant_matches_eager`, `weight_cache_*`, `cache_retention_*` |
-| Memory | `fp8_memory_less_than_bf16` |
-| Full production | `production_shape_all_gradients`, `use_fp8_production_shape` |
+**WARNING:** Do NOT run both test files in the same pytest invocation. The `enable_native_fp8()` context manager modifies process-global state (`_IS_NATIVE_FP8`, `_IS_FP8_ACTIVE`, `_IS_USING_QUACK_GEMM`) that leaks between test classes.
 
 ---
 
@@ -233,32 +272,65 @@ The FP8 pipeline has a fundamental constraint: **CUTLASS GemmDGated requires bf1
 2. Larger I (FP8 advantage scales with GEMM size — I=2048 gets ~2.35×)
 3. Custom CUTLASS epilogue for FP8 z dequant (saves 130µs/iter)
 
+### Native FP8 insight (Session 34)
+**The "simulate native by quantizing inside MoE" approach provides zero value.** Both frontier and native paths fire identical kernels. The only real savings come from:
+1. **Pre-quantizing x upstream** (outside MoE) — saves ~60µs x-quant kernel per forward
+2. **Pre-computing weight FP8 buffers at init** — saves ~480 MiB weight cache memory
+3. Neither requires a new code path in MoE forward — just (a) accept pre-quantized x as input and (b) use persistent FP8 weight buffers instead of dynamic caches
+
+**Key technical discovery:** E8M0 blockscaled scales encode the **original BF16 magnitude** used during quantization, NOT the magnitude of the resulting FP8 data. You cannot reconstruct correct scales from FP8 data alone — the scale must be computed from the BF16 source and stored alongside the FP8 data. This is why `compute_scales_from_fp8_and_pack` was fundamentally broken (every byte off by ~12.8 on average).
+
+**GEMM kernel interface:** All CUTLASS kernels (`gemm_gated`, `gemm_dgated`, `blockscaled_fp8_gemm_varlen`) accept pre-quantized FP8 weights + ISA-packed scales directly. The `precompute_weight_fp8*` functions are just convenience wrappers. If you store weights natively as FP8 + ISA-packed scales, you can bypass all weight quantization completely.
+
+### Weight flow (critical for native FP8 implementation)
+```
+Storage: c_fc.weight (E, 2I, H) bf16, c_proj.weight (E, H, I) bf16
+Permute: w1 = c_fc.weight.permute(1,2,0) → (2I, H, E) view
+         w2 = c_proj.weight.permute(1,2,0) → (H, I, E) view
+
+Forward fused gated (gemm_gated):
+  precompute_weight_fp8_for_fused_gated(w1):
+    (2I,H,E) → permute(2,1,0).mT.contiguous() → (E, 2I, H) contiguous
+    quantize → fp8 (E,2I,H) + ISA scales along K=H
+    return .mT view: (E,H,2I) fp8 + scales  [cached in _FUSED_WEIGHT_CACHE]
+
+Forward down-proj (blockscaled_fp8_gemm_varlen):
+  precompute_weight_fp8(w2):
+    (H,I,E) → permute(2,0,1).contiguous() → (E,H,I) contiguous
+    quantize → fp8 (E,H,I) + ISA scales along K=I  [cached in _VARLEN_WEIGHT_CACHE]
+
+Backward actgrad (blockscaled_fp8_gemm_varlen):
+  precompute_weight_fp8(w1.permute(1,0,2)):
+    (H,2I,E) → permute(2,0,1).contiguous() → (E,H,2I) contiguous
+    quantize → fp8 (E,H,2I) + ISA scales  [cached]
+
+Backward dgated (gemm_dgated_kernel):
+  precompute_weight_fp8_for_direct_fused_dgated(w2):
+    (H,I,E) → (E,I,H) contiguous
+    quantize → fp8 (E,I,H) + ISA scales along K=H  [cached]
+
+Wgrad: ALWAYS BF16. Uses original bf16 parameters via quack.gemm().
+```
+
 ### Memory insight
-**FP8 uses more peak memory than BF16 at Ernie production shape** (+502 MiB). The Z FP8 save reduces activation memory by 186 MiB, but weight caches (3 caches × 3 weights × ~72MB each) add ~650 MiB. Possible mitigations:
-- Selective cache eviction (keep only forward cache, recompute dgated/actgrad caches)
-- Cache sharing across experts (if weight structure permits)
-- Lazy cache population (only cache on first access per training step)
+**FP8 uses more peak memory than BF16 at Ernie production shape** (+502 MiB). The Z FP8 save reduces activation memory by 186 MiB, but weight caches (3 caches × 3 weights × ~72MB each) add ~650 MiB. The true native FP8 approach would replace dynamic caches with persistent buffers (~216 MiB total), saving ~434 MiB.
 
 ### Profiling insight
 - **Always use nsys GPU projection, not wall-clock** — CPU dispatch overhead is 40-60% on contested nodes
-- **Use `tools/cluster_idle_launch.py scan`** to find idle nodes with 4+ free GPUs
+- **Use `tools/cluster_idle_launch.py scan`** to find idle nodes with 8/8 free GPUs
 - **Official BF16 baseline needs `z.backward(dout)`**, not `z.sum().backward()` (non-contiguous gradient assertion)
-- **The fused quant kernel at 167µs operates at 67% DRAM throughput** (55% of B200's 8TB/s peak) — this is near the practical limit for single-pass blockscaled quantization
-
-### ncu insight
-- The dominant quant kernel bottleneck is **L1TEX scoreboard stalls** (waiting for DRAM loads)
-- Z-scale stores had 24% excess sectors due to stride-96 byte writes — fixed with packed int32 (down to 6%)
-- `token_gather_sum_kernel` has **8-16× shared memory bank conflicts** (from `tl.sum(x_vals, axis=0)` on [BLOCK_K, BLOCK_H] tensor) — DO NOT MODIFY per user directive
+- **GPU contention invalidates profiling data** — node 0344 (4/8 idle) showed 6609µs BF16; same workload on fully idle 0342 was 3932µs (1.68× inflation). Always use fully idle nodes.
+- **nsys install**: `dpkg -i /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/NsightSystems-linux-cli-public-2025.1.1.131-3554042.deb` (required once per node restart)
 
 ---
 
 ## 7. Next Steps (Priority Order)
 
-1. **Investigate CUTLASS epilogue FP8 PreAct** — If GemmDGated could read FP8 z (with ISA-packed or raw E8M0 scales) and dequant in epilogue, saves 130µs/iter + 582MB I/O. This is the highest-value single optimization remaining.
+1. **True native FP8 (highest value for inference):** Implement `NativeFP8Params` dataclass + `MoE.prepare_native_fp8()` + `forward(x_fp8_data=..., x_fp8_scales=...)`. Detailed plan at `.claude/plans/shiny-beaming-knuth.md`. Expected: ~60µs latency savings + ~480 MiB memory savings. All GEMM kernels already accept pre-quantized FP8 weights — just need to thread the pre-computed buffers through.
 
-2. **Reduce FP8 weight cache memory** — FP8 peak is 502 MiB above BF16. Selective cache eviction or lazy population could close this gap while retaining most of the speed benefit.
+2. **Investigate CUTLASS epilogue FP8 PreAct** — If GemmDGated could read FP8 z (with ISA-packed or raw E8M0 scales) and dequant in epilogue, saves 130µs/iter + 582MB I/O. Highest-value single optimization remaining.
 
-3. **FP8 wgrad revisited at E=8, K=8** — Previous dead-end was at E=128, K_per_expert=256. At Ernie shape E=8, K_per_expert=8192, the layout overhead might be amortized. Worth re-profiling.
+3. **Reduce FP8 weight cache memory (if NOT doing native FP8)** — Selective cache eviction or lazy population could close the 502 MiB gap while retaining most of the speed benefit.
 
 4. **Larger I shapes** — FP8 advantage scales with GEMM size. At I=2048+, expect 1.3-2.4× speedup.
 
@@ -274,27 +346,15 @@ BF16 env: /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/offici
 FP8 codebase: /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe
 BF16 codebase: /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/official/sonic-moe
 Profiling output: /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/output/sonic-moe-profiling/
-Session 33 data: /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/output/sonic-moe-profiling/session33_0342/
+Session 33 data: .../session33_0342/ (nsys BF16+FP8, mem BF16+FP8, test results)
+Session 34 data: .../session33_native/ (nsys native FP8, timing, precision, memory)
 ```
 
-### Profiling commands
-
+### Idle node discovery
 ```bash
-# Install nsys on remote node first (required once per node restart)
-ssh <idle_node> "dpkg -i /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/NsightSystems-linux-cli-public-2025.1.1.131-3554042.deb"
-
-# Unified profiling runner (handles env activation + codebase switching)
-ssh <idle_node> "bash tools/_profiling_runner.sh nsys_official_bf16 0"  # BF16 on GPU0
-ssh <idle_node> "bash tools/_profiling_runner.sh nsys_fp8_frontier 1"  # FP8 on GPU1
-ssh <idle_node> "bash tools/_profiling_runner.sh mem_fp8 2"            # FP8 memory
-ssh <idle_node> "bash tools/_profiling_runner.sh mem_bf16 3"           # BF16 memory
-ssh <idle_node> "bash tools/_profiling_runner.sh test 4"               # 31 tests
-
-# Analysis
-source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate
-python tools/nsys_full_breakdown.py <sqlite_file> --labels <label>
-
-# Tests (direct)
-CUDA_VISIBLE_DEVICES=<gpu> USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
-  python -m pytest tests/fp8_large_project_contract_test.py -v --tb=short
+# Always use this before profiling
+python tools/cluster_idle_launch.py scan
+# Pick nodes with 8/8 idle GPUs (0% utilization)
+# Verified idle nodes as of session 34: 0263 (10.95.252.148), 0267 (10.51.203.76), 0350 (10.51.195.19)
 ```
+
