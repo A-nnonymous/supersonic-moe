@@ -477,11 +477,10 @@ def quantize_activation_blockscaled_fast(
     fp8_out = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=x.device)
     scale_out = torch.empty(M, num_groups, dtype=torch.uint8, device=x.device)
 
-    # Process 4 rows × all-groups-per-block to maximize work per block.
-    # For (65536, 4096): 128 groups per row, GROUPS_PER_BLOCK=128 → 1 col-block.
-    # Grid: (16384, 1) = 16K blocks, each processing 4×128 groups = 16K elements.
-    BLOCK_ROWS = 16  # Production-shape: 0.099ms (BR=16) vs 0.809ms (BR=1), 8.2x faster
-    GROUPS_PER_BLOCK = min(num_groups, 128)
+    # 2D grid: (row_blocks, col_blocks) for better SM utilization.
+    # BR=32, GPB=12 → ~16K blocks → 43% peak BW on B200 (vs 22% with BR=16, GPB=all).
+    BLOCK_ROWS = 32
+    GROUPS_PER_BLOCK = min(num_groups, 12)
     grid = (_div_up(M, BLOCK_ROWS), _div_up(num_groups, GROUPS_PER_BLOCK))
     _quantize_flat_blockscaled_kernel[grid](
         x,

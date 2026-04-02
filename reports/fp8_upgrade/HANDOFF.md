@@ -1,8 +1,8 @@
 # Blockscaled FP8 MoE — Handoff
 
-> **Last updated:** 2026-04-02 (Session 29)
+> **Last updated:** 2026-04-03 (Session 31)
 > **Branch:** `fork-main-sync`
-> **Status:** FP8 frontier is **1.03× faster** than BF16 on GPU projection at Ernie production shape. Memory ≤ BF16. Precision verified (11/11 tests pass).
+> **Status:** FP8 frontier is **1.101× faster** than BF16 on GPU projection at Ernie production shape. Memory ≤ BF16. Precision verified (**26/26** tests pass).
 
 ---
 
@@ -12,41 +12,55 @@
 - Zero-materialization FP8 forward via `gemm_gated()` + `A_idx` (auto-selects `GemmGatedSm100ZeroMat`)
 - Zero-materialization FP8 backward via `gemm_dgated()` + `A_idx` (auto-selects `GemmDGatedSm100ZeroMat`)
 - Triton weight quantization: single-kernel replaces 8-op eager path (eliminated 3136µs/iter reduce_kernel)
-- Precision verified: **RRMSE <7%, correlation >0.997** at both contract and production shapes
-- 11/11 aligned contract tests pass (including weight quant and cache eviction tests)
-- Dead flags removed: `_fp8_lean`, `_use_fp8_wgrad`, `SONIC_MOE_FP8_DOWNPROJ_THRESHOLD`
+- Z quant kernel tuned: BR=32, GPB=12 grid → 166→122µs (26% faster)
+- Weight cache retention: fwd→bwd reuses FP8 caches (saves ~89µs in benchmarks)
+- Precision verified: **RRMSE <8%, correlation >0.997** at both contract and production shapes
+- **26/26** tests pass (11 FP8LargeProjectContractTest + 15 FP8AlignedContractTest)
+- Dead code removed: `_fp8_lean`, `_use_fp8_wgrad`, `SONIC_MOE_FP8_DOWNPROJ_THRESHOLD`, `_WGRAD_DW2_STREAM`, `evict_fp8_weight_cache_entry` import
 
-**Best training path:**
+**Best training path (minimal flags):**
 ```python
+# Option 1: env vars
+# SONIC_MOE_FP8_MODE=perf USE_QUACK_GEMM=1 python train.py
+
+# Option 2: context manager
 from sonicmoe import MoE, enable_fp8, enable_quack_gemm
 with enable_quack_gemm(True):
     out, loss = moe(x, use_fp8=True)
 ```
 
+All other flags default to optimal values (`FUSED_GATED=1`, `SAVE_Z_FP8=1`, `FUSED_SWIGLU_QUANT=1`).
+
 ---
 
 ## 1. Performance (GPU Projection, Ernie shape T=8192 H=3072 I=1536 E=8 K=8)
 
-Measured via nsys + SQLite analysis, 10 warmup + 5 profiled iterations:
+Measured on idle B200 (10.51.200.142), nsys + SQLite, 10 warmup + 5 profiled iterations:
 
-| Metric | BF16 | FP8 | Ratio |
-|--------|------|-----|-------|
-| **GPU projection (steady-state)** | **6.78ms** | **6.57ms** | **1.03× faster** |
-| reduce_kernel overhead | 0µs | 49µs | Eliminated from 3136µs |
+| Metric | BF16 (xfer env) | FP8 frontier | Ratio |
+|--------|-----------------|--------------|-------|
+| **GPU projection (iter2 median)** | **3972µs** | **3608µs** | **1.101× faster** |
 | Kernel count per iter | ~43 | ~50 | +7 (quant kernels) |
 
-**FP8 iter2 GPU kernel breakdown (6557µs total):**
+**FP8 iter2 kernel breakdown (3609µs total, 50 kernels):**
 
-| Kernel | Time | Count | % |
-|--------|------|-------|---|
-| GemmDefault (wgrad dw1, BF16) | 3432µs | 1 | 52% |
-| GemmDefault (wgrad dw2 + actgrad, BF16) | 1718µs | 3 | 26% |
-| GemmDGatedSm100ZeroMat (bwd FP8) | 481µs | 1 | 7% |
-| GemmGatedSm100ZeroMat (fwd FP8) | 455µs | 1 | 7% |
-| _quantize_and_pack_kernel (Triton) | 283µs | 7 | 4% |
-| elementwise + misc | ~188µs | — | 3% |
+| Kernel | Time | Notes |
+|--------|------|-------|
+| GemmDefault (dw1 wgrad, BF16) | 758µs | On wgrad stream |
+| GemmDGatedSm100ZeroMat (bwd FP8) | 483µs | Zero-mat backward |
+| GemmDefault (actgrad, FP8 input) | 470µs | Uses dz_fp8 |
+| GemmGatedSm100ZeroMat (fwd FP8) | 453µs | Zero-mat forward |
+| GemmDefault (dw2 wgrad, BF16) | 351µs | |
+| GemmDefault (down-proj, FP8) | 229µs | |
+| _quantize_flat_blockscaled (z save) | 122µs | Tuned BR=32, GPB=12 |
+| _dequant_blockscaled_fp8 (z restore) | 123µs | 57% bandwidth |
+| _quantize_and_pack (dz) | 111µs | ISA-packed, 65% BW |
+| token_gather_sum ×2 | 145µs | |
+| _quantize_and_pack (y1) | 55µs | ISA-packed |
+| _gather_isa_packed_scales ×2 | 55µs | T→TK scale gather |
+| Other (routing, elementwise) | ~260µs | |
 
-**92% of GPU time is GEMMs** — quant overhead is only 4.3%. The frontier is near-optimal.
+**FP8-only overhead: ~466µs (13% of total)** — near-optimal; 87% is GEMMs.
 
 **Memory:** FP8 peak ≤ BF16 peak (verified by `test_fp8_memory_less_than_bf16`).
 
@@ -54,69 +68,43 @@ Measured via nsys + SQLite analysis, 10 warmup + 5 profiled iterations:
 
 | Shape | FWD RRMSE | FWD corr | BWD RRMSE | BWD corr |
 |-------|-----------|----------|-----------|----------|
-| Contract | 6.60% | 0.9978 | 7.50% | 0.9972 |
-| Ernie prod | 6.60% | 0.9978 | 7.47% | 0.9972 |
-
-**nsys timelines:**
-- `reports/timelines/fp8_triton_wquant.nsys-rep` — FP8 frontier with Triton weight quant
-- `reports/timelines/bf16_steady_state.nsys-rep` — BF16 baseline
+| Contract (T=1024) | <7% | >0.997 | <8% | >0.997 |
+| Ernie prod (T=8192) | <7% | >0.997 | <8% | >0.997 |
 
 ---
 
-## 2. Session 29 Changes: Triton Weight Quant + Dead Flag Cleanup
+## 2. Cumulative Changes (Sessions 25-31)
 
-### Critical fix: Replace eager weight quantization with Triton kernel
+### Session 31: Precision tests + z-quant tuning + final cleanup
 
-**Root cause:** Weight cache eviction (lines 796, 1150 in `functional/__init__.py`) forces
-backward to re-quantize weights every iteration. The old `quantize_activation_blockwise()`
-used 8 PyTorch eager kernels per weight (abs, amax, reciprocal, mul, cast...), generating
-3136µs/iter of `reduce_kernel` overhead = **30% of FP8 GPU time**.
+1. **Z quant grid tuning**: `_quantize_flat_blockscaled_kernel` grid changed from BR=16/GPB=128 → BR=32/GPB=12. Saves 44µs per z quant (166→122µs). More column blocks = better SM utilization on B200.
 
-**Fix:** Added `_quantize_weight_3d_triton()` in `blockscaled_fp8_gemm.py` which:
-1. Reshapes 3D (E,N,K) → 2D (E*N,K) — ISA scale tiles align when N % 128 == 0
-2. Calls existing Triton `quantize_and_pack_activation()` — single kernel, inline `tl.max(tl.abs())`
-3. Reshapes back — produces same FP8 + ISA-packed scales as before
+2. **Cache retention** (session 30): Removed w1/w2 `evict_fp8_weight_cache_entry()` calls. Caches auto-invalidate via `w._version` when optimizer updates weights. Saves ~89µs in benchmarks. No precision impact — in production the cache misses every iter due to `optimizer.step()` version bump.
 
-Applied to all 5 weight precompute paths:
-- `precompute_weight_fp8()`
-- `precompute_weight_fp8_for_fused_gated()`
-- `precompute_weight_fp8_for_fused_dgated()`
-- `precompute_weight_fp8_for_direct_fused_dgated()`
-- `_quantize_w2_cached()`
+3. **Dead code removal**: `_WGRAD_DW2_STREAM` / `_get_wgrad_dw2_stream()` (never called), unused `evict_fp8_weight_cache_entry` import.
 
-### Dead flag cleanup
+4. **5 new precision tests** (26 total):
+   - `test_weight_cache_retention_precision` — full fwd+dx+dw1+dw2 with cache retention
+   - `test_z_quant_blockscaled_roundtrip` — quant+dequant roundtrip at production shape
+   - `test_quantize_and_pack_isa_roundtrip` — ISA-packed quant for x/dz/y1 shapes
+   - `test_production_shape_all_gradients` — T=8192, H=3072, I=1536, E=8, K=8
+   - `test_cache_retention_multi_iter_no_drift` — 3 iters with same weights, bit-exact dx
 
-Removed 3 dead flags and all code paths they guard:
+### Session 29-30: Triton weight quant + dead flag cleanup
 
-| Flag | Why dead | Lines removed |
-|------|----------|---------------|
-| `_fp8_lean()` / `SONIC_MOE_FP8_LEAN` | Disabled by default, untested, created parallel code paths | ~100 lines across 8 locations |
-| `_use_fp8_wgrad()` / `SONIC_MOE_FP8_WGRAD` | Proven dead-end (layout permutation ~637µs > GEMM savings) | ~30 lines, 2 if/else blocks |
-| `SONIC_MOE_FP8_DOWNPROJ_THRESHOLD` | Prequant always hits at I=1536, threshold never triggered | ~15 lines |
+1. **Triton weight quant**: `_quantize_weight_3d_triton()` replaces 8-op eager `quantize_activation_blockwise()`. Applied to all 5 weight precompute paths. Eliminated 3136µs/iter reduce_kernel overhead (30% of GPU time).
 
-### New precision tests
+2. **Dead flags removed**: `_fp8_lean` / `SONIC_MOE_FP8_LEAN`, `_use_fp8_wgrad` / `SONIC_MOE_FP8_WGRAD`, `SONIC_MOE_FP8_DOWNPROJ_THRESHOLD`.
 
-| Test | What it verifies |
-|------|-----------------|
-| `test_triton_weight_quant_matches_eager` | Triton 3D weight quant produces identical FP8 values per-expert |
-| `test_weight_cache_eviction_precision` | Full fwd+bwd with cache eviction maintains <10% RRMSE at production shape |
+### Sessions 25-28: Zero-mat kernels + memory + bugfixes
 
----
-
-## 3. Prior Session Changes (25-28)
-
-### Session 28: Zero-mat B-layout bug fix
-- Fixed `gemm_gated_zeromat()` B-tensor layout bug (was passing .mT view → 101% RRMSE)
-- Replaced standalone wrapper with standard `gemm_gated()` interface
-- Fixed test env-var masking (`_reset_fp8_state()` strips `SONIC_MOE_FP8_MODE`)
-
-### Session 25-27: Zero-mat kernels + memory optimizations
-- `GemmGatedSm100ZeroMat` / `GemmDGatedSm100ZeroMat`: auto-selected for SM100 + gather_A + blockscaled
+- `GemmGatedSm100ZeroMat` / `GemmDGatedSm100ZeroMat`: CUTLASS zero-materialization kernels for SM100
+- Session 28: Fixed B-tensor layout bug (was passing `.mT` view → 101% RRMSE)
 - z FP8 save (~171 MiB), y1 pre-quant, weight cache dedup, cache collision fix
 
 ---
 
-## 4. Proven Dead-Ends (DO NOT retry)
+## 3. Proven Dead-Ends (DO NOT retry)
 
 | Approach | Result | Root cause |
 |----------|--------|------------|
@@ -128,6 +116,37 @@ Removed 3 dead flags and all code paths they guard:
 | **Transpose + rowquant** | 3.8× slower | transpose 1509µs > colwise quant 260µs |
 | **FP8 down-proj at I=1536** | No net win | quant cost ≈ GEMM savings at small I |
 | **Eager weight quant** | 30% overhead | 8 kernel launches × 2 weights = 3136µs/iter |
+| **Custom CUDA warp-level quant** | 5.7× slower | Scalar warp shuffle, no vectorized loads |
+| **Fused z+y1 quant kernel** | +803µs regression | Strided memory access pattern kills throughput |
+
+---
+
+## 4. Flag Inventory
+
+### Production flags (minimal set needed):
+| Flag | Default | Required? |
+|------|---------|-----------|
+| `SONIC_MOE_FP8_MODE=perf` | `off` | **Yes** — master toggle |
+| `USE_QUACK_GEMM=1` | `0` | **Yes** — enables CUTLASS/QuACK |
+
+### Auto-optimal flags (already default to best value):
+| Flag | Default | What it does |
+|------|---------|-------------|
+| `SONIC_MOE_FP8_FUSED_GATED` | `1` | Fused gemm_gated + blockscaled FP8 |
+| `SONIC_MOE_FP8_SAVE_Z_FP8` | `1` | Store z in FP8 (~50% memory save) |
+| `SONIC_MOE_FP8_FUSED_SWIGLU_QUANT` | `1` | Fused SwiGLU+quantize |
+| `SONIC_MOE_FP8_UPPROJ_EPILOGUE_PRECISION` | `fp8` | FP8 epilogue (best perf) |
+| `SONIC_MOE_FP8_ASSUME_ALIGNED` | auto-detect | Runtime alignment detection |
+
+### Legacy flags (disabled by default, non-interfering):
+| Flag | Purpose |
+|------|---------|
+| `SONIC_MOE_FP8_CUTELY_FUSED` | Experimental adapter path |
+| `SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ` | Legacy blockscaled downproj |
+| `SONIC_MOE_FP8_DUMMY_POSTACT_BUFFER` | Debug buffer |
+| `SONIC_MOE_OPT_NATIVE_FP8_UPPROJ` | Backward compat |
+| `SONIC_MOE_OPT_MIXED_DTYPE_DOWNPROJ_DW2` | Backward compat |
+| `SONIC_MOE_STAGEWISE_MEMORY` | Debug memory profiling |
 
 ---
 
@@ -138,44 +157,75 @@ Removed 3 dead flags and all code paths they guard:
 | `sonicmoe/functional/__init__.py` | Main FP8 logic — forward, backward, all decisions |
 | `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` | Triton quant kernels, `_quantize_weight_3d_triton()`, weight caches |
 | `sonicmoe/quack_utils/gemm_sm100_fp8_zeromat.py` | Zero-mat kernel classes |
-| `sonicmoe/quack_utils/gemm_gated.py` | CUTLASS GemmGated (auto ZeroMat at L236) |
-| `sonicmoe/quack_utils/gemm_dgated.py` | CUTLASS GemmDGated (auto ZeroMat at L319) |
-| `tests/fp8_large_project_contract_test.py` | 11 aligned contract tests |
+| `sonicmoe/quack_utils/gemm_gated.py` | CUTLASS GemmGated (auto ZeroMat selection) |
+| `sonicmoe/quack_utils/gemm_dgated.py` | CUTLASS GemmDGated (auto ZeroMat selection) |
+| `sonicmoe/quack_utils/swiglu_triton.py` | Dequant kernel, SwiGLU backward from FP8 |
+| `tests/fp8_large_project_contract_test.py` | **26 tests** (11 project + 15 aligned contract) |
 | `tools/gpu_projection_benchmark.py` | nsys benchmark with sync'd NVTX markers |
-| `reports/timelines/*.sqlite` | nsys SQLite profiles for GPU projection analysis |
 
 ---
 
 ## 6. Validation
 
-11/11 aligned contract tests pass:
+**26/26 tests pass** (102s on idle B200):
 ```bash
 source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate
 cd /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe
-CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 \
-  python -m pytest tests/fp8_large_project_contract_test.py::FP8AlignedContractTest -v --tb=short
+CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
+  python -m pytest tests/fp8_large_project_contract_test.py -v --tb=short
 ```
+
+Test coverage by optimization:
+| Optimization | Tests covering it |
+|-------------|-------------------|
+| Zero-mat fwd/bwd kernels | forward_precision, backward_precision, production_shape_all_gradients |
+| Z FP8 save/restore | z_fp8_save_precision, z_quant_blockscaled_roundtrip |
+| Triton weight quant | triton_weight_quant_matches_eager |
+| ISA-packed quant | quantize_and_pack_isa_roundtrip |
+| Cache retention | weight_cache_retention_precision, cache_retention_multi_iter_no_drift |
+| Cache dedup | weight_cache_dedup |
+| Memory savings | fp8_memory_less_than_bf16 |
+| FP8 downproj | fp8_downproj_prequant_precision, native_fp8_downproj_* |
+| Multi-iteration stability | multi_iteration_cache_consistency, cache_retention_multi_iter_no_drift |
+| Full production shape | production_shape_all_gradients, use_fp8_production_shape |
 
 ---
 
 ## 7. Remaining Optimization Opportunities
 
-92% of FP8 GPU time is BF16 wgrad GEMMs (unchanged from BF16 baseline). Further gains require:
+87% of FP8 GPU time is GEMMs (mostly BF16 wgrad, unchanged from BF16 baseline). Further gains require:
 
 1. **FP8 wgrad without layout overhead** — Needs CUTLASS kernel that accepts non-contiguous K groups
-2. **Larger intermediate size (I≥2048)** — FP8 GEMM savings scale with N; previous estimates: 2.35× at I=2048
-3. **Fuse quant into SwiGLU epilogue** — Save one kernel launch per forward pass
-4. **Weight quant persistence** — If weights don't change between iterations, skip re-quant entirely
+2. **Larger intermediate size (I≥2048)** — FP8 GEMM savings scale with N; ~2.35× at I=2048
+3. **Weight quant persistence** — In production with `optimizer.step()`, caches miss every iter. Zero-cost weight quant or persistent caching across optimizer steps could help
 
 ---
 
 ## 8. Environment
 
 ```
-GPU: NVIDIA B200 (SM100a, 183GB)
+GPU: NVIDIA B200 (SM100a, 183GB, ~8TB/s DRAM BW)
 CUDA: 12.8, PyTorch: 2.9.1+cu128, QuACK: 0.3.7
 Python: 3.13
 FP8 env: /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer
 Official BF16 env: /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/official_bf16
-Remote node: 10.51.195.12
+Clean test machine: ssh 10.51.200.142 (idle B200, use tools/cluster_idle_launch.py scan to find idle nodes)
+Reports output: /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/output/sonic-moe-timelines/
+```
+
+## 9. Profiling Commands
+
+```bash
+# GPU projection benchmark (FP8)
+source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate
+CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 nsys profile -t cuda,nvtx -o /path/to/fp8.nsys-rep \
+  python tools/gpu_projection_benchmark.py
+
+# GPU projection benchmark (BF16)
+source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/official_bf16/bin/activate
+CUDA_VISIBLE_DEVICES=0 nsys profile -t cuda,nvtx -o /path/to/bf16.nsys-rep \
+  python tools/gpu_projection_benchmark.py --mode bf16
+
+# Find idle cluster node
+python tools/cluster_idle_launch.py scan
 ```

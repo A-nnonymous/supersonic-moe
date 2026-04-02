@@ -726,11 +726,12 @@ class FP8AlignedContractTest(TestCommons):
                     f"Expert {e} FP8 values differ for shape ({E},{N},{K})"
                 )
 
-    def test_weight_cache_eviction_precision(self) -> None:
-        """FP8 precision is maintained after weight cache eviction + re-quantization.
+    def test_weight_cache_retention_precision(self) -> None:
+        """FP8 precision is maintained with weight cache retention across fwd+bwd.
 
-        Tests the actual backward re-quantization path: forward populates cache,
-        eviction clears it, backward re-quantizes using Triton weight quant.
+        Verifies that keeping w1/w2 FP8 caches (instead of evicting after forward)
+        does not corrupt backward gradients.  The cache auto-invalidates via
+        ``w._version`` when an optimizer updates weights.
         """
         self._require_blackwell()
         self._reset_fp8_state()
@@ -748,26 +749,162 @@ class FP8AlignedContractTest(TestCommons):
             out_bf16, _ = moe(x)
         out_bf16.backward(dout)
         dx_bf16 = x.grad.clone()
+        dw1_bf16 = moe.c_fc.weight.grad.clone()
+        dw2_bf16 = moe.c_proj.weight.grad.clone()
         x.grad = None
         moe.zero_grad(set_to_none=True)
         self._reset_fp8_state()
 
-        # FP8 with cache eviction (default production path)
+        # FP8 with cache retention (current production path — no eviction)
         with enable_quack_gemm(True):
             out_fp8, _ = moe(x, use_fp8=True)
         out_fp8.backward(dout)
         dx_fp8 = x.grad.clone()
+        dw1_fp8 = moe.c_fc.weight.grad.clone()
+        dw2_fp8 = moe.c_proj.weight.grad.clone()
 
-        fwd_rrmse = self._rrmse(out_fp8, out_bf16)
-        fwd_corr = self._corr(out_fp8, out_bf16)
-        bwd_rrmse = self._rrmse(dx_fp8, dx_bf16)
-        bwd_corr = self._corr(dx_fp8, dx_bf16)
+        for name, fp8_g, bf16_g in [
+            ("dx", dx_fp8, dx_bf16),
+            ("dw1", dw1_fp8, dw1_bf16),
+            ("dw2", dw2_fp8, dw2_bf16),
+        ]:
+            rrmse = self._rrmse(fp8_g, bf16_g)
+            corr = self._corr(fp8_g, bf16_g)
+            self.assertLess(rrmse, 0.10,
+                f"cache-retain {name} RRMSE {rrmse:.4f}")
+            self.assertGreater(corr, 0.99,
+                f"cache-retain {name} corr {corr:.4f}")
 
-        self.assertLess(fwd_rrmse, 0.10,
-            f"cache-evict fwd RRMSE {fwd_rrmse:.4f}")
-        self.assertGreater(fwd_corr, 0.99,
-            f"cache-evict fwd corr {fwd_corr:.4f}")
-        self.assertLess(bwd_rrmse, 0.10,
-            f"cache-evict bwd RRMSE {bwd_rrmse:.4f}")
-        self.assertGreater(bwd_corr, 0.99,
-            f"cache-evict bwd corr {bwd_corr:.4f}")
+    def test_z_quant_blockscaled_roundtrip(self) -> None:
+        """quantize_activation_blockscaled_fast + dequantize_blockscaled_fp8 round-trip.
+
+        Covers the BR=32/GPB=12 tuned kernel grid parameters.
+        Tests at both test shape and production shape.
+        """
+        self._require_blackwell()
+        from sonicmoe.quack_utils.blockscaled_fp8_gemm import (
+            quantize_activation_blockscaled_fast,
+        )
+        from sonicmoe.quack_utils.swiglu_triton import dequantize_blockscaled_fp8
+
+        for label, M, K in [("test", 2048, 768), ("prod", 65536, 3072)]:
+            with self.subTest(shape=label):
+                torch.manual_seed(42)
+                x = 0.02 * torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+
+                fp8_data, scales_e8m0 = quantize_activation_blockscaled_fast(x)
+                self.assertEqual(fp8_data.shape, (M, K))
+                self.assertEqual(fp8_data.dtype, torch.float8_e4m3fn)
+
+                x_restored = dequantize_blockscaled_fp8(
+                    fp8_data, scales_e8m0.view(torch.uint8)
+                )
+                rrmse = self._rrmse(x_restored, x)
+                corr = self._corr(x_restored, x)
+                self.assertLess(rrmse, 0.05,
+                    f"{label} z-quant roundtrip RRMSE {rrmse:.4f} >= 5%")
+                self.assertGreater(corr, 0.999,
+                    f"{label} z-quant roundtrip corr {corr:.6f} < 0.999")
+
+    def test_quantize_and_pack_isa_roundtrip(self) -> None:
+        """quantize_and_pack_activation produces valid FP8 + ISA-packed scales.
+
+        Verifies the fused quant+ISA-pack kernel at production activation shapes.
+        """
+        self._require_blackwell()
+        from sonicmoe.quack_utils.blockscaled_fp8_gemm import (
+            quantize_and_pack_activation,
+        )
+
+        for label, M, K in [("x", 8192, 3072), ("dz", 65536, 3072), ("y1", 65536, 1536)]:
+            with self.subTest(activation=label):
+                torch.manual_seed(42)
+                x = 0.02 * torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+
+                fp8_data, packed_scales = quantize_and_pack_activation(x)
+                self.assertEqual(fp8_data.shape, (M, K))
+                self.assertEqual(fp8_data.dtype, torch.float8_e4m3fn)
+                self.assertFalse(torch.all(fp8_data.view(torch.uint8) == 0).item(),
+                    f"{label}: all-zero FP8 output — quant kernel broken")
+
+                # Verify scale bytes are plausible (not all 0 or all 127)
+                scale_bytes = packed_scales.view(torch.uint8)
+                unique_scales = scale_bytes.unique().numel()
+                self.assertGreater(unique_scales, 1,
+                    f"{label}: packed scales have only {unique_scales} unique value(s)")
+
+    def test_production_shape_all_gradients(self) -> None:
+        """FP8 precision at production shape for ALL gradients: dx, dw1, dw2.
+
+        Extends test_use_fp8_production_shape to verify weight gradients.
+        """
+        self._require_blackwell()
+        self._reset_fp8_state()
+        self.set_seed(42)
+        T, H, I, E, K = 8192, 3072, 1536, 8, 8
+        moe = MoE(num_experts=E, num_experts_per_tok=K, hidden_size=H,
+                  intermediate_size=I, activation_function=ActivationType.SWIGLU,
+                  add_bias=False, std=0.02).to(device="cuda", dtype=torch.bfloat16)
+        x = (0.02 * torch.randn(T, H, device="cuda", dtype=torch.bfloat16)).detach().requires_grad_()
+        dout = 0.02 * torch.randn_like(x)
+
+        with enable_quack_gemm(True):
+            out_bf16, _ = moe(x)
+        out_bf16.backward(dout)
+        dx_bf16 = x.grad.clone()
+        dw1_bf16 = moe.c_fc.weight.grad.clone()
+        dw2_bf16 = moe.c_proj.weight.grad.clone()
+        x.grad = None
+        moe.zero_grad(set_to_none=True)
+        self._reset_fp8_state()
+
+        with enable_quack_gemm(True):
+            out_fp8, _ = moe(x, use_fp8=True)
+        out_fp8.backward(dout)
+        dx_fp8 = x.grad.clone()
+        dw1_fp8 = moe.c_fc.weight.grad.clone()
+        dw2_fp8 = moe.c_proj.weight.grad.clone()
+
+        for name, fp8_g, bf16_g in [
+            ("fwd", out_fp8, out_bf16),
+            ("dx", dx_fp8, dx_bf16),
+            ("dw1", dw1_fp8, dw1_bf16),
+            ("dw2", dw2_fp8, dw2_bf16),
+        ]:
+            rrmse = self._rrmse(fp8_g, bf16_g)
+            corr = self._corr(fp8_g, bf16_g)
+            self.assertLess(rrmse, 0.10,
+                f"prod-shape {name}: RRMSE {rrmse:.4f} >= 10%")
+            self.assertGreater(corr, 0.99,
+                f"prod-shape {name}: corr {corr:.4f} < 0.99")
+
+    def test_cache_retention_multi_iter_no_drift(self) -> None:
+        """Cache retention across 3 iterations: precision must not drift.
+
+        Without eviction, the weight cache persists.  This verifies that
+        repeated fwd+bwd passes with the same weights produce consistent
+        gradients — no cumulative error from stale cache entries.
+        """
+        self._require_blackwell()
+        self._reset_fp8_state()
+        torch.manual_seed(42)
+        moe = self._make_moe()
+        x_orig, dout = self._make_sample()
+
+        # Collect per-iteration dx gradients (same input, same weights)
+        dx_iters = []
+        for i in range(3):
+            moe.zero_grad(set_to_none=True)
+            xi = x_orig.clone().detach().requires_grad_(True)
+            with enable_quack_gemm(True):
+                out, _ = moe(xi, use_fp8=True)
+            out.backward(dout)
+            dx_iters.append(xi.grad.clone())
+            torch.cuda.synchronize()
+
+        # All iterations should produce identical dx (same weights, same input)
+        for i in range(1, 3):
+            torch.testing.assert_close(
+                dx_iters[i], dx_iters[0], rtol=0, atol=0,
+                msg=f"Iter {i} dx differs from iter 0 — cache retention drift",
+            )

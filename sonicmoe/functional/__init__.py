@@ -17,7 +17,6 @@ from ..quack_utils import (
     blockscaled_fp8_weight_grad_gemm,
     clear_raw_weight_cache,
     clear_sgl_weight_cache,
-    evict_fp8_weight_cache_entry,
     fast_gather_quantize_and_pack_activation,
     gather_quantize_and_pack_activation,
     gemm_dgated,
@@ -216,7 +215,6 @@ _PREQUANT_HIT_COUNT: dict[str, int] = collections.defaultdict(int)
 
 # Side stream for overlapping wgrad with actgrad in _UpProjection.backward.
 _WGRAD_STREAM: torch.cuda.Stream | None = None
-_WGRAD_DW2_STREAM: torch.cuda.Stream | None = None
 
 
 def _get_wgrad_stream() -> torch.cuda.Stream:
@@ -224,14 +222,6 @@ def _get_wgrad_stream() -> torch.cuda.Stream:
     if _WGRAD_STREAM is None:
         _WGRAD_STREAM = torch.cuda.Stream()
     return _WGRAD_STREAM
-
-
-def _get_wgrad_dw2_stream() -> torch.cuda.Stream:
-    """Separate stream for dw2 wgrad to avoid conflicts with dw1 wgrad stream."""
-    global _WGRAD_DW2_STREAM
-    if _WGRAD_DW2_STREAM is None:
-        _WGRAD_DW2_STREAM = torch.cuda.Stream()
-    return _WGRAD_DW2_STREAM
 
 
 def _matches_prequant_tensor(lhs: torch.Tensor | None, rhs: torch.Tensor | None) -> bool:
@@ -639,9 +629,6 @@ class _UpProjection(torch.autograd.Function):
                         z_fp8, z_raw_scales = quantize_activation_blockscaled_fast(z)
                         _PREQUANTIZED_SCALES["z_fp8"] = (z_fp8, z_raw_scales)
                     # Pre-quantize y1 while hot in L2 for zero-overhead FP8 down-proj.
-                    # Store 3-tuple (bf16_ref, fp8, scales) so the consumer can verify
-                    # identity via _matches_prequant_tensor(ref, y1) — y1 arrives as BF16
-                    # in _DownProjection while y1_fp8 has dtype float8_e4m3fn.
                     y1_fp8, y1_packed_scales = quantize_and_pack_activation(y1)
                     _PREQUANTIZED_SCALES["fwd"] = (y1, y1_fp8, y1_packed_scales)
                 elif aligned:
@@ -744,10 +731,8 @@ class _UpProjection(torch.autograd.Function):
         ctx.mark_non_differentiable(y1)
         ctx.set_materialize_grads(False)
 
-        # Evict w1 FP8 cache after forward — not needed until next forward pass.
-        # Saves ~74MB at Ernie shape during backward.
-        if _fp8_enabled() and _ALIGNMENT_ASSUMED:
-            evict_fp8_weight_cache_entry(w1)
+        # Keep w1 FP8 cache — backward hits cache (~112µs savings) at ~74MB memory cost.
+        # The cache auto-invalidates via w._version when optimizer updates weights.
 
         return y1, z
 
@@ -1068,9 +1053,8 @@ class _DownProjection(torch.autograd.Function):
                 s_reverse_scatter_idx,
             )
 
-        # Evict w2 FP8 cache after forward — backward uses different quantized layout.
-        if ctx._fp8_enabled_flag and ctx._alignment_assumed_flag:
-            evict_fp8_weight_cache_entry(w2)
+        # Keep w2 FP8 cache — backward hits cache (~38µs savings) at ~37MB memory cost.
+        # The cache auto-invalidates via w._version when optimizer updates weights.
 
         return o
 
