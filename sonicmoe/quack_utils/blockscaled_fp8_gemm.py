@@ -502,6 +502,268 @@ def quantize_activation_blockscaled_fast(
     return fp8_out, scale_out.view(torch.float8_e8m0fnu)
 
 
+# ---------------------------------------------------------------------------
+# Fused z-save + y1-quant kernel
+# ---------------------------------------------------------------------------
+# After the forward GemmGated GEMM, we need to:
+#   1. quantize z (TK, 2I) → FP8 with raw E8M0 scales  (for backward z-save)
+#   2. quantize y1 (TK, I) → FP8 with ISA-packed scales (for FP8 down-proj)
+# These share the same row dimension (TK) and are independent. Fusing them
+# into a single kernel eliminates one launch overhead and improves SM
+# utilization while both tensors are L2-hot from the GEMM output.
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _fused_z_save_y1_quant_kernel(
+    # --- z tensor (TK, 2I) → raw scales ---
+    z_src_ptr,
+    z_dst_fp8_ptr,
+    z_dst_scale_ptr,
+    z_cols,                # 2I
+    z_src_stride_row,
+    z_src_stride_col,
+    z_dst_stride_row,
+    z_dst_stride_col,
+    z_scale_stride_row,
+    z_scale_stride_col,
+    z_col_blocks,          # ceil(z_num_groups / Z_GROUPS_PER_BLOCK)
+    # --- y1 tensor (TK, I) → ISA-packed scales ---
+    y1_src_ptr,
+    y1_dst_fp8_ptr,
+    y1_dst_packed_scale_ptr,
+    y1_cols,               # I
+    y1_src_stride_row,
+    y1_src_stride_col,
+    y1_dst_stride_row,
+    y1_dst_stride_col,
+    y1_k_tiles,
+    # --- shared ---
+    rows,                  # TK
+    fp8_max: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    Z_GROUPS_PER_BLOCK: tl.constexpr,
+    SF_TILE_M: tl.constexpr,
+    SF_TILE_STORAGE: tl.constexpr,
+    Y1_GROUPS_PER_K_TILE: tl.constexpr = 4,
+):
+    """Fused quantization of z (raw E8M0) and y1 (ISA-packed E8M0).
+
+    2D grid: (row_blocks, z_col_blocks + y1_k_tiles).
+    pid_1 < z_col_blocks  → process Z_GROUPS_PER_BLOCK groups of z (raw scales)
+    pid_1 >= z_col_blocks → process 1 k-tile of y1 (ISA-packed scales)
+
+    Ernie shape: grid=(2048, 8+12)=(2048, 20) = 40960 blocks
+    vs old 1D: (2048,) = 2048 blocks → 20× more parallelism.
+    """
+    row_base = tl.program_id(0) * BLOCK_ROWS
+    work_id = tl.program_id(1)
+    row_ids = row_base + tl.arange(0, BLOCK_ROWS)
+    row_mask_1d = row_ids < rows
+
+    if work_id < z_col_blocks:
+        # ---- Z path: quantize Z_GROUPS_PER_BLOCK groups with raw E8M0 scales ----
+        # Scale store optimization: accumulate 4 consecutive group bytes into
+        # uint32, then write as int32 into row-major scale buffer. This reduces
+        # 12 byte stores to 3 uint32 stores per block, improving store throughput.
+        group_base = work_id * Z_GROUPS_PER_BLOCK
+
+        for g4 in range(Z_GROUPS_PER_BLOCK // 4):
+            packed_z_scale_i32 = tl.zeros([BLOCK_ROWS], dtype=tl.int32)
+            for g_inner in range(4):
+                g = g4 * 4 + g_inner
+                group_id = group_base + g
+                col_offsets = group_id * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+                col_mask = col_offsets[None, :] < z_cols
+                mask = row_mask_1d[:, None] & col_mask
+
+                src_ptrs = z_src_ptr + row_ids[:, None] * z_src_stride_row + col_offsets[None, :] * z_src_stride_col
+                values = tl.load(src_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+                block_amax = tl.max(tl.abs(values), axis=1)
+                amax_bits = block_amax.to(tl.int32, bitcast=True)
+                biased_exp = (amax_bits >> 23) & 0xFF
+                mantissa_bits = amax_bits & 0x7FFFFF
+                carry = tl.where(mantissa_bits > 0x600000, 1, 0)
+                e8m0_i32 = biased_exp - 8 + carry
+                e8m0_i32 = tl.where(biased_exp > 0, e8m0_i32, 0)
+                e8m0_byte = tl.maximum(e8m0_i32, 0)
+
+                quant_biased_exp = 254 - e8m0_i32
+                quant_biased_exp = tl.maximum(tl.minimum(quant_biased_exp, 254), 1)
+                quant_scale = (quant_biased_exp.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+
+                quantized = (values * quant_scale[:, None]).to(tl.float8e4nv)
+                dst_ptrs = z_dst_fp8_ptr + row_ids[:, None] * z_dst_stride_row + col_offsets[None, :] * z_dst_stride_col
+                tl.store(dst_ptrs, quantized, mask=mask)
+
+                # Pack scale byte into uint32 (little-endian: byte 0 at bits[0:8])
+                packed_z_scale_i32 = packed_z_scale_i32 | ((e8m0_byte & 0xFF) << (g_inner * 8))
+
+            # Write 4 packed scale bytes as uint32 into row-major scale buffer.
+            # Address = base + row * num_groups + (group_base + g4*4), cast to int32.
+            z_scale_i32_ptr = z_dst_scale_ptr.to(tl.pointer_type(tl.int32))
+            # z_scale_stride_row is num_groups in bytes; divide by 4 for int32 stride
+            z_scale_i32_stride_row = z_scale_stride_row // 4
+            scale_i32_offset = (group_base + g4 * 4) // 4
+            tl.store(
+                z_scale_i32_ptr + row_ids * z_scale_i32_stride_row + scale_i32_offset,
+                packed_z_scale_i32,
+                mask=row_mask_1d,
+            )
+    else:
+        # ---- Y1 path: quantize 1 k-tile (Y1_GROUPS_PER_K_TILE groups) with ISA-packed scales ----
+        k_tile_idx = work_id - z_col_blocks
+
+        # Pre-compute row-dependent ISA layout
+        row_tiles = row_ids // SF_TILE_M
+        row_in_tile = row_ids % SF_TILE_M
+        row_base_offset = (row_in_tile % 32) * 16 + (row_in_tile // 32) * 4
+
+        packed_scale_i32 = tl.zeros([BLOCK_ROWS], dtype=tl.int32)
+
+        for g in range(Y1_GROUPS_PER_K_TILE):
+            group_id = k_tile_idx * Y1_GROUPS_PER_K_TILE + g
+            col_offsets = group_id * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+            col_mask = col_offsets[None, :] < y1_cols
+            mask = row_mask_1d[:, None] & col_mask
+
+            src_ptrs = y1_src_ptr + row_ids[:, None] * y1_src_stride_row + col_offsets[None, :] * y1_src_stride_col
+            values = tl.load(src_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+            block_amax = tl.max(tl.abs(values), axis=1)
+            amax_bits = block_amax.to(tl.int32, bitcast=True)
+            biased_exp = (amax_bits >> 23) & 0xFF
+            mantissa_bits = amax_bits & 0x7FFFFF
+            carry = tl.where(mantissa_bits > 0x600000, 1, 0)
+            e8m0_i32 = biased_exp - 8 + carry
+            e8m0_i32 = tl.where(biased_exp > 0, e8m0_i32, 0)
+            e8m0_clamped = tl.maximum(e8m0_i32, 0)
+
+            quant_biased_exp = 254 - e8m0_i32
+            quant_biased_exp = tl.maximum(tl.minimum(quant_biased_exp, 254), 1)
+            quant_scale = (quant_biased_exp.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+            quantized = (values * quant_scale[:, None]).to(tl.float8e4nv)
+
+            dst_ptrs = y1_dst_fp8_ptr + row_ids[:, None] * y1_dst_stride_row + col_offsets[None, :] * y1_dst_stride_col
+            tl.store(dst_ptrs, quantized, mask=mask)
+
+            packed_scale_i32 = packed_scale_i32 | ((e8m0_clamped & 0xFF) << (g * 8))
+
+        # Write 4 scale bytes as single uint32 (row_base_offset is always 4-byte aligned)
+        tile_base = (row_tiles * y1_k_tiles + k_tile_idx) * SF_TILE_STORAGE
+        packed_offset_i32 = (tile_base + row_base_offset) // 4
+        scale_ptr_i32 = y1_dst_packed_scale_ptr.to(tl.pointer_type(tl.int32))
+        tl.store(scale_ptr_i32 + packed_offset_i32, packed_scale_i32, mask=row_mask_1d)
+
+
+def fused_z_save_y1_quant(
+    z: torch.Tensor,
+    y1: torch.Tensor,
+    group_size: int = _SF_VEC_SIZE,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fused quantization of z (raw scales) and y1 (ISA-packed scales).
+
+    Replaces two separate kernel launches:
+      quantize_activation_blockscaled_fast(z)  → z_fp8, z_raw_scales
+      quantize_and_pack_activation(y1)          → y1_fp8, y1_packed_scales
+
+    Uses a 2D grid (row_blocks, z_col_blocks + y1_k_tiles) so that z and y1
+    quantization run as independent column-parallel work units.  Each block
+    checks pid_1 < z_col_blocks to decide whether it processes z or y1.
+
+    Ernie shape: grid = (2048, 8+12) = 40960 blocks
+    vs separate:  16384 + 24576 = 40960 blocks (same parallelism, 1 launch)
+    vs old 1D:   (2048,) = 2048 blocks (20× less parallelism)
+
+    Parameters
+    ----------
+    z  : Tensor (TK, 2I) bf16 — GemmGated pre-activation output.
+    y1 : Tensor (TK, I) bf16 — SwiGLU output.
+
+    Returns
+    -------
+    z_fp8           : Tensor (TK, 2I) float8_e4m3fn
+    z_raw_scales    : Tensor (TK, num_groups_z) float8_e8m0fnu (raw layout)
+    y1_fp8          : Tensor (TK, I) float8_e4m3fn
+    y1_packed_scales: Tensor (1, packed_size) float8_e8m0fnu (ISA layout)
+    """
+    assert z.is_contiguous(), "z must be contiguous"
+    assert y1.is_contiguous(), "y1 must be contiguous"
+
+    TK = z.shape[0]
+    z_K = z.shape[1]      # 2I
+    y1_K = y1.shape[1]    # I
+    assert y1.shape[0] == TK, "z and y1 must have the same number of rows"
+
+    # --- z outputs (raw scales) ---
+    z_num_groups = _div_up(z_K, group_size)
+    Z_GROUPS_PER_BLOCK = min(z_num_groups, 12)
+    assert z_num_groups % 4 == 0, f"z_num_groups={z_num_groups} must be divisible by 4 for packed int32 scale writes"
+    assert Z_GROUPS_PER_BLOCK % 4 == 0, f"Z_GROUPS_PER_BLOCK={Z_GROUPS_PER_BLOCK} must be divisible by 4"
+    z_col_blocks = _div_up(z_num_groups, Z_GROUPS_PER_BLOCK)
+    z_fp8 = torch.empty(TK, z_K, dtype=torch.float8_e4m3fn, device=z.device)
+    z_scale_out = torch.empty(TK, z_num_groups, dtype=torch.uint8, device=z.device)
+
+    # --- y1 outputs (ISA-packed scales) ---
+    y1_k_tiles = _div_up(y1_K, _SF_TILE_K)
+    y1_fp8 = torch.empty(TK, y1_K, dtype=torch.float8_e4m3fn, device=y1.device)
+    y1_per_batch_storage = _storage_per_batch(TK, y1_K)
+    if TK % _SF_TILE_M == 0 and y1_K % _SF_TILE_K == 0:
+        y1_packed_scales = torch.empty(
+            (1, y1_per_batch_storage), dtype=torch.uint8, device=y1.device
+        )
+    else:
+        y1_packed_scales = torch.full(
+            (1, y1_per_batch_storage), 127, dtype=torch.uint8, device=y1.device
+        )
+
+    y1_groups_per_k_tile = _SF_TILE_K // group_size  # 4 for default
+
+    BLOCK_ROWS = 32
+    # 2D grid: dim0=row_blocks, dim1=z_col_blocks + y1_k_tiles
+    grid = (_div_up(TK, BLOCK_ROWS), z_col_blocks + y1_k_tiles)
+    _fused_z_save_y1_quant_kernel[grid](
+        # z pointers
+        z,
+        z_fp8,
+        z_scale_out,
+        z_K,
+        z.stride(0),
+        z.stride(1),
+        z_fp8.stride(0),
+        z_fp8.stride(1),
+        z_scale_out.stride(0),
+        z_scale_out.stride(1),
+        z_col_blocks,
+        # y1 pointers
+        y1,
+        y1_fp8,
+        y1_packed_scales,
+        y1_K,
+        y1.stride(0),
+        y1.stride(1),
+        y1_fp8.stride(0),
+        y1_fp8.stride(1),
+        y1_k_tiles,
+        # shared
+        TK,
+        fp8_max=float(torch.finfo(torch.float8_e4m3fn).max),
+        GROUP_SIZE=group_size,
+        BLOCK_ROWS=BLOCK_ROWS,
+        Z_GROUPS_PER_BLOCK=Z_GROUPS_PER_BLOCK,
+        SF_TILE_M=_SF_TILE_M,
+        SF_TILE_STORAGE=_SF_TILE_STORAGE,
+        Y1_GROUPS_PER_K_TILE=y1_groups_per_k_tile,
+    )
+    return (
+        z_fp8,
+        z_scale_out.view(torch.float8_e8m0fnu),
+        y1_fp8,
+        y1_packed_scales.view(torch.float8_e8m0fnu),
+    )
+
+
 @triton.jit
 def _pack_quantize_expert_segments_kernel(
     src_ptr,

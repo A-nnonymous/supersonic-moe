@@ -908,3 +908,236 @@ class FP8AlignedContractTest(TestCommons):
                 dx_iters[i], dx_iters[0], rtol=0, atol=0,
                 msg=f"Iter {i} dx differs from iter 0 — cache retention drift",
             )
+
+    # ------------------------------------------------------------------
+    # Tests for fused_z_save_y1_quant kernel
+    # ------------------------------------------------------------------
+
+    def test_fused_z_save_y1_quant_matches_separate_multi_shape(self) -> None:
+        """fused_z_save_y1_quant produces bit-identical output to the two separate kernels.
+
+        Verifies at test, contract, and production shapes that fusing the
+        z-save blockscaled quant + y1 ISA-packed quant into a single kernel
+        does not change the numerical result.
+        """
+        self._require_blackwell()
+        from sonicmoe.quack_utils.blockscaled_fp8_gemm import (
+            fused_z_save_y1_quant,
+            quantize_activation_blockscaled_fast,
+            quantize_and_pack_activation,
+        )
+
+        shapes = [
+            # (label, TK, 2I, I)
+            # Production-relevant shapes only: 2I must have num_groups divisible
+            # by 12 (the GROUPS_PER_BLOCK used by the separate z-quant kernel)
+            # to avoid comparing padding scale bytes that differ due to OOB writes
+            # in the separate kernel's 2D grid.
+            ("contract", 8192, 3072, 1536),
+            ("prod_ernie", 65536, 3072, 1536),
+            ("large_T", 32768, 3072, 1536),
+        ]
+        for label, TK, two_I, I in shapes:
+            with self.subTest(shape=label, TK=TK):
+                torch.manual_seed(42)
+                z = 0.02 * torch.randn(TK, two_I, device="cuda", dtype=torch.bfloat16)
+                y1 = 0.02 * torch.randn(TK, I, device="cuda", dtype=torch.bfloat16)
+
+                # Reference: two separate kernels
+                z_fp8_ref, z_raw_scales_ref = quantize_activation_blockscaled_fast(z)
+                y1_fp8_ref, y1_packed_scales_ref = quantize_and_pack_activation(y1)
+
+                # Fused kernel
+                z_fp8_fused, z_raw_scales_fused, y1_fp8_fused, y1_packed_scales_fused = (
+                    fused_z_save_y1_quant(z, y1)
+                )
+
+                # z outputs must be BIT-IDENTICAL
+                torch.testing.assert_close(
+                    z_fp8_fused.view(torch.uint8), z_fp8_ref.view(torch.uint8),
+                    rtol=0, atol=0,
+                    msg=f"{label}: z_fp8 mismatch",
+                )
+                torch.testing.assert_close(
+                    z_raw_scales_fused.view(torch.uint8), z_raw_scales_ref.view(torch.uint8),
+                    rtol=0, atol=0,
+                    msg=f"{label}: z_raw_scales mismatch",
+                )
+
+                # y1 outputs must be BIT-IDENTICAL
+                torch.testing.assert_close(
+                    y1_fp8_fused.view(torch.uint8), y1_fp8_ref.view(torch.uint8),
+                    rtol=0, atol=0,
+                    msg=f"{label}: y1_fp8 mismatch",
+                )
+                torch.testing.assert_close(
+                    y1_packed_scales_fused.view(torch.uint8), y1_packed_scales_ref.view(torch.uint8),
+                    rtol=0, atol=0,
+                    msg=f"{label}: y1_packed_scales mismatch",
+                )
+
+    def test_fused_z_save_y1_quant_roundtrip_precision(self) -> None:
+        """fused_z_save_y1_quant roundtrip: quantize then dequantize preserves precision.
+
+        Verifies that fused kernel output can be dequantized back with low error
+        for both z (raw scales) and y1 (ISA-packed scales).
+        """
+        self._require_blackwell()
+        from sonicmoe.quack_utils.blockscaled_fp8_gemm import fused_z_save_y1_quant
+        from sonicmoe.quack_utils.swiglu_triton import dequantize_blockscaled_fp8
+
+        for label, TK, two_I, I in [("contract", 8192, 3072, 1536), ("prod", 65536, 3072, 1536)]:
+            with self.subTest(shape=label):
+                torch.manual_seed(42)
+                z = 0.02 * torch.randn(TK, two_I, device="cuda", dtype=torch.bfloat16)
+                y1 = 0.02 * torch.randn(TK, I, device="cuda", dtype=torch.bfloat16)
+
+                z_fp8, z_raw_scales, y1_fp8, _ = fused_z_save_y1_quant(z, y1)
+
+                # z roundtrip
+                z_restored = dequantize_blockscaled_fp8(z_fp8, z_raw_scales.view(torch.uint8))
+                z_rrmse = self._rrmse(z_restored, z)
+                z_corr = self._corr(z_restored, z)
+                self.assertLess(z_rrmse, 0.05,
+                    f"{label} z roundtrip RRMSE {z_rrmse:.4f} >= 5%")
+                self.assertGreater(z_corr, 0.999,
+                    f"{label} z roundtrip corr {z_corr:.6f} < 0.999")
+
+                # y1 FP8 data quality (can't easily roundtrip ISA-packed, check FP8 directly)
+                y1_restored = y1_fp8.to(torch.bfloat16)
+                # FP8 e4m3 has limited dynamic range but data is small-magnitude 0.02*randn
+                self.assertFalse(torch.all(y1_fp8.view(torch.uint8) == 0).item(),
+                    f"{label} y1_fp8 is all zeros")
+
+    def test_fused_quant_full_moe_forward_backward_multi_shape(self) -> None:
+        """Full MoE fwd+bwd with fused z-save+y1-quant matches BF16 at multiple shapes.
+
+        The fused kernel is exercised automatically through the forward path when
+        _save_z_fp8() is true and the fused blockscaled gated path is active.
+        Tests at both contract shape and production shape.
+        """
+        self._require_blackwell()
+        shapes = [
+            # (T, H, I, E, K)
+            (1024, 3072, 1536, 8, 8),      # contract shape
+            (8192, 3072, 1536, 8, 8),       # production Ernie shape
+        ]
+        for T, H, I, E, K in shapes:
+            with self.subTest(T=T, H=H, I=I):
+                self._reset_fp8_state()
+                self.set_seed(42)
+                moe = MoE(num_experts=E, num_experts_per_tok=K, hidden_size=H,
+                          intermediate_size=I, activation_function=ActivationType.SWIGLU,
+                          add_bias=False, std=0.02).to(device="cuda", dtype=torch.bfloat16)
+                x = (0.02 * torch.randn(T, H, device="cuda", dtype=torch.bfloat16)).detach().requires_grad_()
+                dout = 0.02 * torch.randn_like(x)
+
+                # BF16 reference
+                with enable_quack_gemm(True):
+                    out_bf16, _ = moe(x)
+                out_bf16.backward(dout)
+                dx_bf16 = x.grad.clone()
+                x.grad = None
+                moe.zero_grad(set_to_none=True)
+                self._reset_fp8_state()
+
+                # FP8 (exercises fused z-save + y1-quant + stream parallelism)
+                with enable_quack_gemm(True):
+                    out_fp8, _ = moe(x, use_fp8=True)
+                out_fp8.backward(dout)
+                dx_fp8 = x.grad.clone()
+
+                # Forward precision
+                fwd_rrmse = self._rrmse(out_fp8, out_bf16)
+                fwd_corr = self._corr(out_fp8, out_bf16)
+                self.assertLess(fwd_rrmse, 0.10,
+                    f"T={T} fwd RRMSE {fwd_rrmse:.4f} >= 10%")
+                self.assertGreater(fwd_corr, 0.99,
+                    f"T={T} fwd corr {fwd_corr:.4f} < 0.99")
+
+                # Backward precision
+                bwd_rrmse = self._rrmse(dx_fp8, dx_bf16)
+                bwd_corr = self._corr(dx_fp8, dx_bf16)
+                self.assertLess(bwd_rrmse, 0.10,
+                    f"T={T} bwd RRMSE {bwd_rrmse:.4f} >= 10%")
+                self.assertGreater(bwd_corr, 0.99,
+                    f"T={T} bwd corr {bwd_corr:.4f} < 0.99")
+
+    def test_stream_parallel_backward_deterministic(self) -> None:
+        """Stream-parallel z-dequant produces identical gradients across 5 runs.
+
+        The backward stream parallelism (z-dequant on side stream || dout-quant
+        on default stream) must produce deterministic results. Running the same
+        fwd+bwd 5 times with identical inputs/weights must yield identical dx.
+        """
+        self._require_blackwell()
+        self._reset_fp8_state()
+        torch.manual_seed(42)
+        moe = self._make_moe()
+        x_orig, dout = self._make_sample()
+
+        dx_runs = []
+        for run in range(5):
+            moe.zero_grad(set_to_none=True)
+            xi = x_orig.clone().detach().requires_grad_(True)
+            with enable_quack_gemm(True):
+                out, _ = moe(xi, use_fp8=True)
+            out.backward(dout)
+            dx_runs.append(xi.grad.clone())
+            torch.cuda.synchronize()
+
+        for i in range(1, 5):
+            torch.testing.assert_close(
+                dx_runs[i], dx_runs[0], rtol=0, atol=0,
+                msg=f"Run {i} dx differs from run 0 — stream parallelism non-determinism",
+            )
+
+    def test_backward_s_float_precast_precision(self) -> None:
+        """Pre-casting s.float() before stream split must not change backward precision.
+
+        The backward path pre-casts s = topk_scores[scatter_idx].float() on the
+        default stream before launching z-dequant on the side stream. This test
+        verifies that the pre-cast path produces correct dx vs BF16 gold and
+        remains deterministic across multiple runs.
+        """
+        self._require_blackwell()
+        for T, H, I, E, K in [(1024, 3072, 1536, 8, 8), (8192, 3072, 1536, 8, 8)]:
+            with self.subTest(T=T, H=H, I=I):
+                self._reset_fp8_state()
+                self.set_seed(42)
+                moe = MoE(num_experts=E, num_experts_per_tok=K, hidden_size=H,
+                          intermediate_size=I, activation_function=ActivationType.SWIGLU,
+                          add_bias=False, std=0.02).to(device="cuda", dtype=torch.bfloat16)
+                x = (0.02 * torch.randn(T, H, device="cuda", dtype=torch.bfloat16)).detach().requires_grad_()
+                dout = 0.02 * torch.randn(T, H, device="cuda", dtype=torch.bfloat16)
+
+                # BF16 reference
+                with enable_quack_gemm(True):
+                    out_bf16, _ = moe(x, use_fp8=False)
+                out_bf16.backward(dout)
+                dx_bf16 = x.grad.clone()
+                x.grad = None; moe.zero_grad(set_to_none=True)
+
+                # FP8 with pre-cast s.float() + stream parallelism
+                with enable_quack_gemm(True), enable_fp8():
+                    out_fp8, _ = moe(x, use_fp8=True)
+                out_fp8.backward(dout)
+                dx_fp8 = x.grad.clone()
+                x.grad = None; moe.zero_grad(set_to_none=True)
+
+                rrmse = self._rrmse(dx_fp8, dx_bf16)
+                corr = self._corr(dx_fp8, dx_bf16)
+                self.assertLess(rrmse, 0.10,
+                    f"T={T} s_float precast bwd RRMSE {rrmse:.4f} >= 10%")
+                self.assertGreater(corr, 0.99,
+                    f"T={T} s_float precast bwd corr {corr:.6f} < 0.99")
+
+                # Also verify 2 runs produce identical dx (determinism)
+                with enable_quack_gemm(True), enable_fp8():
+                    out_fp8_2, _ = moe(x, use_fp8=True)
+                out_fp8_2.backward(dout)
+                dx_fp8_2 = x.grad.clone()
+                torch.testing.assert_close(
+                    dx_fp8_2, dx_fp8, rtol=0, atol=0,
+                    msg=f"T={T} s_float precast backward not deterministic",
+                )

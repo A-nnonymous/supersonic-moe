@@ -224,6 +224,17 @@ def _get_wgrad_stream() -> torch.cuda.Stream:
     return _WGRAD_STREAM
 
 
+# Side stream for overlapping z-dequant with dout-quant in _DownProjection.backward.
+_DEQUANT_STREAM: torch.cuda.Stream | None = None
+
+
+def _get_dequant_stream() -> torch.cuda.Stream:
+    global _DEQUANT_STREAM
+    if _DEQUANT_STREAM is None:
+        _DEQUANT_STREAM = torch.cuda.Stream()
+    return _DEQUANT_STREAM
+
+
 def _matches_prequant_tensor(lhs: torch.Tensor | None, rhs: torch.Tensor | None) -> bool:
     if lhs is None or rhs is None:
         return False
@@ -624,12 +635,14 @@ class _UpProjection(torch.autograd.Function):
                     z, y1 = _fused_blockscaled_gated_forward(
                         x, w1, expert_frequency_offset, x_gather_idx
                     )
-                    # Pre-quantize z while hot in L2 (saves ~171MB at Ernie shape)
+                    # Fused z+y1 quantize: single 2D-grid kernel launch
+                    # while both tensors are L2-hot from GemmGated output.
                     if _save_z_fp8():
-                        z_fp8, z_raw_scales = quantize_activation_blockscaled_fast(z)
+                        from ..quack_utils.blockscaled_fp8_gemm import fused_z_save_y1_quant
+                        z_fp8, z_raw_scales, y1_fp8, y1_packed_scales = fused_z_save_y1_quant(z, y1)
                         _PREQUANTIZED_SCALES["z_fp8"] = (z_fp8, z_raw_scales)
-                    # Pre-quantize y1 while hot in L2 for zero-overhead FP8 down-proj.
-                    y1_fp8, y1_packed_scales = quantize_and_pack_activation(y1)
+                    else:
+                        y1_fp8, y1_packed_scales = quantize_and_pack_activation(y1)
                     _PREQUANTIZED_SCALES["fwd"] = (y1, y1_fp8, y1_packed_scales)
                 elif aligned:
                     w1_fp8, w1_scales = precompute_weight_fp8(w1)
@@ -1112,15 +1125,27 @@ class _DownProjection(torch.autograd.Function):
             if ctx._fp8_enabled_flag and ctx._alignment_assumed_flag:
                 # All segments aligned: use blockscaled FP8 path.
                 if ctx._use_fused_blockscaled_gated_flag:
-                    if z is None:
-                        z = dequantize_blockscaled_fp8(z_fp8, z_raw_scales_u8)
-                        del z_fp8, z_raw_scales_u8
                     # Zero-materialization FP8 dgated: T-quant + scale_gather + A_idx
                     from ..quack_utils.blockscaled_fp8_gemm import (
                         _gather_isa_packed_scales_kernel,
                         _div_up, _SF_TILE_K, _SF_TILE_M, _SF_TILE_STORAGE,
                         _SF_VEC_SIZE, _storage_per_batch,
                     )
+
+                    # --- Stream parallelism: z-dequant || dout-quant+gather+s_cast ---
+                    # z-dequant (~124µs) and dout-quant+scale_gather+s.float() (~83+28µs)
+                    # operate on completely independent tensors; overlap on
+                    # a side stream to hide the shorter behind the longer.
+                    # Pre-cast s to float32 on default stream during z-dequant overlap.
+                    s_float = s.float()
+                    if z is None:
+                        _ds = _get_dequant_stream()
+                        _ds.wait_stream(torch.cuda.current_stream())
+                        with torch.cuda.stream(_ds):
+                            z = dequantize_blockscaled_fp8(z_fp8, z_raw_scales_u8)
+                            del z_fp8, z_raw_scales_u8
+
+                    # dout-quant + scale_gather on default stream (parallel).
                     dout_fp8, dout_scales_t = quantize_and_pack_activation(dout)
                     TK_bwd = x_gather_idx.shape[0]
                     K_bwd = dout.shape[1]
@@ -1139,6 +1164,9 @@ class _DownProjection(torch.autograd.Function):
                     )
                     dout_scales = dout_scales_tk.view(torch.float8_e8m0fnu)
                     del dout_scales_t, dout_scales_tk
+
+                    # Synchronize: gemm_dgated_kernel needs both z and dout_fp8/dout_scales.
+                    torch.cuda.current_stream().wait_stream(_get_dequant_stream())
 
                     w2_fp8_enk, w2_scales = precompute_weight_fp8_for_direct_fused_dgated(w2)
                     config = default_config(dout.device)
@@ -1166,7 +1194,7 @@ class _DownProjection(torch.autograd.Function):
                         config.pingpong,
                         persistent=True,
                         max_swizzle_size=config.max_swizzle_size,
-                        colvec_scale=s.float(),
+                        colvec_scale=s_float,
                         colvec_reduce=colvec_reduce_partial,
                         cu_seqlens_m=expert_frequency_offset,
                         A_idx=x_gather_idx,

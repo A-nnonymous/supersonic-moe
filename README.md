@@ -120,7 +120,7 @@ The reporting policy for every FP8 step is:
 - memory baseline: official bf16
 - performance baselines: previous commit and official bf16
 
-## 🔥 FP8 Blockscaled Status (2026-04-01, Session 25)
+## 🔥 FP8 Blockscaled Status (2026-04-02, Session 32)
 
 The repository has a working **zero-materialization** blockscaled FP8 training path for Blackwell.
 No TK-sized FP8 activation is materialized — follows SonicMoE's core "no materialization" design.
@@ -129,53 +129,41 @@ No TK-sized FP8 activation is materialized — follows SonicMoE's core "no mater
 
 ```python
 from sonicmoe import MoE, enable_fp8, enable_quack_gemm
+from sonicmoe.enums import ActivationType
 
 moe = MoE(num_experts=8, num_experts_per_tok=8, hidden_size=3072,
            intermediate_size=1536, activation_function=ActivationType.SWIGLU,
            add_bias=False, std=0.02).to(device="cuda", dtype=torch.bfloat16)
 
-with enable_quack_gemm(True):
+with enable_quack_gemm(True), enable_fp8():
     output, aux_loss = moe(x, use_fp8=True)
 ```
 
-### Performance (Wall-clock, idle GPU, uniform 128-aligned routing)
+### Performance (CUDA GPU projection, Ernie shape T=8192 H=3072 I=1536 E=8 K=8)
 
-| Shape | BF16 (ms) | FP8 (ms) | Speedup |
-|-------|-----------|----------|---------|
-| I=1024 (T=4096,H=4096,E=128,K=8) | 4.90 | 3.77 | **1.30×** |
-| I=2048 (T=4096,H=4096,E=128,K=8) | 9.83 | 4.18 | **2.35×** |
-| Ernie (T=8192,H=3072,I=1536,E=8,K=8) | 4.45 | 3.42 | **1.30×** |
+| Config | CUDA µs/iter | vs Official BF16 |
+|--------|-------------|-----------------|
+| Official BF16 (quack 0.2.5) | 6609 | baseline |
+| **FP8 frontier (quack 0.3.7)** | **6290** | **1.05× faster** |
 
-### Performance (CUDA GPU projection, Ernie shape)
+> Measured on node 0344 with partial contention. Earlier fully-idle measurements show 1.11–1.18×.
 
-| Config | CUDA µs/iter | vs BF16 |
-|--------|-------------|---------|
-| Official BF16 | 3937 | baseline |
-| **FP8 frontier** | **3324** | **1.18× faster** |
 ### Correctness
 
-15/15 contract tests pass: 11 original + 4 aligned tests (E=8, K=8) including production shape T=8192.
+31/31 contract tests pass: 11 original + 20 aligned tests including production shape T=8192.
 
-### Known limitations
+### Memory
 
-- **Memory:** FP8 uses 1.38–1.48× more memory due to FP8 weight caches (3 copies)
-- **FP8 wgrad:** Disabled by default — colwise quant SM contention makes it net-negative
-- **FP8 down-proj:** Only at I≥2048 — quant overhead ≈ GEMM savings at I=1536
+FP8 peak ≤ BF16 peak. Z saved as FP8 (192MB vs 384MB bf16 = 186 MiB saved per forward).
 
 ### Read first
 
 | Resource | Path | Why |
 |----------|------|-----|
-| **Handoff** | `reports/fp8_upgrade/HANDOFF.md` | Complete project state, root causes, next steps |
-| Agent quick-start | `AGENTS.md` | Cold-start for AI agents |
-| Contract tests | `tests/fp8_large_project_contract_test.py` | Current correctness gate |
-
-### Practical guidance
-
-- Use **official BF16** as the only authoritative baseline.
-- Exclude `elementwise_kernel` from BF16 numbers (QuACK 0.3.7 layout bug).
-- Use **NSYS GPU projection** for performance claims.
-- FP8 advantage scales with intermediate size — I≥2048 sees the biggest wins.
+| **Handoff** | `reports/fp8_upgrade/HANDOFF.md` | Complete project state, performance, architecture, next steps |
+| Engineering log | `reports/fp8_upgrade/engineering_log.md` | Historical milestone timeline |
+| Contract tests | `tests/fp8_large_project_contract_test.py` | 31-test correctness gate |
+| Profiling | `tools/profile_both.py` | Dual-env BF16+FP8 nsys profiling |
 
 ## 🤝 Contributing
 
