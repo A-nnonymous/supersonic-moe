@@ -124,13 +124,26 @@ class _GemmSm100ZeroMatMixin:
 
         if const_expr(self.blockscaled):
             # ============================================================
-            # ZERO-MAT FIX: Use mSFA.shape when gather_A=True.
-            # Upstream uses mA.shape which is (T, K). When gather_A=True,
-            # mSFA has TK-rows worth of pre-gathered scales, so its shape
-            # correctly reflects the M-dimension for TMA offsets.
+            # ZERO-MAT FIX: derive SFA layout from logical (TK, K) shape.
+            #
+            # When gather_A=True, mA is (T, K) but the GEMM logically
+            # operates on TK rows via the gather index.  The pre-gathered
+            # SFA scales span TK rows, so the ISA tiled layout must be
+            # computed from (TK, K).  TK comes from mD (the output tensor
+            # which always has the correct M-dimension).
+            #
+            # Bug history: the previous version passed mSFA.shape which is
+            # the flat ISA storage shape (1, packed_bytes) — giving M=1
+            # and producing a completely wrong tiled layout (7-20× output
+            # attenuation with zero correlation to BF16).
             # ============================================================
             if const_expr(self.gather_A):
-                sfa_layout = _tile_atom_to_shape_SF_rank_aware(mSFA.shape, self.sf_vec_size)
+                # mA is (T, K) but GEMM logically has TK output rows.
+                # Use (TK, K) = (mD.shape[0], mA.shape[1]) for SFA layout.
+                sfa_logical_shape = (mD.shape[0], mA.shape[1])
+                sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(
+                    sfa_logical_shape, self.sf_vec_size
+                )
             else:
                 sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(mA.shape, self.sf_vec_size)
             mSFA = cute.make_tensor(mSFA.iterator, sfa_layout)

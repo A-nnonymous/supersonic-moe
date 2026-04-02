@@ -380,6 +380,8 @@ class FP8AlignedContractTest(TestCommons):
 
     def _reset_fp8_state(self) -> None:
         """Reset all FP8 global state to prevent cross-test pollution."""
+        # Strip env var that would make BF16 reference use FP8 path
+        os.environ.pop("SONIC_MOE_FP8_MODE", None)
         functional.clear_all_fp8_weight_caches()
         functional._ALIGNMENT_ASSUMED = False
         functional._ALIGNMENT_STREAK = 0

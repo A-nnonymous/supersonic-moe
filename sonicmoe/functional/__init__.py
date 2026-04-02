@@ -157,35 +157,22 @@ def _fused_blockscaled_gated_forward(
     x_scales_tk_e8m0 = x_scales_tk.view(torch.float8_e8m0fnu)
     del x_scales_t
 
-    # Step 3: Zero-materialization GEMM via custom kernel
-    try:
-        from ..quack_utils.gemm_sm100_fp8_zeromat import gemm_gated_zeromat
-        z, y1 = gemm_gated_zeromat(
-            x_fp8, w1_fp8, None,
-            cu_seqlens_m=expert_frequency_offset,
-            A_idx=x_gather_idx,
-            a_scales=x_scales_tk_e8m0,
-            b_scales=w1_scales,
-            activation="swiglu",
-        )
-    except Exception:
-        # Fallback: three-step pipeline (materializes TK FP8 data)
-        x_fp8_tk = x_fp8.index_select(0, x_gather_idx.long())
-        z, y1 = gemm_gated(
-            x_fp8_tk, w1_fp8,
-            activation="swiglu",
-            out_dtype=torch.bfloat16,
-            postact_dtype=torch.bfloat16,
-            cu_seqlens_m=expert_frequency_offset,
-            dynamic_scheduler=False,
-            a_scales=x_scales_tk_e8m0,
-            b_scales=w1_scales,
-            tuned=False,
-        )
-        del x_fp8_tk
+    # Step 3: Zero-materialization GEMM via standard interface.
+    # gemm_gated() with A_idx auto-selects GemmGatedSm100ZeroMat on SM100,
+    # which gathers A rows inside the kernel (no TK FP8 materialization).
+    z, y1 = gemm_gated(
+        x_fp8, w1_fp8,
+        activation="swiglu",
+        out_dtype=torch.bfloat16,
+        postact_dtype=torch.bfloat16,
+        cu_seqlens_m=expert_frequency_offset,
+        A_idx=x_gather_idx,
+        a_scales=x_scales_tk_e8m0,
+        b_scales=w1_scales,
+        dynamic_scheduler=False,
+        tuned=False,
+    )
     del x_fp8, x_scales_tk_e8m0
-
-    return z, y1
 
     return z, y1
 
