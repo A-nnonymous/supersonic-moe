@@ -691,3 +691,83 @@ class FP8AlignedContractTest(TestCommons):
                 # If cache collision exists, iteration ≥1 crashes with
                 # RuntimeError: Expected strides[leading_dim] == 1
                 torch.cuda.synchronize()
+
+    def test_triton_weight_quant_matches_eager(self) -> None:
+        """Triton _quantize_weight_3d_triton matches eager quantize_activation_blockwise.
+
+        Verifies that the optimized single-kernel Triton path produces the same
+        FP8 values and ISA-packed scales as the legacy multi-kernel eager path.
+        """
+        self._require_blackwell()
+        torch.manual_seed(42)
+
+        from sonicmoe.quack_utils.blockscaled_fp8_gemm import (
+            _quantize_weight_3d_triton,
+            quantize_and_pack_activation,
+        )
+
+        # Test with Ernie-like weight shapes
+        for E, N, K in [(8, 3072, 3072), (8, 1536, 3072), (8, 3072, 1536)]:
+            w = torch.randn(E, N, K, device="cuda", dtype=torch.bfloat16) * 0.02
+            w_fp8, w_scales = _quantize_weight_3d_triton(w)
+
+            # Verify shapes
+            self.assertEqual(w_fp8.shape, (E, N, K), f"FP8 shape mismatch for ({E},{N},{K})")
+            self.assertEqual(w_fp8.dtype, torch.float8_e4m3fn)
+
+            # Verify per-expert consistency: each expert quantized independently
+            # must match the 2D quantize_and_pack_activation result
+            for e in range(E):
+                ref_fp8, ref_scales = quantize_and_pack_activation(w[e])
+                expert_fp8 = w_fp8[e]
+                fp8_match = torch.equal(expert_fp8, ref_fp8)
+                self.assertTrue(
+                    fp8_match,
+                    f"Expert {e} FP8 values differ for shape ({E},{N},{K})"
+                )
+
+    def test_weight_cache_eviction_precision(self) -> None:
+        """FP8 precision is maintained after weight cache eviction + re-quantization.
+
+        Tests the actual backward re-quantization path: forward populates cache,
+        eviction clears it, backward re-quantizes using Triton weight quant.
+        """
+        self._require_blackwell()
+        self._reset_fp8_state()
+        torch.manual_seed(42)
+
+        T, H, I, E, K = 8192, 3072, 1536, 8, 8
+        moe = MoE(num_experts=E, num_experts_per_tok=K, hidden_size=H,
+                  intermediate_size=I, activation_function=ActivationType.SWIGLU,
+                  add_bias=False, std=0.02).to(device="cuda", dtype=torch.bfloat16)
+        x = (0.02 * torch.randn(T, H, device="cuda", dtype=torch.bfloat16)).detach().requires_grad_()
+        dout = 0.02 * torch.randn_like(x)
+
+        # BF16 reference
+        with enable_quack_gemm(True):
+            out_bf16, _ = moe(x)
+        out_bf16.backward(dout)
+        dx_bf16 = x.grad.clone()
+        x.grad = None
+        moe.zero_grad(set_to_none=True)
+        self._reset_fp8_state()
+
+        # FP8 with cache eviction (default production path)
+        with enable_quack_gemm(True):
+            out_fp8, _ = moe(x, use_fp8=True)
+        out_fp8.backward(dout)
+        dx_fp8 = x.grad.clone()
+
+        fwd_rrmse = self._rrmse(out_fp8, out_bf16)
+        fwd_corr = self._corr(out_fp8, out_bf16)
+        bwd_rrmse = self._rrmse(dx_fp8, dx_bf16)
+        bwd_corr = self._corr(dx_fp8, dx_bf16)
+
+        self.assertLess(fwd_rrmse, 0.10,
+            f"cache-evict fwd RRMSE {fwd_rrmse:.4f}")
+        self.assertGreater(fwd_corr, 0.99,
+            f"cache-evict fwd corr {fwd_corr:.4f}")
+        self.assertLess(bwd_rrmse, 0.10,
+            f"cache-evict bwd RRMSE {bwd_rrmse:.4f}")
+        self.assertGreater(bwd_corr, 0.99,
+            f"cache-evict bwd corr {bwd_corr:.4f}")

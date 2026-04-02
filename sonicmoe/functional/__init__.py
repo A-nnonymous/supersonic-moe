@@ -92,7 +92,6 @@ from ..quack_utils.swiglu_triton import (
 from ..quack_utils.blockscaled_fp8_gemm import (
     pack_blockscaled_1x32_scales,
     quantize_activation_blockscaled_fast,
-    blockscaled_fp8_wgrad_varlen_k,
 )
 
 
@@ -191,19 +190,6 @@ def _save_z_fp8() -> bool:
     return os.getenv("SONIC_MOE_FP8_SAVE_Z_FP8", "1").lower() in {"1", "true", "yes", "on"}
 
 
-def _fp8_lean() -> bool:
-    """Lean FP8 mode: use FP8 GEMM only where it beats BF16, skip all unnecessary quant.
-
-    When enabled, the FP8 path:
-    - Uses FP8 fused gemm_gated for up-proj (saves ~130us GEMM, costs ~99us quant = net 33us win)
-    - Skips z FP8 save (saves 56us fwd + 42us bwd dequant = 98us total)
-    - Skips y1 FP8 quant (saves 30us fwd, uses BF16 down-proj instead)
-    - Uses BF16 gemm_dgated in backward (saves 88us vs FP8 dgated + quant)
-    - Uses BF16 wgrad and actgrad (no quant overhead)
-    """
-    return os.getenv("SONIC_MOE_FP8_LEAN", "0").lower() in {"1", "true", "yes", "on"}
-
-
 def _use_fused_blockscaled_gated() -> bool:
     """Check if fused gemm_gated + blockscaled FP8 is enabled (default: enabled).
 
@@ -213,17 +199,6 @@ def _use_fused_blockscaled_gated() -> bool:
     best-performing FP8 up-proj path on Blackwell and is enabled by default.
     """
     return os.getenv("SONIC_MOE_FP8_FUSED_GATED", "1").lower() in {"1", "true", "yes", "on"}
-
-
-def _use_fp8_wgrad() -> bool:
-    """Check if FP8 weight-gradient via varlen_k GEMM is enabled (default: disabled).
-
-    When enabled, weight gradients (dw1, dw2) use blockscaled FP8 column-wise
-    quantize + CUTLASS varlen_k GEMM instead of BF16 GEMM.  The FP8 GEMM is
-    faster per-op, but the unavoidable layout permutation copy (~637µs for 3GB
-    at production shapes) currently exceeds the GEMM savings.
-    """
-    return os.getenv("SONIC_MOE_FP8_WGRAD", "0").lower() in {"1", "true", "yes", "on"}
 
 
 # Transfer pre-packed blockscaled scales between autograd Function boundaries.
@@ -655,40 +630,20 @@ class _UpProjection(torch.autograd.Function):
                 aligned = _all_segments_128_aligned(expert_frequency_offset)
                 _ALIGNMENT_ASSUMED = aligned
 
-                if aligned and _fp8_lean():
-                    # Lean FP8: only FP8 for up-proj GEMM, skip all quant overhead.
-                    w1_fp8, w1_scales = precompute_weight_fp8_for_fused_gated(w1)
-                    x_fp8, x_scales = fast_gather_quantize_and_pack_activation(
-                        x, x_gather_idx
-                    )
-                    z, y1 = gemm_gated(
-                        x_fp8, w1_fp8,
-                        activation="swiglu",
-                        out_dtype=torch.bfloat16,
-                        postact_dtype=torch.bfloat16,
-                        cu_seqlens_m=expert_frequency_offset,
-                        dynamic_scheduler=False,
-                        a_scales=x_scales,
-                        b_scales=w1_scales,
-                        tuned=False,
-                    )
-                    del x_fp8, x_scales
-                    # No z FP8 save, no y1 quant — keep everything BF16 downstream
-                elif aligned and _use_fused_blockscaled_gated():
+                if aligned and _use_fused_blockscaled_gated():
                     z, y1 = _fused_blockscaled_gated_forward(
                         x, w1, expert_frequency_offset, x_gather_idx
                     )
                     # Pre-quantize z while hot in L2 (saves ~171MB at Ernie shape)
-                    if _save_z_fp8() and not _fp8_lean():
+                    if _save_z_fp8():
                         z_fp8, z_raw_scales = quantize_activation_blockscaled_fast(z)
                         _PREQUANTIZED_SCALES["z_fp8"] = (z_fp8, z_raw_scales)
                     # Pre-quantize y1 while hot in L2 for zero-overhead FP8 down-proj.
                     # Store 3-tuple (bf16_ref, fp8, scales) so the consumer can verify
                     # identity via _matches_prequant_tensor(ref, y1) — y1 arrives as BF16
                     # in _DownProjection while y1_fp8 has dtype float8_e4m3fn.
-                    if not _fp8_lean():
-                        y1_fp8, y1_packed_scales = quantize_and_pack_activation(y1)
-                        _PREQUANTIZED_SCALES["fwd"] = (y1, y1_fp8, y1_packed_scales)
+                    y1_fp8, y1_packed_scales = quantize_and_pack_activation(y1)
+                    _PREQUANTIZED_SCALES["fwd"] = (y1, y1_fp8, y1_packed_scales)
                 elif aligned:
                     w1_fp8, w1_scales = precompute_weight_fp8(w1)
                     # All segments 128-aligned: use fused gather+quantize
@@ -773,7 +728,6 @@ class _UpProjection(torch.autograd.Function):
         ctx.use_quack_gemm = use_quack_gemm
         # Persist FP8 state for backward (autograd runs outside enable_fp8() context)
         ctx._fp8_enabled = _fp8_enabled()
-        ctx._fp8_lean = _fp8_lean()
         ctx._alignment_assumed = _ALIGNMENT_ASSUMED
 
         ctx.save_for_backward(
@@ -833,19 +787,7 @@ class _UpProjection(torch.autograd.Function):
         if use_quack_gemm:
             assert not is_compiling
 
-            if ctx._fp8_lean and ctx._alignment_assumed:
-                # Lean FP8: BF16 actgrad + BF16 wgrad (no quant overhead)
-                gemm(
-                    x.T,
-                    dz,
-                    out=dw1_base.permute(0, 2, 1),
-                    cu_seqlens_k=expert_frequency_offset,
-                    A_idx=x_gather_idx,
-                    batch_idx_permute=None,
-                    dynamic_scheduler=False,
-                )
-                dx_expanded = gemm(dz, w1.permute(2, 0, 1), cu_seqlens_m=expert_frequency_offset, dynamic_scheduler=False)
-            elif ctx._fp8_enabled and ctx._alignment_assumed:
+            if ctx._fp8_enabled and ctx._alignment_assumed:
                 # Blockscaled FP8 act-grad + weight-grad.
                 # Overlap wgrad (dz^T × x) with actgrad (dz × w1^T) on separate
                 # CUDA streams — they share read-only inputs but no write deps.
@@ -863,23 +805,15 @@ class _UpProjection(torch.autograd.Function):
                 _ws = _get_wgrad_stream()
                 _ws.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(_ws):
-                    if _use_fp8_wgrad():
-                        blockscaled_fp8_wgrad_varlen_k(
-                            dz_bf16, x, expert_frequency_offset,
-                            M=dz_bf16.shape[1], N=x.shape[1],
-                            b_gather_idx=x_gather_idx,
-                            out=dw1_base,
-                        )
-                    else:
-                        gemm(
-                            x.T,
-                            dz_bf16,
-                            out=dw1_base.permute(0, 2, 1),
-                            cu_seqlens_k=expert_frequency_offset,
-                            A_idx=x_gather_idx,
-                            batch_idx_permute=None,
-                            dynamic_scheduler=False,
-                        )
+                    gemm(
+                        x.T,
+                        dz_bf16,
+                        out=dw1_base.permute(0, 2, 1),
+                        cu_seqlens_k=expert_frequency_offset,
+                        A_idx=x_gather_idx,
+                        batch_idx_permute=None,
+                        dynamic_scheduler=False,
+                    )
 
                 # Actgrad on default stream (parallel with wgrad above).
                 if has_prequant:
@@ -991,12 +925,7 @@ class _DownProjection(torch.autograd.Function):
             assert not torch.compiler.is_compiling()
 
             assert b2 is None
-            if _fp8_lean() and _ALIGNMENT_ASSUMED:
-                # Lean FP8: BF16 down-proj (no y1 quant overhead)
-                y2 = gemm(y1, w2.permute(2, 1, 0), cu_seqlens_m=expert_frequency_offset)
-                router_perm = s_reverse_scatter_idx
-                y2_for_router = y2
-            elif _fp8_enabled() and _ALIGNMENT_ASSUMED:
+            if _fp8_enabled() and _ALIGNMENT_ASSUMED:
                 if _use_fused_blockscaled_gated():
                     # Use pre-quantized y1 from _UpProjection if available
                     # (zero quant overhead — y1 was quantized while hot in L2).
@@ -1020,21 +949,17 @@ class _DownProjection(torch.autograd.Function):
                         )
                         del y1_fp8, y1_packed_scales
                     else:
-                        # Fallback: inline quant with threshold check
-                        _fp8_downproj_threshold = int(os.getenv("SONIC_MOE_FP8_DOWNPROJ_THRESHOLD", "2048"))
-                        if I >= _fp8_downproj_threshold:
-                            w2_fp8, w2_scales = precompute_weight_fp8(w2)
-                            y1_fp8, y1_scales = quantize_and_pack_activation(y1)
-                            y2 = blockscaled_fp8_gemm_varlen(
-                                y1_fp8, w2, expert_frequency_offset,
-                                a_scales=y1_scales,
-                                w_fp8=w2_fp8, w_scales=w2_scales,
-                                out_dtype=torch.bfloat16,
-                                assume_aligned=True,
-                            )
-                            del y1_fp8, y1_scales
-                        else:
-                            y2 = gemm(y1, w2.permute(2, 1, 0), cu_seqlens_m=expert_frequency_offset)
+                        # Fallback: inline FP8 quant (prequant cache miss)
+                        w2_fp8, w2_scales = precompute_weight_fp8(w2)
+                        y1_fp8, y1_scales = quantize_and_pack_activation(y1)
+                        y2 = blockscaled_fp8_gemm_varlen(
+                            y1_fp8, w2, expert_frequency_offset,
+                            a_scales=y1_scales,
+                            w_fp8=w2_fp8, w_scales=w2_scales,
+                            out_dtype=torch.bfloat16,
+                            assume_aligned=True,
+                        )
+                        del y1_fp8, y1_scales
                 else:
                     # Blockscaled FP8 down-proj: use pre-quantized y1 if available
                     # from fused SwiGLU+quant in _UpProjection.forward.
@@ -1105,14 +1030,12 @@ class _DownProjection(torch.autograd.Function):
         ctx.use_quack_gemm = use_quack_gemm
         # Persist FP8 state for backward (autograd runs outside enable_fp8() context)
         ctx._fp8_enabled_flag = _fp8_enabled()
-        ctx._fp8_lean_flag = _fp8_lean()
         ctx._alignment_assumed_flag = _ALIGNMENT_ASSUMED
         ctx._use_fused_blockscaled_gated_flag = _use_fused_blockscaled_gated()
 
         # Memory optimization: store z in FP8 to save ~50% of z's memory.
         # At Ernie shape (TK=65536, 2I=3072), z is 384MB BF16 → ~213MB FP8 = ~171MB saved.
-        # Lean mode skips z FP8 save entirely (saves 56us fwd quant + 42us bwd dequant).
-        z_is_fp8 = (_fp8_enabled() and not _fp8_lean() and use_quack_gemm and _save_z_fp8()
+        z_is_fp8 = (_fp8_enabled() and use_quack_gemm and _save_z_fp8()
                     and _ALIGNMENT_ASSUMED and z.dtype == torch.bfloat16)
         ctx._z_is_fp8 = z_is_fp8
 
@@ -1202,41 +1125,7 @@ class _DownProjection(torch.autograd.Function):
             assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
 
             s = topk_scores[s_scatter_idx]
-            if ctx._fp8_lean_flag and ctx._alignment_assumed_flag:
-                # Lean FP8: BF16 dgated + BF16 wgrad (no quant overhead)
-                # z was saved as BF16 (not FP8), so use directly
-                assert z is not None, "lean mode should have BF16 z"
-                dz = torch.empty_like(z)
-                _, y1s, ds = gemm_dgated(
-                    dout,
-                    w2.permute(2, 0, 1),
-                    PreAct=z,
-                    activation="swiglu",
-                    dx_out=dz,
-                    colvec_scale=s.float(),
-                    colvec_reduce=True,
-                    cu_seqlens_m=expert_frequency_offset,
-                    A_idx=x_gather_idx,
-                    dynamic_scheduler=False,
-                )
-                _log_stage_memory("backward:down-proj-dgated")
-                _reset_stage_memory_probe()
-
-                # BF16 wgrad dw2
-                y1s_wgrad = y1s if y1s.dtype == torch.bfloat16 else y1s.to(torch.bfloat16)
-                gemm(
-                    dout.T,
-                    y1s_wgrad,
-                    out=dw2_base,
-                    cu_seqlens_k=expert_frequency_offset,
-                    A_idx=x_gather_idx,
-                    batch_idx_permute=None,
-                    dynamic_scheduler=False,
-                )
-                del y1s_wgrad
-                _log_stage_memory("backward:down-proj-weight")
-                ds = ds[s_reverse_scatter_idx]
-            elif ctx._fp8_enabled_flag and ctx._alignment_assumed_flag:
+            if ctx._fp8_enabled_flag and ctx._alignment_assumed_flag:
                 # All segments aligned: use blockscaled FP8 path.
                 if ctx._use_fused_blockscaled_gated_flag:
                     if z is None:
@@ -1352,25 +1241,17 @@ class _DownProjection(torch.autograd.Function):
                 _log_stage_memory("backward:down-proj-dgated")
                 _reset_stage_memory_probe()
 
-                # Weight-grad: FP8 or BF16 varlen GEMM
+                # Weight-grad: BF16 varlen GEMM
                 y1s_wgrad = y1s if y1s.dtype == torch.bfloat16 else y1s.to(torch.bfloat16)
-                if _use_fp8_wgrad():
-                    blockscaled_fp8_wgrad_varlen_k(
-                        dout, y1s_wgrad, expert_frequency_offset,
-                        M=dout.shape[1], N=y1s_wgrad.shape[1],
-                        a_gather_idx=x_gather_idx,
-                        out=dw2_base,
-                    )
-                else:
-                    gemm(
-                        dout.T,
-                        y1s_wgrad,
-                        out=dw2_base,
-                        cu_seqlens_k=expert_frequency_offset,
-                        A_idx=x_gather_idx,
-                        batch_idx_permute=None,
-                        dynamic_scheduler=False,
-                    )
+                gemm(
+                    dout.T,
+                    y1s_wgrad,
+                    out=dw2_base,
+                    cu_seqlens_k=expert_frequency_offset,
+                    A_idx=x_gather_idx,
+                    batch_idx_permute=None,
+                    dynamic_scheduler=False,
+                )
                 del y1s_wgrad
                 _log_stage_memory("backward:down-proj-weight")
                 ds = ds[s_reverse_scatter_idx]

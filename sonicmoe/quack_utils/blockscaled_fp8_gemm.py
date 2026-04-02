@@ -286,8 +286,7 @@ def _quantize_w2_cached(
         return cached
 
     weight_ehi = w2.permute(2, 0, 1).contiguous()
-    weight_fp8_ehi, weight_scales = quantize_activation_blockwise(weight_ehi, protocol)
-    packed_scales = pack_blockscaled_1x32_scales(weight_scales, weight_ehi.size(-1))
+    weight_fp8_ehi, packed_scales = _quantize_weight_3d_triton(weight_ehi)
     result = (weight_fp8_ehi, packed_scales)
     if len(_WEIGHT_CACHE) > 2:
         _WEIGHT_CACHE.clear()
@@ -2210,6 +2209,39 @@ def quantize_and_pack_activation_varlen(
     return fp8_data, packed
 
 
+def _quantize_weight_3d_triton(
+    w_enk: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a contiguous 3D (E, N, K) weight tensor using the fast Triton kernel.
+
+    Exploits the fact that when N % SF_TILE_M == 0, the ISA scale tile boundaries
+    align perfectly at expert boundaries. So (E, N, K) can be reshaped to (E*N, K),
+    quantized as a single 2D tensor, and reshaped back — producing identical results
+    to per-expert quantization but in a single kernel launch.
+
+    Falls back to per-expert loop when N is not tile-aligned.
+
+    Returns (w_fp8 (E, N, K), packed_scales) with ISA-packed E8M0 scales.
+    """
+    E, N, K = w_enk.shape
+    assert w_enk.is_contiguous(), "Weight must be contiguous (E, N, K)"
+
+    if N % _SF_TILE_M == 0:
+        # Fast path: single kernel launch for all experts
+        w_2d = w_enk.reshape(E * N, K)
+        fp8_2d, packed_scales = quantize_and_pack_activation(w_2d)
+        return fp8_2d.reshape(E, N, K), packed_scales
+    else:
+        # Fallback: per-expert loop (still much faster than PyTorch eager)
+        fp8_slices = []
+        scale_slices = []
+        for e in range(E):
+            fp8_e, scales_e = quantize_and_pack_activation(w_enk[e])
+            fp8_slices.append(fp8_e)
+            scale_slices.append(scales_e)
+        return torch.stack(fp8_slices), torch.cat(scale_slices, dim=-1)
+
+
 def precompute_weight_fp8(
     w: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -2239,9 +2271,7 @@ def precompute_weight_fp8(
         return cached
 
     w_ehi = w.permute(2, 0, 1).contiguous()
-    proto = FP8Protocol(scale_granularity=FP8ScaleGranularity.BLOCK_1X32)
-    w_fp8, w_scales_raw = quantize_activation_blockwise(w_ehi, proto)
-    w_scales_packed = pack_blockscaled_1x32_scales(w_scales_raw, w_ehi.size(-1))
+    w_fp8, w_scales_packed = _quantize_weight_3d_triton(w_ehi)
     result = (w_fp8, w_scales_packed)
     if len(_VARLEN_WEIGHT_CACHE) > 8:
         _VARLEN_WEIGHT_CACHE.clear()
@@ -2297,9 +2327,7 @@ def precompute_weight_fp8_for_fused_gated(
 
     # w is (2I, H, E) -> (E, 2I, H) contiguous = (E, N, K) physical layout
     w_enk = w.permute(2, 1, 0).mT.contiguous()  # (E, N=2I, K=H) contiguous
-    proto = FP8Protocol(scale_granularity=FP8ScaleGranularity.BLOCK_1X32)
-    w_fp8_enk, w_scales_raw = quantize_activation_blockwise(w_enk, proto)
-    w_scales_packed = pack_blockscaled_1x32_scales(w_scales_raw, w_enk.size(-1))
+    w_fp8_enk, w_scales_packed = _quantize_weight_3d_triton(w_enk)
     # Return .mT view (E, K, N) so gemm_gated_tuned's B.mT recovers (E, N, K)
     w_fp8_ekn = w_fp8_enk.mT  # stride view — same physical memory
     result = (w_fp8_ekn, w_scales_packed)
@@ -2343,9 +2371,7 @@ def precompute_weight_fp8_for_fused_dgated(
 
     # w is (H, I, E) → (E, I, H) contiguous = (E, N, K) physical layout
     w_enk = w.permute(2, 1, 0).contiguous()  # (E, N=I, K=H) contiguous
-    proto = FP8Protocol(scale_granularity=FP8ScaleGranularity.BLOCK_1X32)
-    w_fp8_enk, w_scales_raw = quantize_activation_blockwise(w_enk, proto)
-    w_scales_packed = pack_blockscaled_1x32_scales(w_scales_raw, w_enk.size(-1))
+    w_fp8_enk, w_scales_packed = _quantize_weight_3d_triton(w_enk)
     # Return .mT view (E, K=H, N=I) so gemm_dgated_tuned's B.mT recovers (E, N=I, K=H)
     w_fp8_ekn = w_fp8_enk.mT  # stride view — same physical memory
     result = (w_fp8_ekn, w_scales_packed)
@@ -2389,9 +2415,7 @@ def precompute_weight_fp8_for_direct_fused_dgated(
         return w_fp8_view, w_scales
 
     w_enk = w.permute(2, 1, 0).contiguous()  # (E, N=I, K=H) contiguous
-    proto = FP8Protocol(scale_granularity=FP8ScaleGranularity.BLOCK_1X32)
-    w_fp8_enk, w_scales_raw = quantize_activation_blockwise(w_enk, proto)
-    w_scales_packed = pack_blockscaled_1x32_scales(w_scales_raw, w_enk.size(-1))
+    w_fp8_enk, w_scales_packed = _quantize_weight_3d_triton(w_enk)
     # Store contiguous in fused cache; fused_dgated will create .mT view from it
     result_contiguous = (w_fp8_enk, w_scales_packed)
     result_view = (w_fp8_enk.mT, w_scales_packed)
