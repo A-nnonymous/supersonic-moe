@@ -270,48 +270,37 @@ class GemmGatedBlockscaledQuantMixin(GemmGatedMixin):
             self, params, epi_loop_tensors, tRS_rD, tRS_rC
         )
 
-        # ── Blockscaled quant of z (tRS_rD) in registers ──
-        # Uses the SAME integer+carry algorithm as _quantize_and_pack_kernel (Triton)
-        # which is bitwise identical to Paddle reference (verified: 0/100000 mismatches).
-        num_z = cute.size(tRS_rD)
+        # ── Blockscaled quant of z (ONLY when mZScale output is requested) ──
+        _z_scale_active = epi_loop_tensors["mZScale"]
+        ue8m0 = Int32(0)
+        if const_expr(_z_scale_active is not None):
+            num_z = cute.size(tRS_rD)
+            amax = Float32(0.0)
+            for i in cutlass.range(num_z, unroll_full=True):
+                val = tRS_rD[i]
+                neg = Float32(0.0) - val
+                abs_val = cute.arch.fmax(val, neg)
+                amax = cute.arch.fmax(amax, abs_val)
+            amax_bits = _f32_as_i32(amax)
+            biased_exp = (amax_bits >> Int32(23)) & Int32(0xFF)
+            mantissa_bits = amax_bits & Int32(0x7FFFFF)
+            has_carry = cutlass.Boolean(mantissa_bits > Int32(0x600000))
+            carry = Int32(1) if has_carry else Int32(0)
+            e8m0 = biased_exp - Int32(8) + carry
+            is_normal = cutlass.Boolean(biased_exp > Int32(0))
+            e8m0 = e8m0 if is_normal else Int32(0)
+            is_pos = cutlass.Boolean(e8m0 > Int32(0))
+            e8m0 = e8m0 if is_pos else Int32(0)
+            qexp = Int32(254) - e8m0
+            qexp_hi = cutlass.Boolean(qexp > Int32(254))
+            qexp = Int32(254) if qexp_hi else qexp
+            qexp_lo = cutlass.Boolean(qexp < Int32(1))
+            qexp = Int32(1) if qexp_lo else qexp
+            quant_scale = _i32_as_f32(qexp << Int32(23))
+            for i in cutlass.range(num_z, unroll_full=True):
+                tRS_rD[i] = tRS_rD[i] * quant_scale
+            ue8m0 = e8m0
 
-        # Step 1: amax = max(abs(z[0:32])) — AFTER bias/alpha, BEFORE SwiGLU
-        amax = Float32(0.0)
-        for i in cutlass.range(num_z, unroll_full=True):
-            val = tRS_rD[i]
-            neg = Float32(0.0) - val
-            abs_val = cute.arch.fmax(val, neg)
-            amax = cute.arch.fmax(amax, abs_val)
-
-        # Step 2: E8M0 via integer bit manipulation (matches Triton kernel exactly)
-        amax_bits = _f32_as_i32(amax)
-        biased_exp = (amax_bits >> Int32(23)) & Int32(0xFF)
-        mantissa_bits = amax_bits & Int32(0x7FFFFF)
-        # carry = 1 if mantissa > 0x600000 (round up when mantissa > 0.75)
-        has_carry = cutlass.Boolean(mantissa_bits > Int32(0x600000))
-        carry = Int32(1) if has_carry else Int32(0)
-        e8m0 = biased_exp - Int32(8) + carry
-        is_normal = cutlass.Boolean(biased_exp > Int32(0))
-        e8m0 = e8m0 if is_normal else Int32(0)
-        is_pos = cutlass.Boolean(e8m0 > Int32(0))
-        e8m0 = e8m0 if is_pos else Int32(0)
-
-        # Step 3: quant_scale = 2^(254 - e8m0)
-        qexp = Int32(254) - e8m0
-        qexp_hi = cutlass.Boolean(qexp > Int32(254))
-        qexp = Int32(254) if qexp_hi else qexp
-        qexp_lo = cutlass.Boolean(qexp < Int32(1))
-        qexp = Int32(1) if qexp_lo else qexp
-        quant_scale = _i32_as_f32(qexp << Int32(23))
-
-        # Step 4: z *= quant_scale (values now in [-448, 448])
-        for i in cutlass.range(num_z, unroll_full=True):
-            tRS_rD[i] = tRS_rD[i] * quant_scale
-
-        # Step 5: UE8M0 = e8m0 (clamped, same as Triton kernel stores)
-        ue8m0 = e8m0
-
-        # Return y1 + ue8m0 for epilogue to write scale to gmem
         return tRS_rPostAct, ue8m0
 
     @cute.jit
