@@ -302,16 +302,16 @@ def _native_fp8_gated_forward(
     )
 
     # z_fp8_d: fp8 blockscaled quantized z (from epilogue f32→fp8 cast)
-    # z_scale_out: raw UE8M0 bytes (int32, to be cast to uint8)
     z_raw_scales = z_scale_out.to(torch.uint8)
 
-    # Dequant z to bf16 for downstream (_DownProjection needs bf16 z for z_is_fp8 check)
-    from ..quack_utils.swiglu_triton import dequantize_blockscaled_fp8
-    z_bf16 = dequantize_blockscaled_fp8(z_fp8_d, z_raw_scales)
+    # Create a bf16 dummy z (same shape) for _DownProjection dtype check.
+    # The actual z data is NOT used — _DownProjection saves z_fp8+scales from prequant.
+    # This avoids the 129µs dequant kernel in forward.
+    z_dummy_bf16 = torch.empty_like(z_fp8_d, dtype=torch.bfloat16)
 
     del x_fp8, x_scales_tk_e8m0
 
-    return z_bf16, y1, z_fp8_d, z_raw_scales
+    return z_dummy_bf16, y1, z_fp8_d, z_raw_scales
 
 
 def _use_fused_blockscaled_gated() -> bool:
