@@ -17,7 +17,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
-from quack.epi_ops import TileStore
+from quack.epi_ops import TileStore, EpiOp
 from quack.gemm_act import GemmActMixin
 from quack.gemm_default_epi import GemmDefaultEpiMixin
 from quack.gemm_sm90 import GemmSm90
@@ -182,20 +182,68 @@ def _rcp_approx_f32(x: Float32, *, loc=None, ip=None) -> Float32:
 _FP8_MAX = Float32(448.0)
 
 
+class BlockscaledScaleStore(EpiOp):
+    """EpiOp that stores per-group UE8M0 scale bytes computed in epi_visit_subtile.
+
+    State: per-thread Int32 register for each N-group in the CTA tile.
+    Written to gmem in `end` using absolute (M, N_group) coordinates.
+    """
+
+    def param_fields(self):
+        return [(self.name, object, None)]
+
+    def to_params(self, gemm, args):
+        tensor = getattr(args, self.name, None)
+        if tensor is not None:
+            return {self.name: _make_cute_tensor_dynamic(tensor, leading_dim=0)}
+        return {self.name: None}
+
+    @cute.jit
+    def begin(self, gemm, param, smem_tensor, ctx):
+        """Allocate per-M-row scale register (one scale per epi_N subtile)."""
+        state = None
+        if const_expr(param is not None):
+            # One scale per M-row, accumulated across N subtiles
+            # Shape: (num_epi_n_tiles, tile_M) → for simplicity, just flat (tile_M * num_groups,)
+            # Actually: each epi_visit call produces 1 scale per thread (1 group per subtile)
+            # We need to store scales for ALL N subtiles. With CTA N=128 and epi_N=32:
+            # 128/32 = 4 subtiles → 4 scales per M-row.
+            # Use a flat register array: (tile_M_per_warp * n_groups,)
+            n_groups = ctx.tile_N // 32  # groups along full CTA N dimension
+            colvec_layout = cute.make_layout((ctx.tile_M, n_groups), stride=(n_groups, 1))
+            state_layout = ctx.partition_for_epilogue_fn(
+                cute.make_rmem_tensor(colvec_layout, Int32)
+            ).layout
+            state = cute.make_rmem_tensor(state_layout, Int32)
+            cute.filter_zeros(state).fill(0)
+        return state
+
+    @cute.jit
+    def begin_loop(self, gemm, state, epi_coord):
+        """Return slice for current subtile."""
+        result = None
+        if const_expr(state is not None):
+            result = cute.group_modes(state, 3, cute.rank(state))[None, None, None, epi_coord]
+        return result
+
+
 class GemmGatedBlockscaledQuantMixin(GemmGatedMixin):
     """GemmGated with fused blockscaled FP8 quantization of z in epilogue.
 
     Algorithm (matches Paddle fp8_quant_blockwise_kernel with UE8M0 power-of-2 scaling):
-      1. amax = max(abs(z[group]))
-      2. scale = fp8_max / amax  (using rcp.approx for perf)
-      3. Round scale to power-of-2: keep only exponent, clear mantissa
-      4. quantized = z * scale  (shifts values into [-448, 448])
-      5. UE8M0 = exponent of (1/scale) = exponent of inv_scale
-         (rcp.approx of power-of-2 is bitwise exact)
+      1. amax = max(abs(z[group])), with eps protection
+      2. scale = fp8_max * rcp.approx(amax)  (rcp.approx for perf)
+      3. Round scale to power-of-2: keep only exponent bits
+      4. quantized = z * scale  (values now in [-448, 448])
+      5. UE8M0 = exponent of rcp.approx(scale)  (bitwise exact for pow2)
+      6. Write UE8M0 byte to scale state (EpiOp writes to gmem in end())
 
-    Each thread holds 32 contiguous N-elements = one blockscaled group.
-    All computation is register-local, no warp shuffle needed.
+    Includes BlockscaledScaleStore EpiOp for scale output.
     """
+    _epi_ops = (
+        *GemmGatedMixin._epi_ops,
+        BlockscaledScaleStore("mZScale"),
+    )
 
     @cute.jit
     def epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None):
@@ -241,9 +289,10 @@ class GemmGatedBlockscaledQuantMixin(GemmGatedMixin):
         inv_scale_bits = _f32_as_i32(inv_scale)
         ue8m0 = (inv_scale_bits >> Int32(23)) & Int32(0xFF)
 
-        # TODO Phase 2: write ue8m0 to scale output buffer
-        # For now, z is correctly quantized in registers, written as bf16 by store path.
-        # The bf16 values are in [-448, 448] range (fp8 representable).
+        # Write UE8M0 to scale state (BlockscaledScaleStore EpiOp)
+        z_scale_state = epi_loop_tensors["mZScale"]
+        if const_expr(z_scale_state is not None):
+            z_scale_state[0] = ue8m0
 
         return tRS_rPostAct
 

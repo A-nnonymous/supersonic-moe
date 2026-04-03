@@ -363,7 +363,13 @@ class _GemmSm100ZeroMatMixin:
 # Concrete kernel classes: GemmGated + GemmDGated with zero-mat fix
 # ---------------------------------------------------------------------------
 
-class GemmGatedSm100ZeroMat(GemmGatedBlockscaledQuantMixin, _GemmSm100ZeroMatMixin, GemmSm100):
+class GemmGatedSm100ZeroMat(GemmGatedMixin, _GemmSm100ZeroMatMixin, GemmSm100):
+    pass
+
+
+# Experimental: epilogue blockscaled quant variant (opt-in via gemm_gated dispatch)
+class GemmGatedSm100ZeroMatBlockscaledQuant(GemmGatedBlockscaledQuantMixin, _GemmSm100ZeroMatMixin, GemmSm100):
+    pass
     """SM100 GemmGated with zero-materialization FP8 SFA fix.
 
     MRO: GemmGatedMixin → _GemmSm100ZeroMatMixin → GemmSm100
