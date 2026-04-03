@@ -258,63 +258,35 @@ class MoE(nn.Module):
         clear_all_fp8_weight_caches()
 
     @torch.no_grad()
-    def prepare_native_fp8(self) -> NativeFP8Params:
-        """Pre-quantize ALL expert weights for the 4 GEMM paths — NO cache, NO extra memory.
+    def prepare_native_fp8(self, *, recompute_z: bool = False) -> NativeFP8Params:
+        """Pre-quantize expert weights for native FP8 — fwd-only, bwd lazy, z recompute.
 
-        Directly calls ``_quantize_weight_3d_triton`` to produce FP8 + ISA-packed
-        scales in the exact physical layout each GEMM kernel expects.  Does NOT
-        touch the weight cache system (``_FUSED_WEIGHT_CACHE``, ``_VARLEN_WEIGHT_CACHE``).
+        Only forward weights are pre-quantized (fwd path is hot).  Backward
+        weights are recomputed on-demand from BF16 params (~74µs, parallelized
+        with z-dequant/recompute on a side stream).
 
-        Memory: 4 FP8 views sharing 2 underlying contiguous tensors:
-        - w1: (E, 2I, H) contiguous → ~36 MiB FP8 @ Ernie shape
-        - w2: (E, I, H)  contiguous → ~18 MiB FP8 @ Ernie shape
-        Total: ~108 MiB FP8 + ~0.1 MiB scales (vs ~650 MiB dynamic cache system)
+        When ``recompute_z=True`` (default), z is NOT saved during forward —
+        it is recomputed in backward via an extra GemmGated (~450µs), saving
+        ~204 MiB.
 
-        Returns ``NativeFP8Params`` — pass to ``forward(native_fp8_params=...)``.
-        Call again after every optimizer step.
+        Memory: ~111 MiB (w1_fwd 74 + w2_fwd 37) vs ~222 MiB full.
         """
         w1_param = self.c_fc.weight   # (E, 2I, H) parameter
         w2_param = self.c_proj.weight  # (E, H, I) parameter
 
-        # === w1: up-projection ===
-        # Physical layout needed: (E, N=2I, K=H) contiguous, scales along K=H.
-        # Forward (gemm_gated): expects .mT view (E, K=H, N=2I)
-        # Backward actgrad (varlen): expects (E, dim0, dim1) from permute(2,0,1)
-        #   where input is (H, 2I, E) → (E, H, 2I) contiguous. Scales along dim1=2I.
-        #   But wait — _quantize_weight_3d_triton produces scales along K (last dim).
-        #   For varlen: input w1.permute(1,0,2)=(H,2I,E), precompute does
-        #   permute(2,0,1).contiguous()=(E,H,2I), scales along K=2I.
-        #   This is a DIFFERENT quantization axis than fwd (K=H).
-        #   So we need two separate quantizations for w1.
-
         # w1 forward: (E, 2I, H) contiguous → scales along K=H
-        w1_enk = w1_param.contiguous()  # already (E, 2I, H) = (E, N, K)
+        w1_enk = w1_param.contiguous()
         w1_fwd_fp8_enk, w1_fwd_scales = _quantize_weight_3d_triton(w1_enk)
         w1_fwd_fp8 = w1_fwd_fp8_enk.mT  # (E, H, 2I) view for gemm_gated_tuned
 
-        # w1 backward: (E, H, 2I) contiguous → scales along K=2I
-        w1_ehk = w1_param.permute(0, 2, 1).contiguous()  # (E, H, 2I) contiguous
-        w1_bwd_fp8, w1_bwd_scales = _quantize_weight_3d_triton(w1_ehk)
-
-        # === w2: down-projection ===
-        # Forward varlen: input w2=(H,I,E) → permute(2,0,1).contiguous() = (E,H,I)
-        #   scales along K=I
-        # Backward dgated: input w2=(H,I,E) → permute(2,1,0).contiguous() = (E,I,H)
-        #   scales along K=H. Different axis → two separate quantizations.
-
         # w2 forward: (E, H, I) contiguous → scales along K=I
-        w2_ehi = w2_param.contiguous()  # already (E, H, I)
+        w2_ehi = w2_param.contiguous()
         w2_fwd_fp8, w2_fwd_scales = _quantize_weight_3d_triton(w2_ehi)
-
-        # w2 backward: (E, I, H) contiguous → scales along K=H
-        w2_eih = w2_param.permute(0, 2, 1).contiguous()  # (E, I, H) contiguous
-        w2_bwd_fp8, w2_bwd_scales = _quantize_weight_3d_triton(w2_eih)
 
         return NativeFP8Params(
             w1_fwd_fp8=w1_fwd_fp8, w1_fwd_scales=w1_fwd_scales,
-            w1_bwd_fp8=w1_bwd_fp8, w1_bwd_scales=w1_bwd_scales,
             w2_fwd_fp8=w2_fwd_fp8, w2_fwd_scales=w2_fwd_scales,
-            w2_bwd_fp8=w2_bwd_fp8, w2_bwd_scales=w2_bwd_scales,
+            recompute_z=recompute_z,
         )
 
     def forward(

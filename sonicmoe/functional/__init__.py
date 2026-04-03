@@ -197,31 +197,28 @@ def _native_fp8_enabled() -> bool:
 
 @dataclasses.dataclass(frozen=True)
 class NativeFP8Params:
-    """Pre-computed FP8 weight views for all 4 GEMM paths in the MoE.
+    """Pre-computed FP8 weight views for the MoE forward path.
 
-    Created once via ``MoE.prepare_native_fp8()``, reused every forward/backward.
-    Eliminates ALL runtime weight quantization — only the cheap ISA scale
-    gather (T→TK, ~28µs) remains for the activation path.
+    Created via ``MoE.prepare_native_fp8()``.  Backward weights are recomputed
+    on-demand from the BF16 parameters (74µs, parallelized with z-dequant/recompute)
+    to save ~111 MiB of persistent memory.
 
-    Attributes
-    ----------
-    w1_fwd_fp8, w1_fwd_scales : forward up-proj (gemm_gated). Shape (E, H, 2I) fp8 .mT view.
-    w1_bwd_fp8, w1_bwd_scales : backward actgrad (blockscaled_fp8_gemm_varlen). Shape (E, H, 2I) fp8.
-    w2_fwd_fp8, w2_fwd_scales : forward down-proj (blockscaled_fp8_gemm_varlen). Shape (E, H, I) fp8.
-    w2_bwd_fp8, w2_bwd_scales : backward dgated (gemm_dgated_kernel). Shape (E, I, H) fp8 contiguous.
+    When ``recompute_z=True``, z is not saved during forward — it is recomputed
+    in backward via an extra GemmGated call (~450µs), saving ~204 MiB.
     """
     # Up-projection forward: gemm_gated expects (E, H, 2I) .mT view of contiguous (E, 2I, H)
     w1_fwd_fp8: torch.Tensor
     w1_fwd_scales: torch.Tensor
-    # Up-projection backward actgrad: varlen expects (E, H, 2I) contiguous
-    w1_bwd_fp8: torch.Tensor
-    w1_bwd_scales: torch.Tensor
     # Down-projection forward: varlen expects (E, H, I) contiguous
     w2_fwd_fp8: torch.Tensor
     w2_fwd_scales: torch.Tensor
-    # Down-projection backward dgated: kernel expects (E, I, H) contiguous
-    w2_bwd_fp8: torch.Tensor
-    w2_bwd_scales: torch.Tensor
+    # Backward weights: None = lazy recompute from BF16 params at backward entry
+    w1_bwd_fp8: torch.Tensor | None = None
+    w1_bwd_scales: torch.Tensor | None = None
+    w2_bwd_fp8: torch.Tensor | None = None
+    w2_bwd_scales: torch.Tensor | None = None
+    # z recomputation: when True, compatible with torch.utils.checkpoint
+    recompute_z: bool = False
 
 
 def _native_fp8_gated_forward(
@@ -1054,6 +1051,8 @@ class _DownProjection(torch.autograd.Function):
         activation_type: ActivationType,
         fp8_protocol: FP8Protocol | None,
         native_fp8_params: NativeFP8Params | None = None,
+        x_fp8_data: torch.Tensor | None = None,
+        x_fp8_scales: torch.Tensor | None = None,
     ) -> torch.Tensor:
         TK = y1.size(0)
         H, I, E = w2.shape
@@ -1182,9 +1181,28 @@ class _DownProjection(torch.autograd.Function):
         # At Ernie shape (TK=65536, 2I=3072), z is 384MB BF16 → ~213MB FP8 = ~171MB saved.
         z_is_fp8 = (_fp8_enabled() and use_quack_gemm and _save_z_fp8()
                     and _ALIGNMENT_ASSUMED and z.dtype == torch.bfloat16)
-        ctx._z_is_fp8 = z_is_fp8
 
-        if z_is_fp8:
+        # z recompute: save x_fp8+scales instead of z, recompute z in backward
+        _nfp = native_fp8_params
+        _recompute_z = (_nfp is not None and _nfp.recompute_z and z_is_fp8
+                        and x_fp8_data is not None and x_fp8_scales is not None)
+        ctx._z_is_fp8 = z_is_fp8
+        ctx._recompute_z = _recompute_z
+
+        if _recompute_z:
+            # Don't save z at all — save recompute inputs (x_fp8, x_scales are refs, no copy)
+            ctx.save_for_backward(
+                x_fp8_data,  # for z recompute
+                x_fp8_scales,  # for z recompute
+                w2,
+                b2,
+                topk_scores,
+                expert_frequency_offset,
+                x_gather_idx,
+                s_scatter_idx,
+                s_reverse_scatter_idx,
+            )
+        elif z_is_fp8:
             precomputed_z_fp8 = _PREQUANTIZED_SCALES.pop("z_fp8", None)
             if precomputed_z_fp8 is not None:
                 z_fp8, z_raw_scales = precomputed_z_fp8
@@ -1231,7 +1249,29 @@ class _DownProjection(torch.autograd.Function):
         # have stride (0,0) which violates GEMM k-major assertions)
         dout = dout.contiguous()
 
-        if ctx._z_is_fp8:
+        if getattr(ctx, '_recompute_z', False):
+            # z recompute path: saved (x_fp8, x_scales, w2, b2, ...)
+            (
+                _saved_x_fp8,
+                _saved_x_scales,
+                w2,
+                b2,
+                topk_scores,
+                expert_frequency_offset,
+                x_gather_idx,
+                s_scatter_idx,
+                s_reverse_scatter_idx,
+            ) = ctx.saved_tensors
+            z_fp8 = z_raw_scales_u8 = None
+            # Recompute z via GemmGated
+            _nfp = ctx._native_fp8_params
+            z, _y1_recomp = _native_fp8_gated_forward(
+                None, None, expert_frequency_offset, x_gather_idx,
+                x_fp8_data=_saved_x_fp8, x_fp8_scales=_saved_x_scales,
+                w1_fp8=_nfp.w1_fwd_fp8, w1_scales=_nfp.w1_fwd_scales,
+            )
+            del _y1_recomp, _saved_x_fp8, _saved_x_scales
+        elif ctx._z_is_fp8:
             (
                 z_fp8,
                 z_raw_scales,
@@ -1512,7 +1552,7 @@ class _DownProjection(torch.autograd.Function):
         if not is_varlen_K:
             ds = ds.view(T, K)
 
-        return None, dz, dw2, db2, ds, None, *[None] * 12
+        return None, dz, dw2, db2, ds, None, *[None] * 14
 
 
 def _moe_tc_softmax_topk_layer_quack_inference(
@@ -1841,6 +1881,8 @@ def moe_TC_softmax_topk_layer(
         activation_type,
         fp8_protocol,
         native_fp8_params,
+        x_fp8_data,
+        x_fp8_scales,
     )
     _log_stage_memory("forward:down-proj-router")
 
