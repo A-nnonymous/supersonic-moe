@@ -208,12 +208,31 @@ class BlockscaledScaleStore(EpiOp):
 
     @cute.jit
     def begin(self, gemm, param, smem_tensor, ctx):
-        """Just pass through the param tensor (or None)."""
-        return param
+        """Capture param + tile coords + tidx for scale gmem write."""
+        if const_expr(param is not None):
+            tile_M = gemm.cta_tile_shape_mnk[0]
+            tile_N = gemm.cta_tile_shape_mnk[1]
+            m_in_tile = ctx.tidx % tile_M
+            # Compute absolute M offset
+            if const_expr(ctx.varlen_manager.varlen_m):
+                m_abs = ctx.varlen_manager.params.cu_seqlens_m[ctx.tile_coord_mnkl[3]] + ctx.tile_coord_mnkl[0] * tile_M + m_in_tile
+            else:
+                m_abs = ctx.tile_coord_mnkl[0] * tile_M + m_in_tile
+            n_base = ctx.tile_coord_mnkl[1] * (tile_N // 32)
+            return (param, m_abs, n_base)
+        return None
 
     @cute.jit
     def begin_loop(self, gemm, state, epi_coord):
-        """Return None — scale write happens in overridden epilogue(), not via EpiOp state."""
+        """Return (param, m_abs, n_group_abs) for this subtile."""
+        if const_expr(state is not None):
+            param, m_abs, n_base = state
+            # epi_coord may be tuple (m_sub, n_sub) or scalar; extract N-index
+            if const_expr(isinstance(epi_coord, tuple)):
+                n_sub = epi_coord[1] if len(epi_coord) > 1 else epi_coord[0]
+            else:
+                n_sub = epi_coord
+            return (param, m_abs, n_base + n_sub)
         return None
 
 
@@ -272,7 +291,6 @@ class GemmGatedBlockscaledQuantMixin(GemmGatedMixin):
 
         # ── Blockscaled quant of z (ONLY when mZScale output is requested) ──
         _z_scale_active = epi_loop_tensors["mZScale"]
-        ue8m0 = Int32(0)
         if const_expr(_z_scale_active is not None):
             num_z = cute.size(tRS_rD)
             amax = Float32(0.0)
@@ -281,6 +299,7 @@ class GemmGatedBlockscaledQuantMixin(GemmGatedMixin):
                 neg = Float32(0.0) - val
                 abs_val = cute.arch.fmax(val, neg)
                 amax = cute.arch.fmax(amax, abs_val)
+            amax = cute.arch.fmax(amax, Float32(1e-4))
             amax_bits = _f32_as_i32(amax)
             biased_exp = (amax_bits >> Int32(23)) & Int32(0xFF)
             mantissa_bits = amax_bits & Int32(0x7FFFFF)
@@ -299,147 +318,19 @@ class GemmGatedBlockscaledQuantMixin(GemmGatedMixin):
             quant_scale = _i32_as_f32(qexp << Int32(23))
             for i in cutlass.range(num_z, unroll_full=True):
                 tRS_rD[i] = tRS_rD[i] * quant_scale
-            ue8m0 = e8m0
+            # Clamp to [-448, 448] (fp8 e4m3fn range) to prevent bf16 overflow
+            for i in cutlass.range(num_z, unroll_full=True):
+                val = tRS_rD[i]
+                val = cute.arch.fmax(Float32(-448.0), val)
+                # fmin via negation: min(a, b) = -max(-a, -b)
+                val = Float32(0.0) - cute.arch.fmax(Float32(-448.0), Float32(0.0) - val)
+                tRS_rD[i] = val
+            # Write ue8m0 to scale output via EpiOp state (absolute coordinates)
+            scale_info = epi_loop_tensors["mZScale"]
+            scale_tensor, m_abs, n_group_abs = scale_info
+            scale_tensor[m_abs, n_group_abs] = e8m0
 
-        return tRS_rPostAct, ue8m0
-
-    @cute.jit
-    def epilogue(
-        self, params, epi_smem_tensors, epi_pipeline, epi_store_pipeline,
-        epi_read_state, epi_producer_state, epi_tile, load_acc_subtile,
-        tRS_rD, tRS_rC, tiled_copy_t2r, tiled_copy_r2s, tRS_sD,
-        tiled_copy_s2r, tSR_rC, tSR_sC, copy_D, copy_C,
-        tile_coord_mnkl, varlen_manager, epilogue_barrier,
-        tile_scheduler, tidx, is_tma_warp,
-    ):
-        """Override epilogue to inject scale gmem write after epi_visit_subtile.
-
-        This is a copy of GemmSm90.epilogue with ONE addition: after
-        epi_visit_subtile (which computes ue8m0 and stores it in EpiOp state),
-        we write the scale byte directly to gmem using tile coordinates.
-        """
-        has_C = const_expr(tRS_rC is not None)
-        has_D = const_expr(copy_D is not None)
-
-        postact_ctx = self.epi_setup_postact(
-            params, epi_smem_tensors, tiled_copy_r2s, tiled_copy_t2r,
-            tile_coord_mnkl, varlen_manager, tidx,
-        )
-
-        epi_tile_shape = cute.zipped_divide(
-            cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_tile
-        ).shape[1]
-        epi_tile_layout = cute.make_ordered_layout(epi_tile_shape, order=(1, 0))
-        epi_tile_num = cute.size(epi_tile_shape)
-        num_prev_subtiles = tile_scheduler.num_tiles_executed * epi_tile_num
-
-        epi_tensors = self.epi_begin(
-            params, epi_smem_tensors, epi_tile, tiled_copy_t2r, tiled_copy_r2s,
-            tile_coord_mnkl, varlen_manager, epilogue_barrier, tidx,
-        )
-
-        if const_expr(copy_C is not None):
-            for epi_idx in cutlass.range(min(epi_tile_num, self.epi_c_stage), unroll=1):
-                gmem_coord_C = epi_tile_layout.get_hier_coord(epi_idx)
-                if is_tma_warp:
-                    epi_pipeline.producer_acquire(epi_producer_state)
-                    copy_C(src_idx=gmem_coord_C, producer_state=epi_producer_state)
-                    epi_pipeline.producer_commit(epi_producer_state)
-                epi_producer_state.advance()
-
-        for epi_idx in cutlass.range_constexpr(epi_tile_num):
-            gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
-            load_acc_subtile(tRS_rD, epi_idx)
-            epi_loop_tensors = self.epi_begin_loop(params, epi_tensors, gmem_coord)
-            if const_expr(has_C):
-                epi_pipeline.consumer_wait(epi_read_state)
-                cute.copy(tiled_copy_s2r, tSR_sC[None, None, None, epi_read_state.index], tSR_rC)
-                cute.arch.fence_view_async_shared()
-                cute.arch.sync_warp()
-                with cute.arch.elect_one():
-                    epi_pipeline.consumer_release(epi_read_state)
-                epi_read_state.advance()
-            if const_expr(copy_C is not None and epi_idx + self.epi_c_stage < epi_tile_num):
-                gmem_coord_C = epi_tile_layout.get_hier_coord(epi_idx + self.epi_c_stage)
-                if is_tma_warp:
-                    epi_pipeline.producer_acquire(epi_producer_state)
-                    copy_C(src_idx=gmem_coord_C, producer_state=epi_producer_state)
-                    epi_pipeline.producer_commit(epi_producer_state)
-                epi_producer_state.advance()
-
-            # ─── epi_visit_subtile: SwiGLU + blockscaled quant (integer+carry, returns ue8m0) ───
-            tRS_rPostAct, ue8m0 = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
-
-            # ─── SCALE GMEM WRITE ───
-            z_scale_tensor = epi_tensors["mZScale"]
-            if const_expr(z_scale_tensor is not None):
-                tile_M = self.cta_tile_shape_mnk[0]
-                m_in_tile = tidx % tile_M
-                if const_expr(varlen_manager.varlen_m):
-                    batch_idx = tile_coord_mnkl[3]
-                    m_abs = varlen_manager.params.cu_seqlens_m[batch_idx] + tile_coord_mnkl[0] * tile_M + m_in_tile
-                    limit_m = varlen_manager.len_m(batch_idx)
-                else:
-                    m_abs = tile_coord_mnkl[0] * tile_M + m_in_tile
-                    limit_m = tile_M
-                if m_in_tile + tile_coord_mnkl[0] * tile_M < limit_m:
-                    n_groups_per_tile = self.cta_tile_shape_mnk[1] // 32
-                    n_group = tile_coord_mnkl[1] * n_groups_per_tile + epi_idx
-                    z_scale_tensor[m_abs, n_group] = ue8m0
-
-            # Convert and store postact
-            if const_expr(postact_ctx is not None):
-                tRS_rPostAct_out = self.epi_convert_postact(
-                    tRS_rPostAct, epi_loop_tensors["sr_seed"], tidx,
-                    tile_coord_mnkl, num_prev_subtiles, epi_idx,
-                )
-            if is_tma_warp:
-                epi_store_pipeline.producer_acquire()
-            epilogue_barrier.arrive_and_wait()
-            # D registers → smem
-            epi_buffer = (num_prev_subtiles + epi_idx) % self.epi_stage
-            if const_expr(has_D):
-                if const_expr(
-                    self.rounding_mode == RoundingMode.RS
-                    and self.acc_dtype == cutlass.Float32
-                    and self.d_dtype == cutlass.BFloat16
-                ):
-                    seed = epi_loop_tensors["sr_seed"] + (
-                        tile_coord_mnkl[0] * 65537 + tile_coord_mnkl[1] * 257
-                        + tile_coord_mnkl[3] * 17 + (num_prev_subtiles + epi_idx) * 7
-                    )
-                    copy_utils.sr_cvt_copy(
-                        tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer],
-                        seed, tidx,
-                    )
-                else:
-                    copy_utils.cvt_copy(
-                        tiled_copy_r2s, tRS_rD, tRS_sD[None, None, None, epi_buffer]
-                    )
-            # PostAct registers → smem
-            if const_expr(postact_ctx is not None):
-                tiled_copy_postact_r2s, tRS_sPostAct, copy_postact = postact_ctx
-                cute.copy(
-                    tiled_copy_postact_r2s,
-                    tiled_copy_postact_r2s.retile(tRS_rPostAct_out),
-                    tRS_sPostAct[None, None, None, epi_buffer],
-                )
-            # smem → gmem via TMA
-            cute.arch.fence_view_async_shared()
-            epilogue_barrier.arrive_and_wait()
-            if is_tma_warp:
-                if const_expr(has_D):
-                    copy_D(src_idx=epi_buffer, dst_idx=gmem_coord)
-                if const_expr(postact_ctx is not None):
-                    copy_postact(src_idx=epi_buffer, dst_idx=gmem_coord)
-                epi_store_pipeline.producer_commit()
-
-        self.epi_end(
-            params, epi_tensors, epi_tile, tiled_copy_t2r, tiled_copy_r2s,
-            tile_coord_mnkl, varlen_manager, tidx,
-        )
-        return epi_read_state, epi_producer_state
-
+        return tRS_rPostAct
 
 class GemmGatedBlockscaledQuantSm100(GemmGatedBlockscaledQuantMixin, GemmSm100):
     pass

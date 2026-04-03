@@ -280,17 +280,17 @@ def _native_fp8_gated_forward(
         _w1_fp8, _w1_scales = precompute_weight_fp8_for_fused_gated(w1)
 
     # --- Step 4: GemmGated with epilogue blockscaled quant ---
-    # D output as bf16 (epilogue scales z, cvt_copy writes bf16 scaled values)
-    # z_scale_out receives raw UE8M0 bytes from the epilogue
+    # D output as fp8: epilogue scales z, cvt_copy does f32→fp8 (saturating cast).
+    # MUST be fp8, not bf16: quant_scale can produce f32 values >> bf16_max.
     TK = x_gather_idx.shape[0]
     N = _w1_fp8.shape[-1] if _w1_fp8.dim() == 3 else _w1_fp8.shape[1]
     n_groups = N // 32
     z_scale_out = torch.empty(TK, n_groups, dtype=torch.int32, device=x_gather_idx.device)
 
-    z, y1 = gemm_gated(
+    z_fp8_d, y1 = gemm_gated(
         x_fp8, _w1_fp8,
         activation="swiglu",
-        out_dtype=torch.bfloat16,
+        out_dtype=torch.float8_e4m3fn,  # fp8 D output — no bf16 overflow
         postact_dtype=torch.bfloat16,
         cu_seqlens_m=expert_frequency_offset,
         A_idx=x_gather_idx,
@@ -301,15 +301,17 @@ def _native_fp8_gated_forward(
         z_scale_out=z_scale_out,
     )
 
-    # z is bf16 with scaled values. z_fp8 + z_raw_scales for backward save.
-    z_fp8 = z.to(torch.float8_e4m3fn)
+    # z_fp8_d: fp8 blockscaled quantized z (from epilogue f32→fp8 cast)
+    # z_scale_out: raw UE8M0 bytes (int32, to be cast to uint8)
     z_raw_scales = z_scale_out.to(torch.uint8)
+
+    # Dequant z to bf16 for downstream (_DownProjection needs bf16 z for z_is_fp8 check)
+    from ..quack_utils.swiglu_triton import dequantize_blockscaled_fp8
+    z_bf16 = dequantize_blockscaled_fp8(z_fp8_d, z_raw_scales)
 
     del x_fp8, x_scales_tk_e8m0
 
-    # Return z (bf16 scaled — _DownProjection won't use it directly if z_is_fp8),
-    # y1 (bf16 original), z_fp8 + z_raw_scales (for backward save)
-    return z, y1, z_fp8, z_raw_scales
+    return z_bf16, y1, z_fp8_d, z_raw_scales
 
 
 def _use_fused_blockscaled_gated() -> bool:
