@@ -21,6 +21,7 @@ from .quack_utils import (
     precompute_weight_fp8_for_direct_fused_dgated,
     quantize_and_pack_activation,
 )
+from .quack_utils.blockscaled_fp8_gemm import _quantize_weight_3d_triton
 
 
 try:
@@ -258,41 +259,56 @@ class MoE(nn.Module):
 
     @torch.no_grad()
     def prepare_native_fp8(self) -> NativeFP8Params:
-        """Pre-quantize ALL expert weights for the 4 GEMM paths into a single immutable object.
+        """Pre-quantize ALL expert weights for the 4 GEMM paths — NO cache, NO extra memory.
 
-        Returns a ``NativeFP8Params`` holding FP8 weight views + ISA-packed scales
-        for forward and backward. Pass this to ``forward(native_fp8_params=...)``.
+        Directly calls ``_quantize_weight_3d_triton`` to produce FP8 + ISA-packed
+        scales in the exact physical layout each GEMM kernel expects.  Does NOT
+        touch the weight cache system (``_FUSED_WEIGHT_CACHE``, ``_VARLEN_WEIGHT_CACHE``).
 
-        Call once after model init, and again after every optimizer step via
-        ``refresh_native_fp8()``.  Memory: ~216 MiB at Ernie shape (vs ~650 MiB
-        for the dynamic cache system).
+        Memory: 4 FP8 views sharing 2 underlying contiguous tensors:
+        - w1: (E, 2I, H) contiguous → ~36 MiB FP8 @ Ernie shape
+        - w2: (E, I, H)  contiguous → ~18 MiB FP8 @ Ernie shape
+        Total: ~108 MiB FP8 + ~0.1 MiB scales (vs ~650 MiB dynamic cache system)
+
+        Returns ``NativeFP8Params`` — pass to ``forward(native_fp8_params=...)``.
+        Call again after every optimizer step.
         """
-        w1 = self.c_fc.weight   # (E, 2I, H) parameter
-        w2 = self.c_proj.weight  # (E, H, I) parameter
+        w1_param = self.c_fc.weight   # (E, 2I, H) parameter
+        w2_param = self.c_proj.weight  # (E, H, I) parameter
 
-        # 1. Forward up-proj: gemm_gated expects (E, H, 2I) .mT view
-        w1_fwd_fp8, w1_fwd_scales = precompute_weight_fp8_for_fused_gated(
-            w1.permute(1, 2, 0)  # (2I, H, E) view
-        )
+        # === w1: up-projection ===
+        # Physical layout needed: (E, N=2I, K=H) contiguous, scales along K=H.
+        # Forward (gemm_gated): expects .mT view (E, K=H, N=2I)
+        # Backward actgrad (varlen): expects (E, dim0, dim1) from permute(2,0,1)
+        #   where input is (H, 2I, E) → (E, H, 2I) contiguous. Scales along dim1=2I.
+        #   But wait — _quantize_weight_3d_triton produces scales along K (last dim).
+        #   For varlen: input w1.permute(1,0,2)=(H,2I,E), precompute does
+        #   permute(2,0,1).contiguous()=(E,H,2I), scales along K=2I.
+        #   This is a DIFFERENT quantization axis than fwd (K=H).
+        #   So we need two separate quantizations for w1.
 
-        # 2. Backward actgrad: blockscaled_fp8_gemm_varlen expects (E, H, 2I)
-        w1_bwd_fp8, w1_bwd_scales = precompute_weight_fp8(
-            w1.permute(2, 0, 1).permute(0, 2, 1)  # (E, H, 2I) via (E, 2I, H) → permute
-        )
-        # Simpler: w1.permute(1,2,0) is (2I,H,E), .permute(1,0,2) is (H,2I,E)
-        w1_bwd_fp8, w1_bwd_scales = precompute_weight_fp8(
-            w1.permute(1, 2, 0).permute(1, 0, 2)  # (H, 2I, E)
-        )
+        # w1 forward: (E, 2I, H) contiguous → scales along K=H
+        w1_enk = w1_param.contiguous()  # already (E, 2I, H) = (E, N, K)
+        w1_fwd_fp8_enk, w1_fwd_scales = _quantize_weight_3d_triton(w1_enk)
+        w1_fwd_fp8 = w1_fwd_fp8_enk.mT  # (E, H, 2I) view for gemm_gated_tuned
 
-        # 3. Forward down-proj: varlen expects (E, H, I)
-        w2_fwd_fp8, w2_fwd_scales = precompute_weight_fp8(
-            w2.permute(1, 2, 0)  # (H, I, E) view
-        )
+        # w1 backward: (E, H, 2I) contiguous → scales along K=2I
+        w1_ehk = w1_param.permute(0, 2, 1).contiguous()  # (E, H, 2I) contiguous
+        w1_bwd_fp8, w1_bwd_scales = _quantize_weight_3d_triton(w1_ehk)
 
-        # 4. Backward dgated: kernel expects (E, I, H) contiguous
-        w2_bwd_fp8, w2_bwd_scales = precompute_weight_fp8_for_direct_fused_dgated(
-            w2.permute(1, 2, 0)  # (H, I, E) view
-        )
+        # === w2: down-projection ===
+        # Forward varlen: input w2=(H,I,E) → permute(2,0,1).contiguous() = (E,H,I)
+        #   scales along K=I
+        # Backward dgated: input w2=(H,I,E) → permute(2,1,0).contiguous() = (E,I,H)
+        #   scales along K=H. Different axis → two separate quantizations.
+
+        # w2 forward: (E, H, I) contiguous → scales along K=I
+        w2_ehi = w2_param.contiguous()  # already (E, H, I)
+        w2_fwd_fp8, w2_fwd_scales = _quantize_weight_3d_triton(w2_ehi)
+
+        # w2 backward: (E, I, H) contiguous → scales along K=H
+        w2_eih = w2_param.permute(0, 2, 1).contiguous()  # (E, I, H) contiguous
+        w2_bwd_fp8, w2_bwd_scales = _quantize_weight_3d_triton(w2_eih)
 
         return NativeFP8Params(
             w1_fwd_fp8=w1_fwd_fp8, w1_fwd_scales=w1_fwd_scales,

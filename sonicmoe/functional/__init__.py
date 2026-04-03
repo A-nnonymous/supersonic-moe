@@ -240,7 +240,7 @@ def _native_fp8_gated_forward(
     (~60µs) is skipped entirely.  When ``w1_fp8``/``w1_scales`` are given, the
     weight precompute+cache (~0µs cached but ~650 MiB memory) is bypassed.
 
-    Returns (z_bf16, y1_fp8, y1_packed_scales).
+    Returns (z_bf16, y1_bf16).
     """
     from ..quack_utils.blockscaled_fp8_gemm import (
         quantize_and_pack_activation,
@@ -282,7 +282,7 @@ def _native_fp8_gated_forward(
     else:
         _w1_fp8, _w1_scales = precompute_weight_fp8_for_fused_gated(w1)
 
-    # --- Step 4: GemmGated (PostAct bf16) + y1 quantize ---
+    # --- Step 4: GemmGated (PostAct bf16) ---
     z, y1 = gemm_gated(
         x_fp8, _w1_fp8,
         activation="swiglu",
@@ -295,11 +295,10 @@ def _native_fp8_gated_forward(
         dynamic_scheduler=False,
         tuned=False,
     )
-    y1_fp8, y1_scales = quantize_and_pack_activation(y1)
 
     del x_fp8, x_scales_tk_e8m0
 
-    return z, y1_fp8, y1_scales
+    return z, y1
 
 
 def _use_fused_blockscaled_gated() -> bool:
@@ -751,19 +750,21 @@ class _UpProjection(torch.autograd.Function):
                     if _native_fp8_enabled():
                         # Native FP8: skip x-quant + weight-quant when params provided
                         _nfp = native_fp8_params
-                        z, y1_fp8, y1_packed_scales = _native_fp8_gated_forward(
+                        z, y1 = _native_fp8_gated_forward(
                             x, w1, expert_frequency_offset, x_gather_idx,
                             x_fp8_data=x_fp8_data,
                             x_fp8_scales=x_fp8_scales,
                             w1_fp8=_nfp.w1_fwd_fp8 if _nfp else None,
                             w1_scales=_nfp.w1_fwd_scales if _nfp else None,
                         )
-                        y1 = y1_fp8  # y1 is FP8 in native mode
+                        # Fused z+y1 quantize (same as frontier path)
                         if _save_z_fp8():
-                            from ..quack_utils.blockscaled_fp8_gemm import quantize_activation_blockscaled_fast
-                            z_fp8, z_raw_scales = quantize_activation_blockscaled_fast(z)
+                            from ..quack_utils.blockscaled_fp8_gemm import fused_z_save_y1_quant
+                            z_fp8, z_raw_scales, y1_fp8, y1_packed_scales = fused_z_save_y1_quant(z, y1)
                             _PREQUANTIZED_SCALES["z_fp8"] = (z_fp8, z_raw_scales)
-                        _PREQUANTIZED_SCALES["fwd"] = (y1_fp8, y1_fp8, y1_packed_scales)
+                        else:
+                            y1_fp8, y1_packed_scales = quantize_and_pack_activation(y1)
+                        _PREQUANTIZED_SCALES["fwd"] = (y1, y1_fp8, y1_packed_scales)
                     else:
                         z, y1 = _fused_blockscaled_gated_forward(
                             x, w1, expert_frequency_offset, x_gather_idx
