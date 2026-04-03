@@ -336,9 +336,10 @@ class TestTrueNativeFP8(unittest.TestCase):
         self.assertIsInstance(nfp, NativeFP8Params)
         self.assertEqual(nfp.w1_fwd_fp8.dtype, torch.float8_e4m3fn)
         self.assertEqual(nfp.w2_fwd_fp8.dtype, torch.float8_e4m3fn)
-        self.assertEqual(nfp.w1_bwd_fp8.dtype, torch.float8_e4m3fn)
-        self.assertEqual(nfp.w2_bwd_fp8.dtype, torch.float8_e4m3fn)
         self.assertEqual(nfp.w1_fwd_scales.dtype, torch.float8_e8m0fnu)
+        # Bwd weights are lazy (None by default)
+        self.assertIsNone(nfp.w1_bwd_fp8)
+        self.assertIsNone(nfp.w2_bwd_fp8)
         # w2_fwd should be (E, H, I) = (8, 3072, 1536) permuted
         self.assertEqual(nfp.w2_fwd_fp8.shape[0], 8)  # E dimension
 
