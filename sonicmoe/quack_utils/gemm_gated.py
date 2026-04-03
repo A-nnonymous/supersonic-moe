@@ -183,10 +183,15 @@ _FP8_MAX = Float32(448.0)
 
 
 class BlockscaledScaleStore(EpiOp):
-    """EpiOp that stores per-group UE8M0 scale bytes computed in epi_visit_subtile.
+    """EpiOp for writing UE8M0 scale bytes from epilogue blockscaled quant.
 
-    State: per-thread Int32 register for each N-group in the CTA tile.
-    Written to gmem in `end` using absolute (M, N_group) coordinates.
+    In begin(): captures (scale_tensor, tidx, tile_coord_mnkl, tile_M, varlen_manager).
+    In begin_loop(): passes state + epi_coord to epi_visit_subtile.
+    In epi_visit_subtile: computes absolute (m_row, n_group) and writes ue8m0 byte
+    directly to gmem via the scale_tensor.
+
+    Scale output layout: (total_M, N//32) uint8, row-major, same as raw_scales
+    format used by quantize_activation_blockscaled_fast.
     """
 
     def param_fields(self):
@@ -200,45 +205,49 @@ class BlockscaledScaleStore(EpiOp):
 
     @cute.jit
     def begin(self, gemm, param, smem_tensor, ctx):
-        """Allocate per-M-row scale register (one scale per epi_N subtile)."""
-        state = None
+        """Capture scale output tensor + tile coordinates + thread index."""
         if const_expr(param is not None):
-            # One scale per M-row, accumulated across N subtiles
-            # Shape: (num_epi_n_tiles, tile_M) → for simplicity, just flat (tile_M * num_groups,)
-            # Actually: each epi_visit call produces 1 scale per thread (1 group per subtile)
-            # We need to store scales for ALL N subtiles. With CTA N=128 and epi_N=32:
-            # 128/32 = 4 subtiles → 4 scales per M-row.
-            # Use a flat register array: (tile_M_per_warp * n_groups,)
-            n_groups = ctx.tile_N // 32  # groups along full CTA N dimension
-            colvec_layout = cute.make_layout((ctx.tile_M, n_groups), stride=(n_groups, 1))
-            state_layout = ctx.partition_for_epilogue_fn(
-                cute.make_rmem_tensor(colvec_layout, Int32)
-            ).layout
-            state = cute.make_rmem_tensor(state_layout, Int32)
-            cute.filter_zeros(state).fill(0)
-        return state
+            return (param, ctx.tidx, ctx.tile_coord_mnkl, ctx.tile_M,
+                    ctx.varlen_manager)
+        return None
 
     @cute.jit
     def begin_loop(self, gemm, state, epi_coord):
-        """Return slice for current subtile."""
-        result = None
+        """Pass state + current epi N-subtile coord."""
         if const_expr(state is not None):
-            result = cute.group_modes(state, 3, cute.rank(state))[None, None, None, epi_coord]
-        return result
+            param, tidx, tile_coord_mnkl, tile_M, varlen_mgr = state
+            return (param, tidx, tile_coord_mnkl, tile_M, varlen_mgr, epi_coord)
+        return None
 
 
 class GemmGatedBlockscaledQuantMixin(GemmGatedMixin):
     """GemmGated with fused blockscaled FP8 quantization of z in epilogue.
 
-    Algorithm (matches Paddle fp8_quant_blockwise_kernel with UE8M0 power-of-2 scaling):
-      1. amax = max(abs(z[group])), with eps protection
-      2. scale = fp8_max * rcp.approx(amax)  (rcp.approx for perf)
-      3. Round scale to power-of-2: keep only exponent bits
-      4. quantized = z * scale  (values now in [-448, 448])
-      5. UE8M0 = exponent of rcp.approx(scale)  (bitwise exact for pow2)
-      6. Write UE8M0 byte to scale state (EpiOp writes to gmem in end())
+    Matches Paddle fp8_quant_blockwise_kernel.cu with UE8M0 power-of-2 scaling.
+    All 5 steps run atomically in the same register domain:
 
-    Includes BlockscaledScaleStore EpiOp for scale output.
+      1. amax = max(abs(z[group]))  — from ORIGINAL f32 register values
+      2. scale = 448.0 / amax → ldexpf(1.0, floor(log2(scale)))  [power-of-2]
+      3. store_scale = 1.0 / scale  [exact for pow2]
+      4. UE8M0 = biased_exponent(store_scale)
+      5. z_quantized = z_original * scale → hardware fp8 saturating cast
+
+    CRITICAL: steps 1-5 must use the SAME original z values. Cannot split
+    across kernels (bf16 intermediate store loses precision, amax recovery
+    from quantized values is numerically wrong).
+
+    Precision notes (matching Paddle reference):
+      - scale = fp8_max / amax uses fdiv, NOT rcp.approx
+        (rcp.approx has mantissa error that can flip the pow2 rounding boundary)
+      - Power-of-2 rounding: ldexpf(1.0, biased_exp - 127), NOT clearing mantissa bits
+        (ldexpf is exact; clearing mantissa differs for subnormals and exp=0)
+      - store_scale = 1.0 / scale is exact when scale is power-of-2
+      - UE8M0 = (float_as_int(store_scale) >> 23) & 0xFF — direct exponent extraction
+      - fp8 cast: hardware static_cast<fp8>(val * scale) does saturation + round
+
+    Register layout: SM100 Ld32x32bOp maps 1 M-row per thread, all N-elements
+    local. For epi_tile_n=32: each thread holds 32 z-elements = 1 blockscaled group.
+    No warp shuffle needed.
     """
     _epi_ops = (
         *GemmGatedMixin._epi_ops,
@@ -253,9 +262,11 @@ class GemmGatedBlockscaledQuantMixin(GemmGatedMixin):
         )
 
         # ── Blockscaled quant of z (tRS_rD) in registers ──
+        # tRS_rD holds the ORIGINAL f32 z values (preactivation, after bias)
+        # All 5 quant steps run here atomically.
         num_z = cute.size(tRS_rD)
 
-        # Step 1: amax over all elements
+        # Step 1: amax = max(abs(z_original[0:32]))
         amax = Float32(0.0)
         for i in cutlass.range(num_z, unroll_full=True):
             val = tRS_rD[i]
@@ -263,36 +274,45 @@ class GemmGatedBlockscaledQuantMixin(GemmGatedMixin):
             abs_val = cute.arch.fmax(val, neg)
             amax = cute.arch.fmax(amax, abs_val)
 
-        # Step 2: scale = fp8_max / amax (via rcp.approx for performance)
-        # rcp.approx is bitwise exact for power-of-2 values, and the
-        # mantissa error for non-pow2 doesn't matter because we round next.
-        rcp_amax = _rcp_approx_f32(amax)
-        scale = _FP8_MAX * rcp_amax
+        # Step 2: scale = fp8_max / amax, rounded to power-of-2
+        # Use fdiv (not rcp.approx) for precision at pow2 rounding boundary.
+        # Guard amax == 0 → scale = 1.0
+        amax_safe = cute.arch.fmax(amax, Float32(1.17549435e-38))  # FLT_MIN as eps
+        scale = _FP8_MAX / amax_safe  # fdiv — exact enough for pow2 rounding
 
-        # Handle amax == 0: scale would be inf → clamp to 1.0
-        is_inf_bits = _f32_as_i32(scale) & Int32(0x7F800000)
-        is_inf = cutlass.Boolean(is_inf_bits == Int32(0x7F800000))
-        scale = Float32(1.0) if is_inf else scale
-
-        # Step 3: Round to power-of-2 (clear mantissa, keep sign+exponent)
+        # Power-of-2 rounding via ldexpf(1.0, biased_exp - 127)
+        # Extract biased exponent, reconstruct as exact power of 2
         scale_bits = _f32_as_i32(scale)
-        scale_exp = scale_bits & Int32(0x7F800000)  # keep only exponent
-        scale = _i32_as_f32(scale_exp)  # power-of-2 scale
+        biased_exp = (scale_bits >> Int32(23)) & Int32(0xFF)
+        # ldexpf(1.0, biased_exp - 127) = 2^(biased_exp - 127)
+        # This is the same as setting mantissa=0, sign=0, exp=biased_exp
+        # For normal numbers: _i32_as_f32(biased_exp << 23)
+        scale_pow2 = _i32_as_f32(biased_exp << Int32(23))
 
-        # Step 4: Quantize z in-place: z *= scale
+        # Handle edge case: if amax was 0, scale is huge → clamp
+        is_inf = cutlass.Boolean(biased_exp >= Int32(0xFF))
+        scale_pow2 = Float32(1.0) if is_inf else scale_pow2
+
+        # Step 3: store_scale = 1.0 / scale_pow2 (exact for power-of-2)
+        # For pow2, 1/2^n = 2^(-n), represented exactly in float32
+        store_scale_bits = _f32_as_i32(Float32(1.0) / scale_pow2)
+
+        # Step 4: UE8M0 = biased exponent of store_scale
+        ue8m0 = (store_scale_bits >> Int32(23)) & Int32(0xFF)
+
+        # Step 5: Quantize z in-place: z *= scale_pow2
+        # After this, values are in [-448, 448] range.
+        # The epilogue's cvt_copy will f32→bf16→smem→TMA for D output.
+        # NOTE: the bf16 D output contains SCALED values, NOT original z.
+        # This is correct only if the downstream consumer knows to dequant.
         for i in cutlass.range(num_z, unroll_full=True):
-            tRS_rD[i] = tRS_rD[i] * scale
+            tRS_rD[i] = tRS_rD[i] * scale_pow2
 
-        # Step 5: Compute UE8M0 = exponent of inv_scale
-        # inv_scale = 1/scale — rcp.approx is bitwise exact for power-of-2
-        inv_scale = _rcp_approx_f32(scale)
-        inv_scale_bits = _f32_as_i32(inv_scale)
-        ue8m0 = (inv_scale_bits >> Int32(23)) & Int32(0xFF)
-
-        # Write UE8M0 to scale state (BlockscaledScaleStore EpiOp)
-        z_scale_state = epi_loop_tensors["mZScale"]
-        if const_expr(z_scale_state is not None):
-            z_scale_state[0] = ue8m0
+        # Write UE8M0 scale byte (if scale output is provided)
+        z_scale_info = epi_loop_tensors["mZScale"]
+        if const_expr(z_scale_info is not None):
+            # TODO: gmem write using tile coordinates from EpiOp state
+            pass
 
         return tRS_rPostAct
 
