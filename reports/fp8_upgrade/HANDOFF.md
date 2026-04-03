@@ -1,8 +1,8 @@
 # Blockscaled FP8 MoE — Handoff
 
-> **Last updated:** 2026-04-03 (Session 35 — true native FP8 + authoritative A/B comparison on node 0267)
+> **Last updated:** 2026-04-03 (Session 35 — native FP8 + SonicMoE alignment analysis)
 > **Branch:** `native-fp8-exploration`
-> **Status:** True native FP8 is **1.082× faster** than official BF16 on GPU projection (same node, same GPU, back-to-back). x-quant kernel eliminated, weight caches bypassed. FP8 peak memory +472 MiB vs BF16 (weight buffers + z save). Precision: all variables RRMSE <8%, cosine >0.997. **31/31 frontier + 5/5 native tests pass.**
+> **Status:** Native FP8 is **1.082× faster** (GPU projection, same-node A/B). But **521µs FP8 overhead (14.2%) 全部来自非融合的独立 HBM kernel，违背 SonicMoE IO-aware 融合原则**。下一步：epilogue quant fusion。
 
 ---
 
@@ -305,49 +305,48 @@ Wgrad: ALWAYS BF16. Uses original bf16 parameters via quack.gemm().
 
 ---
 
-## 7. Next Steps (Priority Order)
+## 7. SonicMoE 对齐分析 & 下一步
 
-### Remaining FP8 overhead: 521µs/iter (14.2%)
+### 当前 FP8 与 SonicMoE 原则的差距
 
-| Kernel | µs | Status |
-|--------|----|--------|
-| fused_z_save_y1_quant | 168 | 67% DRAM throughput — near practical limit |
-| quantize_and_pack ×2 (dout+dz) | 168 | Needs system-level pre-quantized gradient passing |
-| dequant_blockscaled_fp8 (z) | 129 | **Hard CUTLASS limitation** (see below) |
-| gather_isa_packed_scales ×2 | 55 | Minimal overhead, cannot eliminate |
+SonicMoE 核心：**所有操作融合进 GEMM kernel，零独立 HBM kernel。** 当前 FP8 有 5 个独立 HBM kernel（521µs/iter, 14.2%），是"附加层"而非"融合层"。
 
-### Direction A: z-dequant elimination — **BLOCKED (hard CUTLASS limitation)**
+| FP8 操作 | SonicMoE 理想 | 当前实际 | IO 浪费 |
+|---------|-------------|----------|---------|
+| x quant | GEMM prologue on-the-fly | 已通过 native x 消除 ✓ | 0 |
+| z+y1 quant | GEMM epilogue on-the-fly | **独立 fused_z_y1 kernel** 168µs | 582 MB |
+| z dequant | GEMM C-load on-the-fly | **独立 dequant kernel** 129µs | 582 MB |
+| scale gather | GEMM TMA co-load | **独立 gather kernel** 55µs | ~2 MB |
+| dout/dz quant | 上下游传递预量化 gradient | **独立 kernel ×2** 168µs | 96 MB |
 
-Investigated thoroughly (Session 35). The `GemmDGatedSm100` kernel requires bf16 PreAct because of 5 hard constraints:
-1. `view(float32)` packing trick requires 2-byte elements (FP8 = 1 byte breaks dimensionality)
-2. `recast_tensor` in epilogue assumes bf16 width (8-bit → 4 values per register, breaks x/y pairing)
-3. TMA smem layout is dtype-specific (different atoms, swizzle patterns)
-4. No epilogue visitor hook for pre-visit dequantization
-5. Blockscaled scales need additional TMA channel + smem buffer
+**唯二符合 SonicMoE 的设计：** ZeroMat A_idx gather 融合 + stream 并行 z-dequant||dout-quant。
 
-**Resolution: requires a new `GemmDGatedFP8PreAct` kernel class** — multi-week CUTLASS DSL engineering. Not a parameter tweak.
+### 融合路线图（按可行性排序）
 
-### Direction B: Pre-quantized gradients (dout+dz, 168µs)
+| 目标 | 消除 kernel | 省延迟 | 省 IO | 方法 | 难度 |
+|------|-----------|--------|-------|------|------|
+| **epilogue quant** | fused_z_y1_quant (168µs) | **168µs** | 582 MB | 扩展 GemmGated epilogue visitor：compute z/y1 后直接 blockscaled quant + ISA pack in registers | **中 — GemmGated epilogue 已有 SwiGLU 融合先例** |
+| prologue dequant | dequant_fp8 (129µs) | 129µs | 582 MB | 新 GemmDGated kernel: C-load FP8+scales, register dequant | 高 — 需要新 kernel class |
+| gradient pre-quant | quant ×2 (168µs) | 168µs | 96 MB | 系统级 native FP8 gradient | 高 — 框架级 |
 
-If upstream/downstream layers also run native FP8, they could pass pre-quantized gradients:
-- `dout` from the next layer's backward would arrive as (fp8, scales)
-- `dz` pre-quant could be eliminated if `_UpProjection.backward` accepts FP8 dz
+### 下一步：Epilogue Quant Fusion
 
-This is a **system-level optimization** requiring the entire training framework to adopt native FP8 gradient passing. Not MoE-local.
+**目标：** 将 `fused_z_save_y1_quant` (168µs) 融合进 GemmGated epilogue。
 
-### Direction C: Memory reduction (+472 MiB vs BF16)
+**原理：** GemmGated 的 epilogue 已经计算了 SwiGLU(z) → y1。此时 z 和 y1 都在 registers 中。如果在 epilogue 中直接做：
+1. 对 z 的 register 值计算 per-group amax → E8M0 scale → FP8 clamp-cast → ISA pack
+2. 对 y1 的 register 值做同样操作
+3. 将 FP8 data 写入 epilogue D tensor (替代 bf16 write)
+4. 将 ISA-packed scales 写入单独的 scale buffer
 
-Current breakdown:
-- FP8 weight buffers: ~108 MiB (4 views, needed)
-- BF16 master weights: ~216 MiB (needed for wgrad + optimizer)
-- z FP8 save: ~213 MiB (saves 171 MiB vs bf16 z)
-- y1 pre-quant: ~96 MiB
+就能消除 168µs 的独立 kernel + 582 MB 的 HBM 读（当前 fused kernel 需要从 HBM 重读 z 和 y1）。
 
-To close the gap: would need **pure FP8 parameters** (no BF16 master), requiring mixed-precision optimizer integration. Or trade latency for memory by disabling z FP8 save (+171 MiB memory, -168µs z_quant kernel but +384 MiB z bf16 storage).
+**关键文件：**
+- `sonicmoe/quack_utils/gemm_gated.py` — GemmGatedMixin.epi_visit_subtile
+- `quack/gemm_sm100.py` — GemmSm100 epilogue pipeline
+- `quack/epi_ops.py` — TileStore composable epilogue ops
 
-### Direction D: Larger I shapes (confirmed scaling)
-
-FP8 GEMM advantage scales with matrix size. Current I=1536 gives 22.4% GEMM speedup. At I=2048+ expect ~2.35× GEMM speedup, which would make FP8 overhead (<15%) negligible relative to GEMM savings.
+**可行性：** GemmGated epilogue 的 `epi_visit_subtile` 已经在 register 中持有 z (via tRS_rD) 和 y1 (via postact computation)。增加一个 blockscaled quant + ISA pack step 是同类工作——核心难度在于 ISA tile layout 的 register→smem→HBM 写路径。
 
 ---
 
