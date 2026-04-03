@@ -52,6 +52,7 @@ def gemm_gated_tuned(
     config: Optional[GemmConfig] = None,
     a_scales: Optional[Tensor] = None,  # ISA-packed blockscaled scales for A
     b_scales: Optional[Tensor] = None,  # ISA-packed blockscaled scales for B
+    z_scale_out: Optional[Tensor] = None,  # UE8M0 scale output for epilogue quant
 ) -> None:
     if config is None:
         config = default_config(A.device)
@@ -97,6 +98,7 @@ def gemm_gated_tuned(
         A_idx=A_idx,
         a_scales=a_scales,
         b_scales=b_scales,
+        z_scale_out=z_scale_out,
     )
 
 
@@ -217,6 +219,7 @@ def gemm_gated(
     a_scales: Optional[Tensor] = None,
     b_scales: Optional[Tensor] = None,
     tuned: bool = True,
+    z_scale_out: Optional[Tensor] = None,
 ) -> Tuple[Optional[Tensor], Tensor]:
     """GEMM with gated activation and optional output tensors."""
     out_dtype = A.dtype if out_dtype is None else out_dtype
@@ -235,21 +238,17 @@ def gemm_gated(
         preact_out = torch.empty(out_shape, dtype=out_dtype, device=A.device)
     if postact_out is None:
         postact_out = torch.empty(postact_shape, dtype=postact_dtype, device=A.device)
-    gemm_gated_out(
-        A,
-        B,
-        preact_out,
-        postact_out,
-        C,
-        bias,
-        activation,
-        cu_seqlens_m,
-        A_idx,
-        dynamic_scheduler,
-        tuned,
-        a_scales,
-        b_scales,
-    )
+    if z_scale_out is not None:
+        # Bypass custom_op (can't add z_scale_out to schema) — call tuned directly
+        safe_tuned = tuned and not _uses_blockscaled_runtime(a_scales, b_scales)
+        fn = gemm_gated_tuned if safe_tuned else partial(gemm_gated_tuned.fn, config=None)
+        fn(A, B, preact_out, postact_out, C, bias, activation, cu_seqlens_m, A_idx,
+           dynamic_scheduler, a_scales=a_scales, b_scales=b_scales, z_scale_out=z_scale_out)
+    else:
+        gemm_gated_out(
+            A, B, preact_out, postact_out, C, bias, activation,
+            cu_seqlens_m, A_idx, dynamic_scheduler, tuned, a_scales, b_scales,
+        )
     return preact_out, postact_out
 
 

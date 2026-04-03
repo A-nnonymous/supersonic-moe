@@ -363,7 +363,8 @@ class _GemmSm100ZeroMatMixin:
 # Concrete kernel classes: GemmGated + GemmDGated with zero-mat fix
 # ---------------------------------------------------------------------------
 
-class GemmGatedSm100ZeroMat(GemmGatedMixin, _GemmSm100ZeroMatMixin, GemmSm100):
+class GemmGatedSm100ZeroMat(GemmGatedBlockscaledQuantMixin, _GemmSm100ZeroMatMixin, GemmSm100):
+    """GemmGated ZeroMat with epilogue blockscaled quant (when mZScale provided)."""
     pass
 
 
