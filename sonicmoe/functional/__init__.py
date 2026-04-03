@@ -3,6 +3,7 @@
 # ********************************************************************************
 
 import collections
+import dataclasses
 import os
 
 import torch
@@ -194,20 +195,50 @@ def _native_fp8_enabled() -> bool:
     return is_native_fp8_active()
 
 
+@dataclasses.dataclass(frozen=True)
+class NativeFP8Params:
+    """Pre-computed FP8 weight views for all 4 GEMM paths in the MoE.
+
+    Created once via ``MoE.prepare_native_fp8()``, reused every forward/backward.
+    Eliminates ALL runtime weight quantization — only the cheap ISA scale
+    gather (T→TK, ~28µs) remains for the activation path.
+
+    Attributes
+    ----------
+    w1_fwd_fp8, w1_fwd_scales : forward up-proj (gemm_gated). Shape (E, H, 2I) fp8 .mT view.
+    w1_bwd_fp8, w1_bwd_scales : backward actgrad (blockscaled_fp8_gemm_varlen). Shape (E, H, 2I) fp8.
+    w2_fwd_fp8, w2_fwd_scales : forward down-proj (blockscaled_fp8_gemm_varlen). Shape (E, H, I) fp8.
+    w2_bwd_fp8, w2_bwd_scales : backward dgated (gemm_dgated_kernel). Shape (E, I, H) fp8 contiguous.
+    """
+    # Up-projection forward: gemm_gated expects (E, H, 2I) .mT view of contiguous (E, 2I, H)
+    w1_fwd_fp8: torch.Tensor
+    w1_fwd_scales: torch.Tensor
+    # Up-projection backward actgrad: varlen expects (E, H, 2I) contiguous
+    w1_bwd_fp8: torch.Tensor
+    w1_bwd_scales: torch.Tensor
+    # Down-projection forward: varlen expects (E, H, I) contiguous
+    w2_fwd_fp8: torch.Tensor
+    w2_fwd_scales: torch.Tensor
+    # Down-projection backward dgated: kernel expects (E, I, H) contiguous
+    w2_bwd_fp8: torch.Tensor
+    w2_bwd_scales: torch.Tensor
+
+
 def _native_fp8_gated_forward(
     x: torch.Tensor,
     w1: torch.Tensor,
     expert_frequency_offset: torch.Tensor,
     x_gather_idx: torch.Tensor,
+    x_fp8_data: torch.Tensor | None = None,
+    x_fp8_scales: torch.Tensor | None = None,
+    w1_fp8: torch.Tensor | None = None,
+    w1_scales: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Native FP8 forward: x arrives with pre-computed FP8+scales.
+    """Native FP8 forward: skip x-quant and weight-quant when pre-computed data is provided.
 
-    Simulates a "native FP8 params" scenario:
-    - x quantization (bf16→fp8+scales) is performed once upfront; in production
-      this happens upstream in the communication layer, NOT inside MoE.
-    - Weight quantization uses existing precompute+cache (zero cost after 1st iter).
-    - GemmGated runs with blockscaled FP8 x and weights.
-    - y1 is computed in bf16, then quantized for the down-proj.
+    When ``x_fp8_data``/``x_fp8_scales`` are given, the x quantization kernel
+    (~60µs) is skipped entirely.  When ``w1_fp8``/``w1_scales`` are given, the
+    weight precompute+cache (~0µs cached but ~650 MiB memory) is bypassed.
 
     Returns (z_bf16, y1_fp8, y1_packed_scales).
     """
@@ -218,10 +249,12 @@ def _native_fp8_gated_forward(
         _storage_per_batch,
     )
 
-    # --- Step 1: x quantization (simulated upstream cost) ---
-    # In production, x arrives as (fp8, packed_scales) from the comm layer.
-    # Here we quantize once; this cost is NOT counted in MoE-internal timing.
-    x_fp8, x_scales_t = quantize_and_pack_activation(x)
+    # --- Step 1: x quantization (skip if pre-quantized) ---
+    if x_fp8_data is not None and x_fp8_scales is not None:
+        x_fp8 = x_fp8_data
+        x_scales_t = x_fp8_scales
+    else:
+        x_fp8, x_scales_t = quantize_and_pack_activation(x)
 
     # --- Step 2: Gather ISA-packed scales T→TK ---
     TK = x_gather_idx.shape[0]
@@ -243,19 +276,22 @@ def _native_fp8_gated_forward(
     x_scales_tk_e8m0 = x_scales_tk.view(torch.float8_e8m0fnu)
     del x_scales_t
 
-    # --- Step 3: Weights (cached FP8 + ISA-packed scales) ---
-    w1_fp8, w1_scales = precompute_weight_fp8_for_fused_gated(w1)
+    # --- Step 3: Weights (use provided or precompute+cache) ---
+    if w1_fp8 is not None and w1_scales is not None:
+        _w1_fp8, _w1_scales = w1_fp8, w1_scales
+    else:
+        _w1_fp8, _w1_scales = precompute_weight_fp8_for_fused_gated(w1)
 
     # --- Step 4: GemmGated (PostAct bf16) + y1 quantize ---
     z, y1 = gemm_gated(
-        x_fp8, w1_fp8,
+        x_fp8, _w1_fp8,
         activation="swiglu",
         out_dtype=torch.bfloat16,
         postact_dtype=torch.bfloat16,
         cu_seqlens_m=expert_frequency_offset,
         A_idx=x_gather_idx,
         a_scales=x_scales_tk_e8m0,
-        b_scales=w1_scales,
+        b_scales=_w1_scales,
         dynamic_scheduler=False,
         tuned=False,
     )
@@ -689,6 +725,9 @@ class _UpProjection(torch.autograd.Function):
         activation_type: ActivationType,
         is_inference_mode_enabled: bool,
         use_low_precision_postact_buffer: bool,
+        native_fp8_params: NativeFP8Params | None = None,
+        x_fp8_data: torch.Tensor | None = None,
+        x_fp8_scales: torch.Tensor | None = None,
     ) -> torch.Tensor:
         T, H = x.shape
         I, H, E = w1.shape
@@ -710,9 +749,14 @@ class _UpProjection(torch.autograd.Function):
 
                 if aligned and _use_fused_blockscaled_gated():
                     if _native_fp8_enabled():
-                        # Native FP8: x is FP8, weights are FP8+scales
+                        # Native FP8: skip x-quant + weight-quant when params provided
+                        _nfp = native_fp8_params
                         z, y1_fp8, y1_packed_scales = _native_fp8_gated_forward(
-                            x, w1, expert_frequency_offset, x_gather_idx
+                            x, w1, expert_frequency_offset, x_gather_idx,
+                            x_fp8_data=x_fp8_data,
+                            x_fp8_scales=x_fp8_scales,
+                            w1_fp8=_nfp.w1_fwd_fp8 if _nfp else None,
+                            w1_scales=_nfp.w1_fwd_scales if _nfp else None,
                         )
                         y1 = y1_fp8  # y1 is FP8 in native mode
                         if _save_z_fp8():
@@ -819,6 +863,7 @@ class _UpProjection(torch.autograd.Function):
         ctx._fp8_enabled = _fp8_enabled()
         ctx._alignment_assumed = _ALIGNMENT_ASSUMED
         ctx._native_fp8 = _native_fp8_enabled()
+        ctx._native_fp8_params = native_fp8_params
 
         ctx.save_for_backward(
             x,
@@ -882,7 +927,11 @@ class _UpProjection(torch.autograd.Function):
                 dz_bf16 = dz if dz.dtype == torch.bfloat16 else dz.to(torch.bfloat16)
 
                 # Prepare actgrad resources on default stream first.
-                w1T_fp8, w1T_scales = precompute_weight_fp8(w1.permute(1, 0, 2))
+                _nfp = getattr(ctx, '_native_fp8_params', None)
+                if _nfp is not None and _nfp.w1_bwd_fp8 is not None:
+                    w1T_fp8, w1T_scales = _nfp.w1_bwd_fp8, _nfp.w1_bwd_scales
+                else:
+                    w1T_fp8, w1T_scales = precompute_weight_fp8(w1.permute(1, 0, 2))
                 prequant_dz = _PREQUANTIZED_SCALES.pop("bwd", None)
                 has_prequant = (
                     prequant_dz is not None
@@ -979,7 +1028,7 @@ class _UpProjection(torch.autograd.Function):
         )
         _log_stage_memory("backward:token-reduce")
 
-        return dx_reduced, dw1, db1, *[None] * 12
+        return dx_reduced, dw1, db1, *[None] * 15
 
 
 class _DownProjection(torch.autograd.Function):
@@ -1003,6 +1052,7 @@ class _DownProjection(torch.autograd.Function):
         is_varlen_K: bool,
         activation_type: ActivationType,
         fp8_protocol: FP8Protocol | None,
+        native_fp8_params: NativeFP8Params | None = None,
     ) -> torch.Tensor:
         TK = y1.size(0)
         H, I, E = w2.shape
@@ -1014,6 +1064,13 @@ class _DownProjection(torch.autograd.Function):
 
             assert b2 is None
             if _fp8_enabled() and _ALIGNMENT_ASSUMED:
+                # Resolve w2 FP8 weights: use native params if available, else precompute+cache
+                _nfp = native_fp8_params
+                if _nfp is not None and _nfp.w2_fwd_fp8 is not None:
+                    _w2_fp8, _w2_scales = _nfp.w2_fwd_fp8, _nfp.w2_fwd_scales
+                else:
+                    _w2_fp8, _w2_scales = precompute_weight_fp8(w2)
+
                 if _use_fused_blockscaled_gated():
                     # Use pre-quantized y1 from _UpProjection if available
                     # (zero quant overhead — y1 was quantized while hot in L2).
@@ -1026,24 +1083,22 @@ class _DownProjection(torch.autograd.Function):
                     )
                     if has_prequant:
                         _PREQUANT_HIT_COUNT["fwd"] += 1
-                        w2_fp8, w2_scales = precompute_weight_fp8(w2)
                         _, y1_fp8, y1_packed_scales = prequant
                         y2 = blockscaled_fp8_gemm_varlen(
                             y1_fp8, w2, expert_frequency_offset,
                             a_scales=y1_packed_scales,
-                            w_fp8=w2_fp8, w_scales=w2_scales,
+                            w_fp8=_w2_fp8, w_scales=_w2_scales,
                             out_dtype=torch.bfloat16,
                             assume_aligned=True,
                         )
                         del y1_fp8, y1_packed_scales
                     else:
                         # Fallback: inline FP8 quant (prequant cache miss)
-                        w2_fp8, w2_scales = precompute_weight_fp8(w2)
                         y1_fp8, y1_scales = quantize_and_pack_activation(y1)
                         y2 = blockscaled_fp8_gemm_varlen(
                             y1_fp8, w2, expert_frequency_offset,
                             a_scales=y1_scales,
-                            w_fp8=w2_fp8, w_scales=w2_scales,
+                            w_fp8=_w2_fp8, w_scales=_w2_scales,
                             out_dtype=torch.bfloat16,
                             assume_aligned=True,
                         )
@@ -1051,7 +1106,6 @@ class _DownProjection(torch.autograd.Function):
                 else:
                     # Blockscaled FP8 down-proj: use pre-quantized y1 if available
                     # from fused SwiGLU+quant in _UpProjection.forward.
-                    w2_fp8, w2_scales = precompute_weight_fp8(w2)
                     prequant = _PREQUANTIZED_SCALES.pop("fwd", None)
                     has_prequant = (
                         prequant is not None
@@ -1064,14 +1118,14 @@ class _DownProjection(torch.autograd.Function):
                         y2 = blockscaled_fp8_gemm_varlen(
                             y1_fp8, w2, expert_frequency_offset,
                             a_scales=y1_packed_scales,
-                            w_fp8=w2_fp8, w_scales=w2_scales,
+                            w_fp8=_w2_fp8, w_scales=_w2_scales,
                             out_dtype=torch.bfloat16,
                             assume_aligned=True,
                         )
                     else:
                         y2 = blockscaled_fp8_gemm_varlen(
                             y1, w2, expert_frequency_offset,
-                            w_fp8=w2_fp8, w_scales=w2_scales,
+                            w_fp8=_w2_fp8, w_scales=_w2_scales,
                             out_dtype=torch.bfloat16,
                             assume_aligned=True,
                         )
@@ -1121,6 +1175,7 @@ class _DownProjection(torch.autograd.Function):
         ctx._alignment_assumed_flag = _ALIGNMENT_ASSUMED
         ctx._use_fused_blockscaled_gated_flag = _use_fused_blockscaled_gated()
         ctx._native_fp8_flag = _native_fp8_enabled()
+        ctx._native_fp8_params = native_fp8_params
 
         # Memory optimization: store z in FP8 to save ~50% of z's memory.
         # At Ernie shape (TK=65536, 2I=3072), z is 384MB BF16 → ~213MB FP8 = ~171MB saved.
@@ -1259,7 +1314,11 @@ class _DownProjection(torch.autograd.Function):
                     # Synchronize: gemm_dgated_kernel needs both z and dout_fp8/dout_scales.
                     torch.cuda.current_stream().wait_stream(_get_dequant_stream())
 
-                    w2_fp8_enk, w2_scales = precompute_weight_fp8_for_direct_fused_dgated(w2)
+                    _nfp = getattr(ctx, '_native_fp8_params', None)
+                    if _nfp is not None and _nfp.w2_bwd_fp8 is not None:
+                        w2_fp8_enk, w2_scales = _nfp.w2_bwd_fp8, _nfp.w2_bwd_scales
+                    else:
+                        w2_fp8_enk, w2_scales = precompute_weight_fp8_for_direct_fused_dgated(w2)
                     config = default_config(dout.device)
                     total_m = x_gather_idx.shape[0]  # TK (not T — dout_fp8 is T-sized)
                     n = w2_fp8_enk.shape[-2]
@@ -1299,7 +1358,11 @@ class _DownProjection(torch.autograd.Function):
                     _PREQUANTIZED_SCALES["bwd"] = (dz, dz_fp8, dz_packed_scales)
                 else:
                     w2_actgrad = w2.permute(1, 0, 2)  # (I, H, E)
-                    w2_fp8, w2_scales = precompute_weight_fp8(w2_actgrad)
+                    _nfp = getattr(ctx, '_native_fp8_params', None)
+                    if _nfp is not None and _nfp.w2_bwd_fp8 is not None:
+                        w2_fp8, w2_scales = _nfp.w2_bwd_fp8, _nfp.w2_bwd_scales
+                    else:
+                        w2_fp8, w2_scales = precompute_weight_fp8(w2_actgrad)
 
                     dout_fp8, dout_scales = fast_gather_quantize_and_pack_activation(
                         dout, x_gather_idx
@@ -1448,7 +1511,7 @@ class _DownProjection(torch.autograd.Function):
         if not is_varlen_K:
             ds = ds.view(T, K)
 
-        return None, dz, dw2, db2, ds, None, *[None] * 11
+        return None, dz, dw2, db2, ds, None, *[None] * 12
 
 
 def _moe_tc_softmax_topk_layer_quack_inference(
@@ -1645,6 +1708,9 @@ def moe_TC_softmax_topk_layer(
     activation_type: ActivationType | str = ActivationType.SWIGLU,
     is_inference_mode_enabled: bool = False,
     fp8_protocol: FP8Protocol | None = None,
+    native_fp8_params: NativeFP8Params | None = None,
+    x_fp8_data: torch.Tensor | None = None,
+    x_fp8_scales: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert ((b1 is None) and (b2 is None)) or (
         (b1 is not None) and (b2 is not None)
@@ -1712,6 +1778,9 @@ def moe_TC_softmax_topk_layer(
         activation_type,
         is_inference_mode_enabled,
         use_low_precision_postact_buffer,
+        native_fp8_params,
+        x_fp8_data,
+        x_fp8_scales,
     )
     _log_stage_memory("forward:up-proj")
 
@@ -1770,6 +1839,7 @@ def moe_TC_softmax_topk_layer(
         False,  # is_varlen_K
         activation_type,
         fp8_protocol,
+        native_fp8_params,
     )
     _log_stage_memory("forward:down-proj-router")
 

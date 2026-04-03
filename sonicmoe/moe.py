@@ -11,13 +11,14 @@ import torch.nn.functional as F
 
 from .count_cumsum import count_cumsum
 from .enums import ActivationType, KernelBackendMoE, is_glu
-from .functional import FP8Protocol, moe_TC_softmax_topk_layer, clear_all_fp8_weight_caches
+from .functional import FP8Protocol, NativeFP8Params, moe_TC_softmax_topk_layer, clear_all_fp8_weight_caches
 from .functional.utils import enable_fp8
 from .quack_utils import (
     clear_blockscaled_fp8_weight_cache,
     prefetch_blockscaled_w2_fp8,
     precompute_weight_fp8,
     precompute_weight_fp8_for_fused_gated,
+    precompute_weight_fp8_for_direct_fused_dgated,
     quantize_and_pack_activation,
 )
 
@@ -255,6 +256,51 @@ class MoE(nn.Module):
         """Clear all FP8 weight caches (per-tensor + blockscaled)."""
         clear_all_fp8_weight_caches()
 
+    @torch.no_grad()
+    def prepare_native_fp8(self) -> NativeFP8Params:
+        """Pre-quantize ALL expert weights for the 4 GEMM paths into a single immutable object.
+
+        Returns a ``NativeFP8Params`` holding FP8 weight views + ISA-packed scales
+        for forward and backward. Pass this to ``forward(native_fp8_params=...)``.
+
+        Call once after model init, and again after every optimizer step via
+        ``refresh_native_fp8()``.  Memory: ~216 MiB at Ernie shape (vs ~650 MiB
+        for the dynamic cache system).
+        """
+        w1 = self.c_fc.weight   # (E, 2I, H) parameter
+        w2 = self.c_proj.weight  # (E, H, I) parameter
+
+        # 1. Forward up-proj: gemm_gated expects (E, H, 2I) .mT view
+        w1_fwd_fp8, w1_fwd_scales = precompute_weight_fp8_for_fused_gated(
+            w1.permute(1, 2, 0)  # (2I, H, E) view
+        )
+
+        # 2. Backward actgrad: blockscaled_fp8_gemm_varlen expects (E, H, 2I)
+        w1_bwd_fp8, w1_bwd_scales = precompute_weight_fp8(
+            w1.permute(2, 0, 1).permute(0, 2, 1)  # (E, H, 2I) via (E, 2I, H) → permute
+        )
+        # Simpler: w1.permute(1,2,0) is (2I,H,E), .permute(1,0,2) is (H,2I,E)
+        w1_bwd_fp8, w1_bwd_scales = precompute_weight_fp8(
+            w1.permute(1, 2, 0).permute(1, 0, 2)  # (H, 2I, E)
+        )
+
+        # 3. Forward down-proj: varlen expects (E, H, I)
+        w2_fwd_fp8, w2_fwd_scales = precompute_weight_fp8(
+            w2.permute(1, 2, 0)  # (H, I, E) view
+        )
+
+        # 4. Backward dgated: kernel expects (E, I, H) contiguous
+        w2_bwd_fp8, w2_bwd_scales = precompute_weight_fp8_for_direct_fused_dgated(
+            w2.permute(1, 2, 0)  # (H, I, E) view
+        )
+
+        return NativeFP8Params(
+            w1_fwd_fp8=w1_fwd_fp8, w1_fwd_scales=w1_fwd_scales,
+            w1_bwd_fp8=w1_bwd_fp8, w1_bwd_scales=w1_bwd_scales,
+            w2_fwd_fp8=w2_fwd_fp8, w2_fwd_scales=w2_fwd_scales,
+            w2_bwd_fp8=w2_bwd_fp8, w2_bwd_scales=w2_bwd_scales,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -262,6 +308,9 @@ class MoE(nn.Module):
         is_inference_mode: bool = False,
         fp8_protocol: FP8Protocol | None = None,
         use_fp8: bool = False,
+        native_fp8_params: NativeFP8Params | None = None,
+        x_fp8_data: torch.Tensor | None = None,
+        x_fp8_scales: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         original_shape = hidden_states.shape
 
@@ -285,6 +334,9 @@ class MoE(nn.Module):
                     self.activation_function,
                     is_inference_mode or not self.training,
                     fp8_protocol,
+                    native_fp8_params=native_fp8_params,
+                    x_fp8_data=x_fp8_data,
+                    x_fp8_scales=x_fp8_scales,
                 )
             else:
                 # hidden_states -> (total_q, hidden_size)

@@ -15,6 +15,7 @@ from .functional import (
     FP8ScaleEncoding,
     FP8ScaleGranularity,
     FP8Tensor,
+    NativeFP8Params,
     apply_activation_fp8_protocol,
     dequantize_activation_reference,
     enable_fp8,

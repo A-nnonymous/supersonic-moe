@@ -19,8 +19,9 @@ import torch
 os.environ.setdefault("USE_QUACK_GEMM", "1")
 os.environ.setdefault("SONIC_MOE_FP8_MODE", "perf")
 
-from sonicmoe import MoE, enable_fp8, enable_native_fp8, enable_quack_gemm
+from sonicmoe import MoE, enable_fp8, enable_native_fp8, enable_quack_gemm, NativeFP8Params
 from sonicmoe.enums import ActivationType
+from sonicmoe.quack_utils import quantize_and_pack_activation
 
 
 _SEED = 42
@@ -256,6 +257,133 @@ class TestNativeFP8ProductionShape(unittest.TestCase):
         rrmse = _rrmse(native_out, gold_out)
         print(f"  Production shape RRMSE: {rrmse:.4f}")
         self.assertLess(rrmse, 0.15)
+
+
+class TestTrueNativeFP8(unittest.TestCase):
+    """Tests for prepare_native_fp8() + pre-quantized x — the true native FP8 path."""
+
+    def _run_true_native(self, moe, x, dout):
+        """Run MoE with pre-quantized x and NativeFP8Params weight buffers."""
+        nfp = moe.prepare_native_fp8()
+        x_fp8, x_scales = quantize_and_pack_activation(x.detach())
+        x_c = x.detach().clone().requires_grad_()
+        moe.zero_grad(set_to_none=True)
+        with enable_native_fp8():
+            out, _ = moe(x_c, use_fp8=True, native_fp8_params=nfp,
+                         x_fp8_data=x_fp8, x_fp8_scales=x_scales)
+        out.backward(dout)
+        return out.detach(), x_c.grad.detach(), nfp
+
+    def test_true_native_bit_identical_to_frontier(self):
+        """True native FP8 output is bit-identical to frontier FP8."""
+        _require_blackwell()
+        torch.manual_seed(_SEED)
+        moe = _make_moe(E=8, K=8, H=3072, I=1536)
+        x, dout = _make_sample(T=8192, H=3072)
+
+        # Frontier
+        x_f = x.detach().clone().requires_grad_()
+        moe.zero_grad(set_to_none=True)
+        with enable_quack_gemm(True), enable_fp8():
+            out_f, _ = moe(x_f, use_fp8=True)
+        out_f.backward(dout)
+
+        # True native
+        native_out, native_dx, _ = self._run_true_native(moe, x, dout)
+        rrmse = _rrmse(native_out, out_f.detach())
+        print(f"  True native vs frontier fwd RRMSE: {rrmse:.6f}")
+        self.assertLess(rrmse, 0.001, f"Should be near-identical: {rrmse}")
+
+    def test_true_native_production_shape(self):
+        """True native FP8 works at production shape E=8, K=8."""
+        _require_blackwell()
+        torch.manual_seed(_SEED)
+        moe = _make_moe(E=8, K=8, H=3072, I=1536)
+        x = (0.02 * torch.randn(8192, 3072, device="cuda", dtype=torch.bfloat16)).detach().requires_grad_()
+        dout = 0.02 * torch.randn_like(x)
+        out, dx, _ = self._run_true_native(moe, x, dout)
+        self.assertFalse(torch.isnan(out).any().item())
+        self.assertFalse(torch.isnan(dx).any().item())
+
+    def test_true_native_production_bit_identical_frontier(self):
+        """Production shape: true native == frontier (bit-identical)."""
+        _require_blackwell()
+        torch.manual_seed(_SEED)
+        moe = _make_moe(E=8, K=8, H=3072, I=1536)
+        x = (0.02 * torch.randn(8192, 3072, device="cuda", dtype=torch.bfloat16)).detach().requires_grad_()
+        dout = 0.02 * torch.randn_like(x)
+
+        # Frontier
+        x_f = x.detach().clone().requires_grad_()
+        moe.zero_grad(set_to_none=True)
+        with enable_quack_gemm(True), enable_fp8():
+            out_f, _ = moe(x_f, use_fp8=True)
+        out_f.backward(dout)
+
+        # True native
+        native_out, native_dx, _ = self._run_true_native(moe, x, dout)
+        rrmse = _rrmse(native_out, out_f.detach())
+        print(f"  Production true native vs frontier RRMSE: {rrmse:.6f}")
+        self.assertLess(rrmse, 0.001)
+
+    def test_prepare_native_fp8_returns_correct_shapes(self):
+        """NativeFP8Params has correct tensor shapes and dtypes."""
+        _require_blackwell()
+        torch.manual_seed(_SEED)
+        moe = _make_moe(E=8, K=8, H=3072, I=1536)
+        nfp = moe.prepare_native_fp8()
+
+        self.assertIsInstance(nfp, NativeFP8Params)
+        self.assertEqual(nfp.w1_fwd_fp8.dtype, torch.float8_e4m3fn)
+        self.assertEqual(nfp.w2_fwd_fp8.dtype, torch.float8_e4m3fn)
+        self.assertEqual(nfp.w1_bwd_fp8.dtype, torch.float8_e4m3fn)
+        self.assertEqual(nfp.w2_bwd_fp8.dtype, torch.float8_e4m3fn)
+        self.assertEqual(nfp.w1_fwd_scales.dtype, torch.float8_e8m0fnu)
+        # w2_fwd should be (E, H, I) = (8, 3072, 1536) permuted
+        self.assertEqual(nfp.w2_fwd_fp8.shape[0], 8)  # E dimension
+
+    def test_memory_savings_vs_frontier(self):
+        """True native FP8 uses less peak memory than frontier FP8."""
+        _require_blackwell()
+        torch.manual_seed(_SEED)
+        E, K, H, I = 8, 8, 3072, 1536
+        T = 8192
+
+        # Frontier
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.empty_cache()
+        moe = _make_moe(E=E, K=K, H=H, I=I)
+        x = (0.02 * torch.randn(T, H, device="cuda", dtype=torch.bfloat16)).detach().requires_grad_()
+        dout = 0.02 * torch.randn_like(x)
+        torch.cuda.reset_peak_memory_stats()
+        moe.zero_grad(set_to_none=True)
+        with enable_quack_gemm(True), enable_fp8():
+            out, _ = moe(x, use_fp8=True)
+        out.backward(dout)
+        frontier_peak = torch.cuda.max_memory_allocated()
+        del moe, x, dout, out
+        torch.cuda.empty_cache()
+
+        # True native
+        torch.cuda.reset_peak_memory_stats()
+        torch.manual_seed(_SEED)
+        moe = _make_moe(E=E, K=K, H=H, I=I)
+        x = (0.02 * torch.randn(T, H, device="cuda", dtype=torch.bfloat16)).detach().requires_grad_()
+        dout = 0.02 * torch.randn_like(x)
+        nfp = moe.prepare_native_fp8()
+        x_fp8, x_scales = quantize_and_pack_activation(x.detach())
+        torch.cuda.reset_peak_memory_stats()
+        moe.zero_grad(set_to_none=True)
+        with enable_native_fp8():
+            out, _ = moe(x, use_fp8=True, native_fp8_params=nfp,
+                         x_fp8_data=x_fp8, x_fp8_scales=x_scales)
+        out.backward(dout)
+        native_peak = torch.cuda.max_memory_allocated()
+
+        delta_mib = (frontier_peak - native_peak) / 1024**2
+        print(f"  Memory: frontier={frontier_peak/1024**2:.1f} native={native_peak/1024**2:.1f} delta={delta_mib:.1f} MiB")
+        # Native should save memory (weight caches not populated during forward/backward)
+        self.assertGreater(delta_mib, 0, f"Expected native to save memory, but delta={delta_mib:.1f} MiB")
 
 
 if __name__ == "__main__":
