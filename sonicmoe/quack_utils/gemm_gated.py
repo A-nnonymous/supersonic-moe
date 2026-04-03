@@ -168,35 +168,46 @@ def _i32_as_f32(x: Int32, *, loc=None, ip=None) -> Float32:
     return Float32(llvm.bitcast(T.f32(), Int32(x).ir_value(loc=loc, ip=ip), loc=loc, ip=ip))
 
 
+@dsl_user_op
+def _rcp_approx_f32(x: Float32, *, loc=None, ip=None) -> Float32:
+    """PTX rcp.approx.f32: fast reciprocal, bitwise exact for powers of 2."""
+    return Float32(llvm.inline_asm(
+        T.f32(), [Float32(x).ir_value(loc=loc, ip=ip)],
+        "rcp.approx.f32 $0, $1;", "=f,f",
+        has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
+
+
+# FP8 E4M3 max representable value
+_FP8_MAX = Float32(448.0)
+
+
 class GemmGatedBlockscaledQuantMixin(GemmGatedMixin):
     """GemmGated with fused blockscaled FP8 quantization of z in epilogue.
 
-    After SwiGLU, quantizes the preactivation z in registers before writing
-    to HBM. Each thread holds 32 contiguous N-elements (one blockscaled group)
-    for epi_tile_n=32, so amax + E8M0 + quant is purely register-local.
+    Algorithm (matches Paddle fp8_quant_blockwise_kernel with UE8M0 power-of-2 scaling):
+      1. amax = max(abs(z[group]))
+      2. scale = fp8_max / amax  (using rcp.approx for perf)
+      3. Round scale to power-of-2: keep only exponent, clear mantissa
+      4. quantized = z * scale  (shifts values into [-448, 448])
+      5. UE8M0 = exponent of (1/scale) = exponent of inv_scale
+         (rcp.approx of power-of-2 is bitwise exact)
 
-    The D tensor is written as bf16 (quantized values in bf16 range) — the
-    actual FP8 cast happens in the cvt_copy stage. Scale bytes are written
-    to a separate output buffer via params.z_scale_ptr.
-
-    NOTE: tRS_rD values are modified in-place (scaled by quant_scale).
-    The bf16 store will clamp these to bf16 range, which is equivalent
-    to FP8 clamp-cast when the quant_scale is correct.
+    Each thread holds 32 contiguous N-elements = one blockscaled group.
+    All computation is register-local, no warp shuffle needed.
     """
 
     @cute.jit
     def epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None):
-        # Standard: apply alpha/beta/bias to tRS_rD, then SwiGLU → tRS_rPostAct
+        # Standard: alpha/beta/bias → SwiGLU → tRS_rPostAct
         tRS_rPostAct = GemmGatedMixin.epi_visit_subtile(
             self, params, epi_loop_tensors, tRS_rD, tRS_rC
         )
 
         # ── Blockscaled quant of z (tRS_rD) in registers ──
-        # Each thread holds all N-elements of its row (32 for epi_N=32).
-        # One blockscaled group = 32 elements = cute.size(tRS_rD).
         num_z = cute.size(tRS_rD)
 
-        # Step 1: amax over all elements (fully unrolled register loop)
+        # Step 1: amax over all elements
         amax = Float32(0.0)
         for i in cutlass.range(num_z, unroll_full=True):
             val = tRS_rD[i]
@@ -204,40 +215,35 @@ class GemmGatedBlockscaledQuantMixin(GemmGatedMixin):
             abs_val = cute.arch.fmax(val, neg)
             amax = cute.arch.fmax(amax, abs_val)
 
-        # Step 2: E8M0 scale from amax (integer bit manipulation)
-        amax_bits = _f32_as_i32(amax)
-        biased_exp = (amax_bits >> Int32(23)) & Int32(0xFF)
-        mantissa_bits = amax_bits & Int32(0x7FFFFF)
-        # Round up if mantissa > 0.75 (0x600000 = 0.75 * 2^23)
-        has_carry = cutlass.Boolean(mantissa_bits > Int32(0x600000))
-        carry = Int32(1) if has_carry else Int32(0)
-        e8m0 = biased_exp - Int32(8) + carry
-        # Clamp: subnormal amax → e8m0 = 0
-        is_normal = cutlass.Boolean(biased_exp > Int32(0))
-        e8m0 = e8m0 if is_normal else Int32(0)
-        is_positive = cutlass.Boolean(e8m0 > Int32(0))
-        e8m0 = e8m0 if is_positive else Int32(0)
+        # Step 2: scale = fp8_max / amax (via rcp.approx for performance)
+        # rcp.approx is bitwise exact for power-of-2 values, and the
+        # mantissa error for non-pow2 doesn't matter because we round next.
+        rcp_amax = _rcp_approx_f32(amax)
+        scale = _FP8_MAX * rcp_amax
 
-        # Step 3: quant_scale = 2^(254 - e8m0)
-        qexp = Int32(254) - e8m0
-        # Clamp to valid biased exponent range [1, 254]
-        qexp_hi = cutlass.Boolean(qexp > Int32(254))
-        qexp = Int32(254) if qexp_hi else qexp
-        qexp_lo = cutlass.Boolean(qexp < Int32(1))
-        qexp = Int32(1) if qexp_lo else qexp
-        quant_scale = _i32_as_f32(qexp << Int32(23))
+        # Handle amax == 0: scale would be inf → clamp to 1.0
+        is_inf_bits = _f32_as_i32(scale) & Int32(0x7F800000)
+        is_inf = cutlass.Boolean(is_inf_bits == Int32(0x7F800000))
+        scale = Float32(1.0) if is_inf else scale
 
-        # Step 4: scale all z elements in-place (quantize)
-        # Multiply by quant_scale to shift values into FP8 representable range
+        # Step 3: Round to power-of-2 (clear mantissa, keep sign+exponent)
+        scale_bits = _f32_as_i32(scale)
+        scale_exp = scale_bits & Int32(0x7F800000)  # keep only exponent
+        scale = _i32_as_f32(scale_exp)  # power-of-2 scale
+
+        # Step 4: Quantize z in-place: z *= scale
         for i in cutlass.range(num_z, unroll_full=True):
-            tRS_rD[i] = tRS_rD[i] * quant_scale
+            tRS_rD[i] = tRS_rD[i] * scale
 
-        # tRS_rD now contains quantized values in f32.
-        # The subsequent cvt_copy (f32→bf16→smem) + TMA store will write these.
-        # Downstream consumer reads bf16 z and re-casts to fp8 using the e8m0 scale.
+        # Step 5: Compute UE8M0 = exponent of inv_scale
+        # inv_scale = 1/scale — rcp.approx is bitwise exact for power-of-2
+        inv_scale = _rcp_approx_f32(scale)
+        inv_scale_bits = _f32_as_i32(inv_scale)
+        ue8m0 = (inv_scale_bits >> Int32(23)) & Int32(0xFF)
 
-        # TODO: write e8m0 scale byte to params.z_scale_ptr
-        # For now, the scale is computed but not stored — Phase 2.
+        # TODO Phase 2: write ue8m0 to scale output buffer
+        # For now, z is correctly quantized in registers, written as bf16 by store path.
+        # The bf16 values are in [-448, 448] range (fp8 representable).
 
         return tRS_rPostAct
 
