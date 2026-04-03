@@ -323,30 +323,126 @@ SonicMoE 核心：**所有操作融合进 GEMM kernel，零独立 HBM kernel。*
 
 ### 融合路线图（按可行性排序）
 
-| 目标 | 消除 kernel | 省延迟 | 省 IO | 方法 | 难度 |
-|------|-----------|--------|-------|------|------|
-| **epilogue quant** | fused_z_y1_quant (168µs) | **168µs** | 582 MB | 扩展 GemmGated epilogue visitor：compute z/y1 后直接 blockscaled quant + ISA pack in registers | **中 — GemmGated epilogue 已有 SwiGLU 融合先例** |
-| prologue dequant | dequant_fp8 (129µs) | 129µs | 582 MB | 新 GemmDGated kernel: C-load FP8+scales, register dequant | 高 — 需要新 kernel class |
-| gradient pre-quant | quant ×2 (168µs) | 168µs | 96 MB | 系统级 native FP8 gradient | 高 — 框架级 |
+| 目标 | 消除 kernel | 省延迟 | 省 IO | 难度 |
+|------|-----------|--------|-------|------|
+| **epilogue blockscaled quant** | fused_z_y1_quant (168µs) | **168µs** | 582 MB read | 高 — CUTLASS DSL epilogue 扩展 |
+| prologue blockscaled dequant | dequant_fp8 (129µs) | 129µs | 582 MB read | 极高 — 新 kernel class |
+| gradient pre-quant | quant ×2 (168µs) | 168µs | 96 MB | 框架级 |
 
-### 下一步：Epilogue Quant Fusion
+### Epilogue Blockscaled Quant Fusion — 详细实现方案
 
-**目标：** 将 `fused_z_save_y1_quant` (168µs) 融合进 GemmGated epilogue。
+**目标：** GemmGated epilogue 中，SwiGLU 计算完成后，z 和 y1 仍在 registers 中。在 epilogue 内直接做 blockscaled FP8 量化（per-32-element amax → E8M0 scale → clamp-cast → ISA pack），消除独立的 `fused_z_save_y1_quant` kernel (168µs, 582 MB HBM 读)。
 
-**原理：** GemmGated 的 epilogue 已经计算了 SwiGLU(z) → y1。此时 z 和 y1 都在 registers 中。如果在 epilogue 中直接做：
-1. 对 z 的 register 值计算 per-group amax → E8M0 scale → FP8 clamp-cast → ISA pack
-2. 对 y1 的 register 值做同样操作
-3. 将 FP8 data 写入 epilogue D tensor (替代 bf16 write)
-4. 将 ISA-packed scales 写入单独的 scale buffer
+**精度要求：** 必须使用 blockscaled 1×32 quantization，不接受 per-element/per-tensor cast。
 
-就能消除 168µs 的独立 kernel + 582 MB 的 HBM 读（当前 fused kernel 需要从 HBM 重读 z 和 y1）。
+#### Register 数据流（深入研究所得）
 
-**关键文件：**
-- `sonicmoe/quack_utils/gemm_gated.py` — GemmGatedMixin.epi_visit_subtile
-- `quack/gemm_sm100.py` — GemmSm100 epilogue pipeline
-- `quack/epi_ops.py` — TileStore composable epilogue ops
+GemmGated epilogue `epi_visit_subtile` (gemm_gated.py:120-133):
+```
+1. tRS_rD = GEMM 输出 (f32 regs, shape covers full 2I cols, gate/up interleaved)
+2. GemmDefaultEpiMixin.epi_visit_subtile: alpha-scale + C-add + bias → tRS_rD 就地修改 = z (preact)
+3. recast_layout(2,1): 将 2I 列 deinterleave 为 I 列
+4. params.act_fn(gate_pair, up_pair): SwiGLU in f32 registers
+5. 返回 tRS_rPostAct = y1 (I 列, f32 regs)
+```
 
-**可行性：** GemmGated epilogue 的 `epi_visit_subtile` 已经在 register 中持有 z (via tRS_rD) 和 y1 (via postact computation)。增加一个 blockscaled quant + ISA pack step 是同类工作——核心难度在于 ISA tile layout 的 register→smem→HBM 写路径。
+epilogue 主循环 (gemm_sm90.py:1253-1309):
+```
+6. epi_convert_postact: tRS_rPostAct (f32) → postact_dtype (.to() cast)
+7. cvt_copy(r2s): tRS_rD (z, f32) → d_dtype → smem (StMatrix8x8x16bOp)
+8. cute.copy(r2s): tRS_rPostAct_out → smem
+9. TMA store: smem → HBM (D = z, PostAct = y1)
+```
+
+**融合插入点：** 在步骤 6-7 之间。此时 z 在 tRS_rD (f32)，y1 在 tRS_rPostAct (f32)，都在 registers 中。
+
+#### 核心难点与解决方案
+
+**难点 1：per-32-element row reduction 跨线程**
+
+epilogue subtile 中每个线程持有的是 M×N tile 的 scattered fragment（由 MMA layout 决定的 register 分布）。blockscaled group 是沿 N 维度（对 y1）或 2N 维度（对 z）的连续 32 元素。一个 group 的 32 元素分散在多个线程的 registers 中。
+
+**方案：** 利用 SM100 的 epilogue subtile 布局特性。epilogue subtile shape 通常是 (epi_M, epi_N) = (128, 64) 或 (128, 128)。每个 subtile 的 N 维度是连续的。对于 blockscaled group_size=32，一个 subtile 包含 epi_N/32 个完整 group。
+
+具体实现：
+```
+a. 在 register 中计算 per-thread partial amax（每个线程持有 group 的一部分元素）
+b. __shfl_xor_sync 做 warp-level reduction 得到 group amax
+c. 从 amax 计算 E8M0 scale (integer bit manipulation, 与现有 Triton kernel 相同)
+d. 用 scale 做 FP8 clamp-cast（f32 * quant_scale → fp8）
+e. 将 FP8 data 和 E8M0 scale byte 分别写入 smem
+```
+
+关键：需要了解 SM100 MMA 的 register-to-thread mapping。Blackwell 使用 f32x2 paired layout，每个线程持有的元素位置由 `tiled_mma.get_slice(tidx)` 决定。需要确认同一 group 的 32 个 N 元素是否在同一 warp 内（大概率是的，因为 CUTLASS 的 warp-tile 通常 ≥32 along N）。
+
+**难点 2：ISA-packed scale 输出路径**
+
+blockscaled scales 需要以 ISA tile layout (128×128 tiles, 512 bytes per tile) 存储。当前 Triton kernel 在 per-row 基础上计算 tile offset 并直接写 global memory。
+
+**方案：** 在 epilogue 中增加一个 scale smem buffer：
+```
+a. 在 shared_storage_struct 中增加 sScales 字段（smem 缓冲区，~512 bytes per 128x128 tile）
+b. 每个线程将计算好的 E8M0 scale byte 写入 sScales 对应位置
+c. fence + barrier 后 TMA store sScales → HBM
+```
+
+或更简单：不走 TMA，直接从 register 用 `cute.arch.store_global` 写 scale bytes 到 global memory（每个 scale 只有 1 byte，总量很小：128×4 = 512 bytes per tile）。
+
+**难点 3：D tensor 输出格式变化**
+
+当前 D tensor (z) 输出为 bf16。融合后输出为 fp8。需要：
+- 修改 `out_dtype` 为 `float8_e4m3fn`
+- 修改 cvt_copy 的 StMatrix op 为 8-bit 版本
+- 修改 TMA store descriptor 为 8-bit
+
+quack 基础设施已经支持 8-bit D output（`gemm_gated.py:110` 允许 `postact_dtype.width in {8, 16}`）。将同样的支持扩展到 D output 应该可行。
+
+#### 实现步骤
+
+1. **新建 `BlockscaledEpiQuant` epilogue op** (`sonicmoe/quack_utils/epi_blockscaled_quant.py`)
+   - 继承 `EpiOp`，管理 scale output buffer 的 smem 和 gmem
+   - `begin_loop`: 获取 subtile 的 M/N 坐标，计算 group offset
+   - 提供 `quantize_subtile(tRS_rData, scale_smem)` 方法
+
+2. **Override `GemmGatedMixin.epi_convert_postact`** 或新增 `epi_blockscaled_store`
+   - 在 f32 → dtype 转换之前，插入 per-group amax reduction + E8M0 computation
+   - 替代简单的 `.to()` cast
+
+3. **修改 D store path**
+   - 当 blockscaled quant 启用时，D tensor 输出 fp8（不是 bf16）
+   - scale tensor 单独输出
+
+4. **修改 functional/__init__.py**
+   - `_native_fp8_gated_forward` 调用 gemm_gated 时传入 `out_dtype=fp8, blockscaled_quant=True`
+   - 接收 `(z_fp8, z_scales, y1_fp8, y1_scales)` 而不是 `(z_bf16, y1_bf16)`
+   - 消除 `fused_z_save_y1_quant` 调用
+
+#### 预期收益
+
+- **消除 168µs** fused_z_y1_quant kernel
+- **消除 582 MB HBM 读**（z + y1 不再需要从 HBM 重读）
+- **减少 ~576 MB HBM 写**（z 从 bf16 384MB → fp8 192MB，y1 类似）
+- **净 FP8 overhead 降至 ~353µs**（从 521µs）
+- **预估总 GPU projection ~3500µs**（从 3669µs），**BF16 3969→FP8 3500 = 1.134×**
+
+#### 关键依赖
+
+- 需要了解 SM100 MMA register-to-thread mapping 来实现正确的 warp-level group reduction
+- 可参考 `cutlass.utils.blockscaled_layout` 中的 ISA tile packing 逻辑
+- 现有 Triton kernel `_quantize_and_pack_kernel` 中的 E8M0 computation 可直接移植到 CUTLASS DSL
+
+#### 参考文件
+
+| File | 用途 |
+|------|------|
+| `sonicmoe/quack_utils/gemm_gated.py:120-133` | `epi_visit_subtile` — SwiGLU in epilogue, z/y1 register state |
+| `sonicmoe/quack_utils/gemm_gated.py:136-142` | `epi_convert_postact` — 当前 dtype cast，融合插入点 |
+| `sonicmoe/quack_utils/gemm_gated.py:62-99` | `epi_setup_postact` — blockscaled mode crash 注释 |
+| `quack/gemm_sm90.py:1253-1309` | epilogue 主循环 — subtile 处理→store pipeline |
+| `quack/gemm_sm100.py:260-285` | blockscaled MMA setup |
+| `quack/epi_ops.py:393-473` | TileStore — composable epilogue store op |
+| `quack/activation.py:256-260` | swiglu — register-level computation |
+| `sonicmoe/quack_utils/blockscaled_fp8_gemm.py:1858-1920` | `_quantize_and_pack_kernel` — E8M0 computation 参考 |
 
 ---
 
