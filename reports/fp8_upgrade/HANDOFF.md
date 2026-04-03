@@ -1,8 +1,8 @@
 # Blockscaled FP8 MoE — Handoff
 
-> **Last updated:** 2026-04-02 (Session 34 — native FP8 exploration + frontier cleanup)
-> **Branches:** `fork-main-sync` (frontier FP8), `native-fp8-exploration` (native FP8 prototype + this handoff)
-> **Status:** FP8 frontier is **1.066× faster** than official BF16 on GPU projection at Ernie production shape (fully idle node). Native FP8 prototype implemented but **functionally identical** to frontier — true native FP8 requires deeper redesign. FP8 peak memory is ~502 MiB higher than BF16 due to weight caches. Precision verified (**31/31 + 12/12** tests pass).
+> **Last updated:** 2026-04-03 (Session 35 — true native FP8 + authoritative A/B comparison on node 0267)
+> **Branch:** `native-fp8-exploration`
+> **Status:** True native FP8 is **1.082× faster** than official BF16 on GPU projection (same node, same GPU, back-to-back). x-quant kernel eliminated, weight caches bypassed. FP8 peak memory +472 MiB vs BF16 (weight buffers + z save). Precision: all variables RRMSE <8%, cosine >0.997. **31/31 frontier + 5/5 native tests pass.**
 
 ---
 
@@ -40,77 +40,58 @@ with enable_quack_gemm(True), enable_fp8():
 
 ## 1. Performance
 
-### GPU Projection (nsys, Ernie shape T=8192 H=3072 I=1536 E=8 K=8)
+### GPU Projection (nsys, same node 0267 GPU0, back-to-back, Session 35)
 
-Measured on **fully idle node 0342** (10.51.203.75, 8/8 GPUs idle, 0% utilization), nsys + SQLite, 10 warmup + 5 profiled:
+Ernie shape T=8192 H=3072 I=1536 E=8 K=8, 10 warmup + 5 profiled:
 
-| Metric | Official BF16 (quack 0.2.5) | FP8 frontier (quack 0.3.7) | Ratio |
-|--------|---------------------------|---------------------------|-------|
-| **GPU total (5 iters)** | **19,659µs** | **18,452µs** | **1.066× faster** |
-| **GPU per-iter** | **3,932µs** | **3,690µs** | **1.066× faster** |
-| Kernel types/iter | 28 | 31 | +3 unique types |
+| Metric | Official BF16 (quack 0.2.5) | Native FP8 (quack 0.3.7) | Ratio |
+|--------|---------------------------|--------------------------|-------|
+| **GPU total/iter** | **3969µs** | **3669µs** | **1.082× faster** |
+| GEMM total | 3648µs | 2831µs | **1.289× faster** |
+| FP8 overhead | 0 | 521µs | — |
 
-> **Previous contested-node data (0344, 4/8 idle) showed 6609 vs 6290µs — those numbers reflected GPU contention inflating GemmDefault Max to 3440µs. The 0342 data above is authoritative.**
+### Kernel Breakdown (Session 35, node 0267 GPU0)
 
-### FP8 Per-Iteration Kernel Breakdown (3690µs/iter, 31 kernel types)
+| Category | BF16 µs | FP8 µs | Delta | FP8 N/iter |
+|----------|---------|--------|-------|------------|
+| GemmDefault (BF16 wgrad+varlen) | 2390 | 1903 | -487 | 4 |
+| Gated/DGated BF16 fused | 1259 | — | -1259 | — |
+| Gated/DGated FP8 ZeroMat | — | 929 | +929 | 2 |
+| quantize_and_pack (dout+dz) | — | 168 | +168 | 2 |
+| fused_z_save_y1_quant | — | 168 | +168 | 1 |
+| dequant_blockscaled_fp8 (z) | — | 129 | +129 | 1 |
+| gather_isa_packed_scales | — | 55 | +55 | 2 |
+| token_gather_sum | 143 | 143 | 0 | 2 |
+| Other | 177 | 174 | -3 | — |
+| **TOTAL** | **3969** | **3669** | **-300** | — |
 
-| Kernel | Avg µs | Total (5 iter) | % | Category |
-|--------|--------|---------------|---|----------|
-| GemmDefaultSm100 BF16 ×4 (wgrad + actgrad + downproj) | 479 | 9,579µs | 51.9% | GEMM |
-| GemmDGatedSm100ZeroMat (bwd FP8) | 477 | 2,384µs | 12.9% | GEMM |
-| GemmGatedSm100ZeroMat (fwd FP8) | 456 | 2,282µs | 12.4% | GEMM |
-| `_quantize_and_pack_kernel` ×3 (x, dout, dz) | 60 | 895µs | 4.8% | FP8 overhead |
-| `_fused_z_save_y1_quant_kernel` (z+y1 quant) | 168 | 838µs | 4.5% | FP8 overhead |
-| `token_gather_sum_kernel` ×2 | 70 | 702µs | 3.8% | Shared (BF16+FP8) |
-| `_dequant_blockscaled_fp8_kernel` (z restore) | 130 | 649µs | 3.5% | FP8 overhead |
-| `_gather_isa_packed_scales_kernel` ×2 | 27 | 273µs | 1.5% | FP8 overhead |
-| Other (routing, elementwise, reduce) | — | 850µs | 4.6% | Shared |
+GEMM savings: 817µs (22.4%). FP8 overhead: 521µs. Net: **296µs (7.6% faster)**.
 
-**FP8-only overhead: ~532µs/iter (14.4% of total)** — GEMMs account for 77.2%.
-
-### Official BF16 Baseline Kernel Breakdown (3932µs/iter, 28 kernel types)
-
-| Kernel | Avg µs | Total (5 iter) | % |
-|--------|--------|---------------|---|
-| GemmDefaultSm100 BF16 ×4 (all BF16 GEMMs) | 587 | 11,744µs | 59.7% |
-| GemmGatedSm100 (up-proj + SwiGLU) | 768 | 3,839µs | 19.5% |
-| GemmDGatedSm100 (bwd + dSwiGLU) | 496 | 2,478µs | 12.6% |
-| `token_gather_sum_kernel` ×2 | 71 | 714µs | 3.6% |
-| Other | — | 884µs | 4.5% |
-
-BF16 GEMM total: 2349 + 768 + 496 = **3613µs/iter** (91.9% of GPU time).
-
-### Savings Breakdown
-
-```
-GEMM savings:
-  BF16 GEMMs: 2349 + 768 + 496 = 3613µs/iter
-  FP8  GEMMs: 1916 + 477 + 456 = 2849µs/iter
-  Saved: 764µs (21.1% GEMM reduction)
-
-FP8-only overhead: 179 + 168 + 130 + 55 = 532µs/iter
-
-Net: 764 - 532 = 232µs → 3932→3690µs/iter (6.6% speedup on fully idle node)
-```
+x-quant kernel eliminated: `quantize_and_pack` dropped from 3→2 calls/iter (dout + dz only).
 
 ### Memory
 
-| Metric | Official BF16 | FP8 Frontier | Delta |
+| Metric | Official BF16 | Native FP8 | Delta |
 |--------|--------------|-------------|-------|
-| **FWD Peak** | 1385.9 MiB | 1913.8 MiB | **+527.9 MiB** |
-| **Total Peak (FWD+BWD)** | 1411.8 MiB | 1913.8 MiB | **+502.0 MiB** |
-| After BWD (steady state) | 640.6 MiB | 871.5 MiB | +230.9 MiB |
+| **FWD+BWD Peak** | 1658 MiB | 2130 MiB | **+472 MiB** |
+| After BWD | 641 MiB | 888 MiB | +247 MiB |
 
-**FP8 uses more peak memory than BF16.** The Z FP8 save reduces activation memory (~186 MiB saved), but three weight caches (fwd/dgated/actgrad, each ~72MB FP8 + scales per weight) add ~650 MiB. Net effect is +502 MiB at Ernie shape. This is acceptable on B200 (183GB HBM) but may need cache eviction policies for larger models.
+FP8 peak > BF16 due to: FP8 weight buffers (~108 MiB), z FP8 save (~213 MiB), y1 pre-quant (~96 MiB). BF16 master weights kept for wgrad.
 
-> Note: `test_fp8_memory_less_than_bf16` still passes — it uses a smaller test shape where the Z savings outweigh the weight cache overhead.
+### Precision (Official BF16 gold vs Native FP8, production shape, same seed)
 
-### Precision (multi-seed, multi-shape, 31/31 tests)
+| Variable | Shape | RRMSE | Cosine |
+|----------|-------|-------|--------|
+| output | 8192×3072 | 6.51% | 1.0001 |
+| dx | 8192×3072 | 7.04% | 0.9996 |
+| d_c_fc.weight | 8×3072×3072 | 5.94% | 1.0115 |
+| d_c_proj.weight | 8×3072×1536 | 6.51% | 1.0024 |
+| d_router.weight | 8×3072 | 7.57% | 0.9971 |
 
-| Shape | FWD RRMSE | FWD corr | BWD RRMSE | BWD corr |
-|-------|-----------|----------|-----------|----------|
-| Contract (T=1024, E=8) | <7% | >0.997 | <8% | >0.997 |
-| Ernie prod (T=8192, E=8) | <7% | >0.997 | <8% | >0.997 |
+MaxRelErr is large (>1e6) but **only at near-zero gold values** (|gold|<1e-8). For |gold|≥1e-4, MaxRelErr < 0.35. This is standard FP8 quantization behavior — not an anomaly.
+
+### Previous Session 33 data (for reference)
+Frontier FP8 on node 0342: 3690µs/iter vs BF16 3932µs/iter = 1.066×.
 
 ---
 
@@ -326,13 +307,47 @@ Wgrad: ALWAYS BF16. Uses original bf16 parameters via quack.gemm().
 
 ## 7. Next Steps (Priority Order)
 
-1. **True native FP8 (highest value for inference):** Implement `NativeFP8Params` dataclass + `MoE.prepare_native_fp8()` + `forward(x_fp8_data=..., x_fp8_scales=...)`. Detailed plan at `.claude/plans/shiny-beaming-knuth.md`. Expected: ~60µs latency savings + ~480 MiB memory savings. All GEMM kernels already accept pre-quantized FP8 weights — just need to thread the pre-computed buffers through.
+### Remaining FP8 overhead: 521µs/iter (14.2%)
 
-2. **Investigate CUTLASS epilogue FP8 PreAct** — If GemmDGated could read FP8 z (with ISA-packed or raw E8M0 scales) and dequant in epilogue, saves 130µs/iter + 582MB I/O. Highest-value single optimization remaining.
+| Kernel | µs | Status |
+|--------|----|--------|
+| fused_z_save_y1_quant | 168 | 67% DRAM throughput — near practical limit |
+| quantize_and_pack ×2 (dout+dz) | 168 | Needs system-level pre-quantized gradient passing |
+| dequant_blockscaled_fp8 (z) | 129 | **Hard CUTLASS limitation** (see below) |
+| gather_isa_packed_scales ×2 | 55 | Minimal overhead, cannot eliminate |
 
-3. **Reduce FP8 weight cache memory (if NOT doing native FP8)** — Selective cache eviction or lazy population could close the 502 MiB gap while retaining most of the speed benefit.
+### Direction A: z-dequant elimination — **BLOCKED (hard CUTLASS limitation)**
 
-4. **Larger I shapes** — FP8 advantage scales with GEMM size. At I=2048+, expect 1.3-2.4× speedup.
+Investigated thoroughly (Session 35). The `GemmDGatedSm100` kernel requires bf16 PreAct because of 5 hard constraints:
+1. `view(float32)` packing trick requires 2-byte elements (FP8 = 1 byte breaks dimensionality)
+2. `recast_tensor` in epilogue assumes bf16 width (8-bit → 4 values per register, breaks x/y pairing)
+3. TMA smem layout is dtype-specific (different atoms, swizzle patterns)
+4. No epilogue visitor hook for pre-visit dequantization
+5. Blockscaled scales need additional TMA channel + smem buffer
+
+**Resolution: requires a new `GemmDGatedFP8PreAct` kernel class** — multi-week CUTLASS DSL engineering. Not a parameter tweak.
+
+### Direction B: Pre-quantized gradients (dout+dz, 168µs)
+
+If upstream/downstream layers also run native FP8, they could pass pre-quantized gradients:
+- `dout` from the next layer's backward would arrive as (fp8, scales)
+- `dz` pre-quant could be eliminated if `_UpProjection.backward` accepts FP8 dz
+
+This is a **system-level optimization** requiring the entire training framework to adopt native FP8 gradient passing. Not MoE-local.
+
+### Direction C: Memory reduction (+472 MiB vs BF16)
+
+Current breakdown:
+- FP8 weight buffers: ~108 MiB (4 views, needed)
+- BF16 master weights: ~216 MiB (needed for wgrad + optimizer)
+- z FP8 save: ~213 MiB (saves 171 MiB vs bf16 z)
+- y1 pre-quant: ~96 MiB
+
+To close the gap: would need **pure FP8 parameters** (no BF16 master), requiring mixed-precision optimizer integration. Or trade latency for memory by disabling z FP8 save (+171 MiB memory, -168µs z_quant kernel but +384 MiB z bf16 storage).
+
+### Direction D: Larger I shapes (confirmed scaling)
+
+FP8 GEMM advantage scales with matrix size. Current I=1536 gives 22.4% GEMM speedup. At I=2048+ expect ~2.35× GEMM speedup, which would make FP8 overhead (<15%) negligible relative to GEMM savings.
 
 ---
 

@@ -67,17 +67,20 @@
 
 ## Phase 9: Native FP8 Exploration (Session 34)
 
-- **Goal**: Full-chain FP8 params — x as FP8, weights as FP8, no quantization inside MoE
-- **Implemented**: `enable_native_fp8()` context manager, `_native_fp8_gated_forward()`, forward routing, 12 precision tests, benchmark script
-- **Initial bug**: `compute_scales_from_fp8_and_pack` kernel produced numerical garbage — E8M0 scales encode BF16 magnitude, not FP8 magnitude. Mean byte error ~12.8. **Removed.**
-- **PostAct FP8 attempted**: GemmGated can output FP8 PostAct, but without blockscaled ISA scales (raw clamp-cast only). Scales must be stored alongside FP8 data, not reconstructed.
-- **FP8 wgrad blocked**: `blockscaled_fp8_gemm_varlen` only supports `cu_seqlens_m`; wgrad needs `cu_seqlens_k + A_idx`
-- **Result**: After fixing scale bug, native path is **functionally identical** to frontier (same kernels, same performance)
-  - Frontier: 3935 µs/iter, Native: 3962 µs/iter (noise)
-  - Memory: identical (2078.4 MiB both)
-  - Precision: bit-identical (RRMSE=0.0000, correlation=1.000000)
-- **Conclusion**: "Simulate native by quantizing inside MoE" approach provides zero value. True native requires pre-quantized x input + persistent FP8 weight buffers. Detailed plan written.
-- 12/12 native tests pass, 31/31 frontier tests pass (run separately)
+- Initial `compute_scales_from_fp8_and_pack` was fundamentally wrong — removed
+- After fixing, simulated native path was functionally identical to frontier
+
+## Phase 10: True Native FP8 + A/B Comparison (Session 35)
+
+- `NativeFP8Params` dataclass: 4 FP8 weight views via `_quantize_weight_3d_triton` — zero cache pollution
+- `MoE.prepare_native_fp8()` + `forward(native_fp8_params=..., x_fp8_data=..., x_fp8_scales=...)`
+- x-quant eliminated: `quantize_and_pack` 3→2 calls/iter
+- fused_z_save_y1_quant restored (separate z+y1 was 15µs slower)
+- **A/B on node 0267 GPU0**: BF16 3969µs → FP8 3669µs = **1.082×** (GEMM -22.4%, overhead +521µs, net -296µs)
+- Per-variable precision: all RRMSE <8%, cosine >0.997. MaxRelErr only at near-zero values.
+- Memory: FP8 2130 MiB vs BF16 1658 MiB (+472 MiB)
+- **Direction A investigated**: z-dequant (129µs) is hard CUTLASS limitation — 5 constraints (view-f32 packing, TMA layout, epilogue recast, no dequant hook, need extra TMA for scales). Needs new kernel class.
+- 31/31 frontier + 5/5 true native tests pass
 
 ---
 
@@ -96,3 +99,5 @@
 11. **E8M0 scales encode BF16 magnitude, NOT FP8 magnitude** — You cannot reconstruct blockscaled scales from FP8 data. Scales must be computed from the original BF16 source and stored alongside FP8 data. `compute_scales_from_fp8_and_pack` was fundamentally wrong.
 12. **PostAct FP8 from GemmGated has no ISA-packed scales** — CUTLASS clamp-casts without producing blockscaled metadata. Must still call `quantize_and_pack_activation(y1)` separately.
 13. **Test isolation matters** — `enable_native_fp8()` modifies process-global state. Native FP8 tests must run in a separate pytest invocation from frontier tests.
+14. **CUTLASS GemmDGated FP8 PreAct is a hard architectural limitation** — 5 constraints make it impossible to feed FP8 z directly: (1) view(f32) packing requires 2-byte elements, (2) recast_tensor assumes bf16 width, (3) TMA smem is dtype-specific, (4) no epilogue dequant hook, (5) scales need separate TMA. Requires a new kernel class, not a config change.
+15. **MaxRelErr at near-zero values is FP8-normal** — when |gold|<1e-8, FP8 quantization noise dominates → relative error >1e6. But absolute error stays <5e-5 and all |gold|≥1e-4 elements have MaxRelErr < 0.35. Not an anomaly.
