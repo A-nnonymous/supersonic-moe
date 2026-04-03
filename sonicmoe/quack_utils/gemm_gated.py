@@ -318,13 +318,9 @@ class GemmGatedBlockscaledQuantMixin(GemmGatedMixin):
             quant_scale = _i32_as_f32(qexp << Int32(23))
             for i in cutlass.range(num_z, unroll_full=True):
                 tRS_rD[i] = tRS_rD[i] * quant_scale
-            # Clamp to [-448, 448] (fp8 e4m3fn range) to prevent bf16 overflow
-            for i in cutlass.range(num_z, unroll_full=True):
-                val = tRS_rD[i]
-                val = cute.arch.fmax(Float32(-448.0), val)
-                # fmin via negation: min(a, b) = -max(-a, -b)
-                val = Float32(0.0) - cute.arch.fmax(Float32(-448.0), Float32(0.0) - val)
-                tRS_rD[i] = val
+            # NOTE: values may exceed bf16 range for small-amax groups.
+            # Caller MUST use out_dtype=fp8 so cvt_copy does f32→fp8
+            # (hardware saturating cast, no bf16 intermediate overflow).
             # Write ue8m0 to scale output via EpiOp state (absolute coordinates)
             scale_info = epi_loop_tensors["mZScale"]
             scale_tensor, m_abs, n_group_abs = scale_info
