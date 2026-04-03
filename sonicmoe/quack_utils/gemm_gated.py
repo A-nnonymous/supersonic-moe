@@ -271,11 +271,11 @@ class GemmGatedBlockscaledQuantMixin(GemmGatedMixin):
         )
 
         # ── Blockscaled quant of z (tRS_rD) in registers ──
-        # tRS_rD holds the ORIGINAL f32 z values (preactivation, after bias)
-        # All 5 quant steps run here atomically.
+        # Uses the SAME integer+carry algorithm as _quantize_and_pack_kernel (Triton)
+        # which is bitwise identical to Paddle reference (verified: 0/100000 mismatches).
         num_z = cute.size(tRS_rD)
 
-        # Step 1: amax = max(abs(z_original[0:32]))
+        # Step 1: amax = max(abs(z[0:32])) — AFTER bias/alpha, BEFORE SwiGLU
         amax = Float32(0.0)
         for i in cutlass.range(num_z, unroll_full=True):
             val = tRS_rD[i]
@@ -283,49 +283,36 @@ class GemmGatedBlockscaledQuantMixin(GemmGatedMixin):
             abs_val = cute.arch.fmax(val, neg)
             amax = cute.arch.fmax(amax, abs_val)
 
-        # Step 2: scale = fp8_max / amax, rounded to power-of-2
-        # Use fdiv (not rcp.approx) for precision at pow2 rounding boundary.
-        # Guard amax == 0 → scale = 1.0
-        amax_safe = cute.arch.fmax(amax, Float32(1.17549435e-38))  # FLT_MIN as eps
-        scale = _FP8_MAX / amax_safe  # fdiv — exact enough for pow2 rounding
+        # Step 2: E8M0 via integer bit manipulation (matches Triton kernel exactly)
+        amax_bits = _f32_as_i32(amax)
+        biased_exp = (amax_bits >> Int32(23)) & Int32(0xFF)
+        mantissa_bits = amax_bits & Int32(0x7FFFFF)
+        # carry = 1 if mantissa > 0x600000 (round up when mantissa > 0.75)
+        has_carry = cutlass.Boolean(mantissa_bits > Int32(0x600000))
+        carry = Int32(1) if has_carry else Int32(0)
+        e8m0 = biased_exp - Int32(8) + carry
+        is_normal = cutlass.Boolean(biased_exp > Int32(0))
+        e8m0 = e8m0 if is_normal else Int32(0)
+        is_pos = cutlass.Boolean(e8m0 > Int32(0))
+        e8m0 = e8m0 if is_pos else Int32(0)
 
-        # Power-of-2 rounding via ldexpf(1.0, biased_exp - 127)
-        # Extract biased exponent, reconstruct as exact power of 2
-        scale_bits = _f32_as_i32(scale)
-        biased_exp = (scale_bits >> Int32(23)) & Int32(0xFF)
-        # ldexpf(1.0, biased_exp - 127) = 2^(biased_exp - 127)
-        # This is the same as setting mantissa=0, sign=0, exp=biased_exp
-        # For normal numbers: _i32_as_f32(biased_exp << 23)
-        scale_pow2 = _i32_as_f32(biased_exp << Int32(23))
+        # Step 3: quant_scale = 2^(254 - e8m0)
+        qexp = Int32(254) - e8m0
+        qexp_hi = cutlass.Boolean(qexp > Int32(254))
+        qexp = Int32(254) if qexp_hi else qexp
+        qexp_lo = cutlass.Boolean(qexp < Int32(1))
+        qexp = Int32(1) if qexp_lo else qexp
+        quant_scale = _i32_as_f32(qexp << Int32(23))
 
-        # Handle edge case: if amax was 0, scale is huge → clamp
-        is_inf = cutlass.Boolean(biased_exp >= Int32(0xFF))
-        scale_pow2 = Float32(1.0) if is_inf else scale_pow2
-
-        # Step 3: store_scale = 1.0 / scale_pow2 (exact for power-of-2)
-        # For pow2, 1/2^n = 2^(-n), represented exactly in float32
-        store_scale_bits = _f32_as_i32(Float32(1.0) / scale_pow2)
-
-        # Step 4: UE8M0 = biased exponent of store_scale
-        ue8m0 = (store_scale_bits >> Int32(23)) & Int32(0xFF)
-
-        # Step 5: Quantize z in-place: z *= scale_pow2
-        # After this, values are in [-448, 448] range.
-        # The epilogue's cvt_copy will f32→bf16→smem→TMA for D output.
-        # NOTE: the bf16 D output contains SCALED values, NOT original z.
-        # This is correct only if the downstream consumer knows to dequant.
+        # Step 4: z *= quant_scale (values now in [-448, 448])
         for i in cutlass.range(num_z, unroll_full=True):
-            tRS_rD[i] = tRS_rD[i] * scale_pow2
+            tRS_rD[i] = tRS_rD[i] * quant_scale
 
-        # Write UE8M0 scale byte to EpiOp state — DISABLED.
-        # Scale write now happens in the overridden epilogue() method which has
-        # access to tile coordinates for the gmem write.
-        # The ue8m0 value computed above is lost here but recomputed in epilogue()
-        # from the modified tRS_rD (which has z *= scale_pow2).
-        # Recovery: inv_scale = amax(tRS_rD) / 448, UE8M0 = exponent(inv_scale).
-        # This is exact because tRS_rD is still f32 (no bf16/fp8 precision loss).
+        # Step 5: UE8M0 = e8m0 (clamped, same as Triton kernel stores)
+        ue8m0 = e8m0
 
-        return tRS_rPostAct
+        # Return y1 + ue8m0 for epilogue to write scale to gmem
+        return tRS_rPostAct, ue8m0
 
     @cute.jit
     def epilogue(
@@ -391,30 +378,12 @@ class GemmGatedBlockscaledQuantMixin(GemmGatedMixin):
                     epi_pipeline.producer_commit(epi_producer_state)
                 epi_producer_state.advance()
 
-            # ─── epi_visit_subtile: SwiGLU + blockscaled quant ───
-            tRS_rPostAct = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
+            # ─── epi_visit_subtile: SwiGLU + blockscaled quant (integer+carry, returns ue8m0) ───
+            tRS_rPostAct, ue8m0 = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
 
             # ─── SCALE GMEM WRITE ───
-            # epi_visit_subtile scaled tRS_rD by scale_pow2 (values now in [-448, 448]).
-            # Recover ue8m0: amax(abs(tRS_rD_scaled)) / 448 = amax_orig * scale / 448.
-            # Since scale = pow2_round(448/amax_orig), amax_scaled = amax_orig * scale.
-            # inv_scale_approx = amax_scaled / 448. The exponent gives UE8M0.
-            # This is EXACT in f32 (no bf16/fp8 precision loss at this point).
             z_scale_tensor = epi_tensors["mZScale"]
             if const_expr(z_scale_tensor is not None):
-                # Compute amax of scaled z (still f32 in registers)
-                num_z = cute.size(tRS_rD)
-                amax_scaled = Float32(0.0)
-                for i in cutlass.range(num_z, unroll_full=True):
-                    val = tRS_rD[i]
-                    neg = Float32(0.0) - val
-                    amax_scaled = cute.arch.fmax(amax_scaled, cute.arch.fmax(val, neg))
-                # inv_scale = amax_scaled / 448
-                inv_scale = amax_scaled / _FP8_MAX
-                inv_bits = _f32_as_i32(inv_scale)
-                ue8m0 = (inv_bits >> Int32(23)) & Int32(0xFF)
-
-                # Write to gmem: scale_tensor[m_abs, n_group]
                 tile_M = self.cta_tile_shape_mnk[0]
                 m_in_tile = tidx % tile_M
                 if const_expr(varlen_manager.varlen_m):
