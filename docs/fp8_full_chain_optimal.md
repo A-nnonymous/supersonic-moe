@@ -251,3 +251,64 @@ Total peak:         ~2105MB     ~1721MB     -384MB (-18%)
 5. ❌ **Backward wgrad FP8 — Phase A** (最大收益点)
 6. ❌ **Backward z dequant 消除 — Phase B** (显存收益点)
 7. ❌ **Backward dz 存储 FP8 化 — Phase C** (额外显存收益)
+
+---
+
+## 6. 修正后的优化路径 (基于 nsys + 效率分析 + cross-node 验证)
+
+### 6.1 效率分析揭示的真相
+
+| Kernel | Measured | Theory | Efficiency | 瓶颈 |
+|--------|---------|--------|-----------|------|
+| wgrad up-proj `gemm(x.T, dz, A_idx)` | 3490µs | 733µs | **16%** | A_idx 不规则访存 |
+| wgrad down-proj `gemm(dout.T, y1)` | 387µs | 367µs | **71%** | 接近峰值 |
+| GemmDGated FP8 | 486µs | 183µs | 38% | epilogue (dSwiGLU) |
+| actgrad FP8 | 430µs | 367µs | 85% | 接近峰值 |
+
+**关键发现：wgrad up-proj 的 84% 时间浪费在 A_idx gather 的不规则内存访问上，
+不是算力不足。FP8 mainloop 只能加速 compute-bound 部分 (~16%)，无法改善
+memory-bound 部分 (~84%)。**
+
+### 6.2 修正后的收益预估
+
+| 优化项 | 原始预估 | 修正预估 | 差异原因 |
+|--------|---------|---------|---------|
+| FP8 wgrad up-proj | -2290µs | **~-560µs** | memory-bound，FP8 只加速 compute 部分 |
+| FP8 wgrad down-proj | -197µs | **~-190µs** | compute-bound，接近 2x |
+| wgrad up-proj A_idx 优化 | 0 | **~-2000µs** | 消除 A_idx gather 的根本方案 |
+| Phase 3.1 z dequant | -130µs/-384MB | -130µs/-384MB | 不变 |
+
+### 6.3 修正后的最优路径
+
+```
+Priority 1: wgrad up-proj A_idx gather 优化 (最大收益 ~2000µs = 38% backward)
+  方案 A: 预先 gather x → x_gathered(TK, H)，消除 A_idx
+          代价: +384MB 临时 buffer
+          收益: wgrad up-proj 从 3490µs → ~1000µs
+  方案 B: 改变 wgrad 计算顺序，避免 gather
+  方案 C: per-expert loop + cuBLAS batch GEMM
+
+Priority 2: FP8 wgrad down-proj (~190µs saving)
+  已接近峰值 (71%)，FP8 可再提升到 ~85%
+  前置条件: dout_fp8 + y1_fp8 已有
+
+Priority 3: Phase 3.1 z dequant 消除 (130µs + 384MB saving)
+  显存收益为主
+
+Priority 4: FP8 wgrad up-proj (~560µs saving)
+  在 A_idx 优化之后才有意义
+```
+
+### 6.4 修正后的理论上限
+
+```
+                    当前        修正最优      收益
+wgrad up (A_idx opt) 3490µs     ~1000µs      -2490µs
+wgrad down (FP8)      387µs      ~190µs       -197µs
+GemmDGated            486µs       486µs       0
+actgrad               430µs       430µs       0
+z dequant             130µs         0µs       -130µs + 384MB
+other                 331µs       331µs       0
+─────────────────────────────────────────────────
+TOTAL                5254µs      2437µs       -2817µs (-54%)
+```
