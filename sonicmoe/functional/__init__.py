@@ -158,8 +158,10 @@ def _fused_blockscaled_gated_forward(
     # Step 3: Zero-materialization GEMM via standard interface.
     # gemm_gated() with A_idx auto-selects GemmGatedSm100ZeroMat on SM100,
     # which gathers A rows inside the kernel (no TK FP8 materialization).
-    # When epilogue quant is enabled, z is quantized in the epilogue and scale
-    # bytes are written atomically — no standalone quant kernel needed.
+    # When epilogue quant is enabled, D output is fp8 directly (no bf16 round-trip).
+    # The epilogue multiplies z by quant_scale in registers → hardware fp8 saturating
+    # cast writes z_fp8 to D. This eliminates the standalone z.to(fp8) cast kernel
+    # and halves D bandwidth (192MB fp8 vs 384MB bf16).
     epilogue_quant = _use_epilogue_quant() and _save_z_fp8()
     if epilogue_quant:
         N = w1.shape[0]  # (2I, H, E) → w1.shape[0] = 2I
@@ -183,7 +185,8 @@ def _fused_blockscaled_gated_forward(
     del x_fp8, x_scales_tk_e8m0
 
     if epilogue_quant:
-        # z D output holds SCALED bf16 values; cast to fp8 (hardware saturating).
+        # Epilogue wrote scales + modified D (scaled z values).
+        # Cast bf16 → fp8 for ctx memory saving.
         z_fp8 = z.to(torch.float8_e4m3fn)
         _PREQUANTIZED_SCALES["z_fp8"] = (z_fp8, z_scale_out.view(torch.float8_e8m0fnu))
 
