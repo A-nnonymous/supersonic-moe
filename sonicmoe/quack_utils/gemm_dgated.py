@@ -315,6 +315,21 @@ class GemmDGatedFP8PreActMixin(GemmDGatedMixin):
         FP8PreActLoad("mFP8PreAct"),
     )
 
+    def epi_to_underlying_arguments(self, args, *, loc=None, ip=None):
+        self.rounding_mode = getattr(args, "rounding_mode", 0)
+        self.postact_dtype = args.mPostAct.element_type
+        self.postact_layout = cutlass.utils.LayoutEnum.from_tensor(args.mPostAct)
+        fp8_mode = getattr(args, "mFP8PreAct_fp8", None) is not None
+        if not fp8_mode:
+            assert args.implicit_dtype.width == 16, "GemmDGated only supports 16bit for now"
+            assert self.c_dtype.width == 32, "C storage type must be 32 bit"
+        assert self.d_dtype.width == 32, "D storage type must be 32 bit"
+        self.cta_tile_shape_postact_mn = self.cta_tile_shape_mnk[:2]
+        d = self._epi_ops_to_params_dict(args)
+        d["act_bwd_fn"] = args.act_bwd_fn
+        d["implicit_dtype"] = args.implicit_dtype
+        return self.EpilogueParams(**d)
+
     @mlir_namedtuple
     class EpilogueArguments(NamedTuple):
         mPostAct: cute.Tensor
@@ -342,22 +357,26 @@ class GemmDGatedFP8PreActMixin(GemmDGatedMixin):
             fp8_tensor, scales_tensor, m_abs, n_logical = fp8_preact_info
             num_d = cute.size(tRS_rD)  # N_phys elements in D per thread
 
-            # Construct tRS_rXY_f32x2 with 2 * num_d f32 elements
-            tRS_rXY_f32x2_layout = cute.recast_layout(2, 1, tRS_rD.layout)
-            tRS_rXY_f32x2 = cute.make_rmem_tensor(tRS_rXY_f32x2_layout.shape, Float32)
+            # Construct tRS_rXY_f32x2: same layout as recast_tensor(tRS_rC, bf16) → f32 widen
+            # tRS_rC is N f32 → recast to 2N bf16 → widen to 2N f32
+            # We need the same: N f32 → 2N f32 (from fp8 dequant)
+            # Use recast_tensor on tRS_rD (f32) to get the bf16x2 layout, then make f32 version
+            tRS_rXY_bf16_layout = cute.recast_tensor(tRS_rD, cutlass.BFloat16).layout
+            tRS_rXY_f32x2 = cute.make_rmem_tensor(tRS_rXY_bf16_layout.shape, Float32)
 
             num_xy = cute.size(tRS_rXY_f32x2)  # 2 * num_d
             for i in cutlass.range(num_xy, unroll_full=True):
                 # Load fp8 byte from z_fp8[m_abs, n_logical + i]
                 fp8_byte = fp8_tensor[m_abs, n_logical + i]
                 # Load scale: 1 UE8M0 byte per 32-element group
-                group_idx = (n_logical + i) / Int32(32)
+                group_idx = (n_logical + i) >> Int32(5)  # integer divide by 32
                 scale_byte = scales_tensor[m_abs, group_idx]
                 # Dequant: fp8_to_f32(byte) * 2^(e8m0 - 127)
                 # 2^(e8m0 - 127) = _i32_as_f32(Int32(e8m0) << 23) when 0 < e8m0 < 255
                 dequant_scale = _i32_as_f32(Int32(scale_byte) << Int32(23))
-                fp8_f32 = Float32(fp8_byte)  # hardware fp8→f32 widening
-                tRS_rXY_f32x2[i] = fp8_f32 * dequant_scale
+                # fp8→f32: convert via bf16 intermediate (scalar fp8 cvt requires packed vec in DSL)
+                fp8_as_bf16 = cutlass.BFloat16(fp8_byte)
+                tRS_rXY_f32x2[i] = Float32(fp8_as_bf16) * dequant_scale
         else:
             # ── Standard bf16 PreAct path ──
             assert tRS_rC is not None
@@ -439,8 +458,14 @@ class GemmDGatedFP8PreActMixin(GemmDGatedMixin):
                             (tDrColVec_mn[m, 0], tDrColVec_mn[m, 0]),
                         )
 
-        # Return D as is and rOut as "postact" (same convention as parent)
-        tRS_rD.store(tRS_rdXY_f32x2.load())
+        # Write dXY (packed f16x2 as f32) back to D
+        if const_expr(fp8_preact_info is not None):
+            pack_dtype = cutlass.BFloat16
+        else:
+            pack_dtype = params.implicit_dtype
+        tRS_rdXY_f16x2 = cute.make_rmem_tensor(tRS_rdXY_f32x2.layout, pack_dtype)
+        tRS_rdXY_f16x2.store(tRS_rdXY_f32x2.load().to(pack_dtype))
+        tRS_rD.store(cute.recast_tensor(tRS_rdXY_f16x2, Float32).load())
         return tRS_rOut
 
 
