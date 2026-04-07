@@ -525,14 +525,17 @@ class GemmDGatedFP8CLoadMixin(GemmDGatedMixin):
         FP8PreActLoad("mFP8PreAct"),
     )
 
-    # Override TMA atom creation: use smem shape as tile (handles fp8 2x N)
-    @staticmethod
-    def _make_tma_epi_atoms_and_tensors(tensor_d, epi_smem_layout_staged, epi_tile, op_type="load"):
+    # Override TMA atom creation: use integer fp8 tile for CTA mapping
+    def _make_tma_epi_atoms_and_tensors(self, tensor_d, epi_smem_layout_staged, epi_tile, op_type="load"):
         from cutlass.cute.nvgpu import cpasync
         epi_smem_layout = cute.slice_(epi_smem_layout_staged, (None, None, 0))
+        # Use the stored integer fp8 tile if available (set in _setup_attributes)
+        tile = getattr(self, '_fp8_c_tile_mn', None)
+        if tile is None:
+            tile = epi_tile
         d_cta_v_layout = cute.composition(
             cute.make_identity_layout(tensor_d.shape),
-            epi_smem_layout.shape,
+            tile,
         )
         op = (
             cpasync.CopyBulkTensorTileG2SOp()
@@ -577,6 +580,7 @@ class GemmDGatedFP8CLoadMixin(GemmDGatedMixin):
             self.epi_c_smem_layout_staged = sm100_utils.make_smem_layout_epi(
                 self.c_dtype, self.c_layout, fp8_epi_tile, self.epi_c_stage
             )
+            self._fp8_c_tile_mn = fp8_epi_tile  # integer (M, 2N) for TMA
 
     def epilog_smem_load_and_partition(
         self, tiled_copy_t2r, c_layout, dtype, sC, tRS_rD_layout, tidx
