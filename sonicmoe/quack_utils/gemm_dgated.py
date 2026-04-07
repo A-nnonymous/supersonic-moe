@@ -237,6 +237,24 @@ class GemmDGatedSm100(GemmDGatedMixin, GemmSm100):
 # ---------------------------------------------------------------------------
 
 @dsl_user_op
+def _fp8e4m3_to_f32(x, *, loc=None, ip=None) -> Float32:
+    """Convert scalar f8E4M3FN to f32 via PTX: fp8 → f16 → f32."""
+    from cutlass._mlir.dialects import arith as _arith
+    x_i8 = llvm.bitcast(T.i8(), x.ir_value(loc=loc, ip=ip) if hasattr(x, 'ir_value') else x,
+                         loc=loc, ip=ip)
+    x_i16 = llvm.zext(T.i16(), x_i8, loc=loc, ip=ip)
+    f16_val = llvm.inline_asm(
+        T.f16(), [x_i16],
+        "{ .reg .b8 s; mov.b16 {s, _}, $1; cvt.rn.f16.e4m3 $0, s; }",
+        "=h,h",
+        has_side_effects=False, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+    f32_val = _arith.extf(T.f32(), f16_val, loc=loc, ip=ip)
+    return Float32(f32_val)
+
+
+@dsl_user_op
 def _f32_as_i32(x: Float32, *, loc=None, ip=None) -> Int32:
     return Int32(llvm.bitcast(T.i32(), Float32(x).ir_value(loc=loc, ip=ip), loc=loc, ip=ip))
 
@@ -274,30 +292,33 @@ class FP8PreActLoad(EpiOp):
             fp8_tensor, scales_tensor = param
             tile_M = gemm.cta_tile_shape_mnk[0]
             tile_N = gemm.cta_tile_shape_mnk[1]
-            m_in_tile = ctx.tidx % tile_M
+
+            # Compute varlen M offset
             if const_expr(ctx.varlen_manager.varlen_m):
-                m_abs = (ctx.varlen_manager.params.cu_seqlens_m[ctx.tile_coord_mnkl[3]]
-                         + ctx.tile_coord_mnkl[0] * tile_M + m_in_tile)
+                m_offset = ctx.varlen_manager.params.cu_seqlens_m[ctx.tile_coord_mnkl[3]]
             else:
-                m_abs = ctx.tile_coord_mnkl[0] * tile_M + m_in_tile
-            # tile_N is physical N of C = logical_N / 2 (bf16x2 packing)
-            # fp8 z has logical_N = 2 * tile_N elements per row
+                m_offset = Int32(0)
+            m_base = ctx.tile_coord_mnkl[0] * tile_M
+
+            # Identity tensor partitioned for this thread's epilogue elements
+            # This gives the exact (row, col) for each register position
+            tDcD = ctx.partition_for_epilogue_fn(
+                cute.make_identity_tensor((tile_M, tile_N))
+            )
+
+            # N base in fp8 logical coordinates (tile_N f32 = 2*tile_N bf16 = 2*tile_N fp8)
             n_base_logical = ctx.tile_coord_mnkl[1] * tile_N * 2
-            return (fp8_tensor, scales_tensor, m_abs, n_base_logical, tile_N)
+
+            return (fp8_tensor, scales_tensor, tDcD, m_offset, m_base, n_base_logical)
         return None
 
     @cute.jit
     def begin_loop(self, gemm, state, epi_coord):
         if const_expr(state is not None):
-            fp8_tensor, scales_tensor, m_abs, n_base, tile_N = state
-            if const_expr(isinstance(epi_coord, tuple)):
-                n_sub = epi_coord[1] if len(epi_coord) > 1 else epi_coord[0]
-            else:
-                n_sub = epi_coord
-            # Each epi subtile maps to 1 scale group = 32 logical fp8 elements
-            # (confirmed: BlockscaledScaleStore uses epi_coord directly as group index)
-            n_logical = n_base + n_sub * Int32(32)
-            return (fp8_tensor, scales_tensor, m_abs, n_logical)
+            fp8_tensor, scales_tensor, tDcD, m_offset, m_base, n_base = state
+            # Extract this subtile's identity coordinates
+            tDcD_sub = cute.group_modes(tDcD, 3, cute.rank(tDcD))[None, None, None, epi_coord]
+            return (fp8_tensor, scales_tensor, tDcD_sub, m_offset, m_base, n_base)
         return None
 
 
@@ -353,31 +374,45 @@ class GemmDGatedFP8PreActMixin(GemmDGatedMixin):
         fp8_preact_info = epi_loop_tensors["mFP8PreAct"]
 
         if const_expr(fp8_preact_info is not None):
-            # ── FP8 PreAct path: load fp8 z + vectorized dequant ──
-            fp8_tensor, scales_tensor, m_abs, n_logical = fp8_preact_info
-            num_d = cute.size(tRS_rD)
+            # ── FP8 PreAct path: use identity tensor for correct coordinates ──
+            fp8_tensor, scales_tensor, tDcD_sub, m_offset, m_base, n_base = fp8_preact_info
 
-            # Create fp8 register tensor matching the 2N logical elements
+            # tDcD_sub[i] gives (row_in_tile, col_in_tile) for each D register element
+            # col is C's physical N (f32 = bf16x2). Each f32 maps to 2 fp8 bytes.
+            num_d = cute.size(tDcD_sub)
+
+            # Allocate fp8 register tensor (2x D elements for gate+up pairs)
             tRS_rXY_bf16_layout = cute.recast_tensor(tRS_rD, cutlass.BFloat16).layout
-            num_xy = cute.size(tRS_rXY_bf16_layout)
-
-            # Load fp8 values into a register tensor, then vectorized convert
             tRS_rFP8 = cute.make_rmem_tensor(tRS_rXY_bf16_layout.shape, cutlass.Float8E4M3FN)
-            for i in cutlass.range(num_xy, unroll_full=True):
-                tRS_rFP8[i] = fp8_tensor[m_abs, n_logical + i]
 
-            # Vectorized fp8 → f32 conversion via tensor .to()
-            # DSL internally uses: fp8(vec4) → f16(vec2) → f32 (nvgpu.cvt_fpext + arith.extf)
+            # Load fp8 bytes using identity-derived coordinates
+            # For each D[i] at (row, col), load fp8[row, col*2] and fp8[row, col*2+1]
+            for i in cutlass.range(num_d, unroll_full=True):
+                coord = tDcD_sub[i]
+                row = coord[0]
+                col = coord[1]
+                m_abs = m_offset + m_base + row
+                n0 = n_base + col * 2
+                tRS_rFP8[2 * i] = fp8_tensor[m_abs, n0]
+                tRS_rFP8[2 * i + 1] = fp8_tensor[m_abs, n0 + Int32(1)]
+
+            # Vectorized fp8→f32 (DSL auto-packs vec4 → nvgpu.cvt_fpext)
             tRS_rXY_f32x2 = cute.make_rmem_tensor(tRS_rXY_bf16_layout.shape, Float32)
             tRS_rXY_f32x2.store(tRS_rFP8.load().to(Float32))
 
-            # Apply blockscaled dequant: 1 scale per 32 fp8 elements
-            # num_xy elements may span multiple groups (e.g., 64 = 2 groups)
-            for i in cutlass.range(num_xy, unroll_full=True):
-                group_idx = (n_logical + i) >> Int32(5)  # (n_logical + i) / 32
-                scale_byte = scales_tensor[m_abs, group_idx]
-                dequant_scale = _i32_as_f32(Int32(scale_byte) << Int32(23))
-                tRS_rXY_f32x2[i] = tRS_rXY_f32x2[i] * dequant_scale
+            # Blockscaled dequant using identity coordinates for correct group index
+            for i in cutlass.range(num_d, unroll_full=True):
+                coord = tDcD_sub[i]
+                row = coord[0]
+                col = coord[1]
+                m_abs = m_offset + m_base + row
+                n0 = n_base + col * 2
+                group_0 = n0 >> Int32(5)
+                group_1 = (n0 + Int32(1)) >> Int32(5)
+                scale_0 = _i32_as_f32(Int32(scales_tensor[m_abs, group_0]) << Int32(23))
+                scale_1 = _i32_as_f32(Int32(scales_tensor[m_abs, group_1]) << Int32(23))
+                tRS_rXY_f32x2[2 * i] = tRS_rXY_f32x2[2 * i] * scale_0
+                tRS_rXY_f32x2[2 * i + 1] = tRS_rXY_f32x2[2 * i + 1] * scale_1
         else:
             # ── Standard bf16 PreAct path ──
             assert tRS_rC is not None
