@@ -1025,6 +1025,77 @@ def _fused_transpose_quantize_kernel(
     tl.store(scale_ptrs, e8m0_byte, mask=dim_offs < dim)
 
 
+@triton.jit
+def _warp32x32_transpose_quant_kernel(
+    src_ptr, gather_idx_ptr,
+    dst_fp8_ptr, dst_scales_ptr,
+    dim, capacity, per_batch_storage,
+    src_stride_row, src_stride_col,
+    HAS_GATHER: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+    GROUPS_PER_BLOCK: tl.constexpr,
+    SF_TILE_M: tl.constexpr,
+    SF_TILE_K: tl.constexpr,
+    SF_TILE_STORAGE: tl.constexpr,
+):
+    """32x32 single-warp transpose+quant: minimal L1 pressure, no smem.
+
+    Each block processes GROUPS_PER_BLOCK × (32 tokens × 32 dims) tiles.
+    Only 32 output cache lines per store (vs 128 in original).
+    """
+    pid_row = tl.program_id(0)
+    pid_grp_block = tl.program_id(1)
+    num_dim_blocks = tl.cdiv(dim, BLOCK_DIM)
+    expert_id = pid_row // num_dim_blocks
+    dim_block = pid_row % num_dim_blocks
+    dim_offs = dim_block * BLOCK_DIM + tl.arange(0, BLOCK_DIM)
+    dim_mask = dim_offs < dim
+
+    k_tiles: tl.constexpr = tl.cdiv(capacity, SF_TILE_K)
+    groups_per_k: tl.constexpr = SF_TILE_K // GROUP_SIZE
+    row_tiles = dim_offs // SF_TILE_M
+    row_in_tile = dim_offs % SF_TILE_M
+    row_base = (row_in_tile % 32) * 16 + (row_in_tile // 32) * 4
+    out_rows = expert_id * dim + dim_offs
+
+    for g in tl.range(0, GROUPS_PER_BLOCK):
+        pid_group = pid_grp_block * GROUPS_PER_BLOCK + g
+        cap_offs = pid_group * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+        flat_ids = expert_id * capacity + cap_offs
+        if HAS_GATHER:
+            src_rows = tl.load(gather_idx_ptr + flat_ids).to(tl.int64)
+        else:
+            src_rows = flat_ids.to(tl.int64)
+
+        src_ptrs = src_ptr + src_rows[:, None] * src_stride_row + dim_offs[None, :] * src_stride_col
+        values = tl.load(src_ptrs, mask=dim_mask[None, :], other=0.0).to(tl.float32)
+        values_t = tl.trans(values)
+
+        block_amax = tl.max(tl.abs(values_t), axis=1)
+        amax_bits = block_amax.to(tl.int32, bitcast=True)
+        biased_exp = (amax_bits >> 23) & 0xFF
+        mantissa = amax_bits & 0x7FFFFF
+        carry = tl.where(mantissa > 0x600000, 1, 0)
+        e8m0 = biased_exp - 8 + carry
+        e8m0 = tl.where(biased_exp > 0, e8m0, 0)
+        e8m0_byte = tl.maximum(e8m0, 0).to(tl.uint8)
+        qexp = tl.maximum(tl.minimum(254 - e8m0, 254), 1)
+        qscale = (qexp.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+        quantized = (values_t * qscale[:, None]).to(tl.float8e4nv)
+
+        out_cols = pid_group * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+        fp8_ptrs = dst_fp8_ptr + out_rows[:, None].to(tl.int64) * capacity + out_cols[None, :].to(tl.int64)
+        tl.store(fp8_ptrs, quantized, mask=dim_mask[:, None])
+
+        k_idx = pid_group // groups_per_k
+        k_in = pid_group % groups_per_k
+        tile_base = (row_tiles * k_tiles + k_idx) * SF_TILE_STORAGE
+        isa_idx = tile_base + row_base + k_in
+        scale_ptrs = dst_scales_ptr + expert_id.to(tl.int64) * per_batch_storage + isa_idx.to(tl.int64)
+        tl.store(scale_ptrs, e8m0_byte, mask=dim_mask)
+
+
 def fused_transpose_quantize_for_wgrad(
     flat_sorted: torch.Tensor,
     num_experts: int,
@@ -1040,10 +1111,17 @@ def fused_transpose_quantize_for_wgrad(
       - packed_scales: ISA-packed scales for CUTLASS (directly, no separate pack step)
 
     Optionally fuses a gather step via *gather_idx*.
+
+    Uses 32x32 single-warp kernel for minimal L1 cache pressure (32 output
+    cache lines vs 128 in the original 32x128 kernel). GROUPS_PER_BLOCK=16
+    amortizes block launch overhead.
     """
     device = flat_sorted.device
     GROUP_SIZE = _SF_VEC_SIZE  # 32
-    BLOCK_DIM = 128
+    BLOCK_DIM = 32  # 32x32 tile for minimal L1 pressure
+    # Heuristic: larger GPB reduces grid overhead but increases register pressure
+    # NCU shows 72 regs/thread with GPB=16. Try GPB=8 for less reg → more occupancy.
+    GROUPS_PER_BLOCK = 8
 
     fp8_flat = torch.empty(num_experts * dim, capacity, dtype=torch.float8_e4m3fn, device=device)
 
@@ -1051,12 +1129,13 @@ def fused_transpose_quantize_for_wgrad(
     per_batch_storage = _storage_per_batch(dim, capacity)
     packed_scales = torch.ones(num_experts, per_batch_storage, dtype=torch.float8_e8m0fnu, device=device)
 
-    grid = (num_experts * _div_up(dim, BLOCK_DIM), capacity // GROUP_SIZE)
+    total_groups = capacity // GROUP_SIZE
+    grid = (num_experts * _div_up(dim, BLOCK_DIM), _div_up(total_groups, GROUPS_PER_BLOCK))
 
     has_gather = gather_idx is not None
     gather_ptr = gather_idx if has_gather else flat_sorted  # dummy, unused
 
-    _fused_transpose_quantize_kernel[grid](
+    _warp32x32_transpose_quant_kernel[grid](
         flat_sorted,
         gather_ptr,
         fp8_flat,
@@ -1069,9 +1148,11 @@ def fused_transpose_quantize_for_wgrad(
         HAS_GATHER=has_gather,
         GROUP_SIZE=GROUP_SIZE,
         BLOCK_DIM=BLOCK_DIM,
+        GROUPS_PER_BLOCK=GROUPS_PER_BLOCK,
         SF_TILE_M=_SF_TILE_M,
         SF_TILE_K=_SF_TILE_K,
         SF_TILE_STORAGE=_SF_TILE_STORAGE,
+        num_warps=1,
     )
 
     fp8_3d = fp8_flat.reshape(num_experts, dim, capacity)
