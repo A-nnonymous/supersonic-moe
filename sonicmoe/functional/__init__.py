@@ -304,14 +304,14 @@ def _native_fp8_gated_forward(
     # z_fp8_d: fp8 blockscaled quantized z (from epilogue f32→fp8 cast)
     z_raw_scales = z_scale_out.to(torch.uint8)
 
-    # Create a bf16 dummy z (same shape) for _DownProjection dtype check.
-    # The actual z data is NOT used — _DownProjection saves z_fp8+scales from prequant.
-    # This avoids the 129µs dequant kernel in forward.
-    z_dummy_bf16 = torch.empty_like(z_fp8_d, dtype=torch.bfloat16)
+    # Dequant z_fp8 to bf16 for backward (dgated kernel requires bf16 PreAct).
+    # This 129µs cost is unavoidable while GemmDGated has the bf16 PreAct constraint.
+    from ..quack_utils.swiglu_triton import dequantize_blockscaled_fp8
+    z_bf16 = dequantize_blockscaled_fp8(z_fp8_d, z_raw_scales)
 
     del x_fp8, x_scales_tk_e8m0
 
-    return z_dummy_bf16, y1, z_fp8_d, z_raw_scales
+    return z_bf16, y1, z_fp8_d, z_raw_scales
 
 
 def _use_fused_blockscaled_gated() -> bool:

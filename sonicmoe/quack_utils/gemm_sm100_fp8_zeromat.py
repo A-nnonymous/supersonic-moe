@@ -363,13 +363,14 @@ class _GemmSm100ZeroMatMixin:
 # Concrete kernel classes: GemmGated + GemmDGated with zero-mat fix
 # ---------------------------------------------------------------------------
 
-class GemmGatedSm100ZeroMat(GemmGatedBlockscaledQuantMixin, _GemmSm100ZeroMatMixin, GemmSm100):
-    """GemmGated ZeroMat with epilogue blockscaled quant (when mZScale provided)."""
+class GemmGatedSm100ZeroMat(GemmGatedMixin, _GemmSm100ZeroMatMixin, GemmSm100):
+    """Standard ZeroMat (no epilogue quant). Stable production class."""
     pass
 
 
-# Experimental: epilogue blockscaled quant variant (opt-in via gemm_gated dispatch)
+# Epilogue blockscaled quant variant (opt-in via gemm_gated dispatch)
 class GemmGatedSm100ZeroMatBlockscaledQuant(GemmGatedBlockscaledQuantMixin, _GemmSm100ZeroMatMixin, GemmSm100):
+    """ZeroMat + epilogue quant. Use when GemmDGated supports fp8 PreAct."""
     pass
     """SM100 GemmGated with zero-materialization FP8 SFA fix.
 
