@@ -1079,6 +1079,242 @@ def fused_transpose_quantize_for_wgrad(
 
 
 # ---------------------------------------------------------------------------
+# Dual quantization: read bf16 once, produce row-major + col-major fp8
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _dual_quantize_kernel(
+    # Input
+    src_ptr,            # (T, H) bf16
+    gather_idx_ptr,     # (TK,) int32 — maps TK positions to T rows
+
+    # Output 1: row-major (T, H) fp8 + ISA scales
+    row_fp8_ptr,        # (T, H) fp8
+    row_scales_ptr,     # (1, row_packed_size) uint8 ISA
+
+    # Output 2: col-major (E*H, capacity) fp8 + ISA scales
+    col_fp8_ptr,        # (E*H, capacity) fp8
+    col_scales_ptr,     # (E, col_packed_size) uint8 ISA
+
+    # Dimensions
+    T,                  # source rows (may be < TK when topK > 1)
+    H,                  # hidden dim
+    capacity,           # padded per-expert token count
+    col_per_batch_storage,  # ISA storage per expert for col output
+    src_stride_row,
+    src_stride_col,
+    row_k_tiles,        # ceil(H / SF_TILE_K) for row ISA
+
+    # Constexprs
+    HAS_GATHER: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,      # 32
+    BLOCK_DIM: tl.constexpr,       # 128
+    SF_TILE_M: tl.constexpr,       # 128
+    SF_TILE_K: tl.constexpr,       # 128
+    SF_TILE_STORAGE: tl.constexpr, # 512
+):
+    """Read (32, 128) bf16 tile once, produce both row-major and col-major fp8.
+
+    Grid: (E * ceil(H/BLOCK_DIM), ceil(capacity/GROUP_SIZE))
+    Each block processes one (expert, dim_block, cap_group) tile.
+    """
+    pid_row = tl.program_id(0)       # expert_id * num_dim_blocks + dim_block
+    pid_group = tl.program_id(1)     # capacity group index
+
+    num_dim_blocks = tl.cdiv(H, BLOCK_DIM)
+    expert_id = pid_row // num_dim_blocks
+    dim_block = pid_row % num_dim_blocks
+
+    cap_offs = pid_group * GROUP_SIZE + tl.arange(0, GROUP_SIZE)     # (32,)
+    dim_offs = dim_block * BLOCK_DIM + tl.arange(0, BLOCK_DIM)      # (128,)
+
+    # Source row indices (with optional gather)
+    flat_token_ids = expert_id * capacity + cap_offs
+    if HAS_GATHER:
+        src_rows = tl.load(gather_idx_ptr + flat_token_ids).to(tl.int64)
+    else:
+        src_rows = flat_token_ids.to(tl.int64)
+
+    # Load (GROUP_SIZE=32, BLOCK_DIM=128) bf16 tile — THE SINGLE HBM READ
+    dim_mask = dim_offs[None, :] < H
+    src_ptrs = src_ptr + src_rows[:, None] * src_stride_row + dim_offs[None, :] * src_stride_col
+    values = tl.load(src_ptrs, mask=dim_mask, other=0.0).to(tl.float32)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # OUTPUT 2: Col-major (transposed) quantization → (E*H, capacity) fp8
+    # Groups of 32 along capacity (the K dimension for wgrad GEMM)
+    # ═══════════════════════════════════════════════════════════════════
+    values_t = tl.trans(values)  # (128, 32)
+
+    col_amax = tl.max(tl.abs(values_t), axis=1)  # (128,)
+    col_amax_bits = col_amax.to(tl.int32, bitcast=True)
+    col_biased_exp = (col_amax_bits >> 23) & 0xFF
+    col_mantissa = col_amax_bits & 0x7FFFFF
+    col_carry = tl.where(col_mantissa > 0x600000, 1, 0)
+    col_e8m0 = col_biased_exp - 8 + col_carry
+    col_e8m0 = tl.where(col_biased_exp > 0, col_e8m0, 0)
+    col_e8m0_byte = tl.maximum(col_e8m0, 0).to(tl.uint8)
+    col_qexp = 254 - col_e8m0
+    col_qexp = tl.maximum(tl.minimum(col_qexp, 254), 1)
+    col_qscale = (col_qexp.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+    col_quantized = (values_t * col_qscale[:, None]).to(tl.float8e4nv)
+
+    # Write col fp8
+    col_out_rows = expert_id * H + dim_offs
+    col_out_cols = pid_group * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+    col_fp8_ptrs = col_fp8_ptr + col_out_rows[:, None].to(tl.int64) * capacity + col_out_cols[None, :].to(tl.int64)
+    tl.store(col_fp8_ptrs, col_quantized, mask=dim_offs[:, None] < H)
+
+    # Write col ISA scales
+    col_k_tiles: tl.constexpr = tl.cdiv(capacity, SF_TILE_K)
+    col_groups_per_k: tl.constexpr = SF_TILE_K // GROUP_SIZE
+    col_row_tiles = dim_offs // SF_TILE_M
+    col_row_in_tile = dim_offs % SF_TILE_M
+    col_k_tiles_idx = pid_group // col_groups_per_k
+    col_k_in_tile = pid_group % col_groups_per_k
+    col_tile_base = (col_row_tiles * col_k_tiles + col_k_tiles_idx) * SF_TILE_STORAGE
+    col_row_base = (col_row_in_tile % 32) * 16 + (col_row_in_tile // 32) * 4
+    col_isa_idx = col_tile_base + col_row_base + col_k_in_tile
+    col_scale_ptrs = col_scales_ptr + expert_id.to(tl.int64) * col_per_batch_storage + col_isa_idx.to(tl.int64)
+    tl.store(col_scale_ptrs, col_e8m0_byte, mask=dim_offs < H)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # OUTPUT 1: Row-major quantization → (T, H) fp8
+    # Groups of 32 along H (the K dimension for actgrad GEMM)
+    # Process 4 groups within the 128-dim block, pack into uint32
+    # Re-uses the ALREADY-LOADED values — but re-computes amax per group.
+    # The HBM load was already done above; only register computation + store.
+    # ═══════════════════════════════════════════════════════════════════
+    GROUPS_PER_DIM_BLOCK: tl.constexpr = BLOCK_DIM // GROUP_SIZE  # 4
+
+    # ISA layout for row output: rows indexed by src_rows (T-space)
+    row_row_tiles = src_rows // SF_TILE_M
+    row_row_in_tile = src_rows % SF_TILE_M
+    row_row_base_offset = (row_row_in_tile % 32) * 16 + (row_row_in_tile // 32) * 4
+
+    packed_row_scale_i32 = tl.zeros([GROUP_SIZE], dtype=tl.int32)
+
+    # Re-load from L1/L2 cache (data was just loaded above, should be cache-hot)
+    for g in tl.range(0, GROUPS_PER_DIM_BLOCK):
+        g_col_offs = dim_block * BLOCK_DIM + g * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+        g_col_mask = g_col_offs[None, :] < H
+
+        g_vals = tl.load(
+            src_ptr + src_rows[:, None] * src_stride_row + g_col_offs[None, :] * src_stride_col,
+            mask=g_col_mask,
+            other=0.0,
+        ).to(tl.float32)
+
+        # E8M0 quant per source row (amax over 32 cols)
+        row_amax = tl.max(tl.abs(g_vals), axis=1)  # (32,)
+        row_amax_bits = row_amax.to(tl.int32, bitcast=True)
+        row_biased_exp = (row_amax_bits >> 23) & 0xFF
+        row_mantissa = row_amax_bits & 0x7FFFFF
+        row_carry = tl.where(row_mantissa > 0x600000, 1, 0)
+        row_e8m0 = row_biased_exp - 8 + row_carry
+        row_e8m0 = tl.where(row_biased_exp > 0, row_e8m0, 0)
+        row_e8m0_clamped = tl.maximum(row_e8m0, 0)
+        row_qexp = 254 - row_e8m0
+        row_qexp = tl.maximum(tl.minimum(row_qexp, 254), 1)
+        row_qscale = (row_qexp.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+        row_quantized = (g_vals * row_qscale[:, None]).to(tl.float8e4nv)
+
+        # Write row fp8 at (src_rows, g_col_offs)
+        row_fp8_ptrs = row_fp8_ptr + src_rows[:, None] * H + g_col_offs[None, :]
+        tl.store(row_fp8_ptrs, row_quantized, mask=g_col_mask)
+
+        # Pack scale byte into uint32
+        packed_row_scale_i32 = packed_row_scale_i32 | ((row_e8m0_clamped & 0xFF) << (g * 8))
+
+    # Write row ISA packed scales as uint32
+    # k_tile_idx for the row output corresponds to dim_block
+    row_tile_base = (row_row_tiles * row_k_tiles + dim_block) * SF_TILE_STORAGE
+    row_packed_offset_i32 = (row_tile_base + row_row_base_offset) // 4
+    row_scale_ptr_i32 = row_scales_ptr.to(tl.pointer_type(tl.int32))
+    tl.store(row_scale_ptr_i32 + row_packed_offset_i32, packed_row_scale_i32, mask=src_rows < T)
+
+
+def dual_quantize_and_pack(
+    src: torch.Tensor,
+    num_experts: int,
+    capacity: int,
+    *,
+    gather_idx: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Read bf16 source once, produce both row-major and col-major fp8 + ISA scales.
+
+    Parameters
+    ----------
+    src : (T, H) bf16 — source activation (e.g. dout).
+    num_experts : number of experts E.
+    capacity : padded per-expert token count.
+    gather_idx : optional (TK,) int32 — maps TK positions to T source rows.
+
+    Returns
+    -------
+    row_fp8 : (T, H) fp8 — row-major quantized (groups along H).
+    row_scales : (1, packed_size) e8m0fnu ISA-packed scales.
+    col_fp8 : (E, H, capacity) fp8 — col-major quantized (groups along capacity).
+    col_scales : (E, col_packed_size) e8m0fnu ISA-packed scales.
+    """
+    src = src.contiguous()
+    T, H = src.shape
+    device = src.device
+
+    GROUP_SIZE = _SF_VEC_SIZE       # 32
+    BLOCK_DIM = 128
+
+    # Row-major outputs
+    row_fp8 = torch.empty(T, H, dtype=torch.float8_e4m3fn, device=device)
+    row_per_batch = _storage_per_batch(T, H)
+    if T % _SF_TILE_M == 0 and H % _SF_TILE_K == 0:
+        row_scales = torch.empty((1, row_per_batch), dtype=torch.uint8, device=device)
+    else:
+        row_scales = torch.full((1, row_per_batch), 127, dtype=torch.uint8, device=device)
+
+    # Col-major (transposed) outputs
+    col_fp8_flat = torch.empty(num_experts * H, capacity, dtype=torch.float8_e4m3fn, device=device)
+    col_per_batch = _storage_per_batch(H, capacity)
+    col_scales = torch.ones(num_experts, col_per_batch, dtype=torch.uint8, device=device)
+
+    has_gather = gather_idx is not None
+    gather_ptr = gather_idx if has_gather else src  # dummy when unused
+
+    row_k_tiles = _div_up(H, _SF_TILE_K)
+    grid = (num_experts * _div_up(H, BLOCK_DIM), capacity // GROUP_SIZE)
+
+    _dual_quantize_kernel[grid](
+        src,
+        gather_ptr,
+        row_fp8,
+        row_scales,
+        col_fp8_flat,
+        col_scales,
+        T,
+        H,
+        capacity,
+        col_per_batch,
+        src.stride(0),
+        src.stride(1),
+        row_k_tiles,
+        HAS_GATHER=has_gather,
+        GROUP_SIZE=GROUP_SIZE,
+        BLOCK_DIM=BLOCK_DIM,
+        SF_TILE_M=_SF_TILE_M,
+        SF_TILE_K=_SF_TILE_K,
+        SF_TILE_STORAGE=_SF_TILE_STORAGE,
+    )
+
+    col_fp8_3d = col_fp8_flat.reshape(num_experts, H, capacity)
+    return (
+        row_fp8,
+        row_scales.view(torch.float8_e8m0fnu),
+        col_fp8_3d,
+        col_scales.view(torch.float8_e8m0fnu),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Column-wise blockscaled quantize + ISA-pack for wgrad (varlen_k approach)
 # ---------------------------------------------------------------------------
 # Groups of 32 along dim 0 of (TK, dim) tensor. ISA-packed scales for
