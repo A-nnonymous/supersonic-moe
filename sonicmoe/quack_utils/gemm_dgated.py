@@ -525,6 +525,28 @@ class GemmDGatedFP8CLoadMixin(GemmDGatedMixin):
         FP8PreActLoad("mFP8PreAct"),
     )
 
+    # Override TMA atom creation: use smem shape as tile (handles fp8 2x N)
+    @staticmethod
+    def _make_tma_epi_atoms_and_tensors(tensor_d, epi_smem_layout_staged, epi_tile, op_type="load"):
+        from cutlass.cute.nvgpu import cpasync
+        epi_smem_layout = cute.slice_(epi_smem_layout_staged, (None, None, 0))
+        d_cta_v_layout = cute.composition(
+            cute.make_identity_layout(tensor_d.shape),
+            epi_smem_layout.shape,
+        )
+        op = (
+            cpasync.CopyBulkTensorTileG2SOp()
+            if op_type == "load"
+            else cpasync.CopyBulkTensorTileS2GOp()
+            if op_type == "store"
+            else cpasync.CopyReduceBulkTensorTileS2GOp(cute.ReductionOp.ADD)
+        )
+        tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(
+            op, tensor_d, epi_smem_layout, d_cta_v_layout
+        )
+        return tma_atom, tma_tensor
+
+
     def epi_to_underlying_arguments(self, args, *, loc=None, ip=None):
         self.rounding_mode = getattr(args, "rounding_mode", 0)
         self.postact_dtype = args.mPostAct.element_type
@@ -539,48 +561,31 @@ class GemmDGatedFP8CLoadMixin(GemmDGatedMixin):
         return self.EpilogueParams(**d)
 
     def _setup_attributes(self, epilogue_args, varlen_args):
-        """Override: compute fp8 C smem layout with 2x N dimension."""
+        """Override: recompute epi_c_smem_layout for fp8 C with doubled N."""
         super()._setup_attributes(epilogue_args, varlen_args)
         if const_expr(self.c_dtype is not None and self.c_dtype == cutlass.Float8E4M3FN):
             import cutlass.utils.blackwell_helpers as sm100_utils
-            # SM100 make_smem_layout_epi doesn't support 8-bit elements.
-            # Use a simple row-major smem layout for fp8 C.
-            # epi_tile for fp8: (M, 2*N) where (M, N) is D's epi_tile
-            epi_tile_m = self.epi_tile[0]
-            epi_tile_n = self.epi_tile[1]
-            # Get static epi_tile_N size
-            epi_n_static = cute.size(epi_tile_n) if hasattr(epi_tile_n, 'shape') else epi_tile_n
-            fp8_epi_m = cute.size(epi_tile_m) if hasattr(epi_tile_m, 'shape') else epi_tile_m
-            fp8_epi_n = epi_n_static * 2
-            # Simple swizzled smem layout: (M, 2N) fp8 × stages
-            # Use CopyUniversalOp-compatible layout (no LDSM requirements)
-            smem_shape = (fp8_epi_m, fp8_epi_n)
-            smem_layout = cute.make_layout(smem_shape, stride=(fp8_epi_n, 1))
-            # Add staging dimension
-            smem_layout_staged = cute.make_layout(
-                (smem_shape[0], smem_shape[1], self.epi_c_stage),
-                stride=(fp8_epi_n, 1, fp8_epi_m * fp8_epi_n),
+            # fp8 C: (TK, 2I) fp8 vs D: (TK, I) f32.
+            # Each D subtile of N f32 = 2N logical values = 2N fp8 bytes.
+            # Extract epi_tile as integers (handle Layout objects)
+            epi_m = self.epi_tile[0]
+            epi_n = self.epi_tile[1]
+            m_int = cute.size(epi_m) if hasattr(epi_m, 'shape') else int(epi_m)
+            n_int = cute.size(epi_n) if hasattr(epi_n, 'shape') else int(epi_n)
+            # Doubled epi_tile for fp8: 2N fp8 per subtile
+            fp8_epi_tile = (m_int, n_int * 2)
+            self.epi_c_smem_layout_staged = sm100_utils.make_smem_layout_epi(
+                self.c_dtype, self.c_layout, fp8_epi_tile, self.epi_c_stage
             )
-            self.epi_c_smem_layout_staged = smem_layout_staged
 
     def epilog_smem_load_and_partition(
         self, tiled_copy_t2r, c_layout, dtype, sC, tRS_rD_layout, tidx
     ):
-        """Override: for fp8 C, pass doubled layout to get 2N fp8 register elements.
-
-        D has N f32 elements per thread per subtile.
-        C (bf16 standard) has N f32 elements (bf16x2 packed).
-        C (fp8) has 2N fp8 elements (same logical data, different encoding).
-
-        SM100's standard method creates tRS_rC with tRS_rD_layout (N elements).
-        For fp8, we need 2N elements → pass a recast layout.
-        """
+        """Override: for fp8 C, double the register layout to hold 2N fp8 elements."""
         if const_expr(dtype == cutlass.Float8E4M3FN):
-            # Create doubled layout: f32(N elements) → bf16(2N elements) → use as fp8(2N)
-            # recast f32 → bf16 doubles element count (f32=4bytes, bf16=2bytes)
+            # f32(N elements) recast to bf16 → 2N elements. Use this as fp8 register size.
             tmp_f32_tensor = cute.make_rmem_tensor(tRS_rD_layout, Float32)
             doubled_layout = cute.recast_tensor(tmp_f32_tensor, cutlass.BFloat16).layout
-            # Delegate to SM100 with doubled layout for fp8 (2N fp8 = same bytes as N f32)
             return GemmSm100.epilog_smem_load_and_partition(
                 self, tiled_copy_t2r, c_layout, dtype, sC, doubled_layout, tidx
             )
