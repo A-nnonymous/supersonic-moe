@@ -538,35 +538,46 @@ class GemmDGatedFP8CLoadMixin(GemmDGatedMixin):
         d["implicit_dtype"] = args.implicit_dtype
         return self.EpilogueParams(**d)
 
-    def epilog_smem_load_and_partition(
-        self, tiled_copy_t2r_or_mma, c_layout, dtype, sC, tRS_rD_layout, tidx
-    ):
-        """Override: when C is fp8, create register tensor with 2x elements.
+    def _setup_attributes(self, epilogue_args, varlen_args):
+        """Override: compute fp8 C smem layout with 2x N dimension."""
+        super()._setup_attributes(epilogue_args, varlen_args)
+        if const_expr(self.c_dtype is not None and self.c_dtype == cutlass.Float8E4M3FN):
+            import cutlass.utils.blackwell_helpers as sm100_utils
+            # fp8 C has 2x elements vs f32 C. Need 2x N for smem layout.
+            # epi_tile may contain CuTe Layout objects on SM100
+            epi_tile_m = self.epi_tile[0]
+            epi_tile_n = self.epi_tile[1]
+            # Double the N dimension: create a new tile with 2x N size
+            # For CuTe Layout: use cute.recast_layout to get 2x elements
+            fp8_epi_tile = (epi_tile_m, cute.recast_layout(2, 1, epi_tile_n) if hasattr(epi_tile_n, 'shape') else epi_tile_n * 2)
+            self.epi_c_smem_layout_staged = sm100_utils.make_smem_layout_epi(
+                self.c_dtype, self.c_layout, fp8_epi_tile, self.epi_c_stage
+            )
 
-        Standard: tRS_rC has N f32 elements (same as D).
-        FP8: tRS_rC has 2N fp8 elements (each f32 covers 2 bf16 = 2 fp8).
-        After fp8→f32 conversion: 2N f32 = correct for dSwiGLU.
+    def epilog_smem_load_and_partition(
+        self, tiled_copy_t2r, c_layout, dtype, sC, tRS_rD_layout, tidx
+    ):
+        """Override: for fp8 C, pass doubled layout to get 2N fp8 register elements.
+
+        D has N f32 elements per thread per subtile.
+        C (bf16 standard) has N f32 elements (bf16x2 packed).
+        C (fp8) has 2N fp8 elements (same logical data, different encoding).
+
+        SM100's standard method creates tRS_rC with tRS_rD_layout (N elements).
+        For fp8, we need 2N elements → pass a recast layout.
         """
         if const_expr(dtype == cutlass.Float8E4M3FN):
-            # fp8 C: double the register layout
-            # tRS_rD_layout has N elements; we need 2N fp8 elements
-            tRS_rC_fp8_layout = cute.recast_tensor(
-                cute.make_rmem_tensor(tRS_rD_layout, cutlass.BFloat16),
-                cutlass.Float8E4M3FN
-            ).layout
-            # Use standard copy atom but with fp8 dtype
-            from quack import copy_utils
-            tiled_copy_C_atom = self.epilog_smem_copy_atom(tiled_copy_t2r_or_mma)
-            copy_atom_s2r = copy_utils.sm90_get_smem_load_op(c_layout, dtype)
-            tiled_copy_s2r = cute.make_tiled_copy_S(copy_atom_s2r, tiled_copy_C_atom)
-            thr_copy_s2r = tiled_copy_s2r.get_slice(tidx)
-            tSR_sC = thr_copy_s2r.partition_S(sC)
-            tRS_rC = cute.make_rmem_tensor(tRS_rC_fp8_layout, dtype)
-            tSR_rC = thr_copy_s2r.retile(tRS_rC)
-            return tiled_copy_s2r, tRS_rC, tSR_rC, tSR_sC
+            # Create doubled layout: f32(N elements) → bf16(2N elements) → use as fp8(2N)
+            # recast f32 → bf16 doubles element count (f32=4bytes, bf16=2bytes)
+            tmp_f32_tensor = cute.make_rmem_tensor(tRS_rD_layout, Float32)
+            doubled_layout = cute.recast_tensor(tmp_f32_tensor, cutlass.BFloat16).layout
+            # Delegate to SM100 with doubled layout for fp8 (2N fp8 = same bytes as N f32)
+            return GemmSm100.epilog_smem_load_and_partition(
+                self, tiled_copy_t2r, c_layout, dtype, sC, doubled_layout, tidx
+            )
         else:
-            return GemmDGatedMixin.epilog_smem_load_and_partition(
-                self, tiled_copy_t2r_or_mma, c_layout, dtype, sC, tRS_rD_layout, tidx
+            return GemmSm100.epilog_smem_load_and_partition(
+                self, tiled_copy_t2r, c_layout, dtype, sC, tRS_rD_layout, tidx
             )
 
     @mlir_namedtuple
