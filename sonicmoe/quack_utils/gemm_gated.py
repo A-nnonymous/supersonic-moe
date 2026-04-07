@@ -169,10 +169,12 @@ def _i32_as_f32(x: Int32, *, loc=None, ip=None) -> Float32:
 
 
 class BlockscaledScaleStore(EpiOp):
-    """EpiOp: writes UE8M0 scale bytes to gmem. No smem needed.
+    """EpiOp: writes UE8M0 scale bytes to gmem from epi_visit_subtile.
 
-    Modeled after ColVecReduce: gmem-direct write, 0 smem, optional param.
     Scale output layout: (total_M, N//32) uint8, row-major.
+    begin(): computes absolute M row and N-group base for this thread.
+    begin_loop(): returns (param, m_abs, n_group_abs, m_limit, n_limit) with bounds.
+    The mixin's epi_visit_subtile writes the scale byte after bounds check.
     """
 
     def param_fields(self):
@@ -188,26 +190,30 @@ class BlockscaledScaleStore(EpiOp):
     def begin(self, gemm, param, smem_tensor, ctx):
         if const_expr(param is not None):
             tile_M = gemm.cta_tile_shape_mnk[0]
+            tile_N = gemm.cta_tile_shape_mnk[1]
+            # Thread-to-M-row: SM100 Ld32x32bOp maps tidx → M-row within tile
             m_in_tile = ctx.tidx % tile_M
             if const_expr(ctx.varlen_manager.varlen_m):
-                m_abs = (ctx.varlen_manager.params.cu_seqlens_m[ctx.tile_coord_mnkl[3]]
-                         + ctx.tile_coord_mnkl[0] * tile_M + m_in_tile)
+                batch_start = ctx.varlen_manager.params.cu_seqlens_m[ctx.tile_coord_mnkl[3]]
+                m_abs = batch_start + ctx.tile_coord_mnkl[0] * tile_M + m_in_tile
+                m_limit = ctx.varlen_manager.params.cu_seqlens_m[ctx.tile_coord_mnkl[3] + Int32(1)]
             else:
                 m_abs = ctx.tile_coord_mnkl[0] * tile_M + m_in_tile
-            tile_N = gemm.cta_tile_shape_mnk[1]
+                m_limit = param.shape[0]  # total_M
             n_base = ctx.tile_coord_mnkl[1] * (tile_N // 32)
-            return (param, m_abs, n_base)
+            n_limit = param.shape[1]  # N//32
+            return (param, m_abs, n_base, m_limit, n_limit)
         return None
 
     @cute.jit
     def begin_loop(self, gemm, state, epi_coord):
         if const_expr(state is not None):
-            param, m_abs, n_base = state
+            param, m_abs, n_base, m_limit, n_limit = state
             if const_expr(isinstance(epi_coord, tuple)):
                 n_sub = epi_coord[1] if len(epi_coord) > 1 else epi_coord[0]
             else:
                 n_sub = epi_coord
-            return (param, m_abs, n_base + n_sub)
+            return (param, m_abs, n_base + n_sub, m_limit, n_limit)
         return None
 
 
@@ -277,9 +283,13 @@ class GemmGatedBlockscaledQuantMixin(GemmGatedMixin):
             for i in cutlass.range(num_z, unroll_full=True):
                 tRS_rD[i] = tRS_rD[i] * quant_scale
 
-            # Step 5: write UE8M0 scale
-            scale_tensor, m_abs, n_group_abs = _z_scale_active
-            scale_tensor[m_abs, n_group_abs] = cutlass.Int8(e8m0)
+            # Step 5: store UE8M0 scale to gmem (bounds-checked)
+            z_scale_info = epi_loop_tensors["mZScale"]
+            if const_expr(z_scale_info is not None):
+                scale_tensor, m_abs, n_group_abs, m_limit, n_limit = z_scale_info
+                in_bounds = cutlass.Boolean(m_abs < m_limit) & cutlass.Boolean(n_group_abs < n_limit)
+                if in_bounds:
+                    scale_tensor[m_abs, n_group_abs] = cutlass.Int8(e8m0)
 
         return tRS_rPostAct
 

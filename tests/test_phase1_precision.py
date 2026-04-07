@@ -58,7 +58,21 @@ def run_mode(epilogue_quant: bool):
 
     with enable_quack_gemm(True):
         out, _ = moe(x)
+    torch.cuda.synchronize()
+
+    # Check z_fp8 saved in ctx by examining _PREQUANTIZED_SCALES state
+    from sonicmoe.functional import _PREQUANTIZED_SCALES
+    print(f"  [{mode}] _PREQUANTIZED_SCALES keys after fwd: {list(_PREQUANTIZED_SCALES.keys())}")
+
+    # Test dequant directly before backward
+    if epilogue_quant:
+        # The z_fp8 should have been consumed by _DownProjection.forward
+        # and saved to ctx. Let's verify the backward doesn't crash.
+        print(f"  [{mode}] out shape: {out.shape}, requires_grad: {out.requires_grad}")
+        print(f"  [{mode}] Starting backward...")
+
     out.backward(dout)
+    torch.cuda.synchronize()
 
     # Collect grads
     dx = x.grad.clone()
