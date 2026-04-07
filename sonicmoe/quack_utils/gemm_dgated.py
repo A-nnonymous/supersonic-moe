@@ -36,6 +36,7 @@ _TORCH_TO_CUTLASS_DTYPE = {
     torch.float8_e4m3fn: cutlass.Float8E4M3FN,
     torch.float8_e8m0fnu: cutlass.Float8E8M0FNU,
     torch.uint8: cutlass.Uint8,
+    torch.int16: cutlass.Int16,
     torch.float16: cutlass.Float16,
     torch.bfloat16: cutlass.BFloat16,
     torch.float32: cutlass.Float32,
@@ -511,13 +512,18 @@ class GemmDGatedFP8CLoadMixin(GemmDGatedMixin):
     Loads fp8 z (PreAct) via TMA to smem, then fp8→f32 conversion in registers.
     Eliminates 384MB z_bf16 temporary buffer.
 
-    C tensor: z_fp8 (TK, 2I) Float8E4M3FN
+    Key insight: View z_fp8 (TK, 2I) fp8 as (TK, I) Int16 to match D's shape.
+    Each Int16 = 2 packed fp8 values (gate + up), mirroring D's f32 = 2 packed bf16.
+    This avoids changing the epi_tile (shared by kernel for both C and D).
+
+    C tensor: z_fp8.view(int16) → (TK, I) Int16
     Scale tensor: z_scales (TK, 2I/32) uint8 — loaded via EpiOp LDG
 
     Key overrides:
-    - epilog_smem_load_and_partition: double the register layout for fp8 (2N fp8 vs N f32)
-    - epi_visit_subtile: fp8→f32 vectorized conversion + blockscaled dequant
-    - epi_to_underlying_arguments: handle fp8 c_dtype
+    - _setup_attributes: create Int16 smem layout for C (same epi_tile, different dtype)
+    - epilog_smem_load_and_partition: double the register layout (Int16 → 2 fp8 elements)
+    - epi_visit_subtile: unpack Int16 → 2 fp8 → 2 f32 + blockscaled dequant + dSwiGLU
+    - epi_to_underlying_arguments: handle Int16 c_dtype
     """
 
     _epi_ops = (
@@ -525,38 +531,17 @@ class GemmDGatedFP8CLoadMixin(GemmDGatedMixin):
         FP8PreActLoad("mFP8PreAct"),
     )
 
-    # Override TMA atom creation: use integer fp8 tile for CTA mapping
-    def _make_tma_epi_atoms_and_tensors(self, tensor_d, epi_smem_layout_staged, epi_tile, op_type="load"):
-        from cutlass.cute.nvgpu import cpasync
-        epi_smem_layout = cute.slice_(epi_smem_layout_staged, (None, None, 0))
-        # Use the stored integer fp8 tile if available (set in _setup_attributes)
-        tile = getattr(self, '_fp8_c_tile_mn', None)
-        if tile is None:
-            tile = epi_tile
-        d_cta_v_layout = cute.composition(
-            cute.make_identity_layout(tensor_d.shape),
-            tile,
-        )
-        op = (
-            cpasync.CopyBulkTensorTileG2SOp()
-            if op_type == "load"
-            else cpasync.CopyBulkTensorTileS2GOp()
-            if op_type == "store"
-            else cpasync.CopyReduceBulkTensorTileS2GOp(cute.ReductionOp.ADD)
-        )
-        tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(
-            op, tensor_d, epi_smem_layout, d_cta_v_layout
-        )
-        return tma_atom, tma_tensor
+    # No _make_tma_epi_atoms_and_tensors override needed:
+    # Int16 C has the same shape as D (TK, I), so the standard epi_tile works.
+    # The parent's staticmethod handles TMA atom creation correctly.
 
 
     def epi_to_underlying_arguments(self, args, *, loc=None, ip=None):
         self.rounding_mode = getattr(args, "rounding_mode", 0)
         self.postact_dtype = args.mPostAct.element_type
         self.postact_layout = cutlass.utils.LayoutEnum.from_tensor(args.mPostAct)
-        # fp8 C: c_dtype is Float8E4M3FN, skip bf16 assertions
+        # Int16 C: c_dtype is Int16 (2 packed fp8), allow it
         assert self.d_dtype.width == 32, "D storage type must be 32 bit"
-        # c_dtype may be fp8 (8-bit) — allow it
         self.cta_tile_shape_postact_mn = self.cta_tile_shape_mnk[:2]
         d = self._epi_ops_to_params_dict(args)
         d["act_bwd_fn"] = args.act_bwd_fn
@@ -564,34 +549,33 @@ class GemmDGatedFP8CLoadMixin(GemmDGatedMixin):
         return self.EpilogueParams(**d)
 
     def _setup_attributes(self, epilogue_args, varlen_args):
-        """Override: recompute epi_c_smem_layout for fp8 C with doubled N."""
+        """Override: create Int16 smem layout for fp8 C.
+
+        View z_fp8 (TK, 2I) fp8 as (TK, I) Int16 to match D's shape (TK, I) f32.
+        Each Int16 = 2 packed fp8 values (gate + up), just as each f32 = 2 packed bf16.
+        This way C and D share the same epi_tile, avoiding kernel-level changes.
+        """
         super()._setup_attributes(epilogue_args, varlen_args)
-        if const_expr(self.c_dtype is not None and self.c_dtype == cutlass.Float8E4M3FN):
+        if const_expr(self.c_dtype is not None and self.c_dtype == cutlass.Int16):
             import cutlass.utils.blackwell_helpers as sm100_utils
-            # fp8 C: (TK, 2I) fp8 vs D: (TK, I) f32.
-            # Each D subtile of N f32 = 2N logical values = 2N fp8 bytes.
-            # Extract epi_tile as integers (handle Layout objects)
-            epi_m = self.epi_tile[0]
-            epi_n = self.epi_tile[1]
-            m_int = cute.size(epi_m) if hasattr(epi_m, 'shape') else int(epi_m)
-            n_int = cute.size(epi_n) if hasattr(epi_n, 'shape') else int(epi_n)
-            # Doubled epi_tile for fp8: 2N fp8 per subtile
-            fp8_epi_tile = (m_int, n_int * 2)
+            # Int16 C: same shape as D, but 16-bit element → different smem swizzle
             self.epi_c_smem_layout_staged = sm100_utils.make_smem_layout_epi(
-                self.c_dtype, self.c_layout, fp8_epi_tile, self.epi_c_stage
+                self.c_dtype, self.c_layout, self.epi_tile, self.epi_c_stage
             )
-            self._fp8_c_tile_mn = fp8_epi_tile  # integer (M, 2N) for TMA
 
     def epilog_smem_load_and_partition(
         self, tiled_copy_t2r, c_layout, dtype, sC, tRS_rD_layout, tidx
     ):
-        """Override: for fp8 C, double the register layout to hold 2N fp8 elements."""
-        if const_expr(dtype == cutlass.Float8E4M3FN):
-            # f32(N elements) recast to bf16 → 2N elements. Use this as fp8 register size.
-            tmp_f32_tensor = cute.make_rmem_tensor(tRS_rD_layout, Float32)
-            doubled_layout = cute.recast_tensor(tmp_f32_tensor, cutlass.BFloat16).layout
+        """Override: for Int16 C, keep register layout same as D (N elements).
+
+        Int16 C has N elements (same as D's N f32). No doubling needed here.
+        In epi_visit_subtile, we recast N Int16 → 2N fp8 → 2N f32.
+        """
+        if const_expr(dtype == cutlass.Int16):
+            # Same register shape as D (N elements), just Int16 dtype.
+            # The parent's default handles this correctly.
             return GemmSm100.epilog_smem_load_and_partition(
-                self, tiled_copy_t2r, c_layout, dtype, sC, doubled_layout, tidx
+                self, tiled_copy_t2r, c_layout, dtype, sC, tRS_rD_layout, tidx
             )
         else:
             return GemmSm100.epilog_smem_load_and_partition(
@@ -618,11 +602,13 @@ class GemmDGatedFP8CLoadMixin(GemmDGatedMixin):
         tDrColVec = epi_loop_tensors["mColVecBroadcast"]
         tDrColVecReduce = epi_loop_tensors["mColVecReduce"]
 
-        if const_expr(self.c_dtype == cutlass.Float8E4M3FN):
-            # ── FP8 C path: tRS_rC has 2N fp8 elements from TMA ──
-            # Vectorized fp8→f32 conversion
-            tRS_rXY_f32x2 = cute.make_rmem_tensor(tRS_rC.layout.shape, Float32)
-            tRS_rXY_f32x2.store(tRS_rC.load().to(Float32))
+        if const_expr(self.c_dtype == cutlass.Int16):
+            # ── Int16 C path: tRS_rC has N Int16 elements from TMA ──
+            # Each Int16 = 2 packed fp8 values (gate + up)
+            # Recast N Int16 → 2N fp8, then convert to 2N f32
+            tRS_rC_fp8 = cute.recast_tensor(tRS_rC, cutlass.Float8E4M3FN)
+            tRS_rXY_f32x2 = cute.make_rmem_tensor(tRS_rC_fp8.layout.shape, Float32)
+            tRS_rXY_f32x2.store(tRS_rC_fp8.load().to(Float32))
 
             # Blockscaled dequant: multiply by 2^(e8m0 << 23) per group
             # Scale info from EpiOp
@@ -711,7 +697,7 @@ class GemmDGatedFP8CLoadMixin(GemmDGatedMixin):
                             (tDrColVec_mn[m, 0], tDrColVec_mn[m, 0]),
                         )
         # Write dXY back to D
-        if const_expr(self.c_dtype == cutlass.Float8E4M3FN):
+        if const_expr(self.c_dtype == cutlass.Int16):
             pack_dtype = cutlass.BFloat16
         else:
             pack_dtype = params.implicit_dtype
@@ -777,16 +763,17 @@ def gemm_dgated(
     # Special handling for Out and PreAct
     AB_swapped = not Out.stride(-1) == 1
     if fp8_preact_mode:
-        # FP8 PreAct: C = z_fp8 (TK, 2I) fp8 directly — TMA loads fp8 to smem
+        # FP8 PreAct: View (TK, 2I) fp8 as (TK, I) Int16 to match D's shape (TK, I) f32.
+        # Each Int16 = 2 packed fp8 values (gate+up), mirroring f32 = 2 packed bf16.
+        # This avoids changing the epi_tile (shared by kernel for both C and D).
         implicit_dtype = cutlass.BFloat16  # for D output packing
         assert Out.element_size() == 2, "Out dtype must be fp16 or bf16"
         if cu_seqlens_m is not None or not AB_swapped:
             Out = Out.view(torch.float32)
         else:
             Out = Out.mT.view(torch.float32).mT
-        # PreAct stays as fp8 — passed directly to CUTLASS
-        # Shape: (TK, 2I) fp8 ≠ (TK, I) f32, but TMA handles the different shape
-        PreAct = preact_fp8  # (TK, 2I) Float8E4M3FN
+        # View fp8 (TK, 2I) as int16 (TK, I) — 2 fp8 per int16
+        PreAct = preact_fp8.view(torch.int16)  # (TK, 2I) fp8 → (TK, I) int16
     else:
         assert Out.dtype == PreAct.dtype
         implicit_dtype = torch2cute_dtype_map[Out.dtype]
@@ -803,15 +790,11 @@ def gemm_dgated(
         A,
         B,
         Out,
-        None if fp8_preact_mode else PreAct,  # skip C validation for fp8 (different shape)
+        PreAct,  # Int16 (TK,I) for fp8_preact_mode, or f32 (TK,I) for standard
         additional_tensors={"PostAct": PostAct},
         cu_seqlens_m=cu_seqlens_m,
         A_idx=A_idx,
     )
-    if fp8_preact_mode:
-        # Manually set C tensor info for fp8 PreAct (TK, 2I) fp8
-        from quack.gemm_wrapper_utils import GemmTensorInfo
-        tensor_infos["C"] = GemmTensorInfo(PreAct)
     GemmWrapperBase.permute_tensors(tensor_infos, varlen_m=cu_seqlens_m is not None)
     major_configs = {
         "A": ("m", "k", "l"),
