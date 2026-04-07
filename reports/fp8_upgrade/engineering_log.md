@@ -82,6 +82,20 @@
 - **Direction A investigated**: z-dequant (129µs) is hard CUTLASS limitation — 5 constraints (view-f32 packing, TMA layout, epilogue recast, no dequant hook, need extra TMA for scales). Needs new kernel class.
 - 31/31 frontier + 5/5 true native tests pass
 
+## Phase 11: Comprehensive Benchmark Audit (Sessions 36–37)
+
+- **Discovered process contamination**: `_IS_FP8_ACTIVE` cached at import time from env var (`utils.py:38`). Same-process FP8-vs-BF16 comparison produces fake bit-identical results. **All precision tests must use separate subprocesses.**
+- **Bug 2 found & fixed**: `_DownProjection.backward` line 1310 `out=dw2_base` → `out=dw2.permute(2, 0, 1)` (matching BF16 path). c_proj.weight grad had wrong strides; expert 0 worked by luck.
+- **Bug 1 found (OPEN)**: `GemmDGatedFP8CLoadSm100` writes dz only for expert 0. Experts 1-7 = denormalized garbage (~1e-36). y1s output is fine. Suspected C-output pointer offset bug in CUTLASS varlen path.
+- **Workaround**: `SONIC_MOE_FP8_FUSED_GATED=0` disables fused dgated kernel, uses separate `blockscaled_fp8_gemm_varlen` + SwiGLU backward.
+- **nsys profiling (idle node 00041, 8/8 GPUs idle)**:
+  - BF16: 3930 µs/iter
+  - FP8 fused (buggy): 3273 µs/iter → **1.20× faster** but numerically wrong
+  - FP8 non-fused (correct): 5261 µs/iter → **0.75× (34% slower)** due to de-fused SwiGLU kernels adding 2203 µs/iter
+- **Precision (subprocess-isolated, FUSED_GATED=0)**: all RRMSE 6.4-7.9%, cosine >0.997, uniform across 8 experts
+- **Memory**: FP8 peak 3470 MiB vs Official BF16 1604 MiB (+1866 MiB, mostly QuACK 0.3.7 base overhead)
+- **Conclusion**: Bug 1 fix is the critical path. Fused path has proven 1.20× speedup; non-fused workaround eliminates all gains.
+
 ---
 
 ## Lessons

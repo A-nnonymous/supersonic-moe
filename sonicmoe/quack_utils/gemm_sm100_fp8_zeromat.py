@@ -42,7 +42,7 @@ from .blockscaled_fp8_gemm import _tile_atom_to_shape_SF_rank_aware
 
 # Import mixins for GemmGated/GemmDGated from our local files
 from .gemm_gated import GemmGatedMixin, GemmGatedBlockscaledQuantMixin
-from .gemm_dgated import GemmDGatedMixin
+from .gemm_dgated import GemmDGatedMixin, GemmDGatedFP8CLoadMixin
 
 from cutlass.utils import LayoutEnum
 
@@ -375,6 +375,21 @@ class GemmGatedSm100ZeroMatBlockscaledQuant(GemmGatedBlockscaledQuantMixin, _Gem
 
 class GemmDGatedSm100ZeroMat(GemmDGatedMixin, _GemmSm100ZeroMatMixin, GemmSm100):
     """SM100 GemmDGated with zero-materialization FP8 SFA fix."""
+    pass
+
+
+class GemmDGatedFP8CLoadSm100ZeroMat(GemmDGatedFP8CLoadMixin, _GemmSm100ZeroMatMixin, GemmSm100):
+    """SM100 GemmDGated + TMA-based FP8 C load + zero-materialization SFA fix.
+
+    Combines FP8CLoadMixin (TMA epilogue loading fp8 z as Int16 C) with
+    _GemmSm100ZeroMatMixin (__call__ override that derives SFA layout from
+    mD.shape instead of mA.shape when gather_A=True).
+
+    Without ZeroMat, the SFA layout uses mA.shape = (T, K) but the
+    pre-gathered scales have TK rows.  cu_seqlens_m offsets then map
+    incorrectly — expert 0 works (offset 0) but experts 1-7 get wrong
+    scale factors producing garbage dz output.
+    """
     pass
 
 

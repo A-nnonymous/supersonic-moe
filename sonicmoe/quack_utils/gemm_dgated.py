@@ -815,9 +815,8 @@ def gemm_dgated(
     if fp8_preact_mode:
         assert device_capacity[0] > 9, "FP8 PreAct only supported on SM100+"
         if gather_A and blockscaled_runtime:
-            from .gemm_sm100_fp8_zeromat import GemmDGatedSm100ZeroMat
-            # TODO: ZeroMat + FP8CLoad variant
-            GemmCls = GemmDGatedFP8CLoadSm100
+            from .gemm_sm100_fp8_zeromat import GemmDGatedFP8CLoadSm100ZeroMat
+            GemmCls = GemmDGatedFP8CLoadSm100ZeroMat
         else:
             GemmCls = GemmDGatedFP8CLoadSm100
     elif device_capacity[0] > 9 and gather_A and blockscaled_runtime:

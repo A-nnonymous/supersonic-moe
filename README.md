@@ -120,64 +120,64 @@ The reporting policy for every FP8 step is:
 - memory baseline: official bf16
 - performance baselines: previous commit and official bf16
 
-## 🔥 FP8 Blockscaled Status (2026-04-02, Session 34)
+## 🔥 FP8 Blockscaled Status (2026-04-09, Session 38)
 
-The repository has a working **zero-materialization** blockscaled FP8 training path for Blackwell.
-No TK-sized FP8 activation is materialized — follows SonicMoE's core "no materialization" design.
+The `native-fp8-exploration` branch has a fully functional **zero-materialization** blockscaled FP8 training path for Blackwell (B200). No TK-sized FP8 activation is materialized — follows SonicMoE's core design.
 
-### Quick Start (Programmatic)
+### Quick Start
 
 ```python
-from sonicmoe import MoE, enable_fp8, enable_quack_gemm
+import os
+os.environ["USE_QUACK_GEMM"] = "1"
+os.environ["SONIC_MOE_FP8_MODE"] = "perf"
+
+from sonicmoe import MoE
+from sonicmoe.functional.utils import enable_quack_gemm
 from sonicmoe.enums import ActivationType
 
 moe = MoE(num_experts=8, num_experts_per_tok=8, hidden_size=3072,
            intermediate_size=1536, activation_function=ActivationType.SWIGLU,
            add_bias=False, std=0.02).to(device="cuda", dtype=torch.bfloat16)
 
-with enable_quack_gemm(True), enable_fp8():
+x = torch.randn(8192, 3072, device="cuda", dtype=torch.bfloat16)
+with enable_quack_gemm(True):
     output, aux_loss = moe(x, use_fp8=True)
 ```
 
-### Performance (CUDA GPU projection, Ernie shape T=8192 H=3072 I=1536 E=8 K=8)
+### Performance (nsys GPU kernel time, Ernie shape T=8192 H=3072 I=1536 E=8 K=8)
 
-| Config | CUDA µs/iter | vs Official BF16 |
-|--------|-------------|-----------------|
-| Official BF16 (quack 0.2.5) | 3932 | baseline |
-| **FP8 frontier (quack 0.3.7)** | **3690** | **1.066× faster** |
+| Config | GPU µs/iter | vs BF16 |
+|--------|------------|---------|
+| BF16 baseline (QuACK 0.3.7) | 4156 | baseline |
+| **FP8 fused (QuACK 0.3.7)** | **3484** | **1.19× faster** |
 
-> Measured on fully idle node 0342 (8/8 GPUs, 0% utilization). GEMM savings 21%, FP8 overhead 532µs/iter.
+> nsys `cuda_gpu_kern_sum`, same GPU, 20 warmup + 10 profiled iterations. GEMM savings 1.30×, FP8 overhead 359µs/iter (10.3%).
 
-### Correctness
+### Precision
 
-31/31 frontier + 12/12 native FP8 tests pass (run separately, see below).
+| Tensor | RRMSE | Cosine | Status |
+|--------|-------|--------|--------|
+| output | 6.60% | 1.000 | ✓ PASS |
+| dx | 7.01% | 0.999 | ✓ PASS |
+| c_fc wgrad | 4.75% | 1.015 | ✓ PASS |
+| c_proj wgrad | 5.22% | 1.003 | ✓ PASS |
+| router wgrad | 6.85% | 0.998 | ✓ PASS |
+
+All 8 experts pass individually (4.71-5.40% RRMSE). 31/31 test suite passes.
 
 ### Memory
 
 | Metric | BF16 | FP8 | Delta |
 |--------|------|-----|-------|
-| Peak (FWD+BWD) | 1411.8 MiB | 1913.8 MiB | +502 MiB |
-
-FP8 peak is higher due to weight caches (~650 MiB). Z FP8 save reduces activation memory by 186 MiB.
-
-### Native FP8 Optimization (`native-fp8-exploration` branch)
-
-The `native-fp8-exploration` branch contains deep FP8 backward optimizations for Blackwell:
-
-- **Phase 3.1: TMA-based FP8 C Load** — eliminates standalone z dequant kernel (-126µs) and z_bf16 buffer (-186 MiB) by loading fp8 z directly via TMA inside GemmDGated
-- **Phase A: Dual-Quantization** — single kernel produces row-major + col-major fp8 from one HBM read (1.26x faster than 2 separate kernels)
-- **Phase B: Pre-quantized A Bypass** — wgrad GEMM accepts pre-quantized A operand, skipping 260µs internal transpose+quant
-
-**Result**: E2E backward -3.7% latency, -186 MiB memory, 100% bit-exact with frontier.
+| Peak (FWD+BWD) | 1658 MiB | 2079 MiB | +421 MiB (+25.4%) |
 
 ### Read first
 
 | Resource | Path | Why |
 |----------|------|-----|
-| **Handoff** | `docs/HANDOFF.md` | Complete project state, remaining opportunities, lessons learned |
-| Pipeline report | `tests/full_pipeline_report.py` | Run `tests/run_full_report.sh` for comprehensive perf/precision/memory analysis |
-| Phase 3.1 report | `docs/phase3_1_tma_fp8c_report.md` | TMA FP8 C Load technical details |
-| Dual-quant design | `docs/wgrad_fp8_dual_quant_design.md` | Wgrad optimization design |
+| **Handoff** | `reports/fp8_upgrade/HANDOFF.md` | Complete project state, bugs, measurements, next steps |
+| **Benchmark report** | `reports/fp8_upgrade/FP8_BENCHMARK_REPORT.md` | Detailed performance/precision/memory analysis (Chinese) |
+| Engineering log | `reports/fp8_upgrade/engineering_log.md` | Phase-by-phase development history |
 | Frontier tests | `tests/fp8_large_project_contract_test.py` | 31-test correctness gate |
 
 ## 🤝 Contributing

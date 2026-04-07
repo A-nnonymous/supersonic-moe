@@ -89,6 +89,8 @@ from ..quack_utils.swiglu_triton import (
     dequantize_blockscaled_fp8,
 )
 from ..quack_utils.blockscaled_fp8_gemm import (
+    dual_quantize_and_pack,
+    fused_transpose_quantize_for_wgrad,
     pack_blockscaled_1x32_scales,
     quantize_activation_blockscaled_fast,
 )
@@ -1305,7 +1307,7 @@ class _DownProjection(torch.autograd.Function):
                 gemm(
                     dout.T,
                     y1s_wgrad,
-                    out=dw2_base,
+                    out=dw2.permute(2, 0, 1),
                     cu_seqlens_k=expert_frequency_offset,
                     A_idx=x_gather_idx,
                     batch_idx_permute=None,
