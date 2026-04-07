@@ -3589,6 +3589,8 @@ def blockscaled_fp8_weight_grad_gemm_fast(
     b_gather_idx: Optional[torch.Tensor] = None,
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
+    pre_quantized_a: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+    pre_quantized_b: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> torch.Tensor:
     """Optimized blockscaled FP8 weight-gradient GEMM with fused data prep.
 
@@ -3606,6 +3608,8 @@ def blockscaled_fp8_weight_grad_gemm_fast(
     b_gather_idx : optional (TK,) int32 — gather index for b_flat.
     out : optional pre-allocated Tensor (E, dim_A, dim_B).
     out_dtype : output element type (default bf16).
+    pre_quantized_a : optional (fp8_3d, packed_scales) — skip A transpose+quant.
+    pre_quantized_b : optional (fp8_3d, packed_scales) — skip B transpose+quant.
     """
     device = a_flat.device
     if get_device_capacity(device)[0] != 10:
@@ -3634,13 +3638,19 @@ def blockscaled_fp8_weight_grad_gemm_fast(
     if dim_B % _SF_TILE_M != 0:
         raise RuntimeError(f"dim_B ({dim_B}) must be a multiple of {_SF_TILE_M}")
 
-    # Fused transpose + quantize (+ optional gather) in a single kernel pass
-    a_fp8, packed_a_scales = fused_transpose_quantize_for_wgrad(
-        a_flat, num_experts, capacity, dim_A, gather_idx=a_gather_idx,
-    )
-    b_fp8, packed_b_scales = fused_transpose_quantize_for_wgrad(
-        b_flat, num_experts, capacity, dim_B, gather_idx=b_gather_idx,
-    )
+    # Fused transpose + quantize (+ optional gather) — skip if pre-quantized
+    if pre_quantized_a is not None:
+        a_fp8, packed_a_scales = pre_quantized_a
+    else:
+        a_fp8, packed_a_scales = fused_transpose_quantize_for_wgrad(
+            a_flat, num_experts, capacity, dim_A, gather_idx=a_gather_idx,
+        )
+    if pre_quantized_b is not None:
+        b_fp8, packed_b_scales = pre_quantized_b
+    else:
+        b_fp8, packed_b_scales = fused_transpose_quantize_for_wgrad(
+            b_flat, num_experts, capacity, dim_B, gather_idx=b_gather_idx,
+        )
 
     # Allocate output
     d_dtype = torch.bfloat16 if out_dtype is None else out_dtype
