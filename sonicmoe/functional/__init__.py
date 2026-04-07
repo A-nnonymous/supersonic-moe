@@ -162,7 +162,7 @@ def _fused_blockscaled_gated_forward(
     # bytes are written atomically — no standalone quant kernel needed.
     epilogue_quant = _use_epilogue_quant() and _save_z_fp8()
     if epilogue_quant:
-        N = w1_fp8.shape[0]  # (2I, K) after permute → shape[0] = 2I
+        N = w1.shape[0]  # (2I, H, E) → w1.shape[0] = 2I
         z_scale_out = torch.empty(TK, N // 32, dtype=torch.uint8, device=x.device)
     else:
         z_scale_out = None

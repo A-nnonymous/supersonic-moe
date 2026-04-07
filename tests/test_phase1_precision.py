@@ -62,14 +62,14 @@ def run_mode(epilogue_quant: bool):
 
     # Check z_fp8 saved in ctx by examining _PREQUANTIZED_SCALES state
     from sonicmoe.functional import _PREQUANTIZED_SCALES
-    print(f"  [{mode}] _PREQUANTIZED_SCALES keys after fwd: {list(_PREQUANTIZED_SCALES.keys())}")
+    print(f"  [epi={epilogue_quant}] _PREQUANTIZED_SCALES keys after fwd: {list(_PREQUANTIZED_SCALES.keys())}")
 
     # Test dequant directly before backward
     if epilogue_quant:
         # The z_fp8 should have been consumed by _DownProjection.forward
         # and saved to ctx. Let's verify the backward doesn't crash.
-        print(f"  [{mode}] out shape: {out.shape}, requires_grad: {out.requires_grad}")
-        print(f"  [{mode}] Starting backward...")
+        print(f"  [epi={epilogue_quant}] out shape: {out.shape}, requires_grad: {out.requires_grad}")
+        print(f"  [epi={epilogue_quant}] Starting backward...")
 
     out.backward(dout)
     torch.cuda.synchronize()
