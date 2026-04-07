@@ -543,16 +543,25 @@ class GemmDGatedFP8CLoadMixin(GemmDGatedMixin):
         super()._setup_attributes(epilogue_args, varlen_args)
         if const_expr(self.c_dtype is not None and self.c_dtype == cutlass.Float8E4M3FN):
             import cutlass.utils.blackwell_helpers as sm100_utils
-            # fp8 C has 2x elements vs f32 C. Need 2x N for smem layout.
-            # epi_tile may contain CuTe Layout objects on SM100
+            # SM100 make_smem_layout_epi doesn't support 8-bit elements.
+            # Use a simple row-major smem layout for fp8 C.
+            # epi_tile for fp8: (M, 2*N) where (M, N) is D's epi_tile
             epi_tile_m = self.epi_tile[0]
             epi_tile_n = self.epi_tile[1]
-            # Double the N dimension: create a new tile with 2x N size
-            # For CuTe Layout: use cute.recast_layout to get 2x elements
-            fp8_epi_tile = (epi_tile_m, cute.recast_layout(2, 1, epi_tile_n) if hasattr(epi_tile_n, 'shape') else epi_tile_n * 2)
-            self.epi_c_smem_layout_staged = sm100_utils.make_smem_layout_epi(
-                self.c_dtype, self.c_layout, fp8_epi_tile, self.epi_c_stage
+            # Get static epi_tile_N size
+            epi_n_static = cute.size(epi_tile_n) if hasattr(epi_tile_n, 'shape') else epi_tile_n
+            fp8_epi_m = cute.size(epi_tile_m) if hasattr(epi_tile_m, 'shape') else epi_tile_m
+            fp8_epi_n = epi_n_static * 2
+            # Simple swizzled smem layout: (M, 2N) fp8 × stages
+            # Use CopyUniversalOp-compatible layout (no LDSM requirements)
+            smem_shape = (fp8_epi_m, fp8_epi_n)
+            smem_layout = cute.make_layout(smem_shape, stride=(fp8_epi_n, 1))
+            # Add staging dimension
+            smem_layout_staged = cute.make_layout(
+                (smem_shape[0], smem_shape[1], self.epi_c_stage),
+                stride=(fp8_epi_n, 1, fp8_epi_m * fp8_epi_n),
             )
+            self.epi_c_smem_layout_staged = smem_layout_staged
 
     def epilog_smem_load_and_partition(
         self, tiled_copy_t2r, c_layout, dtype, sC, tRS_rD_layout, tidx
