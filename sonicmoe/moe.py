@@ -11,17 +11,15 @@ import torch.nn.functional as F
 
 from .count_cumsum import count_cumsum
 from .enums import ActivationType, KernelBackendMoE, is_glu
-from .functional import FP8Protocol, NativeFP8Params, moe_TC_softmax_topk_layer, clear_all_fp8_weight_caches
+from .functional import FP8Protocol, moe_TC_softmax_topk_layer, clear_all_fp8_weight_caches
 from .functional.utils import enable_fp8
 from .quack_utils import (
     clear_blockscaled_fp8_weight_cache,
     prefetch_blockscaled_w2_fp8,
     precompute_weight_fp8,
     precompute_weight_fp8_for_fused_gated,
-    precompute_weight_fp8_for_direct_fused_dgated,
     quantize_and_pack_activation,
 )
-from .quack_utils.blockscaled_fp8_gemm import _quantize_weight_3d_triton
 
 
 try:
@@ -257,38 +255,6 @@ class MoE(nn.Module):
         """Clear all FP8 weight caches (per-tensor + blockscaled)."""
         clear_all_fp8_weight_caches()
 
-    @torch.no_grad()
-    def prepare_native_fp8(self, *, recompute_z: bool = False) -> NativeFP8Params:
-        """Pre-quantize expert weights for native FP8 — fwd-only, bwd lazy, z recompute.
-
-        Only forward weights are pre-quantized (fwd path is hot).  Backward
-        weights are recomputed on-demand from BF16 params (~74µs, parallelized
-        with z-dequant/recompute on a side stream).
-
-        When ``recompute_z=True`` (default), z is NOT saved during forward —
-        it is recomputed in backward via an extra GemmGated (~450µs), saving
-        ~204 MiB.
-
-        Memory: ~111 MiB (w1_fwd 74 + w2_fwd 37) vs ~222 MiB full.
-        """
-        w1_param = self.c_fc.weight   # (E, 2I, H) parameter
-        w2_param = self.c_proj.weight  # (E, H, I) parameter
-
-        # w1 forward: (E, 2I, H) contiguous → scales along K=H
-        w1_enk = w1_param.contiguous()
-        w1_fwd_fp8_enk, w1_fwd_scales = _quantize_weight_3d_triton(w1_enk)
-        w1_fwd_fp8 = w1_fwd_fp8_enk.mT  # (E, H, 2I) view for gemm_gated_tuned
-
-        # w2 forward: (E, H, I) contiguous → scales along K=I
-        w2_ehi = w2_param.contiguous()
-        w2_fwd_fp8, w2_fwd_scales = _quantize_weight_3d_triton(w2_ehi)
-
-        return NativeFP8Params(
-            w1_fwd_fp8=w1_fwd_fp8, w1_fwd_scales=w1_fwd_scales,
-            w2_fwd_fp8=w2_fwd_fp8, w2_fwd_scales=w2_fwd_scales,
-            recompute_z=recompute_z,
-        )
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -296,9 +262,6 @@ class MoE(nn.Module):
         is_inference_mode: bool = False,
         fp8_protocol: FP8Protocol | None = None,
         use_fp8: bool = False,
-        native_fp8_params: NativeFP8Params | None = None,
-        x_fp8_data: torch.Tensor | None = None,
-        x_fp8_scales: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         original_shape = hidden_states.shape
 
@@ -322,9 +285,6 @@ class MoE(nn.Module):
                     self.activation_function,
                     is_inference_mode or not self.training,
                     fp8_protocol,
-                    native_fp8_params=native_fp8_params,
-                    x_fp8_data=x_fp8_data,
-                    x_fp8_scales=x_fp8_scales,
                 )
             else:
                 # hidden_states -> (total_q, hidden_size)
