@@ -13,6 +13,8 @@ import quack.layout_utils as layout_utils
 import quack.utils as utils
 import torch
 from cutlass import Float32, Int32, const_expr
+from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack
 from quack.cute_dsl_utils import (
     ParamsBase,
@@ -21,7 +23,7 @@ from quack.cute_dsl_utils import (
     mlir_namedtuple,
     torch2cute_dtype_map,
 )
-from quack.epi_ops import ColVecReduce, TileStore
+from quack.epi_ops import ColVecReduce, TileStore, EpiOp, assume_stride_divisibility
 from quack.gemm_act import GemmActMixin
 from quack.gemm_default_epi import GemmDefaultEpiMixin
 from quack.gemm_sm90 import GemmSm90
@@ -227,6 +229,242 @@ class GemmDGatedSm90(GemmDGatedMixin, GemmSm90):
 
 
 class GemmDGatedSm100(GemmDGatedMixin, GemmSm100):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# FP8 PreAct: load z_fp8 + scales directly in epilogue, skip C tensor
+# ---------------------------------------------------------------------------
+
+@dsl_user_op
+def _f32_as_i32(x: Float32, *, loc=None, ip=None) -> Int32:
+    return Int32(llvm.bitcast(T.i32(), Float32(x).ir_value(loc=loc, ip=ip), loc=loc, ip=ip))
+
+
+@dsl_user_op
+def _i32_as_f32(x: Int32, *, loc=None, ip=None) -> Float32:
+    return Float32(llvm.bitcast(T.f32(), Int32(x).ir_value(loc=loc, ip=ip), loc=loc, ip=ip))
+
+
+class FP8PreActLoad(EpiOp):
+    """EpiOp: loads fp8 z + UE8M0 scales from gmem, dequants in registers.
+
+    begin(): captures (z_fp8_tensor, z_scales_tensor, tidx, tile_coord, varlen).
+    begin_loop(): computes absolute (m_abs, n_abs) for current subtile.
+    epi_visit_subtile consumes the returned (z_fp8, scales, m, n) tuple
+    to construct dequanted f32 values matching tRS_rXY_f32x2 layout.
+    """
+
+    def param_fields(self):
+        return [
+            (self.name + "_fp8", object, None),
+            (self.name + "_scales", object, None),
+        ]
+
+    def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile):
+        return 0
+
+    def to_params(self, gemm, args):
+        fp8 = getattr(args, self.name + "_fp8", None)
+        scales = getattr(args, self.name + "_scales", None)
+        if fp8 is not None:
+            fp8 = assume_stride_divisibility(fp8)
+        if scales is not None:
+            scales = assume_stride_divisibility(scales)
+        return {
+            self.name + "_fp8": fp8,
+            self.name + "_scales": scales,
+        }
+
+    @cute.jit
+    def begin(self, gemm, param, smem_tensor, ctx):
+        # param is (fp8_tensor, scales_tensor) from EpilogueParams
+        fp8_param = getattr(param, "mFP8PreAct_fp8", None) if param is not None else None
+        if const_expr(fp8_param is not None):
+            tile_M = gemm.cta_tile_shape_mnk[0]
+            tile_N = gemm.cta_tile_shape_mnk[1]
+            m_in_tile = ctx.tidx % tile_M
+            if const_expr(ctx.varlen_manager.varlen_m):
+                m_abs = (ctx.varlen_manager.params.cu_seqlens_m[ctx.tile_coord_mnkl[3]]
+                         + ctx.tile_coord_mnkl[0] * tile_M + m_in_tile)
+            else:
+                m_abs = ctx.tile_coord_mnkl[0] * tile_M + m_in_tile
+            # N base for fp8 z: each f32 in C represents 2 bf16 = 2 logical elements
+            # For fp8 z, the same N range maps to 2 fp8 bytes per f32 element
+            # tile_N is the physical N of C (= logical_N / 2 because bf16x2 packing)
+            # fp8 z has logical_N = 2 * tile_N bytes at this M row
+            n_base_logical = ctx.tile_coord_mnkl[1] * tile_N * 2  # logical N start in z_fp8
+            scales_param = getattr(param, "mFP8PreAct_scales", None)
+            return (fp8_param, scales_param, m_abs, n_base_logical, tile_N)
+        return None
+
+    @cute.jit
+    def begin_loop(self, gemm, state, epi_coord):
+        if const_expr(state is not None):
+            fp8_param, scales_param, m_abs, n_base, tile_N = state
+            if const_expr(isinstance(epi_coord, tuple)):
+                n_sub = epi_coord[1] if len(epi_coord) > 1 else epi_coord[0]
+            else:
+                n_sub = epi_coord
+            # Each epi subtile covers epi_tile_N physical N elements in C,
+            # which maps to epi_tile_N * 2 logical elements in fp8 z
+            epi_tile_N = tile_N  # will be divided by epi subtile count later
+            n_logical = n_base + n_sub * epi_tile_N * 2
+            return (fp8_param, scales_param, m_abs, n_logical)
+        return None
+
+
+class GemmDGatedFP8PreActMixin(GemmDGatedMixin):
+    """GemmDGated with fp8 PreAct: loads z_fp8 + scales in epilogue, no C tensor.
+
+    When mFP8PreAct_fp8 is provided, tRS_rC is ignored (can be None).
+    The epilogue loads fp8 z bytes + UE8M0 scale bytes via LDG, dequants
+    in registers, and constructs tRS_rXY_f32x2 for dSwiGLU computation.
+
+    Memory saving: eliminates 384MB z_bf16 temporary buffer.
+    """
+    _epi_ops = (
+        *GemmDGatedMixin._epi_ops,
+        FP8PreActLoad("mFP8PreAct"),
+    )
+
+    @mlir_namedtuple
+    class EpilogueArguments(NamedTuple):
+        mPostAct: cute.Tensor
+        act_bwd_fn: cutlass.Constexpr[Callable] = None
+        implicit_dtype: cutlass.Constexpr[type] = cutlass.BFloat16
+        alpha: Optional[Float32 | cute.Tensor] = None
+        beta: Optional[Float32 | cute.Tensor] = None
+        mRowVecBroadcast: Optional[cute.Tensor] = None
+        mColVecBroadcast: Optional[cute.Tensor] = None
+        mColVecReduce: Optional[cute.Tensor] = None
+        rounding_mode: cutlass.Constexpr[int] = 0
+        sr_seed: Optional[Int32 | cute.Tensor] = None
+        mFP8PreAct_fp8: Optional[cute.Tensor] = None
+        mFP8PreAct_scales: Optional[cute.Tensor] = None
+
+    @cute.jit
+    def epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None):
+        tDrColVec = epi_loop_tensors["mColVecBroadcast"]
+        tDrColVecReduce = epi_loop_tensors["mColVecReduce"]
+
+        fp8_preact_info = epi_loop_tensors["mFP8PreAct"]
+
+        if const_expr(fp8_preact_info is not None):
+            # ── FP8 PreAct path: load fp8 z + dequant in registers ──
+            fp8_param, scales_param, m_abs, n_logical = fp8_preact_info
+            num_d = cute.size(tRS_rD)  # N_phys elements in D per thread
+
+            # Construct tRS_rXY_f32x2 with 2 * num_d f32 elements
+            # Each D element corresponds to 2 logical z elements (gate, up)
+            tRS_rXY_f32x2_layout = cute.recast_layout(2, 1, tRS_rD.layout)
+            tRS_rXY_f32x2 = cute.make_rmem_tensor(tRS_rXY_f32x2_layout.shape, Float32)
+
+            num_xy = cute.size(tRS_rXY_f32x2)  # 2 * num_d
+            for i in cutlass.range(num_xy, unroll_full=True):
+                # Load fp8 byte from z_fp8[m_abs, n_logical + i]
+                fp8_byte = fp8_param[m_abs, n_logical + i]
+                # Load scale: 1 per 32-element group
+                scale_byte = scales_param[m_abs, (n_logical + i) / Int32(32)]
+                # Dequant: fp8_val * 2^(scale_byte - 127)
+                # scale_byte is UE8M0 exponent → dequant_scale = 2^(e8m0 - 127)
+                # which is _i32_as_f32(Int32(scale_byte) << 23) when e8m0 is biased
+                # But our scale format: e8m0 = biased_exp(amax) - 8 + carry
+                # dequant: val * 2^(e8m0) where fp8_val was scaled by 2^(254-e8m0)
+                # Actually: standard blockscaled dequant = fp8_to_f32(byte) * 2^(e8m0 - 127)
+                # where e8m0 is the raw UE8M0 byte (biased exponent of store_scale)
+                dequant_scale = _i32_as_f32(Int32(scale_byte) << Int32(23))
+                # fp8 byte → f32: reinterpret as float8_e4m3fn, widen to f32
+                # In DSL: load as Int8, construct fp8 value, convert
+                fp8_f32 = Float32(fp8_byte)  # implicit fp8→f32 conversion
+                tRS_rXY_f32x2[i] = fp8_f32 * dequant_scale
+        else:
+            # ── Standard bf16 PreAct path ──
+            assert tRS_rC is not None
+            implicit_dtype = params.implicit_dtype
+            tRS_rXY_f16x2 = cute.recast_tensor(tRS_rC, implicit_dtype)
+            tRS_rXY_f32x2 = cute.make_rmem_tensor(tRS_rXY_f16x2.layout, Float32)
+            tRS_rXY_f32x2.store(tRS_rXY_f16x2.load().to(Float32))
+
+        # ── dSwiGLU + colvec scale/reduce (unchanged from parent) ──
+        tRS_rdXY_f32x2 = cute.make_rmem_tensor_like(tRS_rXY_f32x2, Float32)
+        tRS_rOut = cute.make_rmem_tensor_like(tRS_rD, Float32)
+        tRS_rD_scaled = cute.make_rmem_tensor_like(tRS_rD)
+        if const_expr(tDrColVec is not None):
+            if const_expr(self.arch < 100):
+                tRS_rD_scaled.store(tRS_rD.load() * tDrColVec.load().to(tRS_rD.element_type))
+            else:
+                tDrColVec_mn = layout_utils.convert_layout_zero_stride(tDrColVec, tDrColVec.layout)
+                tRS_rD_mn = layout_utils.convert_layout_zero_stride(tRS_rD, tDrColVec.layout)
+                tRS_rD_scaled_mn = layout_utils.convert_layout_zero_stride(tRS_rD_scaled, tDrColVec.layout)
+                for m in cutlass.range(cute.size(tDrColVec_mn, mode=[0]), unroll_full=True):
+                    for n in cutlass.range(cute.size(tDrColVec_mn, mode=[1]) // 2, unroll_full=True):
+                        (
+                            tRS_rD_scaled_mn[m, 2 * n],
+                            tRS_rD_scaled_mn[m, 2 * n + 1],
+                        ) = cute.arch.mul_packed_f32x2(
+                            (tRS_rD_mn[m, 2 * n], tRS_rD_mn[m, 2 * n + 1]),
+                            (tDrColVec_mn[m, 0], tDrColVec_mn[m, 0]),
+                        )
+        else:
+            tRS_rD_scaled.store(tRS_rD.load())
+        if const_expr(self.arch < 100):
+            for i in cutlass.range(cute.size(tRS_rD)):
+                (
+                    tRS_rdXY_f32x2[2 * i],
+                    tRS_rdXY_f32x2[2 * i + 1],
+                    tRS_rOut[i],
+                ) = params.act_bwd_fn(tRS_rXY_f32x2[2 * i], tRS_rXY_f32x2[2 * i + 1], tRS_rD_scaled[i])
+        else:
+            for i in cutlass.range(cute.size(tRS_rD) // 2):
+                (
+                    (tRS_rdXY_f32x2[4 * i], tRS_rdXY_f32x2[4 * i + 2]),
+                    (tRS_rdXY_f32x2[4 * i + 1], tRS_rdXY_f32x2[4 * i + 3]),
+                    (tRS_rOut[2 * i], tRS_rOut[2 * i + 1]),
+                ) = params.act_bwd_fn(
+                    (tRS_rXY_f32x2[4 * i], tRS_rXY_f32x2[4 * i + 2]),
+                    (tRS_rXY_f32x2[4 * i + 1], tRS_rXY_f32x2[4 * i + 3]),
+                    (tRS_rD_scaled[2 * i], tRS_rD_scaled[2 * i + 1]),
+                )
+        if const_expr(tDrColVecReduce is not None):
+            if const_expr(self.arch < 100):
+                for i in cutlass.range(cute.size(tDrColVecReduce), unroll_full=True):
+                    tDrColVecReduce[i] += tRS_rOut[i] * tRS_rD[i]
+            else:
+                tDrColVecReduce_mn = layout_utils.convert_layout_zero_stride(tDrColVecReduce, tDrColVecReduce.layout)
+                tRS_rD_mn = layout_utils.convert_layout_zero_stride(tRS_rD, tDrColVecReduce.layout)
+                tRS_rOut_mn = layout_utils.convert_layout_zero_stride(tRS_rOut, tDrColVecReduce.layout)
+                for m in cutlass.range(cute.size(tDrColVecReduce_mn, mode=[0]), unroll_full=True):
+                    row_sum = cute.arch.mul_packed_f32x2(
+                        (tRS_rD_mn[m, 0], tRS_rD_mn[m, 1]), (tRS_rOut_mn[m, 0], tRS_rOut_mn[m, 1])
+                    )
+                    for n in cutlass.range(1, cute.size(tDrColVecReduce_mn, mode=[1]) // 2, unroll_full=True):
+                        row_sum = cute.arch.fma_packed_f32x2(
+                            (tRS_rD_mn[m, 2 * n], tRS_rD_mn[m, 2 * n + 1]),
+                            (tRS_rOut_mn[m, 2 * n], tRS_rOut_mn[m, 2 * n + 1]),
+                            row_sum,
+                        )
+                    tDrColVecReduce_mn[m, 0] += row_sum[0] + row_sum[1]
+
+        if const_expr(tDrColVec is not None):
+            if const_expr(self.arch < 100):
+                tRS_rOut.store(tRS_rOut.load() * tDrColVec.load().to(tRS_rD.element_type))
+            else:
+                tDrColVec_mn = layout_utils.convert_layout_zero_stride(tDrColVec, tDrColVec.layout)
+                tRS_rOut_mn = layout_utils.convert_layout_zero_stride(tRS_rOut, tDrColVec.layout)
+                for m in cutlass.range(cute.size(tDrColVec_mn, mode=[0]), unroll_full=True):
+                    for n in cutlass.range(cute.size(tDrColVec_mn, mode=[1]) // 2, unroll_full=True):
+                        tRS_rOut_mn[m, 2 * n], tRS_rOut_mn[m, 2 * n + 1] = cute.arch.mul_packed_f32x2(
+                            (tRS_rOut_mn[m, 2 * n], tRS_rOut_mn[m, 2 * n + 1]),
+                            (tDrColVec_mn[m, 0], tDrColVec_mn[m, 0]),
+                        )
+
+        # Return D as is and rOut as "postact" (same convention as parent)
+        tRS_rD.store(tRS_rdXY_f32x2.load())
+        return tRS_rOut
+
+
+class GemmDGatedFP8PreActSm100(GemmDGatedFP8PreActMixin, GemmSm100):
     pass
 
 
