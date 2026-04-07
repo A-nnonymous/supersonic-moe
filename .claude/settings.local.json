@@ -141,7 +141,12 @@
       "Bash(NODE=10.51.200.142\nFORK_DIR=\"/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe\"\nXFER_PY=\"/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python\"\nssh $NODE \"cd $FORK_DIR && PYTHONPATH=$FORK_DIR:\\\\$PYTHONPATH CUDA_VISIBLE_DEVICES=6 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf $XFER_PY -m pytest tests/fp8_large_project_contract_test.py -q --tb=line\" 2>&1 | tail -3)",
       "Bash(which python:*)",
       "WebFetch(domain:github.com)",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/env/envs/xfer/bin/python tests/test_fp8c_tma_compile.py 2>&1)",
+      "Bash(OUTDIR=/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/output/wgrad_ncu_v3 echo \"=== BF16 GemmDGated NCU ===\" ssh 10.51.203.82 \"ncu --import $OUTDIR/gemmdgated_bf16.ncu-rep --print-summary per-kernel 2>&1\")",
+      "Bash(OUTDIR=/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/output/wgrad_ncu_v3 echo \"=== BF16 GemmDGated ===\" ssh 10.51.203.82 \"ncu --import $OUTDIR/gemmdgated_bf16.ncu-rep --page raw 2>&1\")",
+      "Bash(OUTDIR=/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/output/wgrad_ncu_v3\nssh 10.51.203.82 \"ncu --import $OUTDIR/gemmdgated_bf16.ncu-rep --print-details all 2>&1\" | head -60)",
+      "Bash(git rm:*)"
     ]
   }
 }
