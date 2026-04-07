@@ -479,8 +479,11 @@ def gemm_dgated(
     A_idx: Optional[Tensor] = None,  # (total_m,) if gather_A with varlen_m
     a_scales: Optional[Tensor] = None,  # ISA-packed blockscaled scales for A
     b_scales: Optional[Tensor] = None,  # ISA-packed blockscaled scales for B
+    preact_fp8: Optional[Tensor] = None,  # (total_m, 2n) fp8 — replaces PreAct when provided
+    preact_scales: Optional[Tensor] = None,  # (total_m, 2n//32) uint8 — blockscaled scales for preact_fp8
 ) -> None:
     """If tile_count_semaphore is provided, it must already be zero'ed out."""
+    fp8_preact_mode = preact_fp8 is not None and preact_scales is not None
     if cu_seqlens_m is not None:
         assert persistent, "varlen_m requires persistent=True"
         assert A.stride(-1) == 1, "varlen_m requires A to be k-major"
@@ -495,20 +498,26 @@ def gemm_dgated(
 
     # Special handling for Out and PreAct
     AB_swapped = not Out.stride(-1) == 1
-    assert Out.dtype == PreAct.dtype
-    implicit_dtype = torch2cute_dtype_map[Out.dtype]
-    assert Out.element_size() == 2, "Out dtype must be fp16 or bf16"
-    assert PreAct.element_size() == 2, "Preact dtype must be fp16 or bf16"
-    # We pretend that Out is (M, N, L) of type fp32 instead of (M, 2N, L) of type f16.
-    # Similarly we pretend that PreAct is (M, N, L) of type fp32 instead of (M, 2N, L) of type f16
-    if cu_seqlens_m is not None or not AB_swapped:
-        # varlen_m (always AB_swapped=False) or normal case with AB_swapped=False
-        Out = Out.view(torch.float32)
-        PreAct = PreAct.view(torch.float32)
+    if fp8_preact_mode:
+        # FP8 PreAct: Out still needs bf16x2→f32 view, PreAct becomes None (C=None)
+        implicit_dtype = torch2cute_dtype_map[Out.dtype]
+        assert Out.element_size() == 2, "Out dtype must be fp16 or bf16"
+        if cu_seqlens_m is not None or not AB_swapped:
+            Out = Out.view(torch.float32)
+        else:
+            Out = Out.mT.view(torch.float32).mT
+        PreAct = None  # C=None — fp8 z loaded via EpiOp
     else:
-        # Normal case with AB_swapped=True
-        Out = Out.mT.view(torch.float32).mT
-        PreAct = PreAct.mT.view(torch.float32).mT
+        assert Out.dtype == PreAct.dtype
+        implicit_dtype = torch2cute_dtype_map[Out.dtype]
+        assert Out.element_size() == 2, "Out dtype must be fp16 or bf16"
+        assert PreAct.element_size() == 2, "Preact dtype must be fp16 or bf16"
+        if cu_seqlens_m is not None or not AB_swapped:
+            Out = Out.view(torch.float32)
+            PreAct = PreAct.view(torch.float32)
+        else:
+            Out = Out.mT.view(torch.float32).mT
+            PreAct = PreAct.mT.view(torch.float32).mT
 
     L, M, K, N, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(
         A,
@@ -536,7 +545,16 @@ def gemm_dgated(
     assert device_capacity[0] in [9, 10], "Only SM90 and SM100 are supported"
     # Use zero-materialization kernel when gather_A + blockscaled (FP8 with A_idx)
     blockscaled_runtime = a_scales is not None and b_scales is not None
-    if device_capacity[0] > 9 and gather_A and blockscaled_runtime:
+    if fp8_preact_mode:
+        assert device_capacity[0] > 9, "FP8 PreAct only supported on SM100+"
+        if gather_A and blockscaled_runtime:
+            from .gemm_sm100_fp8_zeromat import GemmDGatedSm100ZeroMat
+            # TODO: create GemmDGatedSm100ZeroMatFP8PreAct variant
+            # For now, use non-ZeroMat FP8PreAct (requires no A_idx in dgated)
+            GemmCls = GemmDGatedFP8PreActSm100
+        else:
+            GemmCls = GemmDGatedFP8PreActSm100
+    elif device_capacity[0] > 9 and gather_A and blockscaled_runtime:
         from .gemm_sm100_fp8_zeromat import GemmDGatedSm100ZeroMat
         GemmCls = GemmDGatedSm100ZeroMat
     elif device_capacity[0] > 9:
@@ -565,6 +583,10 @@ def gemm_dgated(
                 leading_dim=1 if info.major == major_configs[name][1] else 0,
             )
     act_fn = dgate_fn_map[activation]
+    epi_kwargs = {}
+    if fp8_preact_mode:
+        epi_kwargs["mFP8PreAct_fp8"] = _make_cute_tensor_dynamic(preact_fp8, leading_dim=1)
+        epi_kwargs["mFP8PreAct_scales"] = _make_cute_tensor_dynamic(preact_scales, leading_dim=1)
     epi_args = GemmCls.EpilogueArguments(
         tensor_infos["PostAct"].cute_tensor,
         act_fn,
@@ -583,6 +605,7 @@ def gemm_dgated(
             if colvec_reduce is not None
             else None
         ),
+        **epi_kwargs,
     )
     scheduler_args = GemmWrapperBase.create_scheduler_args(max_active_clusters, tile_count_semaphore)
 
@@ -619,6 +642,7 @@ def gemm_dgated(
         cu_seqlens_m is not None,
         A_idx is not None,
         blockscaled,
+        fp8_preact_mode,
         key_tensor_names=("A", "B", "D", "PostAct", "C"),
     )
     cache = gemm_dgated.compile_cache
