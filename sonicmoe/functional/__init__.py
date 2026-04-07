@@ -158,6 +158,15 @@ def _fused_blockscaled_gated_forward(
     # Step 3: Zero-materialization GEMM via standard interface.
     # gemm_gated() with A_idx auto-selects GemmGatedSm100ZeroMat on SM100,
     # which gathers A rows inside the kernel (no TK FP8 materialization).
+    # When epilogue quant is enabled, z is quantized in the epilogue and scale
+    # bytes are written atomically — no standalone quant kernel needed.
+    epilogue_quant = _use_epilogue_quant() and _save_z_fp8()
+    if epilogue_quant:
+        N = w1_fp8.shape[0]  # (2I, K) after permute → shape[0] = 2I
+        z_scale_out = torch.empty(TK, N // 32, dtype=torch.uint8, device=x.device)
+    else:
+        z_scale_out = None
+
     z, y1 = gemm_gated(
         x_fp8, w1_fp8,
         activation="swiglu",
@@ -169,10 +178,26 @@ def _fused_blockscaled_gated_forward(
         b_scales=w1_scales,
         dynamic_scheduler=False,
         tuned=False,
+        z_scale_out=z_scale_out,
     )
     del x_fp8, x_scales_tk_e8m0
 
+    if epilogue_quant:
+        # z D output holds SCALED bf16 values; cast to fp8 (hardware saturating).
+        z_fp8 = z.to(torch.float8_e4m3fn)
+        _PREQUANTIZED_SCALES["z_fp8"] = (z_fp8, z_scale_out.view(torch.float8_e8m0fnu))
+
     return z, y1
+
+
+def _use_epilogue_quant() -> bool:
+    """Check if epilogue blockscaled quant of z is enabled (default: disabled).
+
+    When enabled, the GemmGated epilogue computes blockscaled FP8 quantization
+    of z in registers (integer+carry E8M0, matching Triton/Paddle reference).
+    This eliminates the standalone fused_z_save_y1_quant kernel for z.
+    """
+    return os.getenv("SONIC_MOE_FP8_EPILOGUE_QUANT", "").lower() in {"1", "true", "yes", "on"}
 
 
 def _use_fused_swiglu_quant() -> bool:
@@ -637,7 +662,9 @@ class _UpProjection(torch.autograd.Function):
                     )
                     # Fused z+y1 quantize: single 2D-grid kernel launch
                     # while both tensors are L2-hot from GemmGated output.
-                    if _save_z_fp8():
+                    # When epilogue quant already set _PREQUANTIZED_SCALES["z_fp8"],
+                    # skip z quantization — only y1 needs quant.
+                    if _save_z_fp8() and "z_fp8" not in _PREQUANTIZED_SCALES:
                         from ..quack_utils.blockscaled_fp8_gemm import fused_z_save_y1_quant
                         z_fp8, z_raw_scales, y1_fp8, y1_packed_scales = fused_z_save_y1_quant(z, y1)
                         _PREQUANTIZED_SCALES["z_fp8"] = (z_fp8, z_raw_scales)

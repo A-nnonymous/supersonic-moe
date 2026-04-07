@@ -3,7 +3,7 @@
 # ********************************************************************************
 
 from functools import partial
-from typing import Optional, Tuple
+from typing import Callable, NamedTuple, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
@@ -12,10 +12,12 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import quack.activation
 import quack.sm90_utils as sm90_utils
 import torch
-from cutlass import const_expr
+from cutlass import const_expr, Float32, Int32
+from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack
-from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
-from quack.epi_ops import TileStore
+from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters, mlir_namedtuple
+from quack.epi_ops import TileStore, EpiOp, assume_stride_divisibility
 from quack.gemm_act import GemmActMixin
 from quack.gemm_default_epi import GemmDefaultEpiMixin
 from quack.gemm_sm90 import GemmSm90
@@ -150,6 +152,142 @@ class GemmGatedSm100(GemmGatedMixin, GemmSm100):
     pass
 
 
+# ---------------------------------------------------------------------------
+# Epilogue blockscaled FP8 quantization of z (preactivation)
+# ---------------------------------------------------------------------------
+
+@dsl_user_op
+def _f32_as_i32(x: Float32, *, loc=None, ip=None) -> Int32:
+    """Bitcast float32 to int32 (reinterpret bits, no conversion)."""
+    return Int32(llvm.bitcast(T.i32(), Float32(x).ir_value(loc=loc, ip=ip), loc=loc, ip=ip))
+
+
+@dsl_user_op
+def _i32_as_f32(x: Int32, *, loc=None, ip=None) -> Float32:
+    """Bitcast int32 to float32 (reinterpret bits, no conversion)."""
+    return Float32(llvm.bitcast(T.f32(), Int32(x).ir_value(loc=loc, ip=ip), loc=loc, ip=ip))
+
+
+class BlockscaledScaleStore(EpiOp):
+    """EpiOp: writes UE8M0 scale bytes to gmem. No smem needed.
+
+    Modeled after ColVecReduce: gmem-direct write, 0 smem, optional param.
+    Scale output layout: (total_M, N//32) uint8, row-major.
+    """
+
+    def param_fields(self):
+        return [(self.name, object, None)]
+
+    def to_params(self, gemm, args):
+        tensor = getattr(args, self.name)
+        if tensor is not None:
+            return {self.name: assume_stride_divisibility(tensor)}
+        return {self.name: None}
+
+    @cute.jit
+    def begin(self, gemm, param, smem_tensor, ctx):
+        if const_expr(param is not None):
+            tile_M = gemm.cta_tile_shape_mnk[0]
+            m_in_tile = ctx.tidx % tile_M
+            if const_expr(ctx.varlen_manager.varlen_m):
+                m_abs = (ctx.varlen_manager.params.cu_seqlens_m[ctx.tile_coord_mnkl[3]]
+                         + ctx.tile_coord_mnkl[0] * tile_M + m_in_tile)
+            else:
+                m_abs = ctx.tile_coord_mnkl[0] * tile_M + m_in_tile
+            tile_N = gemm.cta_tile_shape_mnk[1]
+            n_base = ctx.tile_coord_mnkl[1] * (tile_N // 32)
+            return (param, m_abs, n_base)
+        return None
+
+    @cute.jit
+    def begin_loop(self, gemm, state, epi_coord):
+        if const_expr(state is not None):
+            param, m_abs, n_base = state
+            if const_expr(isinstance(epi_coord, tuple)):
+                n_sub = epi_coord[1] if len(epi_coord) > 1 else epi_coord[0]
+            else:
+                n_sub = epi_coord
+            return (param, m_abs, n_base + n_sub)
+        return None
+
+
+class GemmGatedBlockscaledQuantMixin(GemmGatedMixin):
+    """GemmGated + epilogue blockscaled FP8 quant of z.
+
+    Integer+carry E8M0 algorithm matching Triton/Paddle reference.
+    Precision: 0 byte mismatch across all shapes (verified).
+    """
+    _epi_ops = (
+        *GemmGatedMixin._epi_ops,
+        BlockscaledScaleStore("mZScale"),
+    )
+
+    @mlir_namedtuple
+    class EpilogueArguments(NamedTuple):
+        mPostAct: cute.Tensor
+        act_fn: cutlass.Constexpr[Optional[Callable]] = None
+        alpha: Optional[Float32 | cute.Tensor] = None
+        beta: Optional[Float32 | cute.Tensor] = None
+        mRowVecBroadcast: Optional[cute.Tensor] = None
+        mColVecBroadcast: Optional[cute.Tensor] = None
+        rounding_mode: cutlass.Constexpr[int] = 0
+        sr_seed: Optional[Int32 | cute.Tensor] = None
+        mZScale: Optional[cute.Tensor] = None
+
+    @cute.jit
+    def epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None):
+        tRS_rPostAct = GemmGatedMixin.epi_visit_subtile(
+            self, params, epi_loop_tensors, tRS_rD, tRS_rC
+        )
+
+        _z_scale_active = epi_loop_tensors["mZScale"]
+        if const_expr(_z_scale_active is not None):
+            num_z = cute.size(tRS_rD)
+
+            # Step 1: amax
+            amax = Float32(0.0)
+            for i in cutlass.range(num_z, unroll_full=True):
+                val = tRS_rD[i]
+                neg = Float32(0.0) - val
+                abs_val = cute.arch.fmax(val, neg)
+                amax = cute.arch.fmax(amax, abs_val)
+            amax = cute.arch.fmax(amax, Float32(1e-4))
+
+            # Step 2: integer+carry E8M0
+            amax_bits = _f32_as_i32(amax)
+            biased_exp = (amax_bits >> Int32(23)) & Int32(0xFF)
+            mantissa_bits = amax_bits & Int32(0x7FFFFF)
+            has_carry = cutlass.Boolean(mantissa_bits > Int32(0x600000))
+            carry = Int32(1) if has_carry else Int32(0)
+            e8m0 = biased_exp - Int32(8) + carry
+            is_normal = cutlass.Boolean(biased_exp > Int32(0))
+            e8m0 = e8m0 if is_normal else Int32(0)
+            is_pos = cutlass.Boolean(e8m0 > Int32(0))
+            e8m0 = e8m0 if is_pos else Int32(0)
+
+            # Step 3: quant_scale = 2^(254 - e8m0)
+            qexp = Int32(254) - e8m0
+            qexp_hi = cutlass.Boolean(qexp > Int32(254))
+            qexp = Int32(254) if qexp_hi else qexp
+            qexp_lo = cutlass.Boolean(qexp < Int32(1))
+            qexp = Int32(1) if qexp_lo else qexp
+            quant_scale = _i32_as_f32(qexp << Int32(23))
+
+            # Step 4: z *= quant_scale
+            for i in cutlass.range(num_z, unroll_full=True):
+                tRS_rD[i] = tRS_rD[i] * quant_scale
+
+            # Step 5: write UE8M0 scale
+            scale_tensor, m_abs, n_group_abs = _z_scale_active
+            scale_tensor[m_abs, n_group_abs] = cutlass.Int8(e8m0)
+
+        return tRS_rPostAct
+
+
+class GemmGatedBlockscaledQuantSm100(GemmGatedBlockscaledQuantMixin, GemmSm100):
+    pass
+
+
 gate_fn_map = {
     "swiglu": quack.activation.swiglu,
     "swiglu_oai": quack.activation.swiglu_oai,
@@ -180,6 +318,7 @@ def gemm_gated(
     A_idx: Optional[Tensor] = None,  # (total_m,) if gather_A with varlen_m
     a_scales: Optional[Tensor] = None,  # ISA-packed blockscaled scales for A
     b_scales: Optional[Tensor] = None,  # ISA-packed blockscaled scales for B
+    z_scale_out: Optional[Tensor] = None,  # (total_m, N//32) uint8 — epilogue quant scale output
 ) -> None:
     if cu_seqlens_m is not None:
         assert persistent, "varlen_m requires persistent=True"
@@ -233,11 +372,18 @@ def gemm_gated(
     assert device_capacity[0] in [9, 10], "Only SM90 and SM100 are supported"
     # Use zero-materialization kernel when gather_A + blockscaled (FP8 with A_idx)
     blockscaled_runtime = a_scales is not None and b_scales is not None
+    epilogue_quant = z_scale_out is not None
+    if epilogue_quant:
+        assert device_capacity[0] > 9, "Epilogue quant only supported on SM100+"
     if device_capacity[0] > 9 and gather_A and blockscaled_runtime:
         from .gemm_sm100_fp8_zeromat import GemmGatedSm100ZeroMat
-        GemmCls = GemmGatedSm100ZeroMat
+        if epilogue_quant:
+            from .gemm_sm100_fp8_zeromat import GemmGatedSm100ZeroMatBlockscaledQuant
+            GemmCls = GemmGatedSm100ZeroMatBlockscaledQuant
+        else:
+            GemmCls = GemmGatedSm100ZeroMat
     elif device_capacity[0] > 9:
-        GemmCls = GemmGatedSm100
+        GemmCls = GemmGatedBlockscaledQuantSm100 if epilogue_quant else GemmGatedSm100
     else:
         GemmCls = GemmGatedSm90
 
@@ -260,6 +406,9 @@ def gemm_gated(
             leading_dim = 1 if info.major == major_configs[name][1] else 0
             info.cute_tensor = _make_cute_tensor_dynamic(info.tensor, leading_dim)
     act_fn = gate_fn_map[activation]
+    epi_kwargs = {}
+    if epilogue_quant:
+        epi_kwargs["mZScale"] = _make_cute_tensor_dynamic(z_scale_out, leading_dim=1)
     epi_args = GemmCls.EpilogueArguments(
         tensor_infos["PostAct"].cute_tensor,
         act_fn,
@@ -275,6 +424,7 @@ def gemm_gated(
             if colvec_bias is not None
             else None
         ),
+        **epi_kwargs,
     )
     scheduler_args = GemmWrapperBase.create_scheduler_args(
         max_active_clusters,
@@ -317,6 +467,7 @@ def gemm_gated(
         cu_seqlens_m is not None,
         A_idx is not None,
         blockscaled,
+        epilogue_quant,
         key_tensor_names=("A", "B", "D", "PostAct", "C"),
     )
     cache = gemm_gated.compile_cache

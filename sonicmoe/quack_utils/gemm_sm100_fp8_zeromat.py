@@ -41,7 +41,7 @@ from quack.varlen_utils import VarlenArguments, VarlenManager
 from .blockscaled_fp8_gemm import _tile_atom_to_shape_SF_rank_aware
 
 # Import mixins for GemmGated/GemmDGated from our local files
-from .gemm_gated import GemmGatedMixin
+from .gemm_gated import GemmGatedMixin, GemmGatedBlockscaledQuantMixin
 from .gemm_dgated import GemmDGatedMixin
 
 from cutlass.utils import LayoutEnum
@@ -364,13 +364,12 @@ class _GemmSm100ZeroMatMixin:
 # ---------------------------------------------------------------------------
 
 class GemmGatedSm100ZeroMat(GemmGatedMixin, _GemmSm100ZeroMatMixin, GemmSm100):
-    """SM100 GemmGated with zero-materialization FP8 SFA fix.
+    """SM100 GemmGated with zero-materialization FP8 SFA fix."""
+    pass
 
-    MRO: GemmGatedMixin → _GemmSm100ZeroMatMixin → GemmSm100
-    __call__ resolves to _GemmSm100ZeroMatMixin (the fix).
-    Epilogue methods resolve to GemmGatedMixin (SwiGLU activation).
-    Everything else resolves to GemmSm100 (unchanged kernel, MMA, etc).
-    """
+
+class GemmGatedSm100ZeroMatBlockscaledQuant(GemmGatedBlockscaledQuantMixin, _GemmSm100ZeroMatMixin, GemmSm100):
+    """SM100 GemmGated + epilogue blockscaled FP8 quant + zero-materialization SFA fix."""
     pass
 
 
