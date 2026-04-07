@@ -294,9 +294,9 @@ class FP8PreActLoad(EpiOp):
                 n_sub = epi_coord[1] if len(epi_coord) > 1 else epi_coord[0]
             else:
                 n_sub = epi_coord
-            # Each epi subtile: epi_tile_N physical elements = epi_tile_N * 2 logical fp8 elements
-            # n_sub indexes the subtile within the CTA tile
-            n_logical = n_base + n_sub * tile_N * 2  # TODO: this needs epi_tile_N, not tile_N
+            # Each epi subtile maps to 1 scale group = 32 logical fp8 elements
+            # (confirmed: BlockscaledScaleStore uses epi_coord directly as group index)
+            n_logical = n_base + n_sub * Int32(32)
             return (fp8_tensor, scales_tensor, m_abs, n_logical)
         return None
 
@@ -371,9 +371,10 @@ class GemmDGatedFP8PreActMixin(GemmDGatedMixin):
             tRS_rXY_f32x2 = cute.make_rmem_tensor(tRS_rXY_bf16_layout.shape, Float32)
             tRS_rXY_f32x2.store(tRS_rFP8.load().to(Float32))
 
-            # Apply blockscaled dequant: multiply by 2^(e8m0 - 127) per 32-element group
+            # Apply blockscaled dequant: 1 scale per 32 fp8 elements
+            # num_xy elements may span multiple groups (e.g., 64 = 2 groups)
             for i in cutlass.range(num_xy, unroll_full=True):
-                group_idx = (n_logical + i) >> Int32(5)
+                group_idx = (n_logical + i) >> Int32(5)  # (n_logical + i) / 32
                 scale_byte = scales_tensor[m_abs, group_idx]
                 dequant_scale = _i32_as_f32(Int32(scale_byte) << Int32(23))
                 tRS_rXY_f32x2[i] = tRS_rXY_f32x2[i] * dequant_scale
