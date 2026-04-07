@@ -549,7 +549,8 @@ def gemm_dgated(
         assert persistent, "varlen_m requires persistent=True"
         assert A.stride(-1) == 1, "varlen_m requires A to be k-major"
         assert Out.stride(-1) == 1, "varlen_m requires Out to be n-major"
-        assert PreAct.stride(-1) == 1, "varlen_m requires PreAct to be n-major"
+        if not fp8_preact_mode:
+            assert PreAct.stride(-1) == 1, "varlen_m requires PreAct to be n-major"
         assert PostAct.stride(-1) == 1, "varlen_m requires PostAct to be n-major"
     gather_A = A_idx is not None
     if gather_A:

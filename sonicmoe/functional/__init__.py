@@ -1170,20 +1170,25 @@ class _DownProjection(torch.autograd.Function):
                         _SF_VEC_SIZE, _storage_per_batch,
                     )
 
-                    # --- Stream parallelism: z-dequant || dout-quant+gather+s_cast ---
-                    # z-dequant (~124µs) and dout-quant+scale_gather+s.float() (~83+28µs)
-                    # operate on completely independent tensors; overlap on
-                    # a side stream to hide the shorter behind the longer.
-                    # Pre-cast s to float32 on default stream during z-dequant overlap.
-                    s_float = s.float()
-                    if z is None:
-                        _ds = _get_dequant_stream()
-                        _ds.wait_stream(torch.cuda.current_stream())
-                        with torch.cuda.stream(_ds):
-                            z = dequantize_blockscaled_fp8(z_fp8, z_raw_scales_u8)
-                            del z_fp8, z_raw_scales_u8
+                    # --- Phase 3.1: FP8 PreAct eliminates z dequant + 384MB temp ---
+                    # When z is fp8 (from ctx), pass directly to GemmDGated.
+                    # The kernel loads fp8 z + scales in its epilogue via EpiOp LDG,
+                    # avoiding the standalone dequant kernel and z_bf16 allocation.
+                    use_fp8_preact = (z is None and z_fp8 is not None)
 
-                    # dout-quant + scale_gather on default stream (parallel).
+                    if not use_fp8_preact:
+                        # Fallback: standalone dequant (when z is already bf16)
+                        s_float = s.float()
+                        if z is None:
+                            _ds = _get_dequant_stream()
+                            _ds.wait_stream(torch.cuda.current_stream())
+                            with torch.cuda.stream(_ds):
+                                z = dequantize_blockscaled_fp8(z_fp8, z_raw_scales_u8)
+                                del z_fp8, z_raw_scales_u8
+                    else:
+                        s_float = s.float()
+
+                    # dout-quant + scale_gather on default stream (parallel with dequant if fallback).
                     dout_fp8, dout_scales_t = quantize_and_pack_activation(dout)
                     TK_bwd = x_gather_idx.shape[0]
                     K_bwd = dout.shape[1]
@@ -1203,8 +1208,10 @@ class _DownProjection(torch.autograd.Function):
                     dout_scales = dout_scales_tk.view(torch.float8_e8m0fnu)
                     del dout_scales_t, dout_scales_tk
 
-                    # Synchronize: gemm_dgated_kernel needs both z and dout_fp8/dout_scales.
-                    torch.cuda.current_stream().wait_stream(_get_dequant_stream())
+                    # Synchronize: gemm_dgated_kernel needs dout_fp8/dout_scales
+                    # (and z_bf16 if not using fp8 preact).
+                    if not use_fp8_preact:
+                        torch.cuda.current_stream().wait_stream(_get_dequant_stream())
 
                     w2_fp8_enk, w2_scales = precompute_weight_fp8_for_direct_fused_dgated(w2)
                     config = default_config(dout.device)
@@ -1221,7 +1228,7 @@ class _DownProjection(torch.autograd.Function):
                         dout_fp8,
                         w2_fp8_enk,
                         dz,
-                        z,
+                        dz,  # PreAct: ignored when preact_fp8 is set (C=None in wrapper)
                         y1s,
                         None,
                         "swiglu",
@@ -1238,6 +1245,8 @@ class _DownProjection(torch.autograd.Function):
                         A_idx=x_gather_idx,
                         a_scales=dout_scales,
                         b_scales=w2_scales,
+                        preact_fp8=z_fp8 if use_fp8_preact else None,
+                        preact_scales=z_raw_scales_u8 if use_fp8_preact else None,
                     )
                     ds = colvec_reduce_partial.sum(dim=-1)
                     del dout_fp8, dout_scales, z, colvec_reduce_partial
