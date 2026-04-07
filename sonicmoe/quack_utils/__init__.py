@@ -10,6 +10,7 @@ from .blockscaled_fp8_gemm import (
     blockscaled_fp8_weight_grad_gemm_fast,
     blockscaled_fp8_wgrad_varlen_k,
     clear_blockscaled_fp8_weight_cache,
+    clear_fused_weight_cache,
     dual_quantize_and_pack,
     evict_fp8_weight_cache_entry,
     colwise_quantize_and_pack,

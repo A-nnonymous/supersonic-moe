@@ -301,6 +301,16 @@ def clear_blockscaled_fp8_weight_cache() -> None:
     _PAD_PLAN_CACHE.clear()
 
 
+def clear_fused_weight_cache() -> None:
+    """Clear the fused-gated/dgated weight cache to eagerly release GPU memory.
+
+    In training the optimizer step invalidates these entries anyway
+    (via ``w._version``), so clearing between forward and backward is free.
+    Saves ~74 MiB (w1 fused cache) during the down-projection and backward.
+    """
+    _FUSED_WEIGHT_CACHE.clear()
+
+
 def evict_fp8_weight_cache_entry(w: torch.Tensor) -> None:
     """Remove cached FP8 data for *w* from all blockscaled weight caches.
 

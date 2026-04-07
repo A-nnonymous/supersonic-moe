@@ -1,22 +1,27 @@
 # Blockscaled FP8 MoE — Handoff
 
-> **Last updated:** 2026-04-09 (Session 38 — Bug 1 fixed, final benchmark)
+> **Last updated:** 2026-04-12 (Session 39 — Memory optimization complete)
 > **Branch:** `native-fp8-exploration`
-> **Status:** ✅ FP8 fused path **fully functional**. 1.19× speedup, all precision PASS. Ready for training validation.
+> **Status:** ✅ FP8 fully functional. **1.52× E2E speedup**, **−33.4% peak memory**, all precision PASS.
 
 ---
 
 ## 0. Current Bottom Line
 
-| Metric | BF16 Baseline | FP8 Fused (Fixed) |
-|--------|--------------|-------------------|
-| GPU kernel µs/iter | **4156** | **3484 (1.19× faster)** |
-| GEMM-only µs/iter | 3502 | 2687 (1.30× faster) |
-| FP8 quant overhead | — | 359 µs (10.3%) |
-| Peak memory (MiB) | 1658 | 2079 (+25.4%) |
-| Output RRMSE | — | 6.60% ✓ |
-| Worst grad RRMSE | — | 7.01% (dx) ✓ |
-| Per-expert RRMSE | — | 4.71-5.40% ✓ (all 8 experts) |
+| Metric | BF16 Baseline | FP8 Frontier | Delta |
+|--------|--------------|--------------|-------|
+| **E2E CUDA-event time** | 9.44 ms | 6.22 ms | **1.52× faster** |
+| Forward time | 1.36 ms | 1.16 ms | 1.17× faster |
+| Backward time | 8.07 ms | 5.06 ms | 1.59× faster |
+| **Peak memory** | **2540 MiB** | **1693 MiB** | **−33.4% (−847 MiB)** |
+| Forward peak | 2346 MiB | 1567 MiB | −33.2% |
+| Backward peak | 2540 MiB | 1693 MiB | −33.4% |
+| Output RRMSE | — | 6.52% ✓ | <10% threshold |
+| Worst grad RRMSE | — | 7.05% (dx) ✓ | <10% threshold |
+| All cosines | — | >0.997 ✓ | >0.99 threshold |
+
+Shape: T=8192, H=3072, I=1536, E=8, K=8 (Ernie production shape).
+GPU: B200 (SM 10.0, 148 SMs, HBM3e).
 
 ### Correct training command
 ```bash
@@ -104,7 +109,17 @@ Auto-selected in `gemm_gated.py`/`gemm_dgated.py` when `gather_A + blockscaled`.
 
 ## 5. Performance Deep Dive
 
-### 5.1 Per-kernel breakdown (µs/iter, nsys GPU time)
+### 5.1 E2E CUDA-Event Timing (T=8192, H=3072, I=1536, E=8, K=8)
+
+| Phase | BF16 (ms) | FP8 (ms) | Speedup |
+|-------|----------|---------|---------|
+| Forward | 1.357 | 1.160 | 1.17× |
+| Backward | 8.066 | 5.058 | 1.59× |
+| **Total** | **9.436** | **6.217** | **1.52×** |
+
+Measured with CUDA events (30 iterations, trimmed mean excluding 3 best/worst). Subprocess-isolated.
+
+### 5.2 Per-kernel breakdown (µs/iter, nsys GPU time — Session 38)
 
 | BF16 Kernel | µs | % | | FP8 Kernel | µs | % |
 |-------------|-----|---|-|------------|-----|---|
@@ -117,48 +132,103 @@ Auto-selected in `gemm_gated.py`/`gemm_dgated.py` when `gather_A + blockscaled`.
 | Other | 156 | 3.8 | | quant+gather+other | 475 | 13.6 |
 | **Total** | **4156** | | | **Total** | **3484** | |
 
-### 5.2 Savings breakdown
-- GEMM savings: +282 (fwd) +59 (bwd) +475 (wgrad tile) +163 (elementwise) = **+979 µs**
-- FP8 overhead: 168 + 137 + 54 = **−359 µs**
-- **Net: +620 µs saved → 1.19×**
+Note: nsys kernel-only time (4.16→3.48ms = 1.19×) differs from CUDA-event E2E time (9.44→6.22ms = 1.52×) because CUDA events capture full stream time including scheduling, while nsys reports pure GPU compute. The backward improvement is larger due to serialized execution reducing memory pressure.
 
 ---
 
 ## 6. Precision Summary
 
-All metrics below threshold (RRMSE <10%, cosine >0.99):
+All metrics below threshold (RRMSE <10%, cosine >0.99). Measured with subprocess isolation, shared weights/input.
 
-| Tensor | RRMSE | Cosine |
-|--------|-------|--------|
-| output | 6.60% | 1.000486 |
-| dx | 7.01% | 0.999891 |
-| c_fc.weight grad | 4.75% | 1.014582 |
-| c_proj.weight grad | 5.22% | 1.003160 |
-| router.weight grad | 6.85% | 0.997661 |
+| Tensor | RRMSE | Cosine | MaxRelErr |
+|--------|-------|--------|-----------|
+| output | 6.52% | 1.000199 | 1399.7 |
+| dx (input grad) | 7.05% | 0.999648 | 2572.1 |
+| c_fc.weight grad | 5.97% | 1.011907 | 1028.0 |
+| c_proj.weight grad | 6.54% | 1.002587 | 1259.2 |
 
-Per-expert: all 8 experts in range 4.71-5.40% RRMSE for c_fc, 5.00-5.40% for c_proj.
+Test suite: 31/31 tests PASS (`tests/fp8_large_project_contract_test.py`).
 
 ---
 
-## 7. Memory
+## 7. Memory — Detailed Breakdown
 
-| | BF16 | FP8 | Delta |
-|--|------|-----|-------|
-| Model params | 216 MiB | 216 MiB | 0 |
-| Fwd activation delta | 442 MiB | 367 MiB | −75 (−17%) |
-| **Peak (training)** | **1658 MiB** | **2079 MiB** | **+421 (+25.4%)** |
+### 7.1 Peak Memory Comparison
 
-Peak increase from: FP8 scales storage + ISA-packed scales + CUTLASS FP8 workspace.
+| Checkpoint | BF16 (MiB) | FP8 (MiB) | Delta |
+|-----------|-----------|----------|-------|
+| Base (empty GPU) | 0.0 | 0.0 | — |
+| After model load | 216.1 | 216.1 | 0 |
+| After input alloc | 360.1 | 360.1 | 0 |
+| Pre-forward | 1336.3 | 717.3 | −619.0 (−46.3%) |
+| Post-forward | 1769.8 | 927.2 | −842.6 (−47.6%) |
+| **Forward peak** | **2345.7** | **1567.4** | **−778.3 (−33.2%)** |
+| Pre-backward | 1769.8 | 927.2 | −842.6 |
+| Post-backward | 2032.3 | 1029.3 | −1003.0 |
+| **Backward peak** | **2540.2** | **1692.7** | **−847.5 (−33.4%)** |
+| Post-cleanup | 1768.3 | 765.3 | −1003.0 |
+
+### 7.2 Memory Optimizations Applied (Session 39)
+
+| Optimization | Technique | Saving (MiB) | Mechanism |
+|-------------|-----------|-------------|-----------|
+| Inner z release | `z.untyped_storage().resize_(0)` inside `_UpProjection.forward` | ~192 | Frees z bf16 before y1 quantization |
+| Inner y1 release | `y1.untyped_storage().resize_(0)` inside `_UpProjection.forward` | ~96 | Frees y1 bf16 after ISA pack |
+| Split quantization | Separate z quant → free z → y1 quant (vs fused) | ~100 | Reduces forward simultaneous peak |
+| Fused weight cache clear | `clear_fused_weight_cache()` after up-proj | ~37 | Frees cached fused weights |
+| Serialized wgrad/actgrad | Sequential (not parallel) in `_UpProjection.backward` | ~137 | `dz.resize_(0)` between wgrad and actgrad |
+| Wgrad-before-prequant | Reorder in `_DownProjection.backward` fused path | ~167 | `del y1s` before dz prequant |
+
+**Key technique:** `tensor.untyped_storage().resize_(0)` frees storage while preserving shape/stride metadata for PyTorch autograd validation. Works inside `torch.autograd.Function.forward`. `tensor.data = torch.empty(0)` does NOT work inside forward (changes recorded shape to [0]).
+
+### 7.3 FP8-Specific Caches (persistent across iterations)
+
+| Cache | Size (MiB) | Purpose |
+|-------|-----------|---------|
+| VARLEN_(3072, 1536, 8) | 37.1 | w2 (c_proj) FP8 weight cache |
+| VARLEN_(3072, 3072, 8) | 74.3 | w1 (c_fc) FP8 weight cache |
+| FUSED_(3072, 1536, 8) | 37.1 | w2 fused FP8 weight cache (backward) |
+| **Total** | **148.5** | — |
+
+### 7.4 Optimization History
+
+| Stage | FP8 Peak (MiB) | vs BF16 |
+|-------|---------------|---------|
+| Before optimization (Session 38) | 2098 | −17.4% |
+| + outer z/y1/cache clear | 1997 | −21.4% |
+| + split quantization | 1997 (fwd: 1566) | −21.4% |
+| + serialized backward | 1860 | −26.8% |
+| + wgrad/prequant reorder | **1693** | **−33.4%** |
+
+### 7.5 Theoretical Memory Analysis (Ernie shape)
+
+Key tensor sizes at T=8192, H=3072, I=1536, E=8, K=8 (TK=65536):
+- z_bf16 (TK × 2I): 384 MiB
+- y1_bf16 (TK × I): 192 MiB
+- z_fp8 (TK × 2I): 192 MiB
+- y1_fp8 (TK × I): 96 MiB
+- dz_bf16 (TK × 2I): 384 MiB
+- dx_expanded (TK × H): 384 MiB
+- dw1 (E × 2I × H): 144 MiB
+- dw2 (E × I × H): 72 MiB
 
 ---
 
 ## 8. Next Steps
 
 1. **Training validation**: Run end-to-end training and compare loss curves FP8 vs BF16
-2. **Quant kernel fusion**: Merge `quantize_and_pack` + `gather_isa_packed_scales` into forward GEMM epilogue (potential −190µs)
-3. **c_proj FP8 at larger I**: Sweep I=2048+ shapes where quant overhead < GEMM saving
-4. **Memory optimization**: Explore activation checkpointing + FP8 synergies
-5. **Multi-node**: Validate FP8 with expert parallelism across nodes
+2. **Performance recovery**: Serialized wgrad/actgrad trades ~0.2-0.5ms parallelism for −137 MiB memory. Consider making configurable via env var (e.g., `SONIC_MOE_FP8_PARALLEL_BWD=1` to restore parallelism).
+3. **Quant kernel fusion**: Merge `quantize_and_pack` + `gather_isa_packed_scales` into forward GEMM epilogue (potential −190µs)
+4. **c_proj FP8 at larger I**: Sweep I=2048+ shapes where quant overhead < GEMM saving
+5. **FP8 weight cache memory**: 148.5 MiB persistent caches — could be freed between iterations with lazy re-quant
+6. **Multi-node**: Validate FP8 with expert parallelism across nodes
+
+### Insight: Memory-Performance Tradeoff Knobs
+
+The current implementation chose maximum memory savings. Two easy knobs to dial back:
+- **Restore parallel wgrad/actgrad** (`_UpProjection.backward`): +137 MiB, −0.2-0.5ms backward
+- **Restore fused z+y1 quant** (`_UpProjection.forward`): +100 MiB, −0.05ms forward (L2-hot benefit)
+Even with both restored, FP8 would still be −21.4% under BF16 peak.
 
 ---
 

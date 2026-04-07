@@ -1,0 +1,139 @@
+{
+  "bf16": {
+    "mode": "bf16",
+    "checkpoints": {
+      "base": 0.0,
+      "after_model": 216.05,
+      "after_input": 360.05,
+      "pre_fwd": 1336.3,
+      "post_fwd": 1769.8,
+      "peak_fwd": 2345.67,
+      "pre_bwd": 1769.8,
+      "post_bwd": 2032.34,
+      "peak_bwd": 2540.17,
+      "post_cleanup": 1768.3
+    },
+    "deltas": {
+      "model_params": 216.05,
+      "input_tensors": 144.0,
+      "fwd_activation_delta": 433.5,
+      "fwd_peak_above_pre": 1009.37,
+      "bwd_peak_above_pre": 770.37,
+      "bwd_residual_delta": 262.54
+    },
+    "param_sizes_mib": {
+      "router.weight": 0.0469,
+      "c_fc.weight": 144.0,
+      "c_proj.weight": 72.0
+    },
+    "grad_sizes_mib": {
+      "router.weight": 0.0469,
+      "c_fc.weight": 144.0,
+      "c_proj.weight": 72.0
+    },
+    "fp8_caches_after_fwd": {},
+    "fp8_caches_after_bwd": {},
+    "theoretical_sizes_mib": {
+      "x_input_bf16": 48.0,
+      "z_bf16_TK_2I": 384.0,
+      "z_fp8_TK_2I": 192.0,
+      "z_scales": 6.0,
+      "y1_bf16_TK_I": 192.0,
+      "y1_fp8_TK_I": 96.0,
+      "y1_scales": 3.0,
+      "y2_bf16_TK_H": 384.0,
+      "o_bf16_T_H": 48.0,
+      "dz_bf16_TK_2I": 384.0,
+      "dz_fp8_TK_2I": 192.0,
+      "dz_scales": 6.0,
+      "dx_expanded_TK_H": 384.0,
+      "dx_reduced_T_H": 48.0,
+      "dw1_E_2I_H": 144.0,
+      "dw2_E_I_H": 72.0,
+      "x_fp8_T_H": 24.0,
+      "x_scales_T": 0.75,
+      "x_scales_TK": 6.0,
+      "dout_fp8_T_H": 24.0,
+      "dout_scales_TK": 6.0,
+      "w1_fp8_E_2I_H": 72.0,
+      "w1_fp8_scales": 2.2496,
+      "w2_fp8_E_I_H": 36.0,
+      "w2_fp8_scales": 1.1248,
+      "w1T_fp8_E_H_2I": 72.0,
+      "routing_metadata_total": 1.75,
+      "colvec_reduce_partial_fp32": 12.0
+    }
+  },
+  "fp8": {
+    "mode": "fp8",
+    "checkpoints": {
+      "base": 0.0,
+      "after_model": 216.05,
+      "after_input": 360.05,
+      "pre_fwd": 717.3,
+      "post_fwd": 927.17,
+      "peak_fwd": 1567.42,
+      "pre_bwd": 927.17,
+      "post_bwd": 1029.34,
+      "peak_bwd": 1692.67,
+      "post_cleanup": 765.3
+    },
+    "deltas": {
+      "model_params": 216.05,
+      "input_tensors": 144.0,
+      "fwd_activation_delta": 209.87,
+      "fwd_peak_above_pre": 850.12,
+      "bwd_peak_above_pre": 765.5,
+      "bwd_residual_delta": 102.17
+    },
+    "param_sizes_mib": {
+      "router.weight": 0.0469,
+      "c_fc.weight": 144.0,
+      "c_proj.weight": 72.0
+    },
+    "grad_sizes_mib": {
+      "router.weight": 0.0469,
+      "c_fc.weight": 144.0,
+      "c_proj.weight": 72.0
+    },
+    "fp8_caches_after_fwd": {
+      "VARLEN_(3072, 1536, 8)": 37.125,
+      "VARLEN_(3072, 3072, 8)": 74.25
+    },
+    "fp8_caches_after_bwd": {
+      "VARLEN_(3072, 1536, 8)": 37.125,
+      "VARLEN_(3072, 3072, 8)": 74.25,
+      "FUSED_(3072, 1536, 8)": 37.125
+    },
+    "theoretical_sizes_mib": {
+      "x_input_bf16": 48.0,
+      "z_bf16_TK_2I": 384.0,
+      "z_fp8_TK_2I": 192.0,
+      "z_scales": 6.0,
+      "y1_bf16_TK_I": 192.0,
+      "y1_fp8_TK_I": 96.0,
+      "y1_scales": 3.0,
+      "y2_bf16_TK_H": 384.0,
+      "o_bf16_T_H": 48.0,
+      "dz_bf16_TK_2I": 384.0,
+      "dz_fp8_TK_2I": 192.0,
+      "dz_scales": 6.0,
+      "dx_expanded_TK_H": 384.0,
+      "dx_reduced_T_H": 48.0,
+      "dw1_E_2I_H": 144.0,
+      "dw2_E_I_H": 72.0,
+      "x_fp8_T_H": 24.0,
+      "x_scales_T": 0.75,
+      "x_scales_TK": 6.0,
+      "dout_fp8_T_H": 24.0,
+      "dout_scales_TK": 6.0,
+      "w1_fp8_E_2I_H": 72.0,
+      "w1_fp8_scales": 2.2496,
+      "w2_fp8_E_I_H": 36.0,
+      "w2_fp8_scales": 1.1248,
+      "w1T_fp8_E_H_2I": 72.0,
+      "routing_metadata_total": 1.75,
+      "colvec_reduce_partial_fp32": 12.0
+    }
+  }
+}
