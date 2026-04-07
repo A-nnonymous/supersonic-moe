@@ -1033,8 +1033,12 @@ class _DownProjection(torch.autograd.Function):
 
         # Memory optimization: store z in FP8 to save ~50% of z's memory.
         # At Ernie shape (TK=65536, 2I=3072), z is 384MB BF16 → ~213MB FP8 = ~171MB saved.
+        # Accept fp8 z when prequant cache already holds the fp8+scales pair
+        # (e.g. epilogue quant produced them), even if z.dtype is no longer bf16.
+        z_has_prequant = "z_fp8" in _PREQUANTIZED_SCALES
         z_is_fp8 = (_fp8_enabled() and use_quack_gemm and _save_z_fp8()
-                    and _ALIGNMENT_ASSUMED and z.dtype == torch.bfloat16)
+                    and _ALIGNMENT_ASSUMED
+                    and (z.dtype == torch.bfloat16 or z_has_prequant))
         ctx._z_is_fp8 = z_is_fp8
 
         if z_is_fp8:
@@ -1042,6 +1046,10 @@ class _DownProjection(torch.autograd.Function):
             if precomputed_z_fp8 is not None:
                 z_fp8, z_raw_scales = precomputed_z_fp8
             else:
+                assert z.dtype == torch.bfloat16, (
+                    f"z_is_fp8=True but no prequant cache and z.dtype={z.dtype} "
+                    f"(expected bf16 for inline quantization)"
+                )
                 z_fp8, z_raw_scales = quantize_activation_blockscaled_fast(z)
             ctx.save_for_backward(
                 z_fp8,
