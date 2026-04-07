@@ -139,7 +139,9 @@
       "Bash(NODE=10.51.200.142\nFORK_DIR=\"/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe\"\nXFER_PY=\"/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python\"\nssh $NODE \"cd $FORK_DIR && PYTHONPATH=$FORK_DIR:\\\\$PYTHONPATH CUDA_VISIBLE_DEVICES=4 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf $XFER_PY -m pytest tests/fp8_large_project_contract_test.py -q --tb=line\" 2>&1 | tail -3)",
       "Bash(NODE=10.51.200.142\nFORK_DIR=\"/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe\"\nXFER_PY=\"/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python\"\nssh $NODE \"cd $FORK_DIR && PYTHONPATH=$FORK_DIR:\\\\$PYTHONPATH CUDA_VISIBLE_DEVICES=5 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf $XFER_PY -m pytest tests/fp8_large_project_contract_test.py -q --tb=line\" 2>&1 | tail -3)",
       "Bash(NODE=10.51.200.142\nFORK_DIR=\"/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe\"\nXFER_PY=\"/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python\"\nssh $NODE \"cd $FORK_DIR && PYTHONPATH=$FORK_DIR:\\\\$PYTHONPATH CUDA_VISIBLE_DEVICES=6 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf $XFER_PY -m pytest tests/fp8_large_project_contract_test.py -q --tb=line\" 2>&1 | tail -3)",
-      "Bash(which python:*)"
+      "Bash(which python:*)",
+      "WebFetch(domain:github.com)",
+      "Bash(grep:*)"
     ]
   }
 }

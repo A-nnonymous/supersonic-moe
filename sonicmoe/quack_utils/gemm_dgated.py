@@ -353,30 +353,30 @@ class GemmDGatedFP8PreActMixin(GemmDGatedMixin):
         fp8_preact_info = epi_loop_tensors["mFP8PreAct"]
 
         if const_expr(fp8_preact_info is not None):
-            # ── FP8 PreAct path: load fp8 z + dequant in registers ──
+            # ── FP8 PreAct path: load fp8 z + vectorized dequant ──
             fp8_tensor, scales_tensor, m_abs, n_logical = fp8_preact_info
-            num_d = cute.size(tRS_rD)  # N_phys elements in D per thread
+            num_d = cute.size(tRS_rD)
 
-            # Construct tRS_rXY_f32x2: same layout as recast_tensor(tRS_rC, bf16) → f32 widen
-            # tRS_rC is N f32 → recast to 2N bf16 → widen to 2N f32
-            # We need the same: N f32 → 2N f32 (from fp8 dequant)
-            # Use recast_tensor on tRS_rD (f32) to get the bf16x2 layout, then make f32 version
+            # Create fp8 register tensor matching the 2N logical elements
             tRS_rXY_bf16_layout = cute.recast_tensor(tRS_rD, cutlass.BFloat16).layout
-            tRS_rXY_f32x2 = cute.make_rmem_tensor(tRS_rXY_bf16_layout.shape, Float32)
+            num_xy = cute.size(tRS_rXY_bf16_layout)
 
-            num_xy = cute.size(tRS_rXY_f32x2)  # 2 * num_d
+            # Load fp8 values into a register tensor, then vectorized convert
+            tRS_rFP8 = cute.make_rmem_tensor(tRS_rXY_bf16_layout.shape, cutlass.Float8E4M3FN)
             for i in cutlass.range(num_xy, unroll_full=True):
-                # Load fp8 byte from z_fp8[m_abs, n_logical + i]
-                fp8_byte = fp8_tensor[m_abs, n_logical + i]
-                # Load scale: 1 UE8M0 byte per 32-element group
-                group_idx = (n_logical + i) >> Int32(5)  # integer divide by 32
+                tRS_rFP8[i] = fp8_tensor[m_abs, n_logical + i]
+
+            # Vectorized fp8 → f32 conversion via tensor .to()
+            # DSL internally uses: fp8(vec4) → f16(vec2) → f32 (nvgpu.cvt_fpext + arith.extf)
+            tRS_rXY_f32x2 = cute.make_rmem_tensor(tRS_rXY_bf16_layout.shape, Float32)
+            tRS_rXY_f32x2.store(tRS_rFP8.load().to(Float32))
+
+            # Apply blockscaled dequant: multiply by 2^(e8m0 - 127) per 32-element group
+            for i in cutlass.range(num_xy, unroll_full=True):
+                group_idx = (n_logical + i) >> Int32(5)
                 scale_byte = scales_tensor[m_abs, group_idx]
-                # Dequant: fp8_to_f32(byte) * 2^(e8m0 - 127)
-                # 2^(e8m0 - 127) = _i32_as_f32(Int32(e8m0) << 23) when 0 < e8m0 < 255
                 dequant_scale = _i32_as_f32(Int32(scale_byte) << Int32(23))
-                # fp8→f32: convert via bf16 intermediate (scalar fp8 cvt requires packed vec in DSL)
-                fp8_as_bf16 = cutlass.BFloat16(fp8_byte)
-                tRS_rXY_f32x2[i] = Float32(fp8_as_bf16) * dequant_scale
+                tRS_rXY_f32x2[i] = tRS_rXY_f32x2[i] * dequant_scale
         else:
             # ── Standard bf16 PreAct path ──
             assert tRS_rC is not None
