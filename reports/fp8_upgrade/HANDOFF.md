@@ -136,6 +136,19 @@ Removed `data_ptr` / `id(storage)` from cache keys. Now keys are `(_version, sha
 
 ## 7. Dead Ends (verified, do NOT retry without new approach)
 
+### Memory ceiling: 4-layout fp8 ≈ bf16 params
+The 4 GEMM layouts need 4 fp8 tensors (w1_fused 72M + w2_varlen 37M + w1T 72M + w2_dgated 37M + scales 4.5M = **222 MiB**), which is **larger** than bf16 params (216 MiB). Releasing bf16 params and keeping fp8 caches saves zero net memory. This is a **structural limitation** — not a bug.
+
+Ernie's `Fp8FusedMoeFunc` (moe_layer.py L2195) uses the same pattern: bf16 master weights + fp8 shadows stored as `weight.fp8_weight_stacked` attributes. Ernie does NOT attempt to free bf16 masters. The `MlpNode` accesses fp8 weights via `ctx.node` (not `save_for_backward`), avoiding cache-key fragility. But the memory footprint is identical.
+
+### `stash_bf16_to_cpu` — works but net-zero savings
+- `resize_(0)` frees bf16 params (−216 MiB)
+- Named cache / standard caches hold fp8 weights (+222 MiB)
+- `as_strided` proxy (2 bytes!) provides shape for GEMM dispatch
+- **output+dx: BIT-IDENTICAL** ✅, dw1/dw2 gradients: need custom hook
+- **Net: +6 MiB** (fp8 caches > bf16 params due to 4 layouts + scales)
+- Only useful if bf16 params can be CPU-offloaded AND layout count reduced to ≤3
+
 ### FP8 wgrad (dual_quantize path)
 - `dual_quantize_and_pack` kernel works correctly (single HBM read → row+col fp8)
 - `blockscaled_fp8_weight_grad_gemm_fast` with `pre_quantized_b` works
