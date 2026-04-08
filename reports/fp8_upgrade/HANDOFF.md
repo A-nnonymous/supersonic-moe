@@ -80,19 +80,65 @@ wgrad norm relative error: c_fc <0.33%, c_proj <0.38%, router <0.55%.
 
 ---
 
-## 3. Memory
+## 3. Memory — Official BF16 vs FP8 Frontier Breakdown
 
-### Weight cache lifecycle
-FP8 weight caches (w1, w2) are **transient**: populated on demand, auto-invalidated via `w._version` at optimizer step. In no-optimizer benchmarks, caches hit from iter 2+. In training, they miss every step (re-quantized).
+> **Methodology**: subprocess-isolated, idle B200 (0% util, 0 MiB), 2 warmup + 1 measured iter.
+> **BF16 baseline**: official upstream code (`lab/official/sonic-moe`, `envs/official_bf16`).
+> **FP8 frontier**: `native-fp8-exploration` branch (`lab/sonic-moe`, `envs/xfer`).
+> **Reproducibility**: BF16 3 runs (GPU 3,4,5), FP8 2 runs (GPU 5,6) — all identical (deterministic).
+
+### 3.1 Per-Checkpoint Comparison
+
+| Checkpoint | Official BF16 (MiB) | FP8 Frontier (MiB) | Delta | Note |
+|-----------|:---:|:---:|:---:|------|
+| 00_empty | 0.0 | 0.0 | — | bare CUDA context |
+| 01_model | 216.1 | 216.1 | 0 | same params (bf16 storage) |
+| 02_input | 312.1 | 312.1 | 0 | x(48M) + dout(48M) + model |
+| 03_post_warmup | 376.3 | 487.7 | **+111.4** | FP8 weight caches from warmup |
+| **04_fwd_peak** | **1385.7** | **1337.7** | **−48.0 (−3.5%)** | FP8 saves on z/y1 storage |
+| 05_post_fwd | 761.6 | 649.8 | **−111.8** | FP8 freed z/y1 bf16 via resize_(0) |
+| **06_bwd_peak** | **1411.6** | **1366.9** | **−44.6 (−3.2%)** | FP8 z stored as fp8 (−192M), but dz+dz_fp8 coexist |
+| 07_post_bwd | 640.3 | 751.7 | +111.4 | FP8 backward weight caches |
+| 08_cleanup | 328.3 | 439.7 | +111.4 | FP8 caches persist (invalidated at optimizer.step) |
+
+### 3.2 Key Metrics
+
+| Metric | Official BF16 | FP8 Frontier | Delta |
+|--------|:---:|:---:|:---:|
+| **Forward peak** | **1385.7 MiB** | **1337.7 MiB** | **−48.0 MiB (−3.5%)** |
+| **Backward peak** | **1411.6 MiB** | **1366.9 MiB** | **−44.6 MiB (−3.2%)** |
+| Net forward activation (peak − base) | 1009.4 MiB | 850.0 MiB | **−159.4 MiB (−15.8%)** |
+| Net backward activation (peak − post_fwd) | 650.0 MiB | 717.1 MiB | +67.1 MiB (+10.3%) |
+| Post-cleanup residual | 328.3 MiB | 439.7 MiB | +111.4 MiB |
+
+### 3.3 Analysis
+
+**Forward peak (−48 MiB / −3.5%)**:
+- FP8 saves ~159 MiB on z/y1 (resize_(0) frees bf16 after fp8 quant)
+- FP8 warmup base is +111 MiB higher (weight caches from previous iter)
+- Net: 159 − 111 = **−48 MiB absolute peak reduction**
+
+**Backward peak (−44.6 MiB / −3.2%)**:
+- FP8 saves 192 MiB by storing z as fp8 (vs bf16 in BF16 path)
+- FP8 spends +198 MiB on dz_fp8 prequant + weight caches
+- z_fp8 released after dgated GEMM (−198 MiB)
+- Net: modest reduction due to offsetting effects
+
+**Post-cleanup residual (+111.4 MiB)**:
+- Entirely from FP8 weight caches: w1T VARLEN (74.3 MiB) + w2 FUSED (37.1 MiB)
+- These auto-invalidate at `optimizer.step()` via `w._version` increment
+- In training with optimizer: **effective residual delta = 0**
+
+### 3.4 Weight cache lifecycle
 
 | Cache | Size (MiB) | Forward | Backward | Post-step |
-|-------|-----------|---------|----------|-----------|
+|-------|:---------:|---------|----------|-----------|
 | w1 fused (FUSED_CACHE) | 74.3 | populated → cleared | — | invalidated |
 | w2 varlen (VARLEN_CACHE) | 37.1 | populated → evicted | — | invalidated |
 | w1T varlen (VARLEN_CACHE) | 74.3 | — | populated → persists | invalidated |
 | w2 fused (FUSED_CACHE) | 37.1 | — | populated → persists | invalidated |
 
-### Key optimizations applied (Session 41)
+### 3.5 Optimizations applied (Session 41)
 - z_fp8/z_raw_scales released immediately after dgated GEMM (−198 MiB backward peak)
 - w2 varlen evicted after down-proj forward (−37 MiB during ctx save)
 - w1 fused cleared before down-proj (−74 MiB during down-proj)
