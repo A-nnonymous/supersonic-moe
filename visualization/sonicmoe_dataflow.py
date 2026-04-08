@@ -4,14 +4,15 @@ SonicMoE FP8 Blockscaled — Publication-Quality Visualization Suite
 ===================================================================
 
 Ten data-driven figures for the zero-materialization FP8 training path
-on Blackwell (B200), aligned with Session 41 HANDOFF.md measurements.
+on Blackwell (B200).  All numerical data loaded from ground-truth JSON
+profiling files (``mem_breakdown.json``, ``kernel_breakdown.json``).
 
 Figures
 -------
   1. Executive Summary        — 3-panel: speedup, memory, precision
   2. Performance Waterfall    — BF16 -> GEMM savings -> quant overhead -> FP8
-  3. Memory Lifecycle         — 4-checkpoint BF16 vs FP8 trajectory
-  4. Backward Peak Breakdown  — 100% tensor-level audit (1367 MiB)
+  3. Memory Lifecycle         — 6-checkpoint BF16 vs FP8 trajectory
+  4. Backward Peak Breakdown  — 100% tensor-level audit
   5. Kernel-Level Comparison  — per-kernel BF16 vs FP8 grouped bars
   6. Precision State Matrix   — dtype heatmap at each tensor x phase cell
   7. Precision Profile        — RRMSE + cosine with pass thresholds
@@ -25,11 +26,13 @@ Usage
     python visualization/sonicmoe_dataflow.py
 
 Output: <repo_root>/assets/
-All data: Session 41, idle B200, subprocess-isolated, nsys GPU Projection.
+All data: idle B200, subprocess-isolated torch.profiler + CUDA events.
 """
 from __future__ import annotations
 
+import json
 import pathlib
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Optional
 
@@ -51,6 +54,72 @@ import seaborn as sns                                        # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 ASSETS = ROOT / "assets"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Ground-Truth Data Loading
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _load_profiling_data():
+    """Load measured profiling JSON; return (mem_data, kernel_data) dicts."""
+    mem_path = ROOT / "mem_breakdown.json"
+    kern_path = ROOT / "kernel_breakdown.json"
+    mem = json.loads(mem_path.read_text()) if mem_path.exists() else None
+    kern = json.loads(kern_path.read_text()) if kern_path.exists() else None
+    return mem, kern
+
+
+def _categorize_kernel(name: str) -> str:
+    """Map torch.profiler kernel name to a human-readable category."""
+    if "GemmDefault" in name and "Sm100" in name:
+        return "Wgrad GEMM"
+    if "GemmGated" in name and "ZeroMat" not in name:
+        return "GemmGated (fwd)"
+    if "GemmDGated" in name and "ZeroMat" not in name:
+        return "GemmDGated (bwd)"
+    if "GemmGated" in name and "ZeroMat" in name:
+        return "GemmGated ZeroMat (fwd)"
+    if "GemmDGated" in name and "ZeroMat" in name:
+        return "GemmDGated ZeroMat (bwd)"
+    if "_quantize_and_pack" in name:
+        return "FP8 Blockscaled Quant"
+    if "_quantize_flat_blockscaled" in name:
+        return "FP8 Flat Quant"
+    if "_gather_isa_packed_scales" in name:
+        return "ISA Scale Gather"
+    if "token_gather_sum" in name:
+        return "Token Scatter/Gather"
+    if "elementwise_kernel" in name and "BFloat16" in name:
+        return "SwiGLU / Elementwise"
+    if "nvjet" in name:
+        return "Router NVJet GEMM"
+    if "Memcpy" in name:
+        return "Memcpy D2D"
+    if "softmax" in name:
+        return "Router Softmax"
+    if "_compute_col_partial_sum" in name:
+        return "ColVec Reduce"
+    if "_bitmatrix" in name:
+        return "Routing Bitmatrix"
+    if "index_elementwise" in name:
+        return "Index Gather"
+    if "reduce_kernel" in name:
+        return "Reduction Ops"
+    if "vectorized_elementwise" in name:
+        return "Vectorized Add"
+    if "unrolled_elementwise" in name:
+        return "Elementwise Ops"
+    return "Other"
+
+
+def _aggregate_kernels(kernel_list: list[dict]) -> dict[str, dict]:
+    """Aggregate raw kernel events into categories -> {us, count}."""
+    cats: dict[str, dict] = defaultdict(lambda: {"us": 0.0, "count": 0.0})
+    for k in kernel_list:
+        cat = _categorize_kernel(k["name"])
+        cats[cat]["us"] += k["avg_cuda_us"]
+        cats[cat]["count"] += k["avg_count"]
+    return dict(cats)
+
 
 # ── Ernie shape ───────────────────────────────────────────────────────────
 
@@ -138,63 +207,95 @@ def _pct(base: float, new: float) -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def fig1_executive_summary() -> None:
-    """Three-panel hero figure: speedup, memory, precision."""
+    """Three-panel hero figure: latency (wall+CUDA), memory, precision."""
+    mem_data, kern_data = _load_profiling_data()
+
     fig, axes = plt.subplots(1, 3, figsize=(15.5, 5.5),
                               gridspec_kw={"wspace": 0.42})
-    fig.subplots_adjust(top=0.82, bottom=0.10)
+    fig.subplots_adjust(top=0.80, bottom=0.10)
 
-    # ── (a) Latency / Speedup ────────────────────────────────────────────
+    # ── (a) Latency — stacked wall-clock (fwd + bwd) ─────────────────────
     ax = axes[0]
-    vals = [3840, 3442]
-    colors = [C_BF16, C_FP8]
-    bars = ax.bar(["BF16", "FP8"], vals, width=0.52, color=colors,
-                  edgecolor="white", linewidth=1.2, zorder=3)
-    for b, v in zip(bars, vals):
-        ax.text(b.get_x() + b.get_width() / 2, v + 60,
-                f"{v}", ha="center", va="bottom",
-                fontsize=10, fontweight="bold", color="#1F2937")
-    # speedup bracket — draw to the right of FP8 bar
-    ax.annotate("", xy=(1.15, 3442), xytext=(1.15, 3840),
+    if kern_data:
+        bf_fwd = kern_data["bf16"]["median_fwd_ms"] * 1000   # µs
+        bf_bwd = kern_data["bf16"]["median_bwd_ms"] * 1000
+        fp_fwd = kern_data["fp8"]["median_fwd_ms"] * 1000
+        fp_bwd = kern_data["fp8"]["median_bwd_ms"] * 1000
+    else:
+        bf_fwd, bf_bwd = 1363, 8233
+        fp_fwd, fp_bwd = 1192, 5284
+
+    x_pos = np.arange(2)
+    fwd_vals = [bf_fwd, fp_fwd]
+    bwd_vals = [bf_bwd, fp_bwd]
+    b1 = ax.bar(x_pos, fwd_vals, 0.52, label="Forward", color=[C_BF16, C_FP8],
+                edgecolor="white", linewidth=1.2, zorder=3, alpha=0.70)
+    b2 = ax.bar(x_pos, bwd_vals, 0.52, bottom=fwd_vals,
+                label="Backward", color=[C_BF16, C_FP8],
+                edgecolor="white", linewidth=1.2, zorder=3, alpha=1.0)
+    bf_total = bf_fwd + bf_bwd
+    fp_total = fp_fwd + fp_bwd
+    for i, (fwd, bwd, total) in enumerate(
+            [(bf_fwd, bf_bwd, bf_total), (fp_fwd, fp_bwd, fp_total)]):
+        ax.text(i, total + 150, f"{total:.0f} µs",
+                ha="center", va="bottom", fontsize=9.5, fontweight="bold")
+        ax.text(i, fwd / 2, f"fwd {fwd:.0f}", ha="center", va="center",
+                fontsize=7.5, color="white", fontweight="bold")
+        ax.text(i, fwd + bwd / 2, f"bwd {bwd:.0f}", ha="center", va="center",
+                fontsize=7.5, color="white", fontweight="bold")
+
+    speedup = bf_total / fp_total
+    ax.annotate("", xy=(1.18, fp_total), xytext=(1.18, bf_total),
                 arrowprops=dict(arrowstyle="<->", color=C_SAVE, lw=2),
                 annotation_clip=False)
-    ax.text(1.32, (3840 + 3442) / 2, "$\\mathbf{1.12\\times}$",
-            fontsize=13, color=C_SAVE, va="center", ha="left",
-            clip_on=False)
-    ax.set_ylabel("GPU Kernel Time ($\\mu$s / iter)")
-    ax.set_title("(a) Latency", fontweight="bold", pad=8)
-    ax.set_ylim(0, 4700)
-    ax.set_xlim(-0.5, 1.8)
-    ax.yaxis.set_major_locator(mticker.MultipleLocator(1000))
+    ax.text(1.35, (bf_total + fp_total) / 2,
+            f"$\\mathbf{{{speedup:.2f}\\times}}$",
+            fontsize=12, color=C_SAVE, va="center", ha="left", clip_on=False)
+    ax.set_xticks(x_pos)
+    ax.set_xticklabels(["BF16", "FP8"])
+    ax.set_ylabel("Wall-Clock Latency ($\\mu$s / iter)")
+    ax.set_title("(a) Latency (CUDA Events)", fontweight="bold", pad=8)
+    ax.set_ylim(0, bf_total * 1.25)
+    ax.set_xlim(-0.5, 1.85)
 
-    # ── (b) Peak Memory ──────────────────────────────────────────────────
+    # ── (b) Peak Memory (deltas above pre-fwd base) ──────────────────────
     ax = axes[1]
+    if mem_data:
+        bf_c = mem_data["bf16"]["checkpoints"]
+        fp_c = mem_data["fp8"]["checkpoints"]
+        bf16_mem = [bf_c["peak_fwd"] - bf_c["pre_fwd"],
+                    bf_c["peak_bwd"] - bf_c["pre_bwd"]]
+        fp8_mem = [fp_c["peak_fwd"] - fp_c["pre_fwd"],
+                   fp_c["peak_bwd"] - fp_c["pre_bwd"]]
+    else:
+        bf16_mem = [1009, 770]
+        fp8_mem = [850, 765]
+
     x = np.arange(2)
     w = 0.28
-    bf16_mem = [1386, 1412]
-    fp8_mem  = [1263, 1367]
     b1 = ax.bar(x - w / 2, bf16_mem, w, label="BF16", color=C_BF16,
                 edgecolor="white", linewidth=1.2, zorder=3)
-    b2 = ax.bar(x + w / 2, fp8_mem,  w, label="FP8",  color=C_FP8,
+    b2 = ax.bar(x + w / 2, fp8_mem, w, label="FP8", color=C_FP8,
                 edgecolor="white", linewidth=1.2, zorder=3)
-    # bar-top values — stagger vertically so they don't collide
+    ymax_mem = max(max(bf16_mem), max(fp8_mem))
     for b in b1:
-        ax.text(b.get_x() + b.get_width() / 2, b.get_height() + 18,
+        ax.text(b.get_x() + b.get_width() / 2, b.get_height() + ymax_mem * 0.015,
                 f"{b.get_height():.0f}", ha="center", va="bottom",
                 fontsize=8.5, fontweight="bold", color=C_BF16)
     for b in b2:
-        ax.text(b.get_x() + b.get_width() / 2, b.get_height() + 18,
+        ax.text(b.get_x() + b.get_width() / 2, b.get_height() + ymax_mem * 0.015,
                 f"{b.get_height():.0f}", ha="center", va="bottom",
                 fontsize=8.5, fontweight="bold", color=C_FP8)
-    # delta annotations — placed well above bars
     for i, (bf, fp) in enumerate(zip(bf16_mem, fp8_mem)):
-        ax.text(i, 1560, f"{fp - bf:+.0f} MiB ({_pct(bf, fp)})",
-                ha="center", fontsize=8.5, fontweight="bold", color=C_SAVE)
+        color = C_SAVE if fp < bf else C_COST
+        ax.text(i, ymax_mem * 1.18, f"{fp - bf:+.0f} MiB ({_pct(bf, fp)})",
+                ha="center", fontsize=8.5, fontweight="bold", color=color)
     ax.set_xticks(x)
-    ax.set_xticklabels(["Forward Peak", "Backward Peak"])
-    ax.set_ylabel("Peak Memory (MiB)")
+    ax.set_xticklabels(["Forward\n$\\Delta$Peak", "Backward\n$\\Delta$Peak"])
+    ax.set_ylabel("Peak $\\Delta$ Memory (MiB above pre-fwd)")
     ax.set_title("(b) Memory", fontweight="bold", pad=8)
-    ax.set_ylim(0, 1700)
-    ax.legend(loc="upper left", framealpha=0.9)
+    ax.set_ylim(0, ymax_mem * 1.35)
+    ax.legend(loc="upper right", framealpha=0.9)
 
     # ── (c) Precision ────────────────────────────────────────────────────
     ax = axes[2]
@@ -216,14 +317,13 @@ def fig1_executive_summary() -> None:
     ax.set_ylabel("Relative Error (%)")
     ax.set_title("(c) Precision", fontweight="bold", pad=8)
     ax.set_ylim(0, 14)
-    # place legend and badge so they don't overlap
     ax.legend(loc="upper left", framealpha=0.9, fontsize=8)
-    ax.text(3, 12.5, "31/31 PASS", fontsize=10, fontweight="bold",
+    ax.text(3, 12.5, "15/15 PASS", fontsize=10, fontweight="bold",
             color=C_SAVE, ha="center",
             bbox=dict(boxstyle="round,pad=0.3", fc="#ECFDF5", ec=C_SAVE,
                       lw=1.2, alpha=0.95))
 
-    fig.suptitle(f"SonicMoE FP8 Blockscaled  --  Executive Summary\n"
+    fig.suptitle(f"SonicMoE FP8 Blockscaled  —  Executive Summary\n"
                  f"{_SUB}  |  {_HW}",
                  fontsize=12.5, fontweight="bold", y=0.97)
     _save(fig, "fig1_executive_summary.png")
@@ -234,13 +334,49 @@ def fig1_executive_summary() -> None:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def fig2_performance_waterfall() -> None:
-    """Waterfall: BF16 total -> GEMM savings -> quant overhead -> FP8 total."""
+    """Waterfall: BF16 CUDA total → GEMM savings → quant overhead → FP8 total.
+    Loads real per-kernel profiling from kernel_breakdown.json."""
+    _, kern_data = _load_profiling_data()
+
+    if kern_data:
+        bf_cats = _aggregate_kernels(kern_data["bf16"]["kernels"])
+        fp_cats = _aggregate_kernels(kern_data["fp8"]["kernels"])
+        bf_total_us = sum(v["us"] for v in bf_cats.values())
+        fp_total_us = sum(v["us"] for v in fp_cats.values())
+
+        # GEMM categories
+        gemm_cats = {"Wgrad GEMM", "GemmGated (fwd)", "GemmDGated (bwd)",
+                     "GemmGated ZeroMat (fwd)", "GemmDGated ZeroMat (bwd)"}
+        bf_gemm = sum(v["us"] for c, v in bf_cats.items() if c in gemm_cats)
+        fp_gemm = sum(v["us"] for c, v in fp_cats.items() if c in gemm_cats)
+        gemm_savings = fp_gemm - bf_gemm  # negative = savings
+
+        # FP8 overhead categories
+        overhead_cats = {"FP8 Blockscaled Quant", "FP8 Flat Quant",
+                         "ISA Scale Gather"}
+        fp_overhead = sum(v["us"] for c, v in fp_cats.items()
+                          if c in overhead_cats)
+        bf_overhead = sum(v["us"] for c, v in bf_cats.items()
+                          if c in overhead_cats)
+        quant_delta = fp_overhead - bf_overhead
+
+        other_delta = fp_total_us - bf_total_us - gemm_savings - quant_delta
+    else:
+        bf_total_us, fp_total_us = 6471, 6124
+        gemm_savings, quant_delta, other_delta = -803, 458, -2
+
+    bf_total_r = round(bf_total_us)
+    fp_total_r = round(fp_total_us)
+    gemm_r = round(gemm_savings)
+    quant_r = round(quant_delta)
+    other_r = fp_total_r - bf_total_r - gemm_r - quant_r
+
     steps = [
-        ("BF16\nBaseline",      3840,  C_NEUTRAL, True),
-        ("GEMM\nSavings",       -921,  C_SAVE,    False),
-        ("FP8 Quant\nOverhead", +559,  C_COST,    False),
-        ("Other\n$\\Delta$",    -36,   C_NEUTRAL, False),
-        ("FP8\nFrontier",       3442,  C_FP8,     True),
+        ("BF16\nBaseline",      bf_total_r,  C_NEUTRAL, True),
+        ("GEMM\nSavings",       gemm_r,      C_SAVE,    False),
+        ("FP8 Quant\nOverhead", quant_r,     C_COST,    False),
+        ("Other\n$\\Delta$",    other_r,     C_NEUTRAL, False),
+        ("FP8\nFrontier",       fp_total_r,  C_FP8,     True),
     ]
 
     fig, ax = plt.subplots(figsize=(13, 5.8))
@@ -248,7 +384,6 @@ def fig2_performance_waterfall() -> None:
 
     running = 0
     bar_w = 0.55
-    tops = []  # track bar top for connectors
 
     for i, (_, val, color, is_abs) in enumerate(steps):
         if is_abs:
@@ -266,25 +401,31 @@ def fig2_performance_waterfall() -> None:
 
         ax.bar(i, height, bar_w, bottom=bottom, color=color,
                edgecolor="white", linewidth=1.5, zorder=3, alpha=0.9)
-        tops.append(bottom + height)
 
-        # value label — above for positive, below for negative deltas
         val_str = f"{val:+d}" if not is_abs else str(val)
-        ax.text(i, bottom + height + 50, f"{val_str} $\\mu$s",
+        ax.text(i, bottom + height + bf_total_r * 0.015,
+                f"{val_str} $\\mu$s",
                 ha="center", va="bottom", fontsize=10, fontweight="bold",
                 color=color if not is_abs else "#1F2937")
 
     # connector lines
-    levels = [3840, 3840, 2919, 3478, 3442]  # running after each step
-    for i in range(3):
+    levels = [bf_total_r]
+    r = bf_total_r
+    for _, val, _, is_abs in steps[1:-1]:
+        r += val
+        levels.append(r)
+    levels.append(fp_total_r)
+    for i in range(len(steps) - 2):
         y = levels[i + 1]
         ax.plot([i + bar_w / 2 + 0.04, i + 1 - bar_w / 2 - 0.04],
                 [y, y], color="#9CA3AF", lw=1.0, ls=":", zorder=2)
 
-    # speedup callout — positioned in the empty space below, left of FP8 bar
+    net_us = fp_total_r - bf_total_r
+    speedup = bf_total_r / fp_total_r
     ax.annotate(
-        "$\\mathbf{1.12\\times}$ speedup\n$-398\\;\\mu$s ($-10.4\\%$)",
-        xy=(4, 3442), xytext=(3.0, 1200),
+        f"$\\mathbf{{{speedup:.2f}\\times}}$ CUDA\n"
+        f"${net_us:+d}\\;\\mu$s ({net_us/bf_total_r*100:+.1f}%)",
+        xy=(4, fp_total_r), xytext=(3.0, bf_total_r * 0.25),
         fontsize=11, color=C_SAVE, fontweight="bold", ha="center",
         arrowprops=dict(arrowstyle="-|>", color=C_SAVE, lw=1.5),
         bbox=dict(boxstyle="round,pad=0.4", fc="#ECFDF5", ec=C_SAVE,
@@ -292,10 +433,10 @@ def fig2_performance_waterfall() -> None:
 
     ax.set_xticks(range(len(steps)))
     ax.set_xticklabels([s[0] for s in steps], fontsize=10)
-    ax.set_ylabel("GPU Kernel Time ($\\mu$s / iter)")
-    ax.set_ylim(0, 4600)
+    ax.set_ylabel("CUDA Kernel Time ($\\mu$s / iter)")
+    ax.set_ylim(0, bf_total_r * 1.15)
     ax.set_xlim(-0.5, 4.8)
-    ax.set_title(f"Performance Waterfall  --  nsys GPU Projection\n{_SUB}",
+    ax.set_title(f"Performance Waterfall  —  torch.profiler CUDA Kernels\n{_SUB}",
                  fontsize=12.5, fontweight="bold", pad=10)
     _save(fig, "fig2_performance_waterfall.png")
 
@@ -305,15 +446,29 @@ def fig2_performance_waterfall() -> None:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def fig3_memory_lifecycle() -> None:
-    """Memory trajectory across 4 checkpoints: BF16 vs FP8."""
-    ckpts = ["Post-Warmup\nBase", "Forward\nPeak",
-             "Backward\nPeak", "Post-Cleanup"]
-    bf16 = np.array([376, 1386, 1412, 328])
-    fp8  = np.array([488, 1263, 1367, 440])
+    """Memory trajectory across 6 checkpoints: BF16 vs FP8 (from JSON)."""
+    mem_data, _ = _load_profiling_data()
+
+    ckpts = ["Base", "Model\nLoaded", "Input\nAlloc",
+             "Pre-Fwd\n(warmup)", "Fwd\nPeak", "Bwd\nPeak", "Cleanup"]
+
+    if mem_data:
+        bf_c = mem_data["bf16"]["checkpoints"]
+        fp_c = mem_data["fp8"]["checkpoints"]
+        bf16 = np.array([bf_c["base"], bf_c["after_model"], bf_c["after_input"],
+                         bf_c["pre_fwd"], bf_c["peak_fwd"],
+                         bf_c["peak_bwd"], bf_c["post_cleanup"]])
+        fp8 = np.array([fp_c["base"], fp_c["after_model"], fp_c["after_input"],
+                        fp_c["pre_fwd"], fp_c["peak_fwd"],
+                        fp_c["peak_bwd"], fp_c["post_cleanup"]])
+    else:
+        bf16 = np.array([0, 216, 360, 1816, 2826, 3212, 2488])
+        fp8 = np.array([0, 216, 360, 776, 1626, 1751, 872])
+
     x = np.arange(len(ckpts))
 
-    fig, ax = plt.subplots(figsize=(12, 6))
-    fig.subplots_adjust(top=0.83, bottom=0.12)
+    fig, ax = plt.subplots(figsize=(14, 6.5))
+    fig.subplots_adjust(top=0.83, bottom=0.14)
 
     # filled area between curves
     ax.fill_between(x, fp8, bf16, where=(bf16 > fp8),
@@ -321,48 +476,58 @@ def fig3_memory_lifecycle() -> None:
     ax.fill_between(x, fp8, bf16, where=(fp8 > bf16),
                     alpha=0.12, color=C_COST, interpolate=True, zorder=1)
 
-    ax.plot(x, bf16, "o-", color=C_BF16, lw=2.5, ms=9, zorder=4,
+    ax.plot(x, bf16, "o-", color=C_BF16, lw=2.5, ms=8, zorder=4,
             label="BF16 Baseline", markeredgecolor="white", markeredgewidth=1.5)
-    ax.plot(x, fp8, "s-", color=C_FP8, lw=2.5, ms=9, zorder=4,
+    ax.plot(x, fp8, "s-", color=C_FP8, lw=2.5, ms=8, zorder=4,
             label="FP8 Frontier", markeredgecolor="white", markeredgewidth=1.5)
 
-    # point labels — BF16 always above its point, FP8 always below
+    # point labels — smarter placement
     for i in range(len(ckpts)):
         b, f = bf16[i], fp8[i]
-        # Decide which is on top at this checkpoint
+        gap = abs(b - f)
+        offset = max(gap * 0.12, 50) if gap > 0 else 50
         if b >= f:
-            # BF16 above, FP8 below
-            ax.text(i, b + 40, str(b), ha="center", va="bottom", fontsize=8.5,
-                    color=C_BF16, fontweight="bold")
-            ax.text(i, f - 40, str(f), ha="center", va="top", fontsize=8.5,
-                    color=C_FP8, fontweight="bold")
+            ax.text(i, b + offset, f"{b:.0f}", ha="center", va="bottom",
+                    fontsize=7.5, color=C_BF16, fontweight="bold")
+            ax.text(i, f - offset, f"{f:.0f}", ha="center", va="top",
+                    fontsize=7.5, color=C_FP8, fontweight="bold")
         else:
-            # FP8 above, BF16 below
-            ax.text(i, f + 40, str(f), ha="center", va="bottom", fontsize=8.5,
-                    color=C_FP8, fontweight="bold")
-            ax.text(i, b - 40, str(b), ha="center", va="top", fontsize=8.5,
-                    color=C_BF16, fontweight="bold")
+            ax.text(i, f + offset, f"{f:.0f}", ha="center", va="bottom",
+                    fontsize=7.5, color=C_FP8, fontweight="bold")
+            ax.text(i, b - offset, f"{b:.0f}", ha="center", va="top",
+                    fontsize=7.5, color=C_BF16, fontweight="bold")
 
-    # delta annotations — placed offset to the right, clear of point labels
-    deltas = fp8 - bf16
-    for i in range(len(ckpts)):
-        d = deltas[i]
+    # delta annotations at key divergence points
+    for i in [3, 4, 5, 6]:  # pre-fwd, fwd-peak, bwd-peak, cleanup
+        d = fp8[i] - bf16[i]
+        if abs(d) < 5:
+            continue
         color = C_SAVE if d < 0 else C_COST
         mid_y = (bf16[i] + fp8[i]) / 2
         ax.text(i + 0.28, mid_y, f"{d:+.0f}\nMiB",
-                fontsize=8, fontweight="bold", color=color,
+                fontsize=7.5, fontweight="bold", color=color,
                 ha="left", va="center",
-                bbox=dict(boxstyle="round,pad=0.15", fc="white", ec=color,
+                bbox=dict(boxstyle="round,pad=0.12", fc="white", ec=color,
                           lw=0.6, alpha=0.9))
 
+    # phase shading
+    ax.axvspan(2.5, 4.5, alpha=0.04, color=C_BF16, zorder=0)
+    ax.axvspan(4.5, 5.5, alpha=0.04, color=C_COST, zorder=0)
+    ax.text(3.5, ax.get_ylim()[1] * 0.97, "FORWARD", fontsize=8, ha="center",
+            color=C_BF16, fontweight="bold", alpha=0.6)
+    ax.text(5.0, ax.get_ylim()[1] * 0.97, "BACKWARD", fontsize=8, ha="center",
+            color=C_COST, fontweight="bold", alpha=0.6)
+
     ax.set_xticks(x)
-    ax.set_xticklabels(ckpts, fontsize=10)
-    ax.set_ylabel("GPU Memory (MiB)")
-    ax.set_ylim(100, 1700)
-    ax.set_xlim(-0.4, 3.7)
+    ax.set_xticklabels(ckpts, fontsize=9)
+    ax.set_ylabel("GPU Memory Allocated (MiB)")
+    ymax = max(bf16.max(), fp8.max())
+    ax.set_ylim(-50, ymax * 1.15)
+    ax.set_xlim(-0.4, len(ckpts) - 0.4)
     ax.legend(loc="upper left", framealpha=0.95, fontsize=10)
-    ax.set_title(f"Memory Lifecycle  --  BF16 vs FP8 Training Iteration\n{_SUB}",
-                 fontsize=12.5, fontweight="bold", pad=10)
+    ax.set_title(
+        f"Memory Lifecycle  —  7-Checkpoint BF16 vs FP8\n{_SUB}",
+        fontsize=12.5, fontweight="bold", pad=10)
     _save(fig, "fig3_memory_lifecycle.png")
 
 
@@ -371,26 +536,55 @@ def fig3_memory_lifecycle() -> None:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def fig4_backward_breakdown() -> None:
-    """Horizontal bar: 100% backward peak tensor audit (1367 MiB)."""
+    """Horizontal bar: 100% backward peak tensor audit from mem_breakdown.json."""
+    mem_data, _ = _load_profiling_data()
+
+    if mem_data:
+        th = mem_data["fp8"]["theoretical_sizes_mib"]
+        caches = mem_data["fp8"].get("fp8_caches_after_bwd", {})
+        cache_total = sum(caches.values()) if caches else 111.375
+        measured_delta = mem_data["fp8"]["deltas"]["bwd_peak_above_pre"]
+    else:
+        th = {}
+        cache_total = 111.375
+        measured_delta = 765
+
     categories = [
-        # (short_label, mib, pct, kind, note)
-        ("dz (TK,2I) bf16",             384, 28, "fixed",   "CUTLASS d_dtype=32"),
-        ("y1s (TK,I) bf16",             192, 14, "fixed",   "CUTLASS constraint"),
-        ("z_fp8 (TK,2I) ctx",           192, 14, "shipped", "Already FP8 (was 384)"),
-        ("w1 bf16 params",              144, 11, "limited", "4-layout ceiling"),
-        ("w1T+w2 fp8 caches",           111,  8, "limited", "Can defer w1T"),
-        ("dw2 bf16 pre-alloc",           72,  5, "limited", "Can defer"),
-        ("w2 bf16 params",               72,  5, "limited", "4-layout ceiling"),
-        ("dout_fp8+w2_fp8 input",        66,  5, "fixed",   "Needed by GEMM"),
-        ("x+dout+meta",                  49,  4, "fixed",   "Interface contract"),
-        ("scales+colvec+autograd",        37,  3, "fixed",   "Overhead"),
+        ("dz (TK,2I) bf16",        th.get("dz_bf16_TK_2I", 384),  "fixed",
+         "CUTLASS d_dtype=bf16"),
+        ("y1s (TK,I) bf16",        th.get("y1_bf16_TK_I", 192),   "fixed",
+         "CUTLASS constraint"),
+        ("z_fp8 (TK,2I) ctx",      th.get("z_fp8_TK_2I", 192),    "shipped",
+         "Already FP8 (was 384)"),
+        ("w1 bf16 params",         th.get("dw1_E_2I_H", 144),      "limited",
+         "4-layout ceiling"),
+        ("w1T+w2 fp8 caches",      round(cache_total, 1),          "limited",
+         "Can defer w1T"),
+        ("dw2 bf16 pre-alloc",     th.get("dw2_E_I_H", 72),       "limited",
+         "Can defer"),
+        ("w2 bf16 params",         th.get("w2_fp8_E_I_H", 36) * 2, "limited",
+         "4-layout ceiling"),
+        ("dout_fp8+w2_fp8 input",  round(th.get("dout_fp8_T_H", 24)
+                                         + th.get("w2_fp8_E_I_H", 36)
+                                         + th.get("dout_scales_TK", 6), 1),
+         "fixed", "Needed by GEMM"),
+        ("x+dout+meta",            round(th.get("x_input_bf16", 48)
+                                         + th.get("routing_metadata_total", 1.75), 1),
+         "fixed", "Interface contract"),
+        ("scales+colvec+autograd",  round(th.get("z_scales", 6)
+                                          + th.get("y1_scales", 3)
+                                          + th.get("colvec_reduce_partial_fp32", 12)
+                                          + th.get("x_scales_TK", 6)
+                                          + th.get("dz_scales", 6), 1),
+         "fixed", "Overhead"),
     ]
 
     labels = [c[0] for c in categories]
     sizes  = [c[1] for c in categories]
-    pcts   = [c[2] for c in categories]
-    kinds  = [c[3] for c in categories]
-    notes  = [c[4] for c in categories]
+    kinds  = [c[2] for c in categories]
+    notes  = [c[3] for c in categories]
+    total_theory = sum(sizes)
+    pcts = [s / total_theory * 100 for s in sizes]
 
     kind_color = {"fixed": C_NEUTRAL, "shipped": C_SAVE, "limited": C_AMBER}
     kind_label = {
@@ -407,42 +601,41 @@ def fig4_backward_breakdown() -> None:
     ax.barh(y_pos, sizes, height=0.65, color=colors,
             edgecolor="white", linewidth=1.2, zorder=3, alpha=0.88)
 
-    # annotations — all right-aligned to consistent x to avoid overlap
-    ann_x = 410
+    # annotations
+    ann_x = max(sizes) * 1.08
     for i, (sz, pct, note) in enumerate(zip(sizes, pcts, notes)):
         y = y_pos[i]
-        # inline label at end of bar
         if sz >= 60:
-            ax.text(sz - 4, y, f"{sz}", ha="right", va="center",
+            ax.text(sz - 4, y, f"{sz:.0f}", ha="right", va="center",
                     fontsize=8.5, fontweight="bold", color="white")
         else:
-            ax.text(sz + 4, y, f"{sz}", ha="left", va="center",
+            ax.text(sz + 4, y, f"{sz:.0f}", ha="left", va="center",
                     fontsize=8.5, fontweight="bold", color="#1F2937")
-        # percentage + note at fixed right column
-        ax.text(ann_x, y, f"{pct}%  {note}", va="center", ha="left",
+        ax.text(ann_x, y, f"{pct:.0f}%  {note}", va="center", ha="left",
                 fontsize=8, color="#4B5563", style="italic")
 
     ax.set_yticks(y_pos)
     ax.set_yticklabels(labels, fontsize=9)
     ax.set_xlabel("Memory (MiB)")
-    ax.set_xlim(0, 580)
+    ax.set_xlim(0, max(sizes) * 1.55)
 
-    # legend — bottom left, away from bars
     handles = [Patch(facecolor=kind_color[k], edgecolor="white", label=kind_label[k])
                for k in ("shipped", "limited", "fixed")]
     ax.legend(handles=handles, loc="lower right", fontsize=8.5, framealpha=0.95)
 
-    # total box — top right, clear of top bar
+    gap_pct = abs(total_theory - measured_delta) / measured_delta * 100
     ax.text(0.97, 0.97,
-            "Total: 1368 MiB (theoretical)\n"
-            "Measured: 1367 MiB  |  Gap: 0.1%",
+            f"Theoretical: {total_theory:.0f} MiB\n"
+            f"Measured $\\Delta$peak: {measured_delta:.0f} MiB  |  "
+            f"Gap: {gap_pct:.1f}%",
             transform=ax.transAxes, fontsize=8.5, va="top", ha="right",
             fontweight="bold", color=C_ACCENT,
             bbox=dict(boxstyle="round,pad=0.35", fc="#F5F3FF", ec=C_ACCENT,
                       lw=1.0, alpha=0.95))
 
-    ax.set_title(f"Backward Peak Breakdown  --  100% Tensor-Level Audit\n{_SUB}",
-                 fontsize=12.5, fontweight="bold", pad=10)
+    ax.set_title(
+        f"Backward Peak Breakdown  —  Tensor-Level Audit\n{_SUB}",
+        fontsize=12.5, fontweight="bold", pad=10)
     _save(fig, "fig4_backward_breakdown.png")
 
 
@@ -451,66 +644,149 @@ def fig4_backward_breakdown() -> None:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def fig5_kernel_comparison() -> None:
-    """Grouped bar: per-kernel BF16 vs FP8 timing (forward + backward)."""
-    kernels = [
-        ("GemmGated (up)",       779,  461, "fwd"),
-        ("GemmDefault (down)",   387,  235, "fwd"),
-        ("FP8 Quant (fwd)",       0,  265, "fwd"),
-        ("Other (fwd)",          222,  217, "fwd"),
-        ("Wgrad GEMMs x3",     1978, 1578, "bwd"),
-        ("DGated (bwd)",         508,  410, "bwd"),
-        ("FP8 Quant (bwd)",       0,  328, "bwd"),
-        ("SwiGLU bwd",            0,  157, "bwd"),
-        ("Other (bwd)",          163,  161, "bwd"),
-    ]
+    """Grouped bar: per-kernel BF16 vs FP8 timing from torch.profiler."""
+    _, kern_data = _load_profiling_data()
 
-    names = [k[0] for k in kernels]
-    bf16  = np.array([k[1] for k in kernels], dtype=float)
-    fp8   = np.array([k[2] for k in kernels], dtype=float)
+    if kern_data:
+        bf_cats = _aggregate_kernels(kern_data["bf16"]["kernels"])
+        fp_cats = _aggregate_kernels(kern_data["fp8"]["kernels"])
 
-    fig, ax = plt.subplots(figsize=(13, 7.5))
-    fig.subplots_adjust(left=0.20, right=0.88, top=0.85, bottom=0.08)
+        # Collect named categories, fwd group first then bwd
+        _excl_bf = {"Wgrad GEMM", "GemmGated (fwd)", "GemmDGated (bwd)",
+                    "SwiGLU / Elementwise", "Token Scatter/Gather",
+                    "FP8 Blockscaled Quant", "FP8 Flat Quant",
+                    "ISA Scale Gather", "Router NVJet GEMM",
+                    "Router Softmax", "Routing Bitmatrix"}
+        _excl_fp = {"Wgrad GEMM", "GemmGated ZeroMat (fwd)",
+                    "GemmDGated ZeroMat (bwd)", "SwiGLU / Elementwise",
+                    "Token Scatter/Gather", "FP8 Blockscaled Quant",
+                    "FP8 Flat Quant", "ISA Scale Gather",
+                    "Router NVJet GEMM", "Router Softmax",
+                    "Routing Bitmatrix"}
+        display_rows = [
+            # ── Forward ──
+            ("GemmGated (up-proj)",
+             bf_cats.get("GemmGated (fwd)", {}).get("us", 0),
+             fp_cats.get("GemmGated ZeroMat (fwd)", {}).get("us", 0), "fwd"),
+            ("Routing (NVJet+softmax)",
+             (bf_cats.get("Router NVJet GEMM", {}).get("us", 0)
+              + bf_cats.get("Router Softmax", {}).get("us", 0)
+              + bf_cats.get("Routing Bitmatrix", {}).get("us", 0)),
+             (fp_cats.get("Router NVJet GEMM", {}).get("us", 0)
+              + fp_cats.get("Router Softmax", {}).get("us", 0)
+              + fp_cats.get("Routing Bitmatrix", {}).get("us", 0)), "fwd"),
+            ("Token Scatter/Gather",
+             bf_cats.get("Token Scatter/Gather", {}).get("us", 0),
+             fp_cats.get("Token Scatter/Gather", {}).get("us", 0), "fwd"),
+            ("SwiGLU / Elementwise",
+             bf_cats.get("SwiGLU / Elementwise", {}).get("us", 0),
+             fp_cats.get("SwiGLU / Elementwise", {}).get("us", 0), "fwd"),
+            ("FP8 Blockscaled Quant",
+             bf_cats.get("FP8 Blockscaled Quant", {}).get("us", 0),
+             fp_cats.get("FP8 Blockscaled Quant", {}).get("us", 0), "fwd"),
+            ("FP8 Flat Quant",
+             bf_cats.get("FP8 Flat Quant", {}).get("us", 0),
+             fp_cats.get("FP8 Flat Quant", {}).get("us", 0), "fwd"),
+            ("ISA Scale Gather",
+             bf_cats.get("ISA Scale Gather", {}).get("us", 0),
+             fp_cats.get("ISA Scale Gather", {}).get("us", 0), "fwd"),
+            # ── Backward ──
+            ("GemmDGated (bwd)",
+             bf_cats.get("GemmDGated (bwd)", {}).get("us", 0),
+             fp_cats.get("GemmDGated ZeroMat (bwd)", {}).get("us", 0), "bwd"),
+            ("Wgrad GEMM (×4)",
+             bf_cats.get("Wgrad GEMM", {}).get("us", 0),
+             fp_cats.get("Wgrad GEMM", {}).get("us", 0), "bwd"),
+            ("Other (reduce, copy, …)",
+             sum(v["us"] for c, v in bf_cats.items() if c not in _excl_bf),
+             sum(v["us"] for c, v in fp_cats.items() if c not in _excl_fp),
+             "bwd"),
+        ]
+    else:
+        display_rows = [
+            ("GemmGated (up-proj)",  754, 465, "fwd"),
+            ("Routing",              59,   59, "fwd"),
+            ("Token Scatter/Gather", 140, 145, "fwd"),
+            ("SwiGLU / Elementwise", 210, 209, "fwd"),
+            ("FP8 Blockscaled Quant", 0, 280, "fwd"),
+            ("FP8 Flat Quant",        0, 124, "fwd"),
+            ("ISA Scale Gather",      0,  55, "fwd"),
+            ("GemmDGated (bwd)",    474,  410, "bwd"),
+            ("Wgrad GEMM (×4)",    4674, 4223, "bwd"),
+            ("Other",               160,  155, "bwd"),
+        ]
+
+    names = [r[0] for r in display_rows]
+    bf16 = np.array([r[1] for r in display_rows], dtype=float)
+    fp8 = np.array([r[2] for r in display_rows], dtype=float)
+    phases = [r[3] for r in display_rows]
+
+    # Find fwd/bwd boundary
+    fwd_idx = [i for i, p in enumerate(phases) if p == "fwd"]
+    bwd_idx = [i for i, p in enumerate(phases) if p == "bwd"]
+
+    fig, ax = plt.subplots(figsize=(14, 8))
+    fig.subplots_adjust(left=0.22, right=0.85, top=0.85, bottom=0.10)
 
     y_pos = np.arange(len(names))[::-1]
     h = 0.34
 
     ax.barh(y_pos + h / 2, bf16, h, label="BF16", color=C_BF16,
             edgecolor="white", linewidth=1.0, zorder=3, alpha=0.88)
-    ax.barh(y_pos - h / 2, fp8,  h, label="FP8",  color=C_FP8,
+    ax.barh(y_pos - h / 2, fp8, h, label="FP8", color=C_FP8,
             edgecolor="white", linewidth=1.0, zorder=3, alpha=0.88)
 
-    # speedup / status labels — fixed right column
+    # speedup labels
     ann_x = max(bf16.max(), fp8.max()) * 1.04
     for i, (b16, f8) in enumerate(zip(bf16, fp8)):
         y = y_pos[i]
-        if b16 > 0 and f8 > 0:
+        if b16 > 10 and f8 > 10:
             ratio = b16 / f8
-            color = C_SAVE if ratio >= 1.05 else (C_COST if ratio < 0.95 else C_NEUTRAL)
-            ax.text(ann_x, y, f"{ratio:.2f}x",
+            color = C_SAVE if ratio >= 1.05 else (
+                C_COST if ratio < 0.95 else C_NEUTRAL)
+            ax.text(ann_x, y, f"{ratio:.2f}×",
                     va="center", fontsize=9, fontweight="bold", color=color)
-        elif b16 == 0:
+        elif b16 < 1 and f8 > 0:
             ax.text(ann_x, y, "FP8 only", va="center", fontsize=8,
                     color=C_COST, style="italic")
 
-    # phase separator line
-    sep_y = (y_pos[3] + y_pos[4]) / 2
-    ax.axhline(sep_y, color="#D1D5DB", lw=1.2, ls="-", zorder=1)
-    # phase labels — placed at left margin using axes transform
-    ax.text(0.01, 0.72, "FORWARD", fontsize=8.5, fontweight="bold",
-            color=C_BF16, va="center", transform=ax.transAxes)
-    ax.text(0.01, 0.28, "BACKWARD", fontsize=8.5, fontweight="bold",
-            color=C_COST, va="center", transform=ax.transAxes)
+    # phase separator with shading
+    if bwd_idx and fwd_idx:
+        sep_y = (y_pos[fwd_idx[-1]] + y_pos[bwd_idx[0]]) / 2
+        ax.axhline(sep_y, color="#9CA3AF", lw=0.8, ls="--", zorder=1)
+        # Light background shading for fwd/bwd regions
+        ax.axhspan(sep_y, y_pos[0] + 0.8, alpha=0.04, color=C_BF16, zorder=0)
+        ax.axhspan(y_pos[-1] - 0.8, sep_y, alpha=0.04, color=C_COST, zorder=0)
+        # Inline labels on the separator line
+        from matplotlib.transforms import blended_transform_factory
+        trans = blended_transform_factory(ax.transAxes, ax.transData)
+        ax.text(0.50, sep_y, "  FORWARD          BACKWARD  ",
+                fontsize=7, color="#9CA3AF", fontweight="bold",
+                ha="center", va="center", transform=trans,
+                bbox=dict(boxstyle="round,pad=0.2", fc="white",
+                          ec="#D1D5DB", lw=0.6, alpha=0.95))
 
     ax.set_yticks(y_pos)
     ax.set_yticklabels(names, fontsize=9)
-    ax.set_xlabel("Kernel Time ($\\mu$s)")
-    ax.set_xlim(0, max(bf16.max(), fp8.max()) * 1.18)
+    ax.set_xlabel("CUDA Kernel Time ($\\mu$s)")
+    ax.set_xlim(0, max(bf16.max(), fp8.max()) * 1.20)
     ax.legend(loc="lower right", fontsize=10, framealpha=0.95)
-    ax.xaxis.set_major_locator(mticker.MultipleLocator(500))
 
-    ax.set_title(f"Kernel-Level Performance  --  BF16 vs FP8\n"
-                 f"{_SUB}  |  nsys GPU Projection",
-                 fontsize=12.5, fontweight="bold", pad=10)
+    # Total summary box
+    bf_total = bf16.sum()
+    fp_total = fp8.sum()
+    ax.text(0.98, 0.06,
+            f"BF16: {bf_total:.0f} µs | FP8: {fp_total:.0f} µs | "
+            f"CUDA {bf_total/fp_total:.2f}×",
+            transform=ax.transAxes, fontsize=8.5, va="bottom", ha="right",
+            fontweight="bold", color=C_ACCENT,
+            bbox=dict(boxstyle="round,pad=0.35", fc="#F5F3FF", ec=C_ACCENT,
+                      lw=1.0, alpha=0.95))
+
+    ax.set_title(
+        f"Kernel-Level Performance  —  BF16 vs FP8\n"
+        f"{_SUB}  |  torch.profiler CUDA time",
+        fontsize=12.5, fontweight="bold", pad=10)
     _save(fig, "fig5_kernel_comparison.png")
 
 

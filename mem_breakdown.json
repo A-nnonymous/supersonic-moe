@@ -5,21 +5,21 @@
       "base": 0.0,
       "after_model": 216.05,
       "after_input": 360.05,
-      "pre_fwd": 1336.3,
-      "post_fwd": 1769.8,
-      "peak_fwd": 2345.67,
-      "pre_bwd": 1769.8,
-      "post_bwd": 2032.34,
-      "peak_bwd": 2540.17,
-      "post_cleanup": 1768.3
+      "pre_fwd": 1816.3,
+      "post_fwd": 2441.8,
+      "peak_fwd": 2825.67,
+      "pre_bwd": 2441.8,
+      "post_bwd": 2752.34,
+      "peak_bwd": 3212.17,
+      "post_cleanup": 2488.3
     },
     "deltas": {
       "model_params": 216.05,
       "input_tensors": 144.0,
-      "fwd_activation_delta": 433.5,
+      "fwd_activation_delta": 625.5,
       "fwd_peak_above_pre": 1009.37,
       "bwd_peak_above_pre": 770.37,
-      "bwd_residual_delta": 262.54
+      "bwd_residual_delta": 310.54
     },
     "param_sizes_mib": {
       "router.weight": 0.0469,
@@ -70,21 +70,21 @@
       "base": 0.0,
       "after_model": 216.05,
       "after_input": 360.05,
-      "pre_fwd": 717.3,
-      "post_fwd": 927.17,
-      "peak_fwd": 1567.42,
-      "pre_bwd": 927.17,
-      "post_bwd": 1029.34,
-      "peak_bwd": 1692.67,
-      "post_cleanup": 765.3
+      "pre_fwd": 775.67,
+      "post_fwd": 986.05,
+      "peak_fwd": 1625.67,
+      "pre_bwd": 986.05,
+      "post_bwd": 1135.72,
+      "peak_bwd": 1751.05,
+      "post_cleanup": 871.67
     },
     "deltas": {
       "model_params": 216.05,
       "input_tensors": 144.0,
-      "fwd_activation_delta": 209.87,
-      "fwd_peak_above_pre": 850.12,
-      "bwd_peak_above_pre": 765.5,
-      "bwd_residual_delta": 102.17
+      "fwd_activation_delta": 210.38,
+      "fwd_peak_above_pre": 850.0,
+      "bwd_peak_above_pre": 765.0,
+      "bwd_residual_delta": 149.67
     },
     "param_sizes_mib": {
       "router.weight": 0.0469,
@@ -97,11 +97,9 @@
       "c_proj.weight": 72.0
     },
     "fp8_caches_after_fwd": {
-      "VARLEN_(3072, 1536, 8)": 37.125,
       "VARLEN_(3072, 3072, 8)": 74.25
     },
     "fp8_caches_after_bwd": {
-      "VARLEN_(3072, 1536, 8)": 37.125,
       "VARLEN_(3072, 3072, 8)": 74.25,
       "FUSED_(3072, 1536, 8)": 37.125
     },
