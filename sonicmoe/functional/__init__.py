@@ -259,11 +259,12 @@ _PREQUANTIZED_SCALES: dict[str, tuple] = {}
 _PREQUANT_HIT_COUNT: dict[str, int] = collections.defaultdict(int)
 
 # Named FP8 weight cache for decoupled-weight mode.
-# Populated by MoE.refresh_fp8_named_cache(). Keyed by string tag.
-# This allows backward to access fp8 weights without needing the bf16 Parameter.
+# Populated by MoE.stash_bf16_to_cpu(). When active, backward skips
+# precompute_weight_fp8 calls (which would fail on resize_(0) params)
+# and reads directly from the existing runtime caches by key.
 _NAMED_FP8_CACHE: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
-# Weight shape/device metadata for decoupled mode (replaces save_for_backward of weights).
+# Weight shape/device metadata for decoupled mode.
 _WEIGHT_META: dict[str, tuple] = {}  # {"w1": (shape, device), "w2": (shape, device)}
 
 # Side stream for overlapping wgrad with actgrad in _UpProjection.backward.

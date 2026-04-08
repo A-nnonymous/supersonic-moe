@@ -291,33 +291,44 @@ class MoE(nn.Module):
 
     @torch.no_grad()
     def stash_bf16_to_cpu(self) -> None:
-        """Populate named FP8 cache, then free bf16 params from GPU (−216 MiB).
+        """Populate standard FP8 caches from bf16, then free bf16 on GPU (−216 MiB).
 
-        After this call, forward+backward use _NAMED_FP8_CACHE exclusively.
-        bf16 masters are saved to CPU for restore before optimizer.step().
+        Uses the EXISTING runtime caches (_FUSED_WEIGHT_CACHE, _VARLEN_WEIGHT_CACHE).
+        No separate named cache needed — cache keys use (_version, shape, stride)
+        which are preserved by resize_(0). Sets _NAMED_FP8_CACHE as a sentinel
+        (non-empty = stash mode active, backward skips permute-based lookups).
         """
         from .functional import _NAMED_FP8_CACHE, _WEIGHT_META
         w1, w2 = self.c_fc.weight, self.c_proj.weight
         if w1.untyped_storage().size() == 0:
             return  # already stashed
 
-        # 1. Populate named cache from bf16 (all 4 layouts)
+        # 1. Populate all 4 standard caches from bf16 (cache keys based on bf16 metadata)
         w1_perm = w1.permute(1, 2, 0)
         w2_perm = w2.permute(1, 2, 0)
-        _NAMED_FP8_CACHE["w1_fused"] = precompute_weight_fp8_for_fused_gated(w1_perm)
-        _NAMED_FP8_CACHE["w2_varlen"] = precompute_weight_fp8(w2_perm)
-        _NAMED_FP8_CACHE["w1T_varlen"] = precompute_weight_fp8(w1_perm.permute(1, 0, 2))
-        _NAMED_FP8_CACHE["w2_dgated"] = precompute_weight_fp8_for_direct_fused_dgated(w2_perm)
+        precompute_weight_fp8_for_fused_gated(w1_perm)
+        precompute_weight_fp8(w2_perm)
+        w1T_result = precompute_weight_fp8(w1_perm.permute(1, 0, 2))
+        w2d_result = precompute_weight_fp8_for_direct_fused_dgated(w2_perm)
 
-        # 2. Save shape metadata
+        # 2. Set named cache as sentinel + store direct references for backward
+        # (backward can't do w.permute() after resize_(0), so it reads these)
+        _NAMED_FP8_CACHE["w1T_varlen"] = w1T_result
+        _NAMED_FP8_CACHE["w2_dgated"] = w2d_result
+        _NAMED_FP8_CACHE["w1_fused"] = precompute_weight_fp8_for_fused_gated(w1_perm)  # re-read from cache (hit)
+        _NAMED_FP8_CACHE["w2_varlen"] = precompute_weight_fp8(w2_perm)  # re-read from cache (hit)
+
+        # 3. Save shape metadata
         _WEIGHT_META["w1"] = (w1.shape, w1.device)
         _WEIGHT_META["w2"] = (w2.shape, w2.device)
 
-        # 3. Backup bf16 to CPU
+        # 4. Backup bf16 to CPU
         self._cpu_w1 = w1.data.to('cpu')
         self._cpu_w2 = w2.data.to('cpu')
 
-        # 4. Free GPU storage (−216 MiB)
+        # 5. Free GPU storage (−216 MiB). Cache keys still valid.
+        w1.data.untyped_storage().resize_(0)
+        w2.data.untyped_storage().resize_(0)
         w1.data.untyped_storage().resize_(0)
         w2.data.untyped_storage().resize_(0)
 
