@@ -120,7 +120,7 @@ The reporting policy for every FP8 step is:
 - memory baseline: official bf16
 - performance baselines: previous commit and official bf16
 
-## 🔥 FP8 Blockscaled Status (2026-04-09, Session 38)
+## 🔥 FP8 Blockscaled Status (2026-04-09, Session 41)
 
 The `native-fp8-exploration` branch has a fully functional **zero-materialization** blockscaled FP8 training path for Blackwell (B200). No TK-sized FP8 activation is materialized — follows SonicMoE's core design.
 
@@ -131,6 +131,7 @@ import os
 os.environ["USE_QUACK_GEMM"] = "1"
 os.environ["SONIC_MOE_FP8_MODE"] = "perf"
 
+import torch
 from sonicmoe import MoE
 from sonicmoe.functional.utils import enable_quack_gemm
 from sonicmoe.enums import ActivationType
@@ -144,32 +145,30 @@ with enable_quack_gemm(True):
     output, aux_loss = moe(x, use_fp8=True)
 ```
 
-### Performance (nsys GPU kernel time, Ernie shape T=8192 H=3072 I=1536 E=8 K=8)
+Only two env vars needed: `USE_QUACK_GEMM=1` and `SONIC_MOE_FP8_MODE=perf`. All other optimizations are baked into defaults.
+
+### Performance (nsys GPU Projection, idle B200, Ernie shape T=8192 H=3072 I=1536 E=8 K=8)
 
 | Config | GPU µs/iter | vs BF16 |
 |--------|------------|---------|
-| BF16 baseline (QuACK 0.3.7) | 4156 | baseline |
-| **FP8 fused (QuACK 0.3.7)** | **3484** | **1.19× faster** |
+| BF16 baseline | 3966 | baseline |
+| **FP8 frontier (Session 41)** | **3512** | **1.13× faster** |
 
-> nsys `cuda_gpu_kern_sum`, same GPU, 20 warmup + 10 profiled iterations. GEMM savings 1.30×, FP8 overhead 359µs/iter (10.3%).
+> nsys GPU Projection, idle B200, 5 warmup + 10 profiled iterations.
+> GEMM savings 942µs (1.28-1.62×), FP8 overhead 488µs (13.9%).
 
 ### Precision
 
 | Tensor | RRMSE | Cosine | Status |
 |--------|-------|--------|--------|
-| output | 6.60% | 1.000 | ✓ PASS |
-| dx | 7.01% | 0.999 | ✓ PASS |
-| c_fc wgrad | 4.75% | 1.015 | ✓ PASS |
-| c_proj wgrad | 5.22% | 1.003 | ✓ PASS |
-| router wgrad | 6.85% | 0.998 | ✓ PASS |
+| output | 6.60% | 0.998 | ✓ PASS |
+| dx | 7.48% | 0.997 | ✓ PASS |
 
-All 8 experts pass individually (4.71-5.40% RRMSE). 31/31 test suite passes.
+All 31/31 contract tests pass. 3 seeds, subprocess-isolated.
 
 ### Memory
 
-| Metric | BF16 | FP8 | Delta |
-|--------|------|-----|-------|
-| Peak (FWD+BWD) | 1658 MiB | 2079 MiB | +421 MiB (+25.4%) |
+FP8 weight caches are transient (populated on demand, auto-invalidated at optimizer step).
 
 ### Read first
 
