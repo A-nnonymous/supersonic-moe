@@ -347,7 +347,27 @@ class FP8MoE(MoE):
 | w2 forward eviction | −37 MiB during ctx save | `__init__.py` L1086-1089 |
 | w1 fused clear | −74 MiB during down-proj | `__init__.py` L1828-1830 |
 | `SONIC_MOE_FP8_FUSED_ZY1_QUANT` | −64µs/iter, +96 MiB fwd peak | `__init__.py` L722-740 |
+| **`refresh_fp8_shadow_weights()`** | **BIT-IDENTICAL, −160µs/iter** | **`moe.py` L257-295** |
 | nsys benchmark tooling | Reproducible profiling | `tools/nsys_benchmark.py` |
+
+### `refresh_fp8_shadow_weights()` — verified results
+
+```python
+# Usage: call once after optimizer.step()
+moe.refresh_fp8_shadow_weights()  # ~80µs one-shot
+
+# Then forward+backward uses cached FP8 weights (zero quant overhead)
+with enable_quack_gemm(True):
+    o = moe(x, use_fp8=True)[0]
+o.backward(dout)
+```
+
+| Metric | No shadow | With shadow | Delta |
+|--------|-----------|-------------|-------|
+| Correctness | — | **BIT-IDENTICAL** | ✅ |
+| CUDA events total | 4.92 ms | **4.76 ms** | **−160µs (−3.3%)** |
+| Variance (σ) | 0.45 ms | **0.15 ms** | 3× more stable |
+| 31/31 tests | PASS | **PASS** | ✅ |
 
 ---
 

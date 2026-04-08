@@ -2840,6 +2840,9 @@ def precompute_weight_fp8(
     Uses a dedicated cache (NOT shared with fused_dgated variants which quantize
     in transposed layout with scales along a different dimension).
 
+    When used with MoE.refresh_fp8_shadow_weights(), the cache is pre-populated
+    and this function returns instantly (zero quantize overhead).
+
     Parameters
     ----------
     w : Tensor (dim0, dim1, E) bf16 — expert weights in any layout.
