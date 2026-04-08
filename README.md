@@ -182,6 +182,35 @@ Only two env vars needed: `USE_QUACK_GEMM=1` and `SONIC_MOE_FP8_MODE=perf`. All 
 | Engineering log | `reports/fp8_upgrade/engineering_log.md` | Phase-by-phase development history |
 | Frontier tests | `tests/fp8_large_project_contract_test.py` | 31-test correctness gate |
 
+## 📊 Architecture & Dataflow Visualization
+
+Ten publication-quality figures auto-generated from Session 41 measurements.
+Run `python -m visualization` to regenerate all figures into `assets/`.
+
+### Key Figures
+
+| # | Figure | What it shows |
+|---|--------|---------------|
+| 1 | Executive Summary | 3-panel hero: latency (1.12×), memory (−8.8% fwd), precision (31/31 PASS) |
+| 2 | Performance Waterfall | BF16 → GEMM savings → quant overhead → FP8 breakdown |
+| 3 | Memory Lifecycle | 4-checkpoint BF16 vs FP8 memory trajectory |
+| 4 | Backward Peak Breakdown | 100% tensor-level audit of 1367 MiB backward peak |
+| 5 | Kernel-Level Comparison | Per-kernel BF16 vs FP8 timing (forward + backward) |
+| 6 | Precision State Matrix | Dtype heatmap: every tensor × every phase, BF16 vs FP8 |
+| 7 | Precision Profile | RRMSE + cosine similarity with pass/fail thresholds |
+| 8 | Optimization Design Space | Shipped gains vs dead ends (memory impact) |
+| **9** | **Buffer Lifecycle Gantt** | **Per-buffer lifetime bars, dtype-coloured, event markers, peak MiB** |
+| **10** | **Dtype Transformation Flow** | **Operator-level FP8 quantization pipeline with I/O dtype boxes** |
+
+#### Buffer Lifecycle (fig 9) — per-tensor lifetime, dtype & memory
+![Buffer Lifecycle](./assets/fig9_buffer_lifecycle.png)
+
+#### Dtype Transformation Flow (fig 10) — operator-level FP8 pipeline
+![Dtype Flow](./assets/fig10_dtype_flow.png)
+
+#### Precision State Matrix (fig 6) — tensor dtype at each execution phase
+![Precision Flow](./assets/fig6_precision_flow.png)
+
 ## 🤝 Contributing
 
 We welcome contributions! Please feel free to submit issues, feature requests, or pull requests.
