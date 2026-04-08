@@ -290,6 +290,66 @@ class MoE(nn.Module):
         precompute_weight_fp8(w1_perm.permute(1, 0, 2))  # (H, 2I, E)
 
     @torch.no_grad()
+    def stash_bf16_to_cpu(self) -> None:
+        """Populate named FP8 cache, then free bf16 params from GPU (−216 MiB).
+
+        After this call, forward+backward use _NAMED_FP8_CACHE exclusively.
+        bf16 masters are saved to CPU for restore before optimizer.step().
+        """
+        from .functional import _NAMED_FP8_CACHE, _WEIGHT_META
+        w1, w2 = self.c_fc.weight, self.c_proj.weight
+        if w1.untyped_storage().size() == 0:
+            return  # already stashed
+
+        # 1. Populate named cache from bf16 (all 4 layouts)
+        w1_perm = w1.permute(1, 2, 0)
+        w2_perm = w2.permute(1, 2, 0)
+        _NAMED_FP8_CACHE["w1_fused"] = precompute_weight_fp8_for_fused_gated(w1_perm)
+        _NAMED_FP8_CACHE["w2_varlen"] = precompute_weight_fp8(w2_perm)
+        _NAMED_FP8_CACHE["w1T_varlen"] = precompute_weight_fp8(w1_perm.permute(1, 0, 2))
+        _NAMED_FP8_CACHE["w2_dgated"] = precompute_weight_fp8_for_direct_fused_dgated(w2_perm)
+
+        # 2. Save shape metadata
+        _WEIGHT_META["w1"] = (w1.shape, w1.device)
+        _WEIGHT_META["w2"] = (w2.shape, w2.device)
+
+        # 3. Backup bf16 to CPU
+        self._cpu_w1 = w1.data.to('cpu')
+        self._cpu_w2 = w2.data.to('cpu')
+
+        # 4. Free GPU storage (−216 MiB)
+        w1.data.untyped_storage().resize_(0)
+        w2.data.untyped_storage().resize_(0)
+
+    @torch.no_grad()
+    def unstash_bf16(self) -> None:
+        """Restore bf16 params from CPU. Call before optimizer.step()."""
+        from .functional import _NAMED_FP8_CACHE, _WEIGHT_META
+        w1, w2 = self.c_fc.weight, self.c_proj.weight
+        if not hasattr(self, '_cpu_w1'):
+            return
+        w1.data.untyped_storage().resize_(self._cpu_w1.nelement() * self._cpu_w1.element_size())
+        w1.data.copy_(self._cpu_w1)
+        w2.data.untyped_storage().resize_(self._cpu_w2.nelement() * self._cpu_w2.element_size())
+        w2.data.copy_(self._cpu_w2)
+        del self._cpu_w1, self._cpu_w2
+        _NAMED_FP8_CACHE.clear()
+        _WEIGHT_META.clear()
+
+    @torch.no_grad()
+    def sync_grads(self) -> None:
+        """Copy gradients from autograd-accumulated tensors to Parameters.
+
+        In stash mode, gradients are on the as_strided proxy tensors.
+        Since these proxies don't requires_grad, autograd returns dw1/dw2
+        but doesn't assign them. The gradients are lost.
+
+        For now this is a no-op — gradients must be collected differently.
+        See HANDOFF §9 for the architectural solution.
+        """
+        pass
+
+    @torch.no_grad()
     def has_fp8_shadow_weights(self) -> bool:
         """Check if FP8 shadow weights are fresh (cache entries match current _version)."""
         # Shadow weights live in the runtime caches. If the cache was populated
@@ -316,12 +376,24 @@ class MoE(nn.Module):
                 stack.enter_context(enable_fp8())
 
             if kernel_backend_moe == KernelBackendMoE.sonicmoe and self.num_experts <= 32768:
+                _stashed = self.c_fc.weight.untyped_storage().size() == 0
+                if _stashed:
+                    from .functional import _WEIGHT_META
+                    w1s, w1d = _WEIGHT_META["w1"]
+                    w2s, w2d = _WEIGHT_META["w2"]
+                    # 2-byte shape proxy via as_strided (zero strides, no real data)
+                    _tiny = torch.zeros(1, dtype=torch.bfloat16, device=w1d)
+                    w1_arg = torch.as_strided(_tiny, w1s, (0,) * len(w1s)).permute(1, 2, 0)
+                    w2_arg = torch.as_strided(_tiny, w2s, (0,) * len(w2s)).permute(1, 2, 0)
+                else:
+                    w1_arg = self.c_fc.weight.permute(1, 2, 0)
+                    w2_arg = self.c_proj.weight.permute(1, 2, 0)
                 hidden_states, router_logits, expert_frequency = moe_TC_softmax_topk_layer(
                     hidden_states,
                     self.router.weight,
-                    self.c_fc.weight.permute(1, 2, 0),
+                    w1_arg,
                     self.c_fc.bias,
-                    self.c_proj.weight.permute(1, 2, 0),
+                    w2_arg,
                     self.c_proj.bias,
                     self.top_k,
                     self.stream_id,
