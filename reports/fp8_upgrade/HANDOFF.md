@@ -179,22 +179,137 @@ Removed `data_ptr` / `id(storage)` from cache keys. Now keys are `(_version, sha
 
 ---
 
-## 9. Next Steps (prioritized)
+## 9. Next Steps — P0 Detailed Design: Decouple Weight from Autograd
 
-### P0: Native FP8 Parameters (framework-level)
-**Potential: −327 MiB memory.** Requires one of:
-- PyTorch `FP8Parameter` class (upstream feature request)
-- Custom `torch.autograd.Function` that wraps fp8 buffer + manual grad routing
-- FSDP integration for mixed-precision parameter offload
+### 问题本质
+bf16 参数在 backward peak 占 216 MiB（w1=144 + w2=72），但 FP8 路径中**没有任何 GEMM 读取 bf16 权重数据**（全部通过 fp8 cache）。这 216 MiB 纯粹是 autograd 的 `save_for_backward` 和 `AccumulateGrad` 需要的。
 
-### P1: GEMM Epilogue FP8 Output
-**Potential: −166µs forward.** CUTLASS DSL change to output fp8 D/PostAct directly.
+### 为什么现有方案全部失败
+| 方案 | 失败原因 | 验证方式 |
+|------|---------|---------|
+| `w.data = fp8` | autograd 内部行为变化（梯度 bf16→fp8 cast 导致精度损失）| bisect: repopulate=0, dtype_change≠0 |
+| `resize_(0)` | PyTorch bounds check 阻止 `w.permute()` | `setStorage: ... out of bounds for storage of size 0` |
+| fp8 proxy | `_version` 不匹配 + proxy 不是 Parameter → 无梯度累积 | `dw1: None` |
+| fp8 Parameter + optimizer | Adam 要求 param 和 grad 同 dtype；optimizer state 变成 fp8 | `same dtype` error |
 
-### P2: Training Validation
-Run actual training loop with optimizer.step(). Compare FP8 vs BF16 loss curves.
+### 正确设计方案：Named FP8 Cache + Shape Metadata
 
-### P3: FP8 Wgrad at Larger Shapes
-Test I≥2048 where `dual_quantize` + `blockscaled_fp8_weight_grad_gemm_fast` becomes net-positive.
+**核心思想**：从 `save_for_backward` 中**移除 w1/w2**，backward 通过**命名缓存**直接获取 fp8 权重。
+
+```
+┌─── Training Loop ───────────────────────────────┐
+│                                                  │
+│  optimizer.step()          # updates bf16 master │
+│  ↓                                               │
+│  moe.refresh_fp8()         # bf16→fp8 cache      │
+│  moe.stash_bf16_to_cpu()   # bf16 master→CPU     │
+│                            # GPU: −216 MiB       │
+│  ↓                                               │
+│  forward(x)                # uses fp8 cache only  │
+│  backward(dout)            # uses fp8 cache only  │
+│                            # grads→grad_proxy.grad│
+│  ↓                                               │
+│  moe.unstash_bf16()        # CPU→GPU bf16 master  │
+│  moe.sync_grads()          # proxy.grad→param.grad│
+│                                                  │
+└──────────────────────────────────────────────────┘
+```
+
+#### 具体改动
+
+**Step 1**: 修改 `_UpProjection.forward` (约 10 行)
+```python
+# 当前:
+ctx.save_for_backward(x, w1, b1, expert_freq, x_gather_idx, ...)
+# 改为:
+ctx.save_for_backward(x, b1, expert_freq, x_gather_idx, ...)
+ctx.w1_shape = w1.shape
+ctx.w1_device = w1.device
+```
+
+**Step 2**: 修改 `_UpProjection.backward` (约 15 行)
+```python
+# 当前:
+(x, w1, b1, ...) = ctx.saved_tensors
+w1T_fp8, w1T_scales = precompute_weight_fp8(w1.permute(1, 0, 2))
+# 改为:
+(x, b1, ...) = ctx.saved_tensors
+w1T_fp8, w1T_scales = _NAMED_FP8_CACHE["w1T_varlen"]  # direct lookup
+```
+
+**Step 3**: 修改 `_DownProjection` 同理 (约 20 行)
+
+**Step 4**: 创建全局命名缓存 + `grad_proxy`
+```python
+_NAMED_FP8_CACHE = {}  # {"w1_fused": (fp8, scales), ...}
+
+class MoE:
+    def refresh_fp8(self):
+        _NAMED_FP8_CACHE["w1_fused"] = precompute_weight_fp8_for_fused_gated(w1_perm)
+        _NAMED_FP8_CACHE["w2_varlen"] = precompute_weight_fp8(w2_perm)
+        _NAMED_FP8_CACHE["w1T_varlen"] = precompute_weight_fp8(w1T_perm)
+        _NAMED_FP8_CACHE["w2_dgated"] = precompute_weight_fp8_for_direct_fused_dgated(w2_perm)
+
+    def stash_bf16_to_cpu(self):
+        self._cpu_w1 = self.c_fc.weight.data.to('cpu')
+        self._cpu_w2 = self.c_proj.weight.data.to('cpu')
+        self.c_fc.weight.requires_grad_(False)
+        self.c_proj.weight.requires_grad_(False)
+        self.c_fc.weight.data.untyped_storage().resize_(0)  # −216 MiB
+        self.c_proj.weight.data.untyped_storage().resize_(0)
+        # Create bf16 grad proxies for autograd
+        self._w1_grad_proxy = torch.zeros(w1_shape, dtype=bf16, device='cuda',
+                                          requires_grad=True)
+        self._w2_grad_proxy = torch.zeros(w2_shape, dtype=bf16, device='cuda',
+                                          requires_grad=True)
+```
+
+**Step 5**: forward 传 `grad_proxy` 而不是 Parameter
+```python
+def forward(self, x, ...):
+    if self._stashed:
+        w1_arg = self._w1_grad_proxy.permute(1, 2, 0)  # bf16, requires_grad
+        w2_arg = self._w2_grad_proxy.permute(1, 2, 0)
+    else:
+        w1_arg = self.c_fc.weight.permute(1, 2, 0)
+        w2_arg = self.c_proj.weight.permute(1, 2, 0)
+```
+
+#### 预期收益
+
+| 项目 | 节省 |
+|------|:---:|
+| w1 bf16 Parameter (resize_(0)) | −144 MiB |
+| w2 bf16 Parameter (resize_(0)) | −72 MiB |
+| w1 fp8 cache (已在 fp8 cache 中) | 0 (已计入) |
+| w1/w2 grad_proxy (bf16, same shape) | **+216 MiB** ← 抵消! |
+
+**⚠️ 关键洞察：grad_proxy 和 Parameter 一样大（216 MiB bf16）！** 节省被 proxy 完全抵消。
+
+#### 真正的净节省方案
+
+`grad_proxy` 必须比 Parameter 小。选项：
+1. **grad_proxy 为 fp8** (108 MiB) → 净省 108 MiB，但 autograd 梯度是 bf16 → 赋值时需 cast
+2. **grad_proxy 为空** (0 MiB) → 修改 autograd Function 不 save w1/w2，梯度通过额外返回值传递
+3. **不用 proxy，直接在 autograd Function 中用 `_NAMED_FP8_CACHE` 的 value 作为 save_for_backward** → fp8 tensor 在 ctx 中 (108 MiB) 替代 bf16 (216 MiB)
+
+**方案 3 最优**：将 `ctx.save_for_backward(x, w1, ...)` 改为 `ctx.save_for_backward(x, w1T_fp8, w1T_scales, ...)`。backward 直接用 fp8 tensors。grad_proxy 是一个微型 leaf tensor (0 MiB) 仅用于 autograd graph 连接。
+
+**最终净节省**：216 MiB (bf16 params freed) − 108 MiB (fp8 already in cache) = **108 MiB 净省**。
+
+#### 风险
+
+| 风险 | 严重度 | 对策 |
+|------|--------|------|
+| save_for_backward 改动影响非 FP8 路径 | 中 | 条件分支: `if cfg.offloaded: save fp8 else save bf16` |
+| grad_proxy 的 autograd graph 不正确 | 中 | 单测验证每个梯度 |
+| optimizer 看不到 fp8 params 的 grad | 低 | `sync_grads()` 手动复制 |
+| 工程复杂度 | 中 | ~100 行核心改动 |
+
+### P1-P3 (unchanged)
+- **P1**: GEMM Epilogue FP8 Output (−166µs)
+- **P2**: Training Validation (loss curve)
+- **P3**: FP8 Wgrad at I≥2048
 
 ---
 
