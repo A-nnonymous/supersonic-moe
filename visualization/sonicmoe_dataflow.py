@@ -890,38 +890,95 @@ def _fp8_bufs() -> list[_Buf]:
     ]
 
 
-def _draw_gantt(ax: plt.Axes, bufs: list[_Buf], title: str) -> None:
-    """Render per-buffer Gantt: dtype-coloured bars, event glyphs, peak badge."""
+def _draw_mem_strip(ax: plt.Axes, bufs: list[_Buf], title: str, *,
+                    mode_color: str = C_BF16,
+                    measured_peak: float = 0) -> float:
+    """Narrow cumulative-memory area strip (sits above its Gantt panel).
+
+    Returns tracked peak MiB for cross-panel delta annotation.
+    """
+    phase_mem = np.array([
+        sum(b.mib for b in bufs if b.alive[0] <= p <= b.alive[1])
+        for p in range(N_PH)])
+    peak_ph = int(np.argmax(phase_mem))
+    peak_v = float(phase_mem[peak_ph])
+    xs = np.arange(N_PH)
+
+    ax.fill_between(xs, phase_mem, alpha=0.15, color=mode_color, step="mid")
+    ax.step(xs, phase_mem, where="mid", color=mode_color, lw=2.0, alpha=0.75)
+    ax.plot(xs, phase_mem, "o", color=mode_color, ms=5, alpha=0.65,
+            markeredgecolor="white", markeredgewidth=0.8)
+
+    for xi, mi in zip(xs, phase_mem):
+        ax.text(xi, mi + peak_v * 0.06, f"{mi:.0f}",
+                ha="center", va="bottom", fontsize=7,
+                color=mode_color, alpha=0.65,
+                fontweight="bold" if xi == peak_ph else "normal")
+
+    ax.plot(peak_ph, peak_v, "D", color=mode_color, ms=9,
+            markeredgecolor="white", markeredgewidth=2, zorder=5)
+
+    if measured_peak > 0:
+        ax.axhline(measured_peak, color=mode_color, lw=1.0, ls=":",
+                   alpha=0.40)
+        ax.text(N_PH + 0.3, measured_peak, f"nsys: {measured_peak:.0f}",
+                fontsize=7.5, color=mode_color, alpha=0.55,
+                fontweight="bold", va="center")
+
+    ymax = max(peak_v, measured_peak if measured_peak else 0) * 1.45
+    ax.set_ylim(0, ymax)
+    ax.set_ylabel("MiB", fontsize=8.5, color=mode_color, alpha=0.7,
+                  rotation=0, labelpad=15, va="center")
+    ax.tick_params(axis="y", colors=mode_color, labelsize=7, length=3)
+
+    ax.axvline(2.5, color=C_COST, lw=1.0, ls="--", alpha=0.30)
+    ax.text(1.0, ymax * 0.92, "FWD", fontsize=7, fontweight="bold",
+            color=C_BF16, ha="center", va="top", alpha=0.50)
+    ax.text(4.0, ymax * 0.92, "BWD", fontsize=7, fontweight="bold",
+            color=C_COST, ha="center", va="top", alpha=0.50)
+
+    ax.set_xlim(-0.6, N_PH + 2.0)
+    ax.set_xticks(range(N_PH))
+    ax.tick_params(axis="x", labelbottom=False, length=0)
+
+    ax.set_title(title, fontsize=10.5, fontweight="bold", pad=8,
+                 bbox=dict(boxstyle="round,pad=0.3", fc=C_LIGHT,
+                           ec="#D1D5DB", lw=0.8))
+    return peak_v
+
+
+def _draw_gantt(ax: plt.Axes, bufs: list[_Buf], *,
+                mode_color: str = C_BF16) -> None:
+    """Render per-buffer Gantt bars with subtle phase-pressure shading."""
     bufs = sorted(bufs, key=lambda b: (b.alive[0], -b.mib))
     n = len(bufs)
+    _GL = {"\u26a1": "Q", "\u2298": "F", "\u2192": "C", "\u21bb": "R"}
 
-    # Glyph label mapping (ASCII fallback for fonts without full Unicode)
-    _GLYPH_LABEL = {
-        "\u26a1": "Q",   # ⚡ quantize
-        "\u2298": "F",   # ⊘ free / resize_(0)
-        "\u2192": "C",   # → cache
-        "\u21bb": "R",   # ↻ recompute
-    }
+    # Subtle per-phase background tint (intensity ~ cumulative MiB)
+    phase_mem = np.array([
+        sum(b.mib for b in bufs if b.alive[0] <= p <= b.alive[1])
+        for p in range(N_PH)])
+    peak_v = phase_mem.max()
+    if peak_v > 0:
+        for p in range(N_PH):
+            ax.axvspan(p - 0.5, p + 0.5, color=mode_color,
+                       alpha=0.015 + (phase_mem[p] / peak_v) * 0.045,
+                       zorder=0)
 
     for i, buf in enumerate(bufs):
         s, e = buf.alive
         ax.barh(i, e - s + 0.85, left=s - 0.425, height=0.72,
                 color=_DTYPE_CLR[buf.dtype], alpha=0.88,
-                edgecolor="white", linewidth=0.9, zorder=3)
-        # MiB label — right of bar
+                edgecolor="white", linewidth=0.9, zorder=4)
         lbl = f"{buf.mib:.0f}" if buf.mib >= 1 else f"{buf.mib:.1f}"
-        ax.text(e + 0.52, i, f"{lbl} M", va="center", fontsize=7,
-                color="#374151", fontweight="bold")
-        # Shape annotation — further right, lighter
-        ax.text(e + 1.45, i, f"({buf.shape})", va="center", fontsize=6,
-                color="#9CA3AF")
-        # Event glyphs: white circle marker + letter code
+        ax.text(e + 0.45, i, f"{lbl} M ({buf.shape})", va="center",
+                fontsize=6.5, color="#374151", fontweight="bold")
         for ph, sym in buf.events:
-            code = _GLYPH_LABEL.get(sym, sym)
-            ax.plot(ph, i, "o", color="white", ms=13, mew=0, zorder=5)
+            code = _GL.get(sym, sym)
+            ax.plot(ph, i, "o", color="white", ms=13, mew=0, zorder=6)
             ax.text(ph, i, code, ha="center", va="center",
                     fontsize=7.5, color=_DTYPE_CLR[buf.dtype],
-                    fontweight="bold", zorder=6)
+                    fontweight="bold", zorder=7)
 
     ax.set_yticks(range(n))
     ax.set_yticklabels([b.name for b in bufs], fontsize=8)
@@ -929,60 +986,76 @@ def _draw_gantt(ax: plt.Axes, bufs: list[_Buf], title: str) -> None:
     ax.set_xticklabels(PHASES, fontsize=7.5)
     ax.set_xlim(-0.6, N_PH + 2.0)
     ax.set_ylim(n - 0.5, -0.5)
-
-    # fwd / bwd divider
-    ax.axvline(2.5, color=C_COST, lw=1.3, ls="--", alpha=0.45, zorder=2)
-    ax.text(1.0, -0.85, "FORWARD", fontsize=7.5, fontweight="bold",
-            color=C_BF16, ha="center", clip_on=False)
-    ax.text(4.0, -0.85, "BACKWARD", fontsize=7.5, fontweight="bold",
-            color=C_COST, ha="center", clip_on=False)
-
-    # Peak tracked memory badge
-    phase_mem = [sum(b.mib for b in bufs if b.alive[0] <= p <= b.alive[1])
-                 for p in range(N_PH)]
-    peak_ph = int(np.argmax(phase_mem))
-    peak_mib = phase_mem[peak_ph]
-    ax.text(0.99, 0.03,
-            f"Peak tracked: {peak_mib:.0f} MiB  (phase {peak_ph})",
-            transform=ax.transAxes, fontsize=8, fontweight="bold",
-            color=C_ACCENT, ha="right", va="bottom",
-            bbox=dict(boxstyle="round,pad=0.25", fc="#F5F3FF",
-                      ec=C_ACCENT, lw=0.8, alpha=0.9))
-
-    ax.set_title(title, fontsize=10.5, fontweight="bold", pad=14,
-                 bbox=dict(boxstyle="round,pad=0.3", fc=C_LIGHT,
-                           ec="#D1D5DB", lw=0.8))
+    ax.axvline(2.5, color=C_COST, lw=1.0, ls="--", alpha=0.30, zorder=1)
 
 
 def fig9_buffer_lifecycle() -> None:
-    """Per-buffer lifecycle Gantt: dtype-coloured bars, events, cumulative MiB."""
+    """Per-buffer lifecycle Gantt with cumulative memory strip above each panel."""
     bf16, fp8 = _bf16_bufs(), _fp8_bufs()
+    n_b, n_f = len(bf16), len(fp8)
 
-    fig, (ax1, ax2) = plt.subplots(
-        2, 1, figsize=(16, 14),
-        gridspec_kw={"height_ratios": [len(bf16), len(fp8)], "hspace": 0.38},
-    )
-    fig.subplots_adjust(top=0.91, bottom=0.08, left=0.13, right=0.91)
+    fig = plt.figure(figsize=(16, 15))
+    fig.subplots_adjust(top=0.90, bottom=0.06, left=0.11, right=0.93)
 
-    _draw_gantt(ax1, bf16, f"BF16 Baseline  ({len(bf16)} buffers)")
-    _draw_gantt(ax2, fp8,  f"FP8 Frontier  ({len(fp8)} buffers)")
+    outer = fig.add_gridspec(2, 1, hspace=0.28,
+                             height_ratios=[n_b + 3, n_f + 3])
+    gs_b = outer[0].subgridspec(2, 1, height_ratios=[1.5, n_b * 0.6],
+                                hspace=0.06)
+    gs_f = outer[1].subgridspec(2, 1, height_ratios=[1.5, n_f * 0.6],
+                                hspace=0.06)
 
-    # Shared dtype legend
-    patches = [Patch(facecolor=_DTYPE_CLR[d], edgecolor="white", label=d)
-               for d in ["BF16", "FP8", "FP32", "INT32", "SCALE"]]
-    fig.legend(handles=patches, loc="lower center", ncol=5, fontsize=9,
+    ax_mem_b = fig.add_subplot(gs_b[0])
+    ax_gantt_b = fig.add_subplot(gs_b[1])
+    ax_mem_f = fig.add_subplot(gs_f[0])
+    ax_gantt_f = fig.add_subplot(gs_f[1])
+
+    pk_b = _draw_mem_strip(ax_mem_b, bf16,
+                           f"BF16 Baseline  ({n_b} buffers)",
+                           mode_color=C_BF16, measured_peak=1412)
+    _draw_gantt(ax_gantt_b, bf16, mode_color=C_BF16)
+
+    pk_f = _draw_mem_strip(ax_mem_f, fp8,
+                           f"FP8 Frontier  ({n_f} buffers)",
+                           mode_color=C_FP8, measured_peak=1367)
+    _draw_gantt(ax_gantt_f, fp8, mode_color=C_FP8)
+
+    # Delta summary — placed in the gap between groups
+    pos_gb = ax_gantt_b.get_position()
+    pos_mf = ax_mem_f.get_position()
+    gap_y = (pos_gb.y0 + pos_mf.y1) / 2
+    delta = pk_f - pk_b
+    pct = delta / pk_b * 100
+    fig.text(0.50, gap_y,
+             f"FP8 tracked peak {pk_f:.0f} vs BF16 {pk_b:.0f} MiB  "
+             f"({delta:+.0f} MiB, {pct:+.1f}%)",
+             ha="center", fontsize=9.5, fontweight="bold",
+             color=C_SAVE if delta < 0 else C_COST,
+             bbox=dict(boxstyle="round,pad=0.3", fc="white",
+                       ec=C_SAVE if delta < 0 else C_COST,
+                       lw=0.8, alpha=0.9))
+
+    # ── Shared legend ───────────────────────────────────────────────────
+    from matplotlib.lines import Line2D
+    handles: list = [Patch(facecolor=_DTYPE_CLR[d], edgecolor="white", label=d)
+                     for d in ["BF16", "FP8", "FP32", "INT32", "SCALE"]]
+    handles.append(Line2D([0], [0], color=C_NEUTRAL, lw=2, alpha=0.5,
+                          marker="D", ms=5, markeredgecolor="white",
+                          label="$\\Sigma$ tracked"))
+    handles.append(Line2D([0], [0], color=C_NEUTRAL, lw=1, ls=":",
+                          alpha=0.5, label="nsys peak"))
+    fig.legend(handles=handles, loc="lower center", ncol=7, fontsize=8.5,
                frameon=True, edgecolor="#D1D5DB",
-               bbox_to_anchor=(0.52, 0.022))
+               bbox_to_anchor=(0.50, 0.015))
 
-    fig.text(0.52, 0.005,
-             "Event markers:   Q = quantize    F = free / resize_(0)    "
-             "C = cache (transposed FP8)    R = recompute from ctx",
-             ha="center", fontsize=8.5, color="#4B5563", style="italic")
+    fig.text(0.50, 0.001,
+             "Events:  Q = quantize   F = free / resize_(0)   "
+             "C = cache (transposed FP8)   R = recompute from ctx",
+             ha="center", fontsize=8, color="#4B5563", style="italic")
 
     fig.suptitle(
-        "Buffer Lifecycle  \u2014  Per-Tensor Lifetime, Dtype & Memory\n"
-        f"{_SUB}",
-        fontsize=13, fontweight="bold", y=0.97)
+        "Buffer Lifecycle  \u2014  Per-Tensor Lifetime, Dtype "
+        "& Cumulative Memory\n" f"{_SUB}",
+        fontsize=13, fontweight="bold", y=0.955)
     _save(fig, "fig9_buffer_lifecycle.png")
 
 
