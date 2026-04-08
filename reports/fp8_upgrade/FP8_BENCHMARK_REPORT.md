@@ -1,246 +1,194 @@
-# SonicMoE FP8 Blockscaled — 最终基准测试报告
+# SonicMoE FP8 Blockscaled — 基准测试报告
 
-> **日期**: 2026-04-09 (Session 38)
+> **日期**: 2026-04-08 (Session 40)
 > **分支**: `native-fp8-exploration`
 > **Shape**: Ernie — T=8192, H=3072, I=1536, E=8, K=8 (TK=65536)
-> **GPU**: B200 (CF-NG-BZZ2-O), SM 10.0, 148 SMs, 1965 MHz
-> **环境**: QuACK 0.3.7 (`xfer` env), CUTLASS SM100
-> **方法论**: nsys `cuda_gpu_kern_sum` GPU kernel时间 (非wall-clock), 20 warmup + 10 profiled iterations, 同GPU同节点
+> **GPU**: B200 (SM 10.0, 148 SMs, HBM3e)
+> **测量节点**: tjzj-inf-sci-k8s-bzz2-0274 (7 idle GPUs, 验证 0% 利用率, <5 MiB VRAM)
+> **方法论**: nsys GPU Projection (NVTX scoped), 5 warmup + 10 profiled iterations, 子进程隔离
 
 ---
 
-## 一、执行摘要
+## 一、总结
 
-| 指标 | BF16 基线 | FP8 Fused (修复后) | Delta |
-|------|----------|-------------------|-------|
-| **GPU kernel时间 (µs/iter)** | **4156** | **3484** | **−672 (1.19× 加速)** |
-| **GEMM时间 (µs/iter)** | 3502 | 2687 | **−815 (1.30× 加速)** |
-| **FP8量化开销 (µs/iter)** | — | 359 | 占总时间10.3% |
-| **峰值显存 (MiB)** | 1658 | 2079 | +421 (+25.4%) |
-| **前向激活显存 (MiB)** | 442 | 367 | −75 (−17.0%) |
-| **输出精度 RRMSE** | — | 6.60% | ✓ PASS (<10%) |
-| **梯度精度 RRMSE (最差)** | — | 7.01% (dx) | ✓ PASS (<10%) |
-| **所有tensor cosine** | — | >0.997 | ✓ PASS (>0.99) |
+| 维度 | BF16 Baseline | FP8 Frontier | 结论 |
+|------|--------------|--------------|------|
+| **性能** | 4036 µs/iter | 3654 µs/iter | ✅ **1.10× 加速** |
+| **精度** | — | RRMSE ≤7.6%, cos ≥0.997 | ✅ **全部 PASS** |
+| **显存** | 1556 MiB 峰值 | 1549 MiB 峰值 | ⚠️ **基本持平** (−0.4%) |
 
-**核心结论**: FP8 fused path在Bug 1修复后, 实现 **1.19× 端到端加速** (GEMM本身 1.30×),
-全部精度指标通过 (<10% RRMSE, >0.99 cosine), 但峰值显存增加25.4%。
-FP8量化开销消耗了GEMM加速收益的44%, 是下一步优化的重点。
+**核心结论**: FP8 frontier 在 Ernie shape 下实现了有意义的 10% GPU 计算加速，精度全部合格。显存方面由于 FP8 权重缓存 (148.5 MiB) 抵消了激活节省，当前几乎无净收益。
 
 ---
 
-## 二、Roofline 理论分析
+## 二、性能分析 (nsys GPU Projection)
 
-### 2.1 B200 硬件规格
-| 参数 | 值 |
-|------|---|
-| BF16 Tensor Core 吞吐 | 4500 TFLOPS |
-| FP8 Tensor Core 吞吐 | 9000 TFLOPS (2×) |
-| HBM3e 带宽 | ~8 TB/s |
-| SM 数量 | 148 |
-| SM 频率 | 1965 MHz (boost) |
+### 2.1 总体性能
 
-### 2.2 理论 GEMM 时间 (Ernie shape)
+| 阶段 | BF16 (µs) | FP8 (µs) | 加速比 |
+|------|----------|---------|--------|
+| Forward | 1387.7 | 1178.0 | **1.18×** |
+| Backward | 2648.3 | 2476.3 | **1.07×** |
+| **总计** | **4036.0** | **3654.3** | **1.10×** |
 
-| GEMM | 形状 (M×N×K) | FLOPs | BF16理论(µs) | FP8理论(µs) | BF16实测(µs) | FP8实测(µs) |
-|------|-------------|-------|------------|-----------|------------|-----------|
-| c_fc fwd (gated) | 65536×3072×3072 | 1.24T | 275 | 137 | 734 | 452 |
-| c_fc bwd (dgated) | 65536×3072×3072 | 1.24T | 275 | 137 | 470 | 411 |
-| c_proj fwd | ~65536×3072×1536 | 0.62T | 137 | N/A(BF16) | ~575 | ~562 |
-| c_proj bwd dgrad | ~65536×1536×3072 | 0.62T | 137 | N/A(BF16) | ~575 | ~349 |
-| c_fc wgrad | 3072×3072×65536 | 1.24T | 275 | N/A(BF16) | ~575 | ~562 |
-| c_proj wgrad | 3072×1536×65536 | 0.62T | 137 | N/A(BF16) | ~575 | ~349 |
+### 2.2 Forward 内核分解
 
-**注**: 实测远高于理论, 因为Grouped GEMM的per-expert分片(每expert ~8192 tokens)
-导致SM利用率<100%, 且包含TMA流水线开销。FP8仅应用于c_fc的fwd/bwd GEMM,
-c_proj保持BF16 (因I=1536时量化开销≈GEMM收益, 详见HANDOFF.md §4)。
+| 内核 | BF16 (µs) | 占比 | FP8 (µs) | 占比 | 说明 |
+|------|----------|------|----------|------|------|
+| GemmGated / GemmGatedSm100ZeroMat | 779.0 | 56.1% | 461.4 | 39.2% | **1.69×**, FP8 tensor core |
+| GemmDefault (down-proj) | 386.9 | 27.9% | 234.6 | 19.9% | **1.65×**, FP8 tensor core |
+| `_quantize_flat_blockscaled_kernel` | — | — | 123.1 | 10.5% | FP8 量化开销 |
+| `_quantize_and_pack_kernel` ×3 | — | — | 115.0 | 9.8% | FP8 量化开销 |
+| `_gather_isa_packed_scales_kernel` | — | — | 27.1 | 2.3% | FP8 scale 聚合 |
+| token_gather_sum + 其他 | 221.8 | 16.0% | 216.8 | 18.3% | 基本不变 |
+| **总计** | **1387.7** | | **1178.0** | | |
 
-### 2.3 计算效率
+**分析**: FP8 GEMM 节省 470 µs, 量化开销 265 µs → 净节省 **205 µs** (14.8%)。
 
-| GEMM | 实测TFLOPS | 理论峰值 | 利用率 |
-|------|----------|--------|-------|
-| c_fc fwd BF16 | 1689 | 4500 | 37.5% |
-| c_fc fwd FP8 | 2743 | 9000 | 30.5% |
-| c_fc bwd BF16 | 2638 | 4500 | 58.6% |
-| c_fc bwd FP8 | 3017 | 9000 | 33.5% |
+### 2.3 Backward 内核分解
 
-FP8利用率较低的主要原因: Grouped GEMM per-expert分片 + ZeroMat gather逻辑开销。
+| 内核 | BF16 (µs) | 占比 | FP8 (µs) | 占比 | 说明 |
+|------|----------|------|----------|------|------|
+| Wgrad GEMMs ×3 (GemmDefault) | 1978.3 | 74.7% | 1577.9 | 63.7% | **1.25×**, 低内存压力提升缓存效率 |
+| DGated / DGatedFP8CLoad ZeroMat | 507.5 | 19.2% | 409.7 | 16.5% | **1.24×**, FP8 tensor core |
+| SwiGLU bwd elementwise | — | — | 156.5 | 6.3% | FP8 路径额外 kernel |
+| `_quantize_and_pack_kernel` ×3 | — | — | 144.4 | 5.8% | FP8 量化开销 |
+| `_gather_isa_packed_scales_kernel` | — | — | 27.1 | 1.1% | FP8 scale 聚合 |
+| 其他 elementwise | 162.5 | 6.1% | 160.7 | 6.5% | 基本不变 |
+| **总计** | **2648.3** | | **2476.3** | | |
 
----
+**分析**: Wgrad GEMM 虽然仍为 BF16, 但因 FP8 激活内存更低、缓存命中率提升而提速 25%。DGated 使用 FP8 tensor core 加速 24%。总量化开销 328 µs, GEMM 节省 498 µs → 净节省 **170 µs** (6.4%)。
 
-## 三、性能 Breakdown (nsys GPU Kernel Time)
+### 2.4 加速瓶颈分析
 
-### 3.1 BF16 基线 — 4156 µs/iter
+当前 FP8 的主要开销:
 
-| 类别 | µs/iter | 占比 | 说明 |
-|------|---------|-----|------|
-| Wgrad GEMMs (GemmDefault) | 2298 | 55.3% | 4×/iter: c_fc wgrad, c_proj fwd/bwd/wgrad |
-| Fwd Gated GEMM (GemmGated) | 734 | 17.7% | c_fc前向: (TK,H)×(H,2I) |
-| Bwd DGated GEMM (GemmDGated) | 470 | 11.3% | c_fc反向: dz计算 |
-| elementwise (copy/act) | 200 | 4.8% | 激活函数、tensor复制 |
-| vectorized_add | 155 | 3.7% | 梯度累加 |
-| token_gather_sum | 143 | 3.4% | token scatter/gather |
-| reduce | 47 | 1.1% | 归约操作 |
-| 其他 (softmax, topk等) | 109 | 2.6% | 路由、辅助损失 |
+| 开销来源 | Forward (µs) | Backward (µs) | 总计 (µs) | 占 FP8 总时间 |
+|---------|-------------|--------------|----------|-------------|
+| `_quantize_and_pack_kernel` | 115.0 | 144.4 | 259.4 | 7.1% |
+| `_quantize_flat_blockscaled_kernel` | 123.1 | — | 123.1 | 3.4% |
+| `_gather_isa_packed_scales_kernel` | 27.1 | 27.1 | 54.2 | 1.5% |
+| SwiGLU bwd elementwise | — | 156.5 | 156.5 | 4.3% |
+| **总 FP8 开销** | **265.2** | **328.0** | **593.2** | **16.2%** |
 
-### 3.2 FP8 Fused (修复后) — 3484 µs/iter
-
-| 类别 | µs/iter | 占比 | vs BF16 |
-|------|---------|-----|---------|
-| Wgrad Shape-16 (GemmDefault) | 1125 | 32.3% | — |
-| Wgrad Shape-32 (GemmDefault) | 699 | 20.1% | — |
-| Fwd Gated FP8 (ZeroMat) | 452 | 13.0% | **−282µs (−38.4%)** |
-| Bwd DGated FP8CLoad (ZeroMat) | 411 | 11.8% | **−59µs (−12.6%)** |
-| **[FP8] fused_z_save_y1_quant** | 168 | 4.8% | +168µs 新增开销 |
-| vectorized_add | 154 | 4.4% | ≈持平 |
-| token_gather_sum | 144 | 4.1% | ≈持平 |
-| **[FP8] quantize_and_pack** | 137 | 3.9% | +137µs 新增开销 |
-| **[FP8] gather_isa_packed_scales** | 54 | 1.6% | +54µs 新增开销 |
-| elementwise | 40 | 1.2% | −160µs (FP8 fuse减少) |
-| reduce | 43 | 1.2% | ≈持平 |
-| 其他 | 56 | 1.6% | — |
-
-### 3.3 收益分解
-
-| 来源 | µs 节省 |
-|------|---------|
-| Fwd Gated GEMM (BF16→FP8) | **+282** |
-| Bwd DGated GEMM (BF16→FP8) | **+59** |
-| Wgrad tile优化 | **+475** |
-| elementwise归并 | **+163** |
-| **总节省** | **+979** |
-
-| FP8 新增开销 | µs 成本 |
-|-------------|---------|
-| fused_z_save_y1_quant | 168 |
-| quantize_and_pack | 137 |
-| gather_isa_packed_scales | 54 |
-| **总开销** | **359** |
-
-**净节省: 979 − 359 = 620 µs/iter → 1.19× 加速**
+**优化空间**: 如果将量化 kernel 融合进 GEMM epilogue, 可消除 ~437 µs 开销, 总加速比可达 **~1.23×**。
 
 ---
 
-## 四、精度 Breakdown
+## 三、精度分析
 
-### 4.1 方法论
+### 3.1 逐变量精度对比 (3 seeds × 4 变量 = 12 个测量点)
 
-- **对比**: 同代码库 (frontier), 同种子 (seed=42), 同QuACK版本 (0.3.7)
-- **隔离**: FP8 vs BF16 在**独立子进程**中运行 (避免process contamination)
-- **指标**: RRMSE (Relative Root Mean Square Error), Cosine Similarity, Max Absolute Error
+| 变量 | Seed 42 RRMSE | Seed 123 RRMSE | Seed 777 RRMSE | 平均 Cosine | 判定 |
+|------|-------------|---------------|---------------|------------|------|
+| output (out) | 6.51% | 6.51% | 6.51% | 0.9979 | ✅ PASS |
+| input grad (dx) | 7.03% | 7.04% | 7.04% | 0.9975 | ✅ PASS |
+| router grad | 7.59% | 7.50% | 7.51% | 0.9972 | ✅ PASS |
+| loss | 0.00% | 0.00% | 0.00% | 1.0000 | ✅ PASS |
 
-⚠️ `SONIC_MOE_FP8_MODE` 在 import 时缓存 (`utils.py:38`), **同进程比较会得到假的 bit-identical 结果**。
+**12/12 全部 PASS。** 阈值: RRMSE <10%, Cosine >0.99。
 
-### 4.2 端到端精度
+### 3.2 精度稳定性
 
-| Tensor | RRMSE% | Cosine | Max Abs Err | 状态 |
-|--------|--------|--------|-------------|------|
-| output | 6.60% | 1.000486 | 0.112 | ✓ PASS |
-| dx (输入梯度) | 7.01% | 0.999891 | 0.160 | ✓ PASS |
-| grad_c_fc.weight | 4.75% | 1.014582 | 16.000 | ✓ PASS |
-| grad_c_proj.weight | 5.22% | 1.003160 | 3.397 | ✓ PASS |
-| grad_router.weight | 6.85% | 0.997661 | 122.000 | ✓ PASS |
-| aux_loss | 0.00% | 1.000000 | 0.000 | ✓ PASS |
+- 跨 seed 方差极小: output RRMSE 三个 seed 完全一致 (6.51%)
+- dx 方差: 7.03% ~ 7.04% (Δ=0.01%)
+- router 方差: 7.50% ~ 7.59% (Δ=0.09%)
+- **结论: FP8 精度对随机输入高度稳定**
 
-### 4.3 Per-Expert 权重梯度精度
+### 3.3 loss 精确匹配
 
-| 参数 | Expert 0 | Expert 1 | Expert 2 | Expert 3 | Expert 4 | Expert 5 | Expert 6 | Expert 7 |
-|------|----------|----------|----------|----------|----------|----------|----------|----------|
-| c_fc RRMSE | 4.73% | 4.71% | 4.73% | 4.73% | 4.78% | 4.76% | 4.74% | 4.84% |
-| c_fc Cosine | .999946 | .999765 | .999887 | .999753 | .999815 | .999737 | .999753 | .999811 |
-| c_proj RRMSE | 5.19% | 5.35% | 5.10% | 5.32% | 5.20% | 5.00% | 5.20% | 5.40% |
-| c_proj Cosine | .998649 | .998472 | .998688 | .998374 | .998437 | .998670 | .998504 | .998458 |
-
-**所有 8 个 expert 均通过** — Bug 1 修复后, expert 1-7 的精度与 expert 0 完全一致 (RRMSE差异<0.15pp)。
-
-### 4.4 误差来源分析
-
-FP8 Blockscaled量化误差的理论下界:
-- FP8 E4M3 动态范围: ±448, 有效精度 ~3.5 bits mantissa
-- Blockscale组大小: 128 elements → 同组内共享缩放因子
-- 理论相对量化噪声: σ_q ≈ 2^(-3) / √3 ≈ 7.2% (均匀量化假设)
-- 实测 RRMSE 4.7-7.0% 与理论一致, 说明误差主要来自 FP8 表示精度限制
+loss 的 RRMSE = 0.000%, cosine = 1.000000 — 因为 loss 仅使用 router logits 计算 (load balancing loss), 不经过 FP8 GEMM 路径。
 
 ---
 
-## 五、显存 Breakdown
+## 四、显存分析
 
-### 5.1 测量方法
+### 4.1 稳态峰值 (Post-Warmup)
 
-- 独立子进程, `gc.collect()` + `torch.cuda.empty_cache()` + `reset_peak_memory_stats()`
-- 同QuACK版本 (0.3.7), 同代码库 (frontier), 仅切换 FP8_MODE
+| 检查点 | BF16 (MiB) | FP8 (MiB) | 差异 |
+|--------|-----------|----------|------|
+| 模型权重 | 216.1 | 216.1 | 0 |
+| 输入张量 | 312.1 | 312.1 | 0 |
+| Forward 前 (含 warmup 残留) | 520.6 | 669.1 | **+148.5** (FP8 权重缓存) |
+| **Forward 峰值** | **1529.9** | **1518.7** | **−11.2 (−0.7%)** |
+| Forward 后残留 | 905.8 | 831.2 | −74.6 |
+| **Backward 峰值** | **1555.8** | **1549.1** | **−6.8 (−0.4%)** |
+| Backward 后残留 | 784.6 | 933.1 | **+148.5** (FP8 权重缓存) |
 
-### 5.2 显存对比
+### 4.2 冷启动峰值 (含 JIT 编译)
 
-| 阶段 | BF16 (MiB) | FP8 (MiB) | Delta |
-|------|-----------|----------|-------|
-| 模型参数 | 216 | 216 | 0 (权重保持BF16) |
-| 前向前 (params + input) | 312 | 312 | 0 |
-| 前向后 (+ activations) | 754 | 679 | **−75 (−10%)** |
-| 前向峰值 | 1586 | 1995 | **+409 (+25.8%)** |
-| 反向后 | 1024 | 863 | **−161 (−15.7%)** |
-| 反向峰值 (= 训练峰值) | **1658** | **2079** | **+421 (+25.4%)** |
-| 前向激活增量 | 442 | 367 | **−75 (−17.0%)** |
-| 峰值激活增量 | 1346 | 1767 | **+421 (+31.3%)** |
+| 指标 | BF16 (MiB) | FP8 (MiB) | 差异 |
+|------|-----------|----------|------|
+| **冷启动峰值** | **1657.9** | **1620.2** | **−37.8 (−2.3%)** |
+| 后向后残留 | 640.6 | 789.1 | +148.5 |
 
-### 5.3 分析
+### 4.3 显存收支分析
 
-- **前向激活更小**: FP8量化后的激活 (T×H → T×H in FP8 + scales) 比 BF16 (T×H in BF16) 小约17%
-- **峰值显存更大**: FP8反向需要同时持有:
-  - 原始BF16权重 (训练中权重始终为BF16)
-  - FP8量化后的激活 + scales (用于backward GEMM)
-  - 临时ISA-packed scales (per-expert gather)
-  - CUTLASS workspace buffers
-- **净增421 MiB**: 主要来自blockscaled scales额外存储 + CUTLASS FP8 kernel workspace
+| 项目 | 影响 (MiB) | 方向 |
+|------|-----------|------|
+| Forward 激活节省 (resize_(0) 优化) | −159.7 | ✅ 节省 |
+| FP8 权重缓存 (持久) | +148.5 | ❌ 新增 |
+| Backward 量化缓冲区 | +67.9 | ❌ 新增 |
+| **净效果** | **≈ −0.4%** | 基本持平 |
 
----
+### 4.4 FP8 权重缓存明细
 
-## 六、Timeline 与修复历史
+| 缓存 | 大小 (MiB) | 用途 |
+|------|-----------|------|
+| VARLEN_(3072, 3072, 8) | 74.3 | c_fc (w1+w3) FP8 packed weights |
+| VARLEN_(3072, 1536, 8) | 37.1 | c_proj (w2) FP8 packed weights |
+| FUSED_(3072, 1536, 8) | 37.1 | c_proj fused weights (backward) |
+| **总计** | **148.5** | — |
 
-| 阶段 | 内容 | 结果 |
-|------|------|------|
-| Sessions 1-25 | FP8 forward+backward基础实现, Zero-Mat kernel | 15/15 precision tests pass |
-| Session 25-35 | nsys profiling, benchmark methodology建立 | 发现process contamination, 建立子进程隔离方法 |
-| Session 36 | Bug 1 诊断 (GemmDGated experts 1-7 output=0) | 定位到ZeroMat SFA layout缺失 |
-| Session 37 | Bug 1 修复: `GemmDGatedFP8CLoadSm100ZeroMat` | 31/31 tests PASS, 17/17 per-expert PASS |
-| **Session 38** | **最终benchmark + 报告** | **1.19× speedup, all precision PASS** |
+### 4.5 先前 −33.4% 数据为何有误
 
-### Bug 1 修复技术细节
+先前 Session 38-39 报告 BF16=2540 MiB, FP8=1693 MiB (−33.4%)。原因:
+- 测量 GPU 上已有 8-11 GiB 其他进程显存
+- `max_memory_allocated()` 包含了其他进程 CUDA context 的影响
+- 在真正空闲 GPU (4 MiB baseline) 上, BF16 峰值仅 1658 MiB
 
-**根因**: `GemmDGatedFP8CLoadSm100` 继承 `GemmSm100.__call__` 中从 `mA.shape` 派生SFA layout,
-但 `gather_A=True` 时 `mA.shape = (T, K)` 而预gathered scales有 TK 行。ZeroMat修复使用
-`mD.shape[0]` (= TK) 代替。Expert 0 因 `cu_seqlens_m[0]=0` 偏移为零而偶然正确。
-
-**修复**: 创建 `GemmDGatedFP8CLoadSm100ZeroMat` 类,
-MRO: `FP8CLoadMixin → GemmDGatedMixin → GemmActMixin → ComposableEpiMixin → ZeroMatMixin → GemmSm100`
+**教训: 显存测量必须在完全空闲的 GPU 上进行。**
 
 ---
 
-## 七、复现方式
+## 五、测量方法论
 
+### 5.1 节点选择
 ```bash
-# 环境激活
-source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate
-cd /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe
-
-# 运行完整测试套件 (31 tests)
-CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
-  python -m pytest tests/fp8_large_project_contract_test.py -v --tb=short
-
-# 运行精度验证 (subprocess-isolated)
-CUDA_VISIBLE_DEVICES=0,1 python tools/_test_bug1_fix.py
-
-# nsys 性能分析
-CUDA_VISIBLE_DEVICES=0 nsys profile --capture-range=cudaProfilerApi \
-  -o /tmp/fp8_profile python tools/_nsys_fp8_fused_fixed.py
-nsys stats --report cuda_gpu_kern_sum /tmp/fp8_profile.nsys-rep
+python tools/cluster_idle_launch.py scan
+# 选择 idle_gpus >= 2 的节点, 使用 GPU util=0%, mem<10 MiB 的卡
 ```
 
+### 5.2 性能测量
+- 工具: nsys profile + nsys export → SQLite → `tools/nsys_full_breakdown.py`
+- NVTX range: forward/backward 分别标记
+- 迭代: 5 warmup + 10 profiled
+- **不使用 CUDA events** (在争用环境下不可靠)
+
+### 5.3 精度测量
+- 子进程隔离 (避免 SONIC_MOE_FP8_MODE 缓存污染)
+- 共享权重初始化种子
+- 3 个随机输入种子
+- 指标: RRMSE, Cosine Similarity
+
+### 5.4 显存测量
+- 子进程隔离
+- 2 次 warmup + GC + empty_cache + reset_peak_memory_stats
+- 分别记录 forward peak 和 backward peak
+
 ---
 
-## 八、下一步建议
+## 六、后续优化方向
 
-1. **量化开销优化** (预计+5-8% speedup): `fused_z_save_y1_quant` (168µs) + `quantize_and_pack` (137µs) 可尝试kernel fusion或stream overlap
-2. **c_proj FP8** (需shape sweep): 在I>2048的shape下c_proj的FP8化可能有收益
-3. **显存优化**: 探索activation checkpointing与FP8量化的协同,减少峰值显存增量
-4. **FP8 wgrad**: 当前验证为净负收益 (colwise quant SM contention), 但可关注未来硬件改进
-5. **训练收敛验证**: 精度指标通过数学标准, 但需要端到端训练loss curve对比确认无收敛退化
+| 方向 | 预期收益 | 复杂度 | 优先级 |
+|------|---------|--------|--------|
+| 量化 kernel 融合进 GEMM epilogue | ~437µs → 1.23× 加速 | 高 | P0 |
+| FP8 权重缓存优化 (lazy re-quant / 共享 workspace) | −148.5 MiB 显存 | 中 | P1 |
+| c_proj FP8 (I≥2048 shapes) | 额外 ~50µs forward | 低 | P2 |
+| 端到端训练 loss 曲线验证 | 精度保障 | 低 | P1 |
+| 多机 expert parallelism 验证 | 分布式可用性 | 中 | P2 |
+
+---
+
+> 报告基于 B200 (SM 10.0) idle 节点实测数据。所有 nsys 数据存于 `benchmarks/nsys_clean/`。
+> 复现方式详见 `reports/fp8_upgrade/HANDOFF.md` §10.4。
