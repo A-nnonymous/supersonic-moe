@@ -1,0 +1,11 @@
+{
+  "mode": "FP8",
+  "mem_base_MiB": 0.0,
+  "mem_model_MiB": 216.05,
+  "mem_input_MiB": 312.05,
+  "mem_before_fwd_MiB": 669.05,
+  "mem_fwd_peak_MiB": 1518.68,
+  "mem_after_fwd_MiB": 831.17,
+  "mem_bwd_peak_MiB": 1549.05,
+  "mem_after_bwd_MiB": 933.1
+}

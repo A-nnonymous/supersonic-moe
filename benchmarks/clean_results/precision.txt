@@ -1,0 +1,17 @@
+\n--- Seed 42 ---
+  out       : RRMSE=0.0651  cos=0.997878  maxrel=495159.89  [PASS]
+  dx        : RRMSE=0.0703  cos=0.997524  maxrel=26464462.28  [PASS]
+  drouter   : RRMSE=0.0759  cos=0.997113  maxrel=369.12  [PASS]
+  loss      : RRMSE=0.0000  cos=1.000000  maxrel=0.00  [PASS]
+\n--- Seed 123 ---
+  out       : RRMSE=0.0651  cos=0.997877  maxrel=2310145.00  [PASS]
+  dx        : RRMSE=0.0704  cos=0.997522  maxrel=20384788.51  [PASS]
+  drouter   : RRMSE=0.0750  cos=0.997181  maxrel=464.45  [PASS]
+  loss      : RRMSE=0.0000  cos=1.000000  maxrel=0.00  [PASS]
+\n--- Seed 777 ---
+  out       : RRMSE=0.0651  cos=0.997878  maxrel=6169079.82  [PASS]
+  dx        : RRMSE=0.0704  cos=0.997522  maxrel=20027160.64  [PASS]
+  drouter   : RRMSE=0.0751  cos=0.997177  maxrel=965.64  [PASS]
+  loss      : RRMSE=0.0000  cos=1.000000  maxrel=0.00  [PASS]
+\n=== Summary: 12 measurements ===
+PASS: 12/12
