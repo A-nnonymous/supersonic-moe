@@ -239,28 +239,101 @@ Fix: `out=dw2.permute(2, 0, 1)` → correct layout.
 
 ## 9. Next Steps (prioritized)
 
-### P0: GEMM Epilogue FP8 Output
-**Potential: −177µs forward quant overhead → 1.18× total speedup.**
+### P0: Native FP8 Parameters (highest ROI)
+**Potential: −174~480 µs/iter performance + −327 MiB memory → speedup 1.18-1.24×**
 
-Current `GemmGatedBlockscaledQuantMixin` computes E8M0 scales in the epilogue but still writes D as bf16. If D could be written as `float8_e4m3fn` directly, it eliminates:
-- `_fused_z_save_y1_quant_kernel` (166µs) or split quant z+y1 (177µs)
-- The standalone `.to(fp8)` cast
+#### Insight
+当前最大的单项开销不是 GEMM epilogue，而是**运行时权重量化**。每次 forward+backward 调用 7 次 `_quantize_and_pack_kernel` (174µs) + permute/contiguous (训练中额外 ~308µs)。这些全部可以通过预存 FP8 参数消除。
 
-**Feasibility assessment**: CUTLASS CuTeDSL supports `Float8E4M3FN` as a dtype, and TMA stores for 8-bit elements exist. The challenge is:
-1. D and PostAct have different dtypes (z=fp8, y1=fp8) — need two TMA store atoms
-2. ISA scale packing must happen in the epilogue (per-tile, not per-subtile)
-3. SM100 MMA register-to-thread mapping must be understood for warp-level amax reduction
+wgrad GEMM (`dw1 = x.T @ dz`, `dw2 = dout.T @ y1s`) **完全不读权重**——它们只用激活和梯度。所以将权重从 bf16 切到 fp8 **不影响 wgrad 路径**，这是这个方案可行的核心原因。
 
-**Recommendation**: Start with PostAct (y1) → fp8 in epilogue (simpler, single output), then extend to D (z).
+#### 当前权重在 6 个 GEMM 中的使用模式
 
-### P1: End-to-end Training Validation
-Run actual training loop with optimizer.step() and compare FP8 vs BF16 loss curves. Current data is forward+backward only.
+| GEMM | 权重用法 | 当前 runtime 操作 | 原生 fp8 后 |
+|------|---------|-----------------|-----------|
+| Forward up-proj | w1 → `(E,K,N)` fp8 | permute+contiguous+quant (16µs) | **直接读取** |
+| Forward down-proj | w2 → `(E,H,I)` fp8 | permute+contiguous+quant (23µs) | **直接读取** |
+| Backward dgated | w2 → `(E,I,H)` fp8 | permute+contiguous+quant (20µs) | **直接读取** |
+| Backward actgrad | w1 → `(E,H,2I)` fp8 | permute+contiguous+quant (40µs) + 首次 308µs contiguous | **直接读取** |
+| Backward wgrad dw1 | **不读 w1** | — | — |
+| Backward wgrad dw2 | **不读 w2** | — | — |
 
-### P2: Shape Scaling
-Test T=4096, T=16384, I=2048+ shapes. At larger I, down-proj FP8 becomes beneficial.
+#### Layout 难点
+同一权重需要**两种 physical layout**（forward 和 backward 的 permute 不同）:
+- w1: forward 需 `(E, 2I, H).mT` = `(E,H,2I)` contiguous; backward 需 `(E,H,2I)` contiguous → **同一 layout，可复用！**
+- w2: forward 需 `(E,H,I)` contiguous; backward dgated 需 `(E,I,H)` contiguous → **不同 layout**
 
-### P3: Multi-node Expert Parallelism
-Validate FP8 path with distributed expert parallelism.
+w2 有两个选择:
+1. 存两份 fp8 w2 (36+36=72 MiB) — 仍比 bf16 w2 (72 MiB) 相同
+2. 存一份 + 运行时 transpose (一次 ~20µs elementwise kernel) — 仍省去 quantize
+
+#### 实现方案（推荐: bf16 master + fp8 shadow）
+
+```python
+class FP8MoE(MoE):
+    def __init__(self, ...):
+        super().__init__(...)
+        # bf16 master weights for optimizer (existing)
+        # fp8 shadow weights + scales (new, registered as buffers)
+        self._w1_fp8 = None  # lazy init
+        self._w1_scales = None
+        self._w2_fp8_fwd = None  # (E,H,I) layout for forward
+        self._w2_fp8_bwd = None  # (E,I,H) layout for backward
+        # ... scales buffers ...
+
+    def refresh_fp8_weights(self):
+        """Call after optimizer.step() to re-quantize."""
+        # One-shot quantize: ~80µs total (vs 174µs per-iter in current path)
+        # This runs ONCE per optimizer step, not per forward+backward
+        self._w1_fp8, self._w1_scales = quantize_weight_3d_triton(...)
+        self._w2_fp8_fwd, self._w2_scales_fwd = quantize_weight_3d_triton(...)
+        self._w2_fp8_bwd, self._w2_scales_bwd = quantize_weight_3d_triton(...)
+```
+
+**工程量**: ~200 行核心代码 (`moe.py` + `__init__.py` + `blockscaled_fp8_gemm.py`)
+
+#### 收益量化
+
+| 收益项 | 数值 | 说明 |
+|--------|------|------|
+| 参数内存 | **−104.6 MiB (−48%)** | 216→111 MiB (fp8 + scales) |
+| 权重缓存消除 | **−222.8 MiB** | 4 个 runtime 缓存全部不再需要 |
+| 权重量化 kernel | **−174 µs/iter** | 7 次 _quantize_and_pack_kernel 消除 |
+| permute+contiguous | **−0~308 µs** | 依 layout 预存程度 |
+| **Total memory** | **−327 MiB** | 参数 + 缓存 |
+| **Total latency** | **−174~480 µs/iter** | 占当前 FP8 overhead 488µs 的 36-98% |
+| 理论 speedup | **1.13× → 1.18-1.24×** | |
+
+#### 风险与对策
+
+| 风险 | 严重度 | 对策 |
+|------|--------|------|
+| 量化误差积累 (optimizer step → requant → next step) | **中** | bf16 master weights 保证每步 requant 从 full-precision 出发，不会积累 |
+| PyTorch `nn.Parameter` 不支持 fp8 dtype | **低** | 用 `register_buffer` 存 fp8 shadow，master weights 仍是 `nn.Parameter` bf16 |
+| Distributed 兼容性 (DDP/FSDP 同步 fp8 buffers) | **中** | 只同步 bf16 master weights；fp8 shadow 在每个 rank 独立 requant |
+| Serialization (save/load fp8 checkpoints) | **低** | `state_dict` 包含 bf16 master + fp8 shadow，加载时 requant |
+| `refresh_fp8_weights()` 的调用时机 | **低** | 在 `optimizer.step()` 后立即调用；或用 optimizer hook 自动触发 |
+
+### P1: GEMM Epilogue FP8 Output (high complexity, moderate ROI)
+**Potential: −166µs forward → speedup ~1.18× (if stacked with P0, up to ~1.29×).**
+
+当前 `GemmGatedBlockscaledQuantMixin` 在 epilogue 中计算 E8M0 scales 但仍输出 bf16 D。若 D/PostAct 直接输出 fp8，消除 `_fused_z_save_y1_quant_kernel` (166µs)。
+
+**可行性**: CUTLASS CuTeDSL 支持 `Float8E4M3FN` dtype 和 8-bit TMA store。难点:
+1. D 和 PostAct 需要不同 TMA store atoms (z=fp8 with flat scales, y1=fp8 with ISA scales)
+2. ISA scale packing 需要在 epilogue 中 per-tile 完成
+3. SM100 MMA register-to-thread mapping 必须已知才能做 warp-level amax reduction
+
+**建议**: 在 P0 完成后再考虑。P0 + P1 叠加可达 **~1.29×**。
+
+### P2: End-to-end Training Validation
+用实际 optimizer.step() 跑训练 loop，对比 FP8 vs BF16 loss 曲线。当前数据仅覆盖 forward+backward。
+
+### P3: Shape Scaling
+测试 T=4096, T=16384, I=2048+ shapes。I≥2048 时 down-proj FP8 变得有利。
+
+### P4: Multi-node Expert Parallelism
+验证 FP8 路径在分布式 expert parallelism 下的正确性。
 
 ---
 
