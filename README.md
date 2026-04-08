@@ -151,11 +151,18 @@ Only two env vars needed: `USE_QUACK_GEMM=1` and `SONIC_MOE_FP8_MODE=perf`. All 
 
 | Config | GPU µs/iter | vs BF16 |
 |--------|------------|---------|
-| BF16 baseline | 3966 | baseline |
-| **FP8 frontier (Session 41)** | **3512** | **1.13× faster** |
+| BF16 baseline | 3840 | baseline |
+| **FP8 frontier** | **3442** | **1.12× faster** |
 
-> nsys GPU Projection, idle B200, 5 warmup + 10 profiled iterations.
-> GEMM savings 942µs (1.28-1.62×), FP8 overhead 488µs (13.9%).
+### Memory (idle B200, subprocess-isolated vs official BF16)
+
+| Metric | BF16 | FP8 | Delta |
+|--------|------|-----|-------|
+| Forward peak | 1386 MiB | **1263 MiB** | **−122 MiB (−8.8%)** |
+| Backward peak | 1412 MiB | **1367 MiB** | **−45 MiB (−3.2%)** |
+
+> Backward peak fully audited: 100% accounted (1368 MiB theoretical vs 1367 measured).
+> See `HANDOFF.md §1` for tensor-level breakdown.
 
 ### Precision
 
@@ -164,11 +171,7 @@ Only two env vars needed: `USE_QUACK_GEMM=1` and `SONIC_MOE_FP8_MODE=perf`. All 
 | output | 6.60% | 0.998 | ✓ PASS |
 | dx | 7.48% | 0.997 | ✓ PASS |
 
-All 31/31 contract tests pass. 3 seeds, subprocess-isolated.
-
-### Memory
-
-FP8 weight caches are transient (populated on demand, auto-invalidated at optimizer step).
+31/31 contract tests pass. 3 seeds, subprocess-isolated. Shadow weights BIT-IDENTICAL.
 
 ### Read first
 

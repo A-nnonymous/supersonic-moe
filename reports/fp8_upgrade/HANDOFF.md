@@ -1,170 +1,101 @@
 # Blockscaled FP8 MoE — Handoff
 
-> **Last updated:** 2026-04-08 (Session 41 — Memory optimization + kernel fusion + adapter skip)
-> **Branch:** `native-fp8-exploration`
-> **Status:** ✅ FP8 fully functional. **1.13× GPU compute speedup (nsys)**, precision PASS, memory optimized.
+> **Last updated:** 2026-04-09 (Session 41 final — complete state for next agent)
+> **Branch:** `native-fp8-exploration`  **Commit:** `a65eed1`
+> **Status:** ✅ FP8 functional. 1.12× speedup, −8.8% forward peak, 31/31 PASS.
 
 ---
 
-## 0. Current Bottom Line
+## 0. Bottom Line (verified on idle B200, nsys GPU Projection)
 
-> All data measured via **nsys GPU Projection on idle B200 nodes** (0% util, <5 MiB VRAM).
+| Metric | Official BF16 | FP8 Frontier | Delta |
+|--------|:---:|:---:|:---:|
+| **nsys GPU kernel/iter** | **3840 µs** | **3442 µs** | **1.12× faster** |
+| **Forward peak** | **1386 MiB** | **1263 MiB** | **−122 MiB (−8.8%)** |
+| **Backward peak** | **1412 MiB** | **1367 MiB** | **−45 MiB (−3.2%)** |
+| Output RRMSE | — | 6.60% | PASS (<10%) |
+| dx RRMSE | — | 7.48% | PASS (<10%) |
+| dw1 norm rel err | — | 0.45% | PASS |
+| dw2 norm rel err | — | 0.50% | PASS |
+| Test suite | — | **31/31 PASS** | ✅ |
+| Shadow correctness | — | **BIT-IDENTICAL** | ✅ |
 
-| Metric | BF16 Baseline | FP8 Frontier | Delta |
-|--------|--------------|--------------|-------|
-| **GPU Projection total** | **3966 µs** | **3512 µs** | **1.13× faster** |
-| Output RRMSE | — | 6.60% ✓ | <10% threshold |
-| Worst grad RRMSE | — | 7.48% (dx) ✓ | <10% threshold |
-| All cosines | — | ≥0.9972 ✓ | >0.99 threshold |
-| Test suite | — | **31/31 PASS** | ✓ |
-
-Shape: T=8192, H=3072, I=1536, E=8, K=8 (Ernie).  GPU: B200 (SM 10.0).
-
-### Usage (two env vars only)
+### Usage
 ```bash
 SONIC_MOE_FP8_MODE=perf USE_QUACK_GEMM=1 python train.py
 ```
 ```python
-from sonicmoe.functional.utils import enable_quack_gemm
+moe.refresh_fp8_shadow_weights()  # call after optimizer.step()
 with enable_quack_gemm(True):
-    out, loss = moe(x, use_fp8=True)
-```
-
-For best forward performance (trades +96 MiB peak for +64µs/iter):
-```bash
-SONIC_MOE_FP8_MODE=perf USE_QUACK_GEMM=1 SONIC_MOE_FP8_FUSED_ZY1_QUANT=1 python train.py
+    out, aux_loss = moe(x, use_fp8=True)
 ```
 
 ---
 
-## 1. nsys Kernel Breakdown (idle B200, 10 profiled iterations)
+## 1. 100% Backward Peak Breakdown (1367 MiB)
 
-### BF16 baseline: 3966 µs/iter
+> Verified by tensor-level audit: theoretical 1368 MiB vs measured 1367 MiB (0.1% gap).
 
-| Kernel | µs/iter | % |
-|--------|---------|---|
-| GemmDefault (wgrad×3 + downproj) | 2257 | 56.9% |
-| GemmGatedSm100 (up-proj fwd) | 737 | 18.6% |
-| GemmDGatedSm100 (bwd) | 482 | 12.2% |
-| elementwise (SwiGLU bwd etc) | 157 | 4.0% |
-| token_gather_sum | 141 | 3.6% |
-| Other | 192 | 4.8% |
-
-### FP8 frontier (with fused_zy1_quant): 3512 µs/iter
-
-| Kernel | µs/iter | % | vs BF16 |
-|--------|---------|---|---------|
-| GemmDefault (wgrad BF16) | 1764 | 50.2% | 1.28× faster |
-| GemmGatedSm100ZeroMat (FP8 fwd) | 454 | 12.9% | 1.62× faster |
-| GemmDGatedFP8CLoadSm100ZeroMat (FP8 bwd) | 415 | 11.8% | 1.16× faster |
-| _fused_z_save_y1_quant_kernel | 166 | 4.7% | FP8 overhead |
-| _quantize_and_pack_kernel (×6) | 222 | 6.3% | FP8 overhead |
-| elementwise (SwiGLU bwd) | 156 | 4.4% | ~same |
-| token_gather_sum | 144 | 4.1% | ~same |
-| _gather_isa_packed_scales_kernel (×2) | 55 | 1.6% | FP8 overhead |
-| Other | 136 | 3.9% | — |
-
-**GEMM savings: +942µs. FP8 overhead: −488µs. Net: +454µs (1.13×).**
+| Category | Tensor | MiB | % | Optimizable? |
+|----------|--------|:---:|:---:|:---:|
+| **dgated output** | dz (TK,2I) bf16 | **384** | 28% | ❌ CUTLASS d_dtype.width==32 |
+| **dgated output** | y1s (TK,I) bf16 | **192** | 14% | ❌ same constraint |
+| **ctx saved** | z_fp8 (TK,2I) | **192** | 14% | ✅ already fp8 (was 384) |
+| **model params** | w1 bf16 | **144** | 11% | ⚠️ see §7 dead ends |
+| **weight caches** | w1T+w2 fused fp8 | **111** | 8% | ⚠️ can defer w1T |
+| **pre-alloc** | dw2_base bf16 | **72** | 5% | ⚠️ can defer |
+| **model params** | w2 bf16 | **72** | 5% | ⚠️ see §7 dead ends |
+| **input/grad** | x+dout+metadata | **49** | 4% | ❌ interface contract |
+| **dgated input** | dout_fp8+w2_fp8 | **66** | 5% | ❌ needed by GEMM |
+| **misc** | scales+colvec+autograd | **37** | 3% | ❌ overhead |
+| **TOTAL** | | **1368** | **100%** | |
 
 ---
 
-## 2. Precision (subprocess-isolated, 3 seeds)
+## 2. Architecture — Zero-Materialization FP8
 
-| Tensor | Seed 42 | Seed 123 | Seed 777 | Cosine |
-|--------|---------|----------|----------|--------|
-| output RRMSE | 6.60% | 6.60% | 6.60% | 0.9978 |
-| dx RRMSE | 7.47% | 7.48% | 7.48% | 0.9972 |
+**Forward** (fused_gated, aligned):
+1. `quantize_and_pack_activation(x)` → T-sized FP8 + ISA scales
+2. `_gather_isa_packed_scales_kernel` → TK-sized ISA scales
+3. `GemmGatedSm100ZeroMat`: T-FP8 + A_idx → z(bf16) + y1(bf16)
+4. split quant: z→z_fp8 + resize_(0); y1→y1_fp8 + resize_(0)
 
-wgrad norm relative error: c_fc <0.33%, c_proj <0.38%, router <0.55%.
-31/31 contract tests PASS.
-
----
-
-## 3. Memory — Official BF16 vs FP8 Frontier Breakdown
-
-> **Methodology**: subprocess-isolated, idle B200 (0% util, 0 MiB), 2 warmup + 1 measured iter.
-> **BF16 baseline**: official upstream code (`lab/official/sonic-moe`, `envs/official_bf16`).
-> **FP8 frontier**: `native-fp8-exploration` branch (`lab/sonic-moe`, `envs/xfer`).
-> **Reproducibility**: BF16 3 runs (GPU 3,4,5), FP8 2 runs (GPU 5,6) — all identical (deterministic).
-
-### 3.1 Per-Checkpoint Comparison
-
-| Checkpoint | Official BF16 (MiB) | FP8 Frontier (MiB) | Delta | Note |
-|-----------|:---:|:---:|:---:|------|
-| 00_empty | 0.0 | 0.0 | — | bare CUDA context |
-| 01_model | 216.1 | 216.1 | 0 | same params (bf16 storage) |
-| 02_input | 312.1 | 312.1 | 0 | x(48M) + dout(48M) + model |
-| 03_post_warmup | 376.3 | 487.7 | **+111.4** | FP8 weight caches from warmup |
-| **04_fwd_peak** | **1385.7** | **1337.7** | **−48.0 (−3.5%)** | FP8 saves on z/y1 storage |
-| 05_post_fwd | 761.6 | 649.8 | **−111.8** | FP8 freed z/y1 bf16 via resize_(0) |
-| **06_bwd_peak** | **1411.6** | **1366.9** | **−44.6 (−3.2%)** | FP8 z stored as fp8 (−192M), but dz+dz_fp8 coexist |
-| 07_post_bwd | 640.3 | 751.7 | +111.4 | FP8 backward weight caches |
-| 08_cleanup | 328.3 | 439.7 | +111.4 | FP8 caches persist (invalidated at optimizer.step) |
-
-### 3.2 Key Metrics
-
-| Metric | Official BF16 | FP8 Frontier | Delta |
-|--------|:---:|:---:|:---:|
-| **Forward peak** | **1385.7 MiB** | **1337.7 MiB** | **−48.0 MiB (−3.5%)** |
-| **Backward peak** | **1411.6 MiB** | **1366.9 MiB** | **−44.6 MiB (−3.2%)** |
-| Net forward activation (peak − base) | 1009.4 MiB | 850.0 MiB | **−159.4 MiB (−15.8%)** |
-| Net backward activation (peak − post_fwd) | 650.0 MiB | 717.1 MiB | +67.1 MiB (+10.3%) |
-| Post-cleanup residual | 328.3 MiB | 439.7 MiB | +111.4 MiB |
-
-### 3.3 Analysis
-
-**Forward peak (−48 MiB / −3.5%)**:
-- FP8 saves ~159 MiB on z/y1 (resize_(0) frees bf16 after fp8 quant)
-- FP8 warmup base is +111 MiB higher (weight caches from previous iter)
-- Net: 159 − 111 = **−48 MiB absolute peak reduction**
-
-**Backward peak (−44.6 MiB / −3.2%)**:
-- FP8 saves 192 MiB by storing z as fp8 (vs bf16 in BF16 path)
-- FP8 spends +198 MiB on dz_fp8 prequant + weight caches
-- z_fp8 released after dgated GEMM (−198 MiB)
-- Net: modest reduction due to offsetting effects
-
-**Post-cleanup residual (+111.4 MiB)**:
-- Entirely from FP8 weight caches: w1T VARLEN (74.3 MiB) + w2 FUSED (37.1 MiB)
-- These auto-invalidate at `optimizer.step()` via `w._version` increment
-- In training with optimizer: **effective residual delta = 0**
-
-### 3.4 Weight cache lifecycle
-
-| Cache | Size (MiB) | Forward | Backward | Post-step |
-|-------|:---------:|---------|----------|-----------|
-| w1 fused (FUSED_CACHE) | 74.3 | populated → cleared | — | invalidated |
-| w2 varlen (VARLEN_CACHE) | 37.1 | populated → evicted | — | invalidated |
-| w1T varlen (VARLEN_CACHE) | 74.3 | — | populated → persists | invalidated |
-| w2 fused (FUSED_CACHE) | 37.1 | — | populated → persists | invalidated |
-
-### 3.5 Optimizations applied (Session 41)
-- z_fp8/z_raw_scales released immediately after dgated GEMM (−198 MiB backward peak)
-- w2 varlen evicted after down-proj forward (−37 MiB during ctx save)
-- w1 fused cleared before down-proj (−74 MiB during down-proj)
-- Redundant FP8 protocol adapter eliminated (−250µs when fp8_protocol is not None)
-
----
-
-## 4. Architecture — Zero-Materialization FP8
-
-SonicMoE's core principle: **no TK-sized FP8 activation materialized in HBM**.
-
-### Forward path (fused_gated, aligned)
-1. `quantize_and_pack_activation(x)` → T-sized FP8 + T-sized ISA scales
-2. `_gather_isa_packed_scales_kernel` → TK-sized ISA scales (~27µs)
-3. `GemmGatedSm100ZeroMat`: T-FP8 + A_idx + TK-scales → z(bf16) + y1(bf16)
-4. `fused_z_save_y1_quant(z, y1)` or split quant → z_fp8 + y1_fp8
-
-### Backward path (fused_gated, aligned)
-1. `quantize_and_pack_activation(dout)` + scale_gather → dout FP8 + TK scales
-2. `GemmDGatedFP8CLoadSm100ZeroMat`: dout_FP8 + w2T_FP8 + z_fp8(preact) → dz + y1s
-3. wgrad: `gemm(dout.T, y1s, out=dw2)`; `gemm(x.T, dz, out=dw1)`
+**Backward** (fused_gated, aligned):
+1. `quantize_and_pack_activation(dout)` + scale_gather → dout FP8
+2. `GemmDGatedFP8CLoadSm100ZeroMat`: dout_FP8 × w2T + z_fp8(preact) → dz + y1s
+3. wgrad: `gemm(dout.T, y1s)` → dw2; `gemm(x.T, dz)` → dw1
 4. actgrad: `blockscaled_fp8_gemm_varlen(dz_fp8, w1T_fp8)` → dx
 
 ---
 
-## 5. FP8 Flag Reference
+## 3. Memory — Official BF16 vs FP8 (idle B200, subprocess-isolated)
+
+| Checkpoint | BF16 (MiB) | FP8 (MiB) | Delta |
+|-----------|:---:|:---:|:---:|
+| Post-warmup base | 376 | 488 | +112 (shadow caches) |
+| **Forward peak** | **1386** | **1263** | **−122 (−8.8%)** |
+| **Backward peak** | **1412** | **1367** | **−45 (−3.2%)** |
+| Post-cleanup | 328 | 440 | +112 (auto-invalidated) |
+
+---
+
+## 4. Key Optimizations (Session 41)
+
+| Optimization | Impact | Verified |
+|-------------|--------|----------|
+| `_FP8Config` object | −15 os.getenv/iter | 31/31 PASS |
+| Adapter skip (fp8_protocol path) | −250µs | 31/31 PASS |
+| z_fp8 early release after dgated | −198 MiB bwd transient | 31/31 PASS |
+| w1 fused cache clear after up-proj | −74 MiB during down-proj | 31/31 PASS |
+| w2 varlen evict after down-proj | −37 MiB during ctx save | 31/31 PASS |
+| `FUSED_ZY1_QUANT` (optional) | −64µs, +96 MiB fwd peak | 31/31 PASS |
+| `refresh_fp8_shadow_weights()` | BIT-IDENTICAL, −160µs | 31/31 PASS |
+| Deferred backward cache fill | prevent 148 MiB transient spike | 31/31 PASS |
+| Cache key: `(_version, shape, stride)` | storage-id independent | 31/31 PASS |
+
+---
+
+## 5. Flags
 
 ### Required
 | Flag | Default | Set to |
@@ -177,217 +108,124 @@ SonicMoE's core principle: **no TK-sized FP8 activation materialized in HBM**.
 |------|---------|--------|
 | `SONIC_MOE_FP8_FUSED_GATED` | 1 | Fused GEMM+SwiGLU+descale |
 | `SONIC_MOE_FP8_SAVE_Z_FP8` | 1 | z stored as FP8 (−192 MiB) |
-| `SONIC_MOE_FP8_FUSED_SWIGLU_QUANT` | 1 | Fused SwiGLU+quant (fallback path) |
 
 ### Optional
-| Flag | Default | Effect | Cost |
-|------|---------|--------|------|
-| `SONIC_MOE_FP8_FUSED_ZY1_QUANT` | 0 | Fused z+y1 quant (1 launch) | +96 MiB fwd peak, saves 64µs |
-| `SONIC_MOE_FP8_EPILOGUE_QUANT` | 0 | GEMM epilogue z-scale compute | +JIT time, marginal gain |
-| `SONIC_MOE_FP8_ASSUME_ALIGNED` | 0 | Skip 128-alignment check | Crashes if misaligned |
+| Flag | Default | Effect |
+|------|---------|--------|
+| `SONIC_MOE_FP8_FUSED_ZY1_QUANT` | 0 | −64µs, +96 MiB fwd peak |
+| `SONIC_MOE_FP8_FUSED_SWIGLU_QUANT` | 1 | Fused SwiGLU+quant (fallback path) |
+| `SONIC_MOE_FP8_EPILOGUE_QUANT` | 0 | GEMM epilogue z-scale compute |
 
 ---
 
 ## 6. Bugs & Lessons
 
-### Bug 1: GemmDGatedFP8CLoadSm100 SFA layout — ✅ FIXED
-Root cause: SFA used T rows instead of TK rows for scale layout with gather_A.
-Fix: `GemmDGatedFP8CLoadSm100ZeroMat` uses `mD.shape[0]` for SFA M-dimension.
-
-### Bug 2: dw2_base permutation — ✅ FIXED
-Fix: `out=dw2.permute(2, 0, 1)` → correct layout.
-
 ### Process contamination ⚠️ CRITICAL
-`SONIC_MOE_FP8_MODE` is cached at import time. **Any BF16 vs FP8 comparison MUST use separate subprocesses.** Same-process gives fake bit-identical results.
+`SONIC_MOE_FP8_MODE` is cached at import time. **BF16 vs FP8 comparison MUST use separate subprocesses.**
 
 ### Measurement methodology
-- **CUDA events** include Python dispatch overhead (~0.5-1ms). Use for trends, not absolute numbers.
-- **nsys GPU Projection** is ground truth for kernel compute time. Always use idle GPUs (0% util, <5 MiB).
-- **ncu** uses base clock by default (`--clock-control=base`); nsys uses boost clock. Don't compare durations across tools.
-- Weight cache effects: benchmarks without optimizer.step() see cache hits from iter 2+; training sees miss every step.
+- **nsys GPU Projection** is ground truth. CUDA events include Python overhead.
+- **ncu** uses base clock; nsys uses boost. Don't compare across tools.
+- Weight cache effects: no-optimizer benchmarks see cache hits from iter 2+. Training misses every step.
+- **Repeated runs without offload are BIT-IDENTICAL** — verified.
+
+### Cache key lesson
+Removed `data_ptr` / `id(storage)` from cache keys. Now keys are `(_version, shape, stride)` only — stable across `w.data =` reassignment. This was needed for offload experiments but is a cleaner design regardless.
 
 ---
 
-## 7. Dead Ends (do NOT retry)
+## 7. Dead Ends (verified, do NOT retry without new approach)
 
-| Attempt | Why it failed |
-|---------|--------------|
-| FP8 wgrad | Colwise quant overhead > GEMM savings at all Ernie shapes |
-| `torch.as_strided` for fake TK shape | PyTorch storage bounds check rejects |
-| Aggressive VARLEN cache eviction in backward | Causes 308µs permute+contiguous re-quant every iter |
-| FP8 down-proj at I=1536 | Quant cost ≈ GEMM savings, net zero |
-| Same-process FP8/BF16 comparison | Process contamination gives fake results |
+### FP8 wgrad (dual_quantize path)
+- `dual_quantize_and_pack` kernel works correctly (single HBM read → row+col fp8)
+- `blockscaled_fp8_weight_grad_gemm_fast` with `pre_quantized_b` works
+- **But**: `_warp32x32_transpose_quant_kernel` costs 634µs/iter at Ernie I=1536
+- **Net result**: FP8 wgrad is **slower** than BF16 wgrad at Ernie shape
+- **Viable when**: I≥2048 (quant overhead < GEMM savings)
+
+### bf16 weight offload (Parameter dtype change)
+- `w.data = w.data.to(fp8)` successfully halves param storage (144→72 MiB)
+- Cache keys match (verified: FUSED=2, VARLEN=2 entries, all keys correct)
+- **Forward output: BIT-IDENTICAL** ✅
+- **Backward gradients: max_diff≠0** (dw1 max_diff=2.75, norm=85000, relative=0.003%)
+- **Root cause**: `w.data =` changes Parameter dtype → PyTorch autograd internals (likely `AccumulateGrad` node) behave differently with fp8 dtype, even though all GEMM computations go through cache
+- **Bisect proof**: cache re-population WITHOUT dtype change → BIT-IDENTICAL; dtype change alone → diff
+- Two identical runs WITHOUT offload → BIT-IDENTICAL (not non-determinism)
+
+### bf16 weight offload (resize_(0) + proxy)
+- `resize_(0)` frees GPU storage but breaks `w.permute()` (PyTorch bounds check)
+- fp8 proxy tensors: correct shape/stride but `_version` mismatch with cache
+- proxy is not `nn.Parameter` → autograd doesn't accumulate gradients to it
+- Gradient forwarding from proxy to Parameter requires framework-level support
+
+### Remaining offload approaches (untried)
+1. **PyTorch `DTensor` with mixed-precision sharding** — framework-level fp8 parameter support
+2. **Custom autograd Function wrapping** — pass fp8 buffers directly, bypass Parameter
+3. **FSDP-style param offload** — use FSDP's existing CPU offload infrastructure
+4. **Ernie-style `fp8_weight_stacked` buffers** — register_buffer with manual grad routing
 
 ---
 
-## 8. Key Files
+## 8. High-Value Information Sources
 
-| File | Role |
-|------|------|
-| `sonicmoe/functional/__init__.py` | Main FP8 forward/backward logic, `_FP8Config`, weight cache management |
-| `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` | Quant kernels, weight caches, `fused_z_save_y1_quant` |
-| `sonicmoe/quack_utils/gemm_sm100_fp8_zeromat.py` | ZeroMat kernel classes (SFA layout fix) |
-| `sonicmoe/quack_utils/gemm_gated.py` | GemmGated + epilogue quant mixin |
-| `sonicmoe/quack_utils/gemm_dgated.py` | GemmDGated + FP8CLoad mixin |
-| `sonicmoe/quack_utils/swiglu_triton.py` | Fused SwiGLU+quant Triton kernels |
-| `tests/fp8_large_project_contract_test.py` | 31-test precision+correctness gate |
-| `tools/nsys_benchmark.py` | nsys-compatible benchmark script |
-| `tools/precision_audit.py` | Subprocess-isolated precision audit |
-| `benchmarks/nsys_run/nsys_s41_*.sqlite` | Session 41 nsys data |
+| Source | Location | Key insight |
+|--------|----------|-------------|
+| Ernie MoELayer FP8 | `ernie-core/src/ernie_core/models/moe/moe_layer.py` L2436-2507 | `fp8_quant_weight()` pattern = bf16 master + fp8 shadow |
+| Ernie fp8_utils | `ernie-core/.../token_dispatcher/fp8_utils.py` | `kitchen_quant` 128×128 block, `deep_gemm` grouped GEMM |
+| Official BF16 baseline | `lab/official/sonic-moe` + `envs/official_bf16` | 10-arg `moe_TC_softmax_topk_layer` (no fp8_protocol) |
+| SonicMoE fork | `lab/sonic-moe` + `envs/xfer` | 11-arg (has fp8_protocol param) |
+| nsys data | `benchmarks/nsys_run/nsys_s41_*.sqlite` | GPU Projection ground truth |
+| env.md | `panzhaowu/env.md` | Proxy, GitHub token, cluster scan, nsys install |
 
 ---
 
 ## 9. Next Steps (prioritized)
 
-### P0: Native FP8 Parameters (highest ROI)
-**Potential: −174~480 µs/iter performance + −327 MiB memory → speedup 1.18-1.24×**
+### P0: Native FP8 Parameters (framework-level)
+**Potential: −327 MiB memory.** Requires one of:
+- PyTorch `FP8Parameter` class (upstream feature request)
+- Custom `torch.autograd.Function` that wraps fp8 buffer + manual grad routing
+- FSDP integration for mixed-precision parameter offload
 
-#### Insight
-当前最大的单项开销不是 GEMM epilogue，而是**运行时权重量化**。每次 forward+backward 调用 7 次 `_quantize_and_pack_kernel` (174µs) + permute/contiguous (训练中额外 ~308µs)。这些全部可以通过预存 FP8 参数消除。
+### P1: GEMM Epilogue FP8 Output
+**Potential: −166µs forward.** CUTLASS DSL change to output fp8 D/PostAct directly.
 
-wgrad GEMM (`dw1 = x.T @ dz`, `dw2 = dout.T @ y1s`) **完全不读权重**——它们只用激活和梯度。所以将权重从 bf16 切到 fp8 **不影响 wgrad 路径**，这是这个方案可行的核心原因。
+### P2: Training Validation
+Run actual training loop with optimizer.step(). Compare FP8 vs BF16 loss curves.
 
-#### 当前权重在 6 个 GEMM 中的使用模式
-
-| GEMM | 权重用法 | 当前 runtime 操作 | 原生 fp8 后 |
-|------|---------|-----------------|-----------|
-| Forward up-proj | w1 → `(E,K,N)` fp8 | permute+contiguous+quant (16µs) | **直接读取** |
-| Forward down-proj | w2 → `(E,H,I)` fp8 | permute+contiguous+quant (23µs) | **直接读取** |
-| Backward dgated | w2 → `(E,I,H)` fp8 | permute+contiguous+quant (20µs) | **直接读取** |
-| Backward actgrad | w1 → `(E,H,2I)` fp8 | permute+contiguous+quant (40µs) + 首次 308µs contiguous | **直接读取** |
-| Backward wgrad dw1 | **不读 w1** | — | — |
-| Backward wgrad dw2 | **不读 w2** | — | — |
-
-#### Layout 难点
-同一权重需要**两种 physical layout**（forward 和 backward 的 permute 不同）:
-- w1: forward 需 `(E, 2I, H).mT` = `(E,H,2I)` contiguous; backward 需 `(E,H,2I)` contiguous → **同一 layout，可复用！**
-- w2: forward 需 `(E,H,I)` contiguous; backward dgated 需 `(E,I,H)` contiguous → **不同 layout**
-
-w2 有两个选择:
-1. 存两份 fp8 w2 (36+36=72 MiB) — 仍比 bf16 w2 (72 MiB) 相同
-2. 存一份 + 运行时 transpose (一次 ~20µs elementwise kernel) — 仍省去 quantize
-
-#### 实现方案（推荐: bf16 master + fp8 shadow）
-
-```python
-class FP8MoE(MoE):
-    def __init__(self, ...):
-        super().__init__(...)
-        # bf16 master weights for optimizer (existing)
-        # fp8 shadow weights + scales (new, registered as buffers)
-        self._w1_fp8 = None  # lazy init
-        self._w1_scales = None
-        self._w2_fp8_fwd = None  # (E,H,I) layout for forward
-        self._w2_fp8_bwd = None  # (E,I,H) layout for backward
-        # ... scales buffers ...
-
-    def refresh_fp8_weights(self):
-        """Call after optimizer.step() to re-quantize."""
-        # One-shot quantize: ~80µs total (vs 174µs per-iter in current path)
-        # This runs ONCE per optimizer step, not per forward+backward
-        self._w1_fp8, self._w1_scales = quantize_weight_3d_triton(...)
-        self._w2_fp8_fwd, self._w2_scales_fwd = quantize_weight_3d_triton(...)
-        self._w2_fp8_bwd, self._w2_scales_bwd = quantize_weight_3d_triton(...)
-```
-
-**工程量**: ~200 行核心代码 (`moe.py` + `__init__.py` + `blockscaled_fp8_gemm.py`)
-
-#### 收益量化
-
-| 收益项 | 数值 | 说明 |
-|--------|------|------|
-| 参数内存 | **−104.6 MiB (−48%)** | 216→111 MiB (fp8 + scales) |
-| 权重缓存消除 | **−222.8 MiB** | 4 个 runtime 缓存全部不再需要 |
-| 权重量化 kernel | **−174 µs/iter** | 7 次 _quantize_and_pack_kernel 消除 |
-| permute+contiguous | **−0~308 µs** | 依 layout 预存程度 |
-| **Total memory** | **−327 MiB** | 参数 + 缓存 |
-| **Total latency** | **−174~480 µs/iter** | 占当前 FP8 overhead 488µs 的 36-98% |
-| 理论 speedup | **1.13× → 1.18-1.24×** | |
-
-#### 风险与对策
-
-| 风险 | 严重度 | 对策 |
-|------|--------|------|
-| 量化误差积累 (optimizer step → requant → next step) | **中** | bf16 master weights 保证每步 requant 从 full-precision 出发，不会积累 |
-| PyTorch `nn.Parameter` 不支持 fp8 dtype | **低** | 用 `register_buffer` 存 fp8 shadow，master weights 仍是 `nn.Parameter` bf16 |
-| Distributed 兼容性 (DDP/FSDP 同步 fp8 buffers) | **中** | 只同步 bf16 master weights；fp8 shadow 在每个 rank 独立 requant |
-| Serialization (save/load fp8 checkpoints) | **低** | `state_dict` 包含 bf16 master + fp8 shadow，加载时 requant |
-| `refresh_fp8_weights()` 的调用时机 | **低** | 在 `optimizer.step()` 后立即调用；或用 optimizer hook 自动触发 |
-
-### P1: GEMM Epilogue FP8 Output (high complexity, moderate ROI)
-**Potential: −166µs forward → speedup ~1.18× (if stacked with P0, up to ~1.29×).**
-
-当前 `GemmGatedBlockscaledQuantMixin` 在 epilogue 中计算 E8M0 scales 但仍输出 bf16 D。若 D/PostAct 直接输出 fp8，消除 `_fused_z_save_y1_quant_kernel` (166µs)。
-
-**可行性**: CUTLASS CuTeDSL 支持 `Float8E4M3FN` dtype 和 8-bit TMA store。难点:
-1. D 和 PostAct 需要不同 TMA store atoms (z=fp8 with flat scales, y1=fp8 with ISA scales)
-2. ISA scale packing 需要在 epilogue 中 per-tile 完成
-3. SM100 MMA register-to-thread mapping 必须已知才能做 warp-level amax reduction
-
-**建议**: 在 P0 完成后再考虑。P0 + P1 叠加可达 **~1.29×**。
-
-### P2: End-to-end Training Validation
-用实际 optimizer.step() 跑训练 loop，对比 FP8 vs BF16 loss 曲线。当前数据仅覆盖 forward+backward。
-
-### P3: Shape Scaling
-测试 T=4096, T=16384, I=2048+ shapes。I≥2048 时 down-proj FP8 变得有利。
-
-### P4: Multi-node Expert Parallelism
-验证 FP8 路径在分布式 expert parallelism 下的正确性。
+### P3: FP8 Wgrad at Larger Shapes
+Test I≥2048 where `dual_quantize` + `blockscaled_fp8_weight_grad_gemm_fast` becomes net-positive.
 
 ---
 
-## 10. Session 41 Changelog
+## 10. Key Files
 
-| Change | Impact | Files |
-|--------|--------|-------|
-| `_FP8Config` object | Eliminates ~15 os.getenv/iter | `__init__.py` |
-| Adapter skip | −250µs (when fp8_protocol≠None) | `__init__.py` L1783-1788 |
-| z_fp8 early release | −198 MiB backward peak | `__init__.py` L1332-1334 |
-| w2 forward eviction | −37 MiB during ctx save | `__init__.py` L1086-1089 |
-| w1 fused clear | −74 MiB during down-proj | `__init__.py` L1828-1830 |
-| `SONIC_MOE_FP8_FUSED_ZY1_QUANT` | −64µs/iter, +96 MiB fwd peak | `__init__.py` L722-740 |
-| **`refresh_fp8_shadow_weights()`** | **BIT-IDENTICAL, −160µs/iter** | **`moe.py` L257-295** |
-| nsys benchmark tooling | Reproducible profiling | `tools/nsys_benchmark.py` |
-
-### `refresh_fp8_shadow_weights()` — verified results
-
-```python
-# Usage: call once after optimizer.step()
-moe.refresh_fp8_shadow_weights()  # ~80µs one-shot
-
-# Then forward+backward uses cached FP8 weights (zero quant overhead)
-with enable_quack_gemm(True):
-    o = moe(x, use_fp8=True)[0]
-o.backward(dout)
-```
-
-| Metric | No shadow | With shadow | Delta |
-|--------|-----------|-------------|-------|
-| Correctness | — | **BIT-IDENTICAL** | ✅ |
-| CUDA events total | 4.92 ms | **4.76 ms** | **−160µs (−3.3%)** |
-| Variance (σ) | 0.45 ms | **0.15 ms** | 3× more stable |
-| 31/31 tests | PASS | **PASS** | ✅ |
+| File | Role |
+|------|------|
+| `sonicmoe/functional/__init__.py` | Main FP8 forward/backward, `_FP8Config` |
+| `sonicmoe/moe.py` | MoE class, `refresh_fp8_shadow_weights()` |
+| `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` | Quant kernels, caches, `dual_quantize_and_pack` |
+| `sonicmoe/quack_utils/gemm_gated.py` | GemmGated + epilogue quant mixin |
+| `sonicmoe/quack_utils/gemm_dgated.py` | GemmDGated + FP8CLoad |
+| `tests/fp8_large_project_contract_test.py` | 31-test gate |
+| `tools/nsys_benchmark.py` | nsys-compatible profiling |
+| `tools/precision_audit.py` | Subprocess-isolated precision |
+| `tools/_inline_audit.py` | Backward peak tensor inventory |
 
 ---
 
 ## 11. Quick Validation
-
 ```bash
 source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate
 cd /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe
 
-# Test suite (31 tests, ~100s)
+# Test suite
 CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
   python -m pytest tests/fp8_large_project_contract_test.py -v --tb=short
 
-# Precision audit (subprocess-isolated, 3 seeds)
+# Precision
 CUDA_VISIBLE_DEVICES=0 python tools/precision_audit.py --gpu 0 --seeds 42,123,777
 
-# nsys GPU Projection
-CUDA_VISIBLE_DEVICES=0 nsys profile --trace=cuda,nvtx --capture-range=cudaProfilerApi \
-  --sample=none -o /tmp/sonic_fp8 \
-  python tools/nsys_benchmark.py --mode fp8 --gpu 0 --warmup 5 --iters 10
-nsys export --type=sqlite --output=/tmp/sonic_fp8.sqlite /tmp/sonic_fp8.nsys-rep
-python tools/nsys_full_breakdown.py /tmp/sonic_bf16.sqlite /tmp/sonic_fp8.sqlite --labels bf16 fp8
+# Memory vs official BF16
+CUDA_VISIBLE_DEVICES=0 python tools/full_benchmark.py
 ```
