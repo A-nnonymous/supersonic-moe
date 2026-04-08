@@ -141,13 +141,14 @@ The 4 GEMM layouts need 4 fp8 tensors (w1_fused 72M + w2_varlen 37M + w1T 72M + 
 
 Ernie's `Fp8FusedMoeFunc` (moe_layer.py L2195) uses the same pattern: bf16 master weights + fp8 shadows stored as `weight.fp8_weight_stacked` attributes. Ernie does NOT attempt to free bf16 masters. The `MlpNode` accesses fp8 weights via `ctx.node` (not `save_for_backward`), avoiding cache-key fragility. But the memory footprint is identical.
 
-### `stash_bf16_to_cpu` — works but net-zero savings
-- `resize_(0)` frees bf16 params (−216 MiB)
-- Named cache / standard caches hold fp8 weights (+222 MiB)
-- `as_strided` proxy (2 bytes!) provides shape for GEMM dispatch
-- **output+dx: BIT-IDENTICAL** ✅, dw1/dw2 gradients: need custom hook
-- **Net: +6 MiB** (fp8 caches > bf16 params due to 4 layouts + scales)
-- Only useful if bf16 params can be CPU-offloaded AND layout count reduced to ≤3
+### `stash_bf16_to_cpu` / register_buffer — verified net-zero, REVERTED
+- Implemented full decoupled-weight mode: `save_for_backward` skips w1/w2, backward reads from `_NAMED_FP8_CACHE` directly, `as_strided` proxy (2 bytes) for shape dispatch, `resize_(0)` bf16 params
+- **Correctness: output+dx BIT-IDENTICAL** ✅
+- **Memory: net zero** — 4 fp8 layouts (222 MiB) ≥ bf16 params (216 MiB). Releasing bf16 and keeping fp8 caches = **+6 MiB**
+- **Gradient collection**: dw1/dw2 become None (proxy doesn't participate in autograd). Needs custom hook — not worth the complexity for zero memory benefit
+- **Ernie comparison**: `Fp8FusedMoeFunc` (moe_layer.py L2195) uses `ctx.node` + `weight.fp8_weight_stacked` — same structural limitation, Ernie also does NOT free bf16 masters
+- **Root cause**: same weight needs 4 different physical layouts (w1_fused, w2_varlen, w1T, w2_dgated). 4 × fp8 + scales > 1 × bf16 master
+- **Code reverted** in commit after `8a152a4`. Only docs remain.
 
 ### FP8 wgrad (dual_quantize path)
 - `dual_quantize_and_pack` kernel works correctly (single HBM read → row+col fp8)

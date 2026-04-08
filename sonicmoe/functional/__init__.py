@@ -132,10 +132,7 @@ def _fused_blockscaled_gated_forward(
         _storage_per_batch,
     )
 
-    if "w1_fused" in _NAMED_FP8_CACHE:
-        w1_fp8, w1_scales = _NAMED_FP8_CACHE["w1_fused"]
-    else:
-        w1_fp8, w1_scales = precompute_weight_fp8_for_fused_gated(w1)
+    w1_fp8, w1_scales = precompute_weight_fp8_for_fused_gated(w1)
 
     # Step 1: Quantize at T-size (NOT TK)
     x_fp8, x_scales_t = quantize_and_pack_activation(x)
@@ -257,15 +254,6 @@ _PREQUANTIZED_SCALES: dict[str, tuple] = {}
 
 # Counter for pre-quantization hits (testing/diagnostics).
 _PREQUANT_HIT_COUNT: dict[str, int] = collections.defaultdict(int)
-
-# Named FP8 weight cache for decoupled-weight mode.
-# Populated by MoE.stash_bf16_to_cpu(). When active, backward skips
-# precompute_weight_fp8 calls (which would fail on resize_(0) params)
-# and reads directly from the existing runtime caches by key.
-_NAMED_FP8_CACHE: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
-
-# Weight shape/device metadata for decoupled mode.
-_WEIGHT_META: dict[str, tuple] = {}  # {"w1": (shape, device), "w2": (shape, device)}
 
 # Side stream for overlapping wgrad with actgrad in _UpProjection.backward.
 _WGRAD_STREAM: torch.cuda.Stream | None = None
@@ -856,32 +844,16 @@ class _UpProjection(torch.autograd.Function):
         ctx._fp8_enabled = ctx._fp8_cfg.enabled
         ctx._alignment_assumed = ctx._fp8_cfg.alignment_assumed
 
-        # In decoupled mode, don't save w1 (bf16 may be freed). Save shape metadata.
-        _decoupled = bool(_NAMED_FP8_CACHE)
-        ctx._decoupled_weights = _decoupled
-        if _decoupled:
-            ctx._w1_shape = w1.shape
-            ctx._w1_device = w1.device
-            ctx.save_for_backward(
-                x,
-                b1,
-                expert_frequency_offset,
-                x_gather_idx,
-                None if use_quack_gemm else s_scatter_idx,
-                s_reverse_scatter_idx,
-                num_activated_expert_per_token_offset,
-            )
-        else:
-            ctx.save_for_backward(
-                x,
-                w1,
-                b1,
-                expert_frequency_offset,
-                x_gather_idx,
-                None if use_quack_gemm else s_scatter_idx,
-                s_reverse_scatter_idx,
-                num_activated_expert_per_token_offset,
-            )
+        ctx.save_for_backward(
+            x,
+            w1,
+            b1,
+            expert_frequency_offset,
+            x_gather_idx,
+            None if use_quack_gemm else s_scatter_idx,
+            s_reverse_scatter_idx,
+            num_activated_expert_per_token_offset,
+        )
 
         ctx.mark_non_differentiable(y1)
         ctx.set_materialize_grads(False)
@@ -908,33 +880,18 @@ class _UpProjection(torch.autograd.Function):
         stream_id = ctx.stream_id
         use_quack_gemm = ctx.use_quack_gemm
 
-        if ctx._decoupled_weights:
-            (
-                x,
-                b1,
-                expert_frequency_offset,
-                x_gather_idx,
-                s_scatter_idx,
-                s_reverse_scatter_idx,
-                num_activated_expert_per_token_offset,
-            ) = ctx.saved_tensors
-            w1_shape = ctx._w1_shape
-            w1_device = ctx._w1_device
-        else:
-            (
-                x,
-                w1,
-                b1,
-                expert_frequency_offset,
-                x_gather_idx,
-                s_scatter_idx,
-                s_reverse_scatter_idx,
-                num_activated_expert_per_token_offset,
-            ) = ctx.saved_tensors
-            w1_shape = w1.shape
-            w1_device = w1.device
+        (
+            x,
+            w1,
+            b1,
+            expert_frequency_offset,
+            x_gather_idx,
+            s_scatter_idx,
+            s_reverse_scatter_idx,
+            num_activated_expert_per_token_offset,
+        ) = ctx.saved_tensors
 
-        dw1_base = torch.empty((E, w1_shape[0], w1_shape[1]), dtype=torch.bfloat16, device=w1_device)
+        dw1_base = torch.empty((E, w1.shape[0], w1.shape[1]), dtype=w1.dtype, device=w1.device)
         dw1 = dw1_base.permute(1, 2, 0)
         db1 = None if b1 is None else torch.empty_like(b1)
         _reset_stage_memory_probe()
@@ -950,11 +907,8 @@ class _UpProjection(torch.autograd.Function):
                 # coexisting, reducing backward peak by ~384 MiB.
                 dz_bf16 = dz if dz.dtype == torch.bfloat16 else dz.to(torch.bfloat16)
 
-                # Prepare actgrad resources (cache lookup or named cache).
-                if ctx._decoupled_weights:
-                    w1T_fp8, w1T_scales = _NAMED_FP8_CACHE["w1T_varlen"]
-                else:
-                    w1T_fp8, w1T_scales = precompute_weight_fp8(w1.permute(1, 0, 2))
+                # Prepare actgrad resources first (cache lookup, no alloc).
+                w1T_fp8, w1T_scales = precompute_weight_fp8(w1.permute(1, 0, 2))
                 prequant_dz = _PREQUANTIZED_SCALES.pop("bwd", None)
                 has_prequant = (
                     prequant_dz is not None
@@ -982,14 +936,8 @@ class _UpProjection(torch.autograd.Function):
                 if has_prequant:
                     _PREQUANT_HIT_COUNT["bwd"] += 1
                     _, dz_fp8, dz_packed_scales = prequant_dz
-                    # In decoupled mode, create 0-byte meta proxy for shape inference
-                    if ctx._decoupled_weights:
-                        w1_proxy = torch.empty(w1_shape[1], w1_shape[0], w1_shape[2],
-                                               device='meta', dtype=torch.bfloat16)
-                    else:
-                        w1_proxy = w1.permute(1, 0, 2)
                     dx_expanded = blockscaled_fp8_gemm_varlen(
-                        dz_fp8, w1_proxy, expert_frequency_offset,
+                        dz_fp8, w1.permute(1, 0, 2), expert_frequency_offset,
                         a_scales=dz_packed_scales,
                         w_fp8=w1T_fp8, w_scales=w1T_scales,
                         out_dtype=torch.bfloat16,
@@ -1107,7 +1055,7 @@ class _DownProjection(torch.autograd.Function):
                     )
                     if has_prequant:
                         _PREQUANT_HIT_COUNT["fwd"] += 1
-                        w2_fp8, w2_scales = _NAMED_FP8_CACHE["w2_varlen"] if "w2_varlen" in _NAMED_FP8_CACHE else precompute_weight_fp8(w2)
+                        w2_fp8, w2_scales = precompute_weight_fp8(w2)
                         _, y1_fp8, y1_packed_scales = prequant
                         y2 = blockscaled_fp8_gemm_varlen(
                             y1_fp8, w2, expert_frequency_offset,
@@ -1119,7 +1067,7 @@ class _DownProjection(torch.autograd.Function):
                         del y1_fp8, y1_packed_scales
                     else:
                         # Fallback: inline FP8 quant (prequant cache miss)
-                        w2_fp8, w2_scales = _NAMED_FP8_CACHE["w2_varlen"] if "w2_varlen" in _NAMED_FP8_CACHE else precompute_weight_fp8(w2)
+                        w2_fp8, w2_scales = precompute_weight_fp8(w2)
                         y1_fp8, y1_scales = quantize_and_pack_activation(y1)
                         y2 = blockscaled_fp8_gemm_varlen(
                             y1_fp8, w2, expert_frequency_offset,
@@ -1132,7 +1080,7 @@ class _DownProjection(torch.autograd.Function):
                 else:
                     # Blockscaled FP8 down-proj: use pre-quantized y1 if available
                     # from fused SwiGLU+quant in _UpProjection.forward.
-                    w2_fp8, w2_scales = _NAMED_FP8_CACHE["w2_varlen"] if "w2_varlen" in _NAMED_FP8_CACHE else precompute_weight_fp8(w2)
+                    w2_fp8, w2_scales = precompute_weight_fp8(w2)
                     prequant = _PREQUANTIZED_SCALES.pop("fwd", None)
                     has_prequant = (
                         prequant is not None
@@ -1156,10 +1104,11 @@ class _DownProjection(torch.autograd.Function):
                             out_dtype=torch.bfloat16,
                             assume_aligned=True,
                         )
-                # Evict w2 cache if NOT in stash/named-cache mode
-                if "w2_varlen" not in _NAMED_FP8_CACHE:
-                    from ..quack_utils.blockscaled_fp8_gemm import evict_fp8_weight_cache_entry
-                    evict_fp8_weight_cache_entry(w2)
+                # Eagerly release w2 FP8 weight cache (~37 MiB) — down-proj GEMM
+                # is done, and in training the optimizer step will invalidate
+                # the cache anyway (w._version increment).
+                from ..quack_utils.blockscaled_fp8_gemm import evict_fp8_weight_cache_entry
+                evict_fp8_weight_cache_entry(w2)
                 router_perm = s_reverse_scatter_idx
                 y2_for_router = y2
             else:
@@ -1232,37 +1181,28 @@ class _DownProjection(torch.autograd.Function):
                     f"(expected bf16 for inline quantization)"
                 )
                 z_fp8, z_raw_scales = quantize_activation_blockscaled_fast(z)
-        _decoupled = bool(_NAMED_FP8_CACHE)
-        ctx._decoupled_weights = _decoupled
-
-        if z_is_fp8:
-            if _decoupled:
-                ctx._w2_shape = w2.shape
-                ctx._w2_device = w2.device
-                ctx.save_for_backward(
-                    z_fp8, z_raw_scales,
-                    b2, topk_scores, expert_frequency_offset,
-                    x_gather_idx, s_scatter_idx, s_reverse_scatter_idx,
-                )
-            else:
-                ctx.save_for_backward(
-                    z_fp8, z_raw_scales, w2, b2, topk_scores,
-                    expert_frequency_offset, x_gather_idx, s_scatter_idx,
-                    s_reverse_scatter_idx,
-                )
+            ctx.save_for_backward(
+                z_fp8,
+                z_raw_scales,
+                w2,
+                b2,
+                topk_scores,
+                expert_frequency_offset,
+                x_gather_idx,
+                s_scatter_idx,
+                s_reverse_scatter_idx,
+            )
         else:
-            if _decoupled:
-                ctx._w2_shape = w2.shape
-                ctx._w2_device = w2.device
-                ctx.save_for_backward(
-                    z, b2, topk_scores, expert_frequency_offset,
-                    x_gather_idx, s_scatter_idx, s_reverse_scatter_idx,
-                )
-            else:
-                ctx.save_for_backward(
-                    z, w2, b2, topk_scores, expert_frequency_offset,
-                    x_gather_idx, s_scatter_idx, s_reverse_scatter_idx,
-                )
+            ctx.save_for_backward(
+                z,
+                w2,
+                b2,
+                topk_scores,
+                expert_frequency_offset,
+                x_gather_idx,
+                s_scatter_idx,
+                s_reverse_scatter_idx,
+            )
 
         # Keep w2 FP8 cache — backward hits cache (~38µs savings) at ~37MB memory cost.
         # The cache auto-invalidates via w._version when optimizer updates weights.
@@ -1283,35 +1223,35 @@ class _DownProjection(torch.autograd.Function):
         dout = dout.contiguous()
 
         if ctx._z_is_fp8:
-            if ctx._decoupled_weights:
-                (z_fp8, z_raw_scales, b2, topk_scores, expert_frequency_offset,
-                 x_gather_idx, s_scatter_idx, s_reverse_scatter_idx) = ctx.saved_tensors
-                w2_shape, w2_device = ctx._w2_shape, ctx._w2_device
-            else:
-                (z_fp8, z_raw_scales, w2, b2, topk_scores, expert_frequency_offset,
-                 x_gather_idx, s_scatter_idx, s_reverse_scatter_idx) = ctx.saved_tensors
-                w2_shape, w2_device = w2.shape, w2.device
+            (
+                z_fp8,
+                z_raw_scales,
+                w2,
+                b2,
+                topk_scores,
+                expert_frequency_offset,
+                x_gather_idx,
+                s_scatter_idx,
+                s_reverse_scatter_idx,
+            ) = ctx.saved_tensors
             z_raw_scales_u8 = z_raw_scales.view(torch.uint8)
+            # Defer dequantize: FP8 path uses fused kernel, others lazy-dequant
             z = None
         else:
-            if ctx._decoupled_weights:
-                (z, b2, topk_scores, expert_frequency_offset,
-                 x_gather_idx, s_scatter_idx, s_reverse_scatter_idx) = ctx.saved_tensors
-                w2_shape, w2_device = ctx._w2_shape, ctx._w2_device
-            else:
-                (z, w2, b2, topk_scores, expert_frequency_offset,
-                 x_gather_idx, s_scatter_idx, s_reverse_scatter_idx) = ctx.saved_tensors
-                w2_shape, w2_device = w2.shape, w2.device
+            (
+                z,
+                w2,
+                b2,
+                topk_scores,
+                expert_frequency_offset,
+                x_gather_idx,
+                s_scatter_idx,
+                s_reverse_scatter_idx,
+            ) = ctx.saved_tensors
             z_fp8 = z_raw_scales_u8 = None
 
-        # Defer dw2_base allocation for FP8 fused_gated path
-        _defer_dw2 = (use_quack_gemm and ctx._fp8_enabled_flag
-                      and ctx._alignment_assumed_flag and ctx._use_fused_blockscaled_gated_flag)
-        if not _defer_dw2:
-            dw2_base = torch.empty((w2_shape[2], w2_shape[0], w2_shape[1]), dtype=torch.bfloat16, device=w2_device)
-            dw2 = dw2_base.permute(1, 2, 0)
-        else:
-            dw2_base = dw2 = None
+        dw2_base = torch.empty((w2.shape[2], w2.shape[0], w2.shape[1]), dtype=w2.dtype, device=w2.device)
+        dw2 = dw2_base.permute(1, 2, 0)
         db2 = None if b2 is None else torch.empty_like(b2)
         _reset_stage_memory_probe()
 
@@ -1373,10 +1313,7 @@ class _DownProjection(torch.autograd.Function):
                     if not use_fp8_preact:
                         torch.cuda.current_stream().wait_stream(_get_dequant_stream())
 
-                    if ctx._decoupled_weights:
-                        w2_fp8_enk, w2_scales = _NAMED_FP8_CACHE["w2_dgated"]
-                    else:
-                        w2_fp8_enk, w2_scales = precompute_weight_fp8_for_direct_fused_dgated(w2)
+                    w2_fp8_enk, w2_scales = precompute_weight_fp8_for_direct_fused_dgated(w2)
                     config = default_config(dout.device)
                     total_m = x_gather_idx.shape[0]  # TK (not T — dout_fp8 is T-sized)
                     n = w2_fp8_enk.shape[-2]
@@ -1419,12 +1356,6 @@ class _DownProjection(torch.autograd.Function):
                         del z_fp8, z_raw_scales_u8
                     # Keep w2 fused cache — avoids ~40µs re-quant on next iter.
                     del w2_fp8_enk, w2_scales
-
-                    # Deferred dw2 allocation (after dgated peak)
-                    if dw2_base is None:
-                        dw2_base = torch.empty((w2_shape[2], w2_shape[0], w2_shape[1]),
-                                               dtype=torch.bfloat16, device=w2_device)
-                        dw2 = dw2_base.permute(1, 2, 0)
 
                     # Weight-grad FIRST (frees y1s before dz prequant to reduce peak).
                     _log_stage_memory("backward:down-proj-dgated")
@@ -1748,7 +1679,7 @@ def _moe_tc_softmax_topk_layer_quack_inference(
             if _fp8_enabled() and _use_fused_blockscaled_gated() and aligned:
                 # Blockscaled FP8 down-proj: same path as training.
                 y1_fp8, y1_scales = quantize_and_pack_activation(y1)
-                w2_fp8, w2_scales = _NAMED_FP8_CACHE["w2_varlen"] if "w2_varlen" in _NAMED_FP8_CACHE else precompute_weight_fp8(w2)
+                w2_fp8, w2_scales = precompute_weight_fp8(w2)
                 y2 = blockscaled_fp8_gemm_varlen(
                     y1_fp8, w2, expert_frequency_offset,
                     a_scales=y1_scales,
@@ -1917,9 +1848,8 @@ def moe_TC_softmax_topk_layer(
     # which is forward-only.  Keep VARLEN cache — entries auto-invalidate
     # via w._version at optimizer step, and hit in no-optimizer benchmarks.
     if _get_fp8_config().enabled and _get_fp8_config().alignment_assumed:
-        if not _NAMED_FP8_CACHE:  # don't clear in stash mode
-            from ..quack_utils.blockscaled_fp8_gemm import clear_fused_weight_cache
-            clear_fused_weight_cache()
+        from ..quack_utils.blockscaled_fp8_gemm import clear_fused_weight_cache
+        clear_fused_weight_cache()
 
     _reset_stage_memory_probe()
     o = _DownProjection.apply(
