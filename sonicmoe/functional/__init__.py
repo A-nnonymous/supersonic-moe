@@ -1845,7 +1845,10 @@ def moe_TC_softmax_topk_layer(
             # (prequant cache holds fp8+scales).  Skip the adapter's quant→dequant
             # round-trip which costs ~250µs and is redundant.
             pass
-        elif is_using_quack_gemm():
+        elif cfg.alignment_assumed and is_using_quack_gemm():
+            # Aligned non-fused-gated path: cutify's fused SwiGLU+quant expects
+            # z in stacked [gate|value] layout.  Both blockscaled_fp8_gemm_varlen
+            # and fused_gated produce z compatible with this convention.
             restored_out = None
             if y1.size(-1) % fp8_protocol.group_size == 0:
                 if use_low_precision_postact_buffer:
@@ -1863,6 +1866,12 @@ def moe_TC_softmax_topk_layer(
                     restored_out=restored_out,
                     output_dtype=z.dtype,
                 )
+        elif is_using_quack_gemm():
+            # Unaligned QuACK path: gemm_gated outputs z in interleaved layout
+            # [g0,v0,g1,v1,…] which is incompatible with cutify's stacked
+            # SwiGLU+quant.  The down-projection also falls back to BF16 for
+            # unaligned segments, so FP8 quantization adds no benefit.  Skip.
+            pass
         else:
             y1, _ = apply_activation_fp8_protocol(
                 y1,
