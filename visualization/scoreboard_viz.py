@@ -22,6 +22,7 @@ import sys
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.lines as mlines
 import matplotlib.patches as mpatches
 import matplotlib.ticker as mticker
 import numpy as np
@@ -69,27 +70,94 @@ def _phase_mem(mode: dict) -> np.ndarray:
     return np.array([ph["alloc_mib"] for ph in mode["board"]])
 
 
-def _critical_flows(mode: dict, min_mib: float = 48) -> list[tuple]:
-    """Return [(src_buf, dst_buf, op_name, phase_idx), ...] for major flows."""
-    bufs = mode["bufs"]
-    flows = []
-    for op in mode["ops"]:
-        oname, phase = op["id"], op["phase"]
-        reads = [r for r in op["R"] if r in bufs and bufs[r]["mib"] >= min_mib]
-        writes = [w for w in op["W"] if w in bufs and bufs[w]["mib"] >= min_mib]
-        for r in reads:
-            for w in writes:
-                if r != w:
-                    flows.append((r, w, oname, phase))
-    flows.sort(key=lambda f: -bufs.get(f[1], {}).get("mib", 0))
-    seen = set()
-    unique = []
-    for f in flows:
-        key = (f[0], f[1], f[3])
-        if key not in seen:
-            seen.add(key)
-            unique.append(f)
-    return unique[:12]
+# ─── Critical dataflow chain definitions ─────────────────────────────
+# Waypoints: (buffer_name, phase_index).
+# Same-buffer consecutive = carry-over (horizontal).
+# Different-buffer = operator transformation (orthogonal right-angle routing).
+
+_CHAINS: dict[str, list[dict]] = {
+    "bf16": [
+        {"name": "Fwd Act",   "c": "#1565C0", "d": False,
+         "wps": [("x",1), ("y1",1), ("y1",2), ("output",2)]},
+        {"name": "Gate→Grad", "c": "#E65100", "d": False,
+         "wps": [("z",1), ("z",3), ("dz",3), ("dz",5), ("dx",5)]},
+        {"name": "Wgrad",     "c": "#2E7D32", "d": True,
+         "wps": [("dz",4), ("dw1",4)]},
+    ],
+    "fp8": [
+        {"name": "Fwd FP8",    "c": "#1565C0", "d": False,
+         "wps": [("x",1), ("fwd_fp8",1), ("fwd_fp8",2), ("output",2)]},
+        {"name": "FP8 Bridge",  "c": "#E65100", "d": False,
+         "wps": [("z_fp8",1), ("z_fp8",3), ("bwd_fp8",3), ("bwd_fp8",5), ("dx",5)]},
+        {"name": "Prequant",    "c": "#6A1B9A", "d": True,
+         "wps": [("z_fp8",3), ("prequant_bwd_0",3), ("prequant_bwd_0",4), ("dw1",4)]},
+    ],
+}
+
+
+def _draw_chains(ax: plt.Axes, mode_key: str,
+                 buf_idx: dict[str, int]) -> list[dict]:
+    """Draw critical-path dataflow chains as orthogonal polylines.
+
+    Returns list of chain defs that were actually rendered (for legend).
+    """
+    chains = _CHAINS.get(mode_key, [])
+    drawn: list[dict] = []
+    n = len(chains)
+
+    for ci, ch in enumerate(chains):
+        wps = [(b, p) for b, p in ch["wps"] if b in buf_idx]
+        if len(wps) < 2:
+            continue
+        drawn.append(ch)
+
+        color = ch["c"]
+        ls: object = (0, (5, 3)) if ch["d"] else "-"
+        v_off = (ci - (n - 1) / 2) * 0.14
+
+        # ── Build orthogonal path through the Gantt ──
+        path: list[tuple[float, float]] = []
+        for wi, (buf, phase) in enumerate(wps):
+            x, y = phase + 0.5, buf_idx[buf] + v_off
+            if wi == 0:
+                path.append((x, y))
+                continue
+            prev_buf, prev_ph = wps[wi - 1]
+            yp = buf_idx[prev_buf] + v_off
+            if prev_buf == buf:                          # carry-over
+                path.append((x, y))
+            elif prev_ph == phase:                       # same-phase op
+                x_jog = phase + 0.88
+                path.extend([(x_jog, yp), (x_jog, y), (x, y)])
+            else:                                        # cross-phase + buf
+                x_mid = max(prev_ph, phase) + 0.02
+                path.extend([(x_mid, yp), (x_mid, y), (x, y)])
+
+        if len(path) < 2:
+            continue
+
+        xs = [p[0] for p in path]
+        ys = [p[1] for p in path]
+
+        # Polyline shaft (with optional dashes)
+        ax.plot(xs, ys, color=color, lw=2.0, ls=ls, alpha=0.6, zorder=7,
+                solid_capstyle="round", solid_joinstyle="round")
+
+        # Arrowhead at terminus (invisible-shaft FancyArrowPatch)
+        arrow = mpatches.FancyArrowPatch(
+            (xs[-2], ys[-2]), (xs[-1], ys[-1]),
+            arrowstyle="-|>", color=color, lw=0.01,
+            alpha=0.7, mutation_scale=14, zorder=8,
+        )
+        ax.add_patch(arrow)
+
+        # Dots at actual waypoints (not routing-jog intermediates)
+        for buf, phase in wps:
+            if buf in buf_idx:
+                ax.plot(phase + 0.5, buf_idx[buf] + v_off, "o",
+                        color=color, ms=3.5, alpha=0.55, zorder=9)
+
+    return drawn
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -97,7 +165,8 @@ def _critical_flows(mode: dict, min_mib: float = 48) -> list[tuple]:
 # ═════════════════════════════════════════════════════════════════════════
 
 def _draw_panel(ax: plt.Axes, mode: dict, buf_list: list[str],
-                title: str, show_ylabel: bool, draw_arrows: bool) -> None:
+                title: str, show_ylabel: bool,
+                mode_key: str = "") -> list[dict]:
     bufs = mode["bufs"]
     board = mode["board"]
     n_ph = len(board)
@@ -148,31 +217,11 @@ def _draw_panel(ax: plt.Axes, mode: dict, buf_list: list[str],
                 va="center", ha="left", fontsize=F["ann"],
                 color="#424242", fontfamily="monospace", fontweight="bold")
 
-    # ── DAG flow arrows (critical path only) ──
-    if draw_arrows:
-        flows = _critical_flows(mode, min_mib=48)
+    # ── Dataflow chain polylines (orthogonal routing) ──
+    drawn_chains: list[dict] = []
+    if mode_key:
         buf_idx = {bn: i for i, bn in enumerate(buf_list)}
-        drawn = set()
-        for src, dst, op, phase in flows:
-            if src not in buf_idx or dst not in buf_idx:
-                continue
-            yi = buf_idx[src]
-            yj = buf_idx[dst]
-            if abs(yi - yj) < 1:
-                continue
-            key = (src, dst, phase)
-            if key in drawn:
-                continue
-            drawn.add(key)
-            x_mid = phase + 0.5
-            rad = 0.35 if yj > yi else -0.35
-            ax.annotate("",
-                        xy=(x_mid + 0.05, yj), xytext=(x_mid - 0.05, yi),
-                        arrowprops=dict(
-                            arrowstyle="-|>", color="#37474F",
-                            connectionstyle=f"arc3,rad={rad}",
-                            lw=1.2, alpha=0.35, shrinkA=4, shrinkB=4),
-                        zorder=2)
+        drawn_chains = _draw_chains(ax, mode_key, buf_idx)
 
     # ── Memory envelope (secondary y-axis right) ──
     ax2 = ax.twinx()
@@ -233,6 +282,7 @@ def _draw_panel(ax: plt.Axes, mode: dict, buf_list: list[str],
     ax.set_facecolor("#FAFAFA")
     ax.set_title(title, fontsize=F["title"], fontweight="bold", pad=18)
     ax.tick_params(length=0)
+    return drawn_chains
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -333,16 +383,16 @@ def render() -> None:
 
     pk_b = bf16["peak"]["alloc_mib"]
     pk_f = fp8["peak"]["alloc_mib"]
-    _draw_panel(ax_b, bf16, blist,
+    chains_b = _draw_panel(ax_b, bf16, blist,
                 f"BF16 Baseline  ·  {len(bf16['bufs'])} bufs  ·  "
                 f"peak {pk_b:.0f} MiB @ P{bf16['peak']['phase']}",
-                show_ylabel=True, draw_arrows=True)
-    _draw_panel(ax_f, fp8, blist,
+                show_ylabel=True, mode_key="bf16")
+    chains_f = _draw_panel(ax_f, fp8, blist,
                 f"FP8 Frontier  ·  {len(fp8['bufs'])} bufs  ·  "
                 f"peak {pk_f:.0f} MiB @ P{fp8['peak']['phase']}",
-                show_ylabel=False, draw_arrows=True)
+                show_ylabel=False, mode_key="fp8")
 
-    # Shared legend
+    # Shared legend (bar states + buffer classes + chain flows)
     leg = [
         mpatches.Patch(fc=_S["W"], label="W  Write (produce)"),
         mpatches.Patch(fc=_S["R"], label="R  Read (consume)"),
@@ -351,6 +401,15 @@ def render() -> None:
     for cls in ["data", "weight", "grad", "quant", "meta"]:
         leg.append(mpatches.Patch(fc="white", ec=_C[cls], lw=2.5,
                                   label=cls.title()))
+    # Chain flow entries (deduplicate by name across BF16/FP8)
+    seen_names: set[str] = set()
+    for ch in chains_b + chains_f:
+        if ch["name"] not in seen_names:
+            seen_names.add(ch["name"])
+            ls = (0, (5, 3)) if ch["d"] else "-"
+            leg.append(mlines.Line2D([0], [0], color=ch["c"], lw=2.0,
+                                     ls=ls, alpha=0.7,
+                                     label=f"⟶ {ch['name']}"))
     ax_f.legend(handles=leg, fontsize=F["leg"], loc="lower right",
                 ncol=2, framealpha=0.92, handlelength=1.4,
                 handletextpad=0.4, columnspacing=0.8,
