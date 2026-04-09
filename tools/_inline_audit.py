@@ -87,7 +87,7 @@ items = [
     ("cache: w2 fused scales", 1.12, "e8m0"),
     ("dgated output: dz", 384.0, "bf16 (TK,2I) ← BIGGEST"),
     ("dgated output: y1s", 192.0, "bf16 (TK,I)"),
-    ("dgated pre-alloc: dw2_base", 72.0, "bf16 (E,H,I)"),
+    ("dgated pre-alloc: dw2_base", 0.0, "DEFERRED to wgrad (session 42)"),
     ("dgated input: dout_fp8", 24.0, "fp8 (T,H)"),
     ("dgated input: dout_scales", 6.0, "e8m0 ISA TK"),
     ("dgated input: w2_fp8_enk", 36.0, "fp8 (E,I,H) — from cache"),

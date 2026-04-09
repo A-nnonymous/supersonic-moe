@@ -278,16 +278,16 @@ class MoE(nn.Module):
         w2_perm = w2.permute(1, 2, 0)  # (H, I, E)
 
         # Layout 1: w1 for fused_gated forward — writes _FUSED_WEIGHT_CACHE
-        precompute_weight_fp8_for_fused_gated(w1_perm)
+        self._fp8_w1_fused = precompute_weight_fp8_for_fused_gated(w1_perm)
 
         # Layout 2: w2 for varlen down-proj forward — writes _VARLEN_WEIGHT_CACHE
-        precompute_weight_fp8(w2_perm)
+        self._fp8_w2_varlen = precompute_weight_fp8(w2_perm)
 
         # Layout 3: w2 for direct_fused_dgated backward — writes _FUSED_WEIGHT_CACHE
-        precompute_weight_fp8_for_direct_fused_dgated(w2_perm)
+        self._fp8_w2_dgated = precompute_weight_fp8_for_direct_fused_dgated(w2_perm)
 
         # Layout 4: w1T for varlen actgrad backward — writes _VARLEN_WEIGHT_CACHE
-        precompute_weight_fp8(w1_perm.permute(1, 0, 2))  # (H, 2I, E)
+        self._fp8_w1T_varlen = precompute_weight_fp8(w1_perm.permute(1, 0, 2))  # (H, 2I, E)
 
     @torch.no_grad()
     def has_fp8_shadow_weights(self) -> bool:
@@ -297,6 +297,75 @@ class MoE(nn.Module):
         # We can't cheaply verify cache freshness, so just check if caches are non-empty.
         from .quack_utils.blockscaled_fp8_gemm import _VARLEN_WEIGHT_CACHE, _FUSED_WEIGHT_CACHE
         return len(_VARLEN_WEIGHT_CACHE) > 0 and len(_FUSED_WEIGHT_CACHE) > 0
+
+    @torch.no_grad()
+    def stash_bf16_to_cpu(self) -> None:
+        """Move bf16 master weights to CPU and free GPU storage.
+
+        Call AFTER refresh_fp8_shadow_weights() and BEFORE forward().
+        The FP8 shadow caches must be populated — forward/backward will
+        use them exclusively via the decoupled-weight path.
+
+        Saves ~216 MiB at Ernie shape (w1=144 MiB + w2=72 MiB).
+
+        Typical training loop::
+
+            optimizer.step()
+            moe.refresh_fp8_shadow_weights()
+            moe.stash_bf16_to_cpu()        # -216 MiB GPU
+            with enable_fp8():
+                out, aux = moe(x, use_fp8=True)
+            out.backward(dout)
+            moe.unstash_bf16()              # +216 MiB GPU, grads ready
+            optimizer.step()
+        """
+        if hasattr(self, '_stashed') and self._stashed:
+            return  # already stashed
+        assert self.has_fp8_shadow_weights(), (
+            "FP8 shadow weights must be populated before stashing. "
+            "Call refresh_fp8_shadow_weights() first."
+        )
+        # Save bf16 data to CPU (non-blocking for overlap with compute)
+        self._cpu_w1 = self.c_fc.weight.data.to('cpu', non_blocking=True)
+        self._cpu_w2 = self.c_proj.weight.data.to('cpu', non_blocking=True)
+
+        # Publish fp8 references to the functional layer so that forward/backward
+        # can bypass global cache lookups (whose keys depend on data_ptr which
+        # will change when we replace .data below).
+        from .functional import _STASHED_FP8_WEIGHTS
+        _STASHED_FP8_WEIGHTS["w1_fused"] = self._fp8_w1_fused
+        _STASHED_FP8_WEIGHTS["w2_varlen"] = self._fp8_w2_varlen
+        _STASHED_FP8_WEIGHTS["w2_dgated"] = self._fp8_w2_dgated
+        _STASHED_FP8_WEIGHTS["w1T_varlen"] = self._fp8_w1T_varlen
+
+        # Replace parameter data with a 1-element expanded tensor (2 bytes).
+        # This preserves the Parameter's shape (so .permute() works in the
+        # autograd graph) while freeing ~216 MiB of GPU storage.
+        for p in (self.c_fc.weight, self.c_proj.weight):
+            shape = p.data.shape
+            p.data = torch.zeros(1, dtype=p.dtype, device=p.device).expand(shape)
+
+        self._stashed = True
+
+    @torch.no_grad()
+    def unstash_bf16(self) -> None:
+        """Restore bf16 master weights from CPU to GPU.
+
+        Call AFTER backward() and BEFORE optimizer.step().
+        Gradients computed during backward are in .grad attributes of the
+        Parameters — they remain valid because autograd routes dw1/dw2 to
+        the Parameter objects (not to the freed storage).
+        """
+        if not getattr(self, '_stashed', False):
+            return  # nothing to restore
+        torch.cuda.synchronize()  # ensure CPU copy finished
+        self.c_fc.weight.data = self._cpu_w1.to(self.c_fc.weight.device)
+        self.c_proj.weight.data = self._cpu_w2.to(self.c_proj.weight.device)
+        del self._cpu_w1, self._cpu_w2
+        # Clear stashed fp8 references — next forward should use global cache
+        from .functional import _STASHED_FP8_WEIGHTS
+        _STASHED_FP8_WEIGHTS.clear()
+        self._stashed = False
 
     def forward(
         self,

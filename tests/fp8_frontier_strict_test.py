@@ -353,6 +353,146 @@ class FP8FrontierStrictTest(unittest.TestCase):
             f"Forward prequant cache NOT hit — fused-gated path inactive?\nHits: {hits}",
         )
 
+    # ── Subprocess-isolated precision: FP8+stash vs BF16 ─────────────
+
+    def test_stash_precision_subprocess_isolated(self) -> None:
+        """FP8+stash vs true BF16 baseline, each in a separate subprocess.
+
+        This is the ONLY reliable precision test — it avoids process
+        contamination from SONIC_MOE_FP8_MODE being cached at import time.
+        Both subprocesses use identical model weights (same seed, same init).
+
+        Asserts:
+          - output RRMSE < 10% (same as frontier gate)
+          - dx     RRMSE < 10%
+          - output cosine > 0.99
+          - no NaN in output or dx
+          - stash vs no-stash is BIT-IDENTICAL
+        """
+        import subprocess, sys, json, tempfile, numpy as np
+
+        bf16_script = _SUBPROCESS_BF16_SCRIPT
+        fp8_stash_script = _SUBPROCESS_FP8_STASH_SCRIPT
+
+        seed = 42
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Run BF16 baseline in a CLEAN process (no FP8_MODE env)
+            env_bf16 = {
+                k: v for k, v in os.environ.items()
+                if "FP8" not in k and "SONIC_MOE_FP8" not in k
+            }
+            env_bf16.update(
+                SEED=str(seed), USE_QUACK_GEMM="1",
+                TMPDIR=tmpdir,
+            )
+            r_bf16 = subprocess.run(
+                [sys.executable, "-c", bf16_script],
+                capture_output=True, text=True, env=env_bf16, timeout=300,
+            )
+            self.assertIn("OK", r_bf16.stdout, f"BF16 subprocess failed:\n{r_bf16.stderr[-500:]}")
+
+            # Run FP8+stash in a separate process (with FP8_MODE)
+            env_fp8 = dict(os.environ, SEED=str(seed), TMPDIR=tmpdir)
+            r_fp8 = subprocess.run(
+                [sys.executable, "-c", fp8_stash_script],
+                capture_output=True, text=True, env=env_fp8, timeout=300,
+            )
+
+            # Parse result
+            result = None
+            for line in r_fp8.stdout.strip().split("\n"):
+                if line.startswith("{"):
+                    result = json.loads(line)
+                    break
+            self.assertIsNotNone(result, f"FP8+stash subprocess produced no JSON:\n{r_fp8.stderr[-500:]}")
+
+        # Assert precision gates
+        print(f"\n  Subprocess-isolated precision (seed={seed}):")
+        print(f"    output RRMSE = {result['out_rrmse']:.2f}%  corr = {result['out_corr']:.4f}")
+        print(f"    dx     RRMSE = {result['dx_rrmse']:.2f}%  corr = {result['dx_corr']:.4f}")
+        print(f"    stash_vs_nostash_identical = {result['stash_identical']}")
+
+        self.assertFalse(result["nan"], "NaN detected in FP8+stash output or dx")
+        self.assertLess(result["out_rrmse"], 10.0, f"Output RRMSE {result['out_rrmse']:.2f}% >= 10%")
+        self.assertLess(result["dx_rrmse"], 10.0, f"dx RRMSE {result['dx_rrmse']:.2f}% >= 10%")
+        self.assertGreater(result["out_corr"], 0.99, f"Output corr {result['out_corr']:.4f} < 0.99")
+        self.assertGreater(result["dx_corr"], 0.99, f"dx corr {result['dx_corr']:.4f} < 0.99")
+        self.assertTrue(result["stash_identical"], "FP8+stash NOT bit-identical to FP8 no-stash!")
+
+
+# ── Subprocess scripts (string constants to avoid closure issues) ───────
+
+_SUBPROCESS_BF16_SCRIPT = r"""
+import torch, os, numpy as np
+os.environ['USE_QUACK_GEMM'] = '1'
+# Intentionally NO SONIC_MOE_FP8_MODE — pure BF16
+from sonicmoe import MoE
+from sonicmoe.functional.utils import enable_quack_gemm
+from sonicmoe.enums import ActivationType
+SEED, TMPDIR = int(os.environ['SEED']), os.environ['TMPDIR']
+torch.manual_seed(SEED)
+moe = MoE(num_experts=8, num_experts_per_tok=8, hidden_size=3072,
+           intermediate_size=1536, activation_function=ActivationType.SWIGLU,
+           add_bias=False, std=0.02).to(device='cuda', dtype=torch.bfloat16)
+x = torch.randn(8192, 3072, device='cuda', dtype=torch.bfloat16).detach().requires_grad_()
+dout = 0.02 * torch.randn_like(x)
+with enable_quack_gemm(True):
+    out, _ = moe(x)
+out.backward(dout)
+np.save(f'{TMPDIR}/bf16_out.npy', out.detach().float().cpu().numpy())
+np.save(f'{TMPDIR}/bf16_dx.npy', x.grad.detach().float().cpu().numpy())
+print('OK')
+"""
+
+_SUBPROCESS_FP8_STASH_SCRIPT = r"""
+import torch, os, json, numpy as np
+os.environ['USE_QUACK_GEMM'] = '1'
+os.environ['SONIC_MOE_FP8_MODE'] = 'perf'
+from sonicmoe import MoE
+from sonicmoe.functional.utils import enable_quack_gemm, enable_fp8
+from sonicmoe.enums import ActivationType
+SEED, TMPDIR = int(os.environ['SEED']), os.environ['TMPDIR']
+torch.manual_seed(SEED)
+moe = MoE(num_experts=8, num_experts_per_tok=8, hidden_size=3072,
+           intermediate_size=1536, activation_function=ActivationType.SWIGLU,
+           add_bias=False, std=0.02).to(device='cuda', dtype=torch.bfloat16)
+x = torch.randn(8192, 3072, device='cuda', dtype=torch.bfloat16).detach().requires_grad_()
+dout = 0.02 * torch.randn_like(x)
+moe.refresh_fp8_shadow_weights()
+for _ in range(3):
+    with enable_quack_gemm(True), enable_fp8():
+        out, _ = moe(x, use_fp8=True)
+    out.backward(dout); x.grad = None; moe.zero_grad(set_to_none=True)
+moe.refresh_fp8_shadow_weights()
+# Run FP8 no-stash (reference for bit-identity check)
+with enable_quack_gemm(True), enable_fp8():
+    out_nostash, _ = moe(x, use_fp8=True)
+out_nostash.backward(dout)
+dx_nostash = x.grad.clone()
+x.grad = None; moe.zero_grad(set_to_none=True)
+# Run FP8+stash
+moe.refresh_fp8_shadow_weights()
+moe.stash_bf16_to_cpu()
+with enable_quack_gemm(True), enable_fp8():
+    out_stash, _ = moe(x, use_fp8=True)
+out_stash.backward(dout)
+dx_stash = x.grad.clone()
+moe.unstash_bf16()
+# Compare stash vs BF16 (from file)
+out_bf16 = torch.from_numpy(np.load(f'{TMPDIR}/bf16_out.npy')).cuda()
+dx_bf16 = torch.from_numpy(np.load(f'{TMPDIR}/bf16_dx.npy')).cuda()
+rrmse = lambda a,b: ((a-b).norm()/b.norm()).item() * 100  # percent
+corr = lambda a,b: torch.corrcoef(torch.stack([a.flatten(),b.flatten()]))[0,1].item()
+print(json.dumps(dict(
+    out_rrmse=round(rrmse(out_stash.detach().float(), out_bf16), 2),
+    out_corr=round(corr(out_stash.detach().float(), out_bf16), 4),
+    dx_rrmse=round(rrmse(dx_stash.float(), dx_bf16), 2),
+    dx_corr=round(corr(dx_stash.float(), dx_bf16), 4),
+    nan=bool(torch.isnan(out_stash).any() or torch.isnan(dx_stash).any()),
+    stash_identical=bool(torch.equal(out_stash, out_nostash) and torch.equal(dx_stash, dx_nostash)),
+)))
+"""
+
 
 if __name__ == "__main__":
     unittest.main()

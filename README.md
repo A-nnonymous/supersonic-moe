@@ -120,9 +120,9 @@ The reporting policy for every FP8 step is:
 - memory baseline: official bf16
 - performance baselines: previous commit and official bf16
 
-## 🔥 FP8 Blockscaled Status (2026-04-09, Session 41)
+## 🔥 FP8 Blockscaled Status (2026-04-09, Session 42)
 
-The `native-fp8-exploration` branch has a fully functional **zero-materialization** blockscaled FP8 training path for Blackwell (B200). No TK-sized FP8 activation is materialized — follows SonicMoE's core design.
+The `native-fp8-exploration` branch has a fully functional **zero-materialization** blockscaled FP8 training path for Blackwell (B200) with **weight stash** memory optimization. No TK-sized FP8 activation is materialized — follows SonicMoE's core design.
 
 ### Quick Start
 
@@ -154,12 +154,13 @@ Only two env vars needed: `USE_QUACK_GEMM=1` and `SONIC_MOE_FP8_MODE=perf`. All 
 | BF16 baseline | 3840 | baseline |
 | **FP8 frontier** | **3442** | **1.12× faster** |
 
-### Memory (idle B200, subprocess-isolated vs official BF16)
+### Memory (subprocess-isolated, B200, Ernie shape)
 
-| Metric | BF16 | FP8 | Delta |
-|--------|------|-----|-------|
-| Forward peak | 1386 MiB | **1263 MiB** | **−122 MiB (−8.8%)** |
-| Backward peak | 1412 MiB | **1367 MiB** | **−45 MiB (−3.2%)** |
+| Metric | BF16 | FP8 | FP8 + stash | vs BF16 |
+|--------|------|-----|-------------|---------|
+| Forward peak | 1365 MiB | 1440 MiB | **1159 MiB** | **−206 MiB (−15.1%)** |
+| Backward peak | 1343 MiB | 1492 MiB | **1239 MiB** | **−105 MiB (−7.8%)** |
+| Base alloc | 489 MiB | 600 MiB | **384 MiB** | **−105 MiB (−21.4%)** |
 
 > Backward peak fully audited: 100% accounted (1368 MiB theoretical vs 1367 measured).
 > See `HANDOFF.md §1` for tensor-level breakdown.
@@ -171,7 +172,7 @@ Only two env vars needed: `USE_QUACK_GEMM=1` and `SONIC_MOE_FP8_MODE=perf`. All 
 | output | 6.60% | 0.998 | ✓ PASS |
 | dx | 7.48% | 0.997 | ✓ PASS |
 
-31/31 contract tests pass. 3 seeds, subprocess-isolated. Shadow weights BIT-IDENTICAL.
+39/39 contract + frontier tests pass. 3 seeds, subprocess-isolated. Shadow weights BIT-IDENTICAL. FP8+stash BIT-IDENTICAL to FP8 no-stash.
 
 ### Read first
 
