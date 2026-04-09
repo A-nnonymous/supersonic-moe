@@ -5,7 +5,7 @@
 import torch
 from parameterized import parameterized
 
-from sonicmoe import KernelBackendMoE, MoE, enable_quack_gemm
+from sonicmoe import KernelBackendMoE, MoE, enable_fp8, enable_quack_gemm
 from sonicmoe.enums import ActivationType
 
 from .test_commons import TestCommons
@@ -41,6 +41,7 @@ class MoETest(TestCommons):
             [False, True],  # is_compiling
             [False, True],  # add_bias
             [False, True],  # use_quack_gemm
+            [False, True],  # use_fp8
         )
     )
     def test_moe(
@@ -52,6 +53,7 @@ class MoETest(TestCommons):
         is_compiling: bool,
         add_bias: bool,
         use_quack_gemm: bool,
+        use_fp8: bool,
     ) -> None:
         if device.type == "cuda":
             major, _ = torch.cuda.get_device_capability(device)
@@ -60,6 +62,17 @@ class MoETest(TestCommons):
 
         if use_quack_gemm and (is_compiling or add_bias):
             self.skipTest("unsupported test")
+
+        if use_fp8 and not use_quack_gemm:
+            self.skipTest("FP8 requires QuACK GEMM")
+
+        if use_fp8 and (is_compiling or add_bias):
+            self.skipTest("FP8 path does not support compile or bias")
+
+        if use_fp8 and device.type == "cuda":
+            major, _ = torch.cuda.get_device_capability(device)
+            if major < 10:
+                self.skipTest("FP8 requires Blackwell SM100+")
 
         self.set_seed(_SEED)
 
@@ -92,15 +105,19 @@ class MoETest(TestCommons):
 
         with torch.autocast(x_torch.device.type, torch.float32):
             with enable_quack_gemm(use_quack_gemm):
-                y_kernel = moe_kernel(x_kernel, kernel_backend_moe=kernel_backend_moe)[0]
+                y_kernel = moe_kernel(x_kernel, kernel_backend_moe=kernel_backend_moe,
+                                      use_fp8=use_fp8)[0]
 
             y_torch = moe_torch(x_torch, kernel_backend_moe=KernelBackendMoE.torch)[0]
+
+            fwd_atol = 5e-2 if use_fp8 else 1.4e-2
+            fwd_rtol = 5e-2 if use_fp8 else 2e-2
             self.assert_equal_tensors(
                 y_kernel.float(),
                 y_torch.float(),
                 False,
-                atol_bfloat16=1.4e-2,
-                rtol_bfloat16=2e-2,
+                atol_bfloat16=fwd_atol,
+                rtol_bfloat16=fwd_rtol,
                 dtype=dtype,
             )
 
@@ -114,13 +131,15 @@ class MoETest(TestCommons):
                 kernel_grads = torch.autograd.grad(y_kernel, [x_kernel] + W, grad_outputs=dy_kernel, retain_graph=True)
             torch_grads = torch.autograd.grad(y_torch, [x_torch] + W, grad_outputs=dy_torch, retain_graph=True)
 
+            bwd_atol = 5e-2 if use_fp8 else 2e-2
+            bwd_rtol = 5e-2 if use_fp8 else 2e-2
             for _torch_grad, _kernel_grad in zip(torch_grads, kernel_grads):
                 self.assert_equal_tensors(
                     _kernel_grad.float(),
                     _torch_grad.float(),
                     False,
-                    atol_bfloat16=2e-2,
-                    rtol_bfloat16=2e-2,
+                    atol_bfloat16=bwd_atol,
+                    rtol_bfloat16=bwd_rtol,
                     dtype=dtype,
                 )
 

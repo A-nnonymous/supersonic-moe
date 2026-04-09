@@ -161,19 +161,33 @@ def _draw_chains(ax: plt.Axes, mode_key: str,
 
 
 # ═════════════════════════════════════════════════════════════════════════
+# Helpers – compact formatting
+# ═════════════════════════════════════════════════════════════════════════
+
+def _kdim(v: int) -> str:
+    """Compact dimension: 65536→64K, 3072→3K, 8→8."""
+    if v >= 1024:
+        k = v / 1024
+        return f"{k:g}K"
+    return str(v)
+
+
+# ═════════════════════════════════════════════════════════════════════════
 # Gantt + Scoreboard + Memory Envelope (unified panel)
 # ═════════════════════════════════════════════════════════════════════════
 
 def _draw_panel(ax: plt.Axes, mode: dict, buf_list: list[str],
-                title: str, show_ylabel: bool,
-                mode_key: str = "") -> list[dict]:
+                title: str, mode_key: str = "",
+                show_ylabels: bool = True) -> list[dict]:
     bufs = mode["bufs"]
     board = mode["board"]
     n_ph = len(board)
     n_buf = len(buf_list)
 
     BAR_H = 0.68
-    SEG_W = 0.90
+    # R|W sub-column geometry within each phase unit [j, j+1]
+    R_L, R_R = 0.03, 0.47
+    W_L, W_R = 0.53, 0.97
 
     # ── Phase background tinting by memory pressure ──
     mem = _phase_mem(mode)
@@ -182,89 +196,105 @@ def _draw_panel(ax: plt.Axes, mode: dict, buf_list: list[str],
         intensity = 0.012 + (mem[j] / peak) * 0.04 if peak > 0 else 0.012
         ax.axvspan(j, j + 1, color="#90A4AE", alpha=intensity, zorder=0)
 
+    # ── R|W sub-column dividers (thin dotted line at phase center) ──
+    for j in range(n_ph):
+        ax.axvline(j + 0.5, color="#CFD8DC", lw=0.5, ls=":", alpha=0.6, zorder=0)
+
+    # ── Sub-column headers: R (left) / W (right) ──
+    for j in range(n_ph):
+        ax.text(j + 0.25, -1.5, "R", ha="center", va="bottom",
+                fontsize=6, color=_S["R"], fontweight="bold", alpha=0.5)
+        ax.text(j + 0.75, -1.5, "W", ha="center", va="bottom",
+                fontsize=6, color=_S["W"], fontweight="bold", alpha=0.5)
+
     # ── Operator labels at phase column top ──
     for j, ph in enumerate(board):
-        ax.text(j + 0.5, -1.2, ph["name"], ha="center", va="bottom",
-                fontsize=F["ann"] - 0.5, color="#555", rotation=0,
+        ax.text(j + 0.5, -1.1, ph["name"], ha="center", va="bottom",
+                fontsize=F["ann"] - 0.5, color="#555",
                 fontweight="bold", fontstyle="italic")
 
-    # ── Gantt bars (R/W/L segments) ──
+    # ── Gantt bars: R → left sub-col, W → right sub-col, L → full ──
     for i, bn in enumerate(buf_list):
-        y = i
         if bn not in bufs:
             continue
         br = bufs[bn]
         alive = br["alive"]
-        mib = br["mib"]
-
         for j in range(n_ph):
             if j < alive[0] or j > alive[1]:
                 continue
             state = board[j]["state"].get(bn, "L")
-            color = _S.get(state, _S["L"])
-            alpha = 1.0 if state in ("R", "W") else 0.28
-            ax.barh(y, SEG_W, left=j + (1 - SEG_W) / 2, height=BAR_H,
-                    color=color, alpha=alpha, edgecolor="white",
-                    linewidth=0.4, zorder=3)
-            # State letter inside active segments
-            if state in ("R", "W"):
-                ax.text(j + 0.5, y, state, ha="center", va="center",
-                        fontsize=6.5, color="white", fontweight="bold", zorder=4)
+            if state == "R":
+                ax.barh(i, R_R - R_L, left=j + R_L, height=BAR_H,
+                        color=_S["R"], alpha=1.0, edgecolor="white",
+                        linewidth=0.4, zorder=3)
+                ax.text(j + 0.25, i, "R", ha="center", va="center",
+                        fontsize=6, color="white", fontweight="bold", zorder=4)
+            elif state == "W":
+                ax.barh(i, W_R - W_L, left=j + W_L, height=BAR_H,
+                        color=_S["W"], alpha=1.0, edgecolor="white",
+                        linewidth=0.4, zorder=3)
+                ax.text(j + 0.75, i, "W", ha="center", va="center",
+                        fontsize=6, color="white", fontweight="bold", zorder=4)
+            else:  # L — live/idle
+                ax.barh(i, W_R - R_L, left=j + R_L, height=BAR_H,
+                        color=_S["L"], alpha=0.28, edgecolor="white",
+                        linewidth=0.4, zorder=2)
 
-        # MiB label right of bar
-        ax.text(alive[1] + 1.08, y,
-                f"{mib:.0f} MiB" if mib >= 1 else f"{mib:.1f} MiB",
-                va="center", ha="left", fontsize=F["ann"],
-                color="#424242", fontfamily="monospace", fontweight="bold")
-
-    # ── Dataflow chain polylines (orthogonal routing) ──
-    drawn_chains: list[dict] = []
-    if mode_key:
-        buf_idx = {bn: i for i, bn in enumerate(buf_list)}
-        drawn_chains = _draw_chains(ax, mode_key, buf_idx)
-
-    # ── Memory envelope (secondary y-axis right) ──
+    # ── Memory envelope (twinx) ──
     ax2 = ax.twinx()
     xs = np.arange(n_ph) + 0.5
-    ax2.step(xs, mem, where="mid", color="#E65100", lw=2.0, alpha=0.6, zorder=5)
-    ax2.fill_between(xs, mem, alpha=0.08, color="#E65100", step="mid")
+    ax2.step(xs, mem, where="mid", color="#E65100", lw=2.0, alpha=0.5, zorder=5)
+    ax2.fill_between(xs, mem, alpha=0.06, color="#E65100", step="mid")
     pk_idx = int(np.argmax(mem))
-    ax2.plot(xs[pk_idx], mem[pk_idx], "v", color="#E65100", ms=8, zorder=6)
-    # Place peak label at far right to avoid overlapping bars
-    ax2.annotate(f"peak {mem[pk_idx]:.0f} MiB",
+    ax2.plot(xs[pk_idx], mem[pk_idx], "v", color="#E65100", ms=7, zorder=6)
+    ax2.annotate(f"peak {mem[pk_idx]:.0f}M",
                  xy=(xs[pk_idx], mem[pk_idx]),
-                 xytext=(n_ph + 0.8, mem[pk_idx]),
+                 xytext=(xs[pk_idx], mem[pk_idx] + peak * 0.12),
                  fontsize=F["ann"], fontweight="bold", color="#BF360C",
-                 arrowprops=dict(arrowstyle="-", color="#BF360C", lw=0.8, alpha=0.5),
-                 va="center")
+                 arrowprops=dict(arrowstyle="-", color="#BF360C",
+                                 lw=0.6, alpha=0.4),
+                 ha="center", va="bottom")
     ax2.set_ylim(0, peak * 1.35)
-    ax2.set_ylabel("Σ Allocated (MiB)", fontsize=F["label"] - 1,
-                   color="#E65100", alpha=0.7)
-    ax2.tick_params(axis="y", labelsize=F["tick"] - 1, labelcolor="#E65100")
+    ax2.set_ylabel("MiB", fontsize=7, color="#BF360C", alpha=0.6,
+                    rotation=0, labelpad=10)
+    ax2.tick_params(axis="y", labelsize=6, colors="#BF360C")
 
     # FWD / BWD divider
     ax.axvline(3, color="#C62828", lw=1.0, ls="--", alpha=0.25, zorder=1)
-    ax.text(1.5, -0.5, "FORWARD", ha="center", fontsize=F["ann"],
+    ax.text(1.5, -0.6, "FORWARD", ha="center", fontsize=F["ann"],
             color="#1565C0", fontweight="bold", alpha=0.4)
-    ax.text(4.5, -0.5, "BACKWARD", ha="center", fontsize=F["ann"],
+    ax.text(4.5, -0.6, "BACKWARD", ha="center", fontsize=F["ann"],
             color="#C62828", fontweight="bold", alpha=0.4)
 
-    # ── Y-axis: buffer names coloured by class ──
-    ax.set_yticks(range(n_buf))
-    if show_ylabel:
-        ax.set_yticklabels(buf_list, fontsize=F["tick"], fontfamily="monospace")
-        for i, bn in enumerate(buf_list):
-            cls = bufs[bn]["class"] if bn in bufs else "aux"
-            ax.get_yticklabels()[i].set_color(_C.get(cls, "#333"))
-            ax.get_yticklabels()[i].set_fontweight("bold")
+    # ── Compact left y-axis labels: name · dtype · K-shape · MiB ──
+    if show_ylabels:
+        max_name = max((len(bn) for bn in buf_list), default=1)
+        labels, label_colors = [], []
+        for bn in buf_list:
+            if bn not in bufs:
+                labels.append(bn)
+                label_colors.append("#BDBDBD")
+                continue
+            br = bufs[bn]
+            cls_c = _C.get(br.get("class", "aux"), "#333")
+            dt = br.get("dtype", "?")
+            sh = "\u00d7".join(_kdim(s) for s in br.get("shape", []))
+            m = br["mib"]
+            ms = f"{m:.0f}M" if m >= 1 else f"{m:.1f}M"
+            labels.append(f"{bn:<{max_name}}  {dt} {sh} {ms}")
+            label_colors.append(cls_c)
+        ax.set_yticks(range(n_buf))
+        ax.set_yticklabels(labels, fontsize=7, fontfamily="monospace")
+        for tick, clr in zip(ax.get_yticklabels(), label_colors):
+            tick.set_color(clr)
     else:
+        ax.set_yticks(range(n_buf))
         ax.set_yticklabels([])
 
-    # ── X-axis ──
     ax.set_xticks(np.arange(n_ph) + 0.5)
     ax.set_xticklabels([f"P{j}" for j in range(n_ph)],
                        fontsize=F["tick"], fontweight="bold")
-    ax.set_xlim(0, n_ph + 2.2)
+    ax.set_xlim(0, n_ph)
     ax.set_ylim(n_buf - 0.5, -1.8)
 
     # Phase grid
@@ -282,7 +312,7 @@ def _draw_panel(ax: plt.Axes, mode: dict, buf_list: list[str],
     ax.set_facecolor("#FAFAFA")
     ax.set_title(title, fontsize=F["title"], fontweight="bold", pad=18)
     ax.tick_params(length=0)
-    return drawn_chains
+    return _CHAINS.get(mode_key, [])
 
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -374,7 +404,7 @@ def render() -> None:
         height_ratios=[3.5, 1.2],
         width_ratios=[1, 1],
         hspace=0.15, wspace=0.06,
-        left=0.08, right=0.95, top=0.93, bottom=0.03,
+        left=0.14, right=0.99, top=0.93, bottom=0.03,
     )
 
     # ── Row 1: Twin Gantt panels ──
@@ -386,34 +416,25 @@ def render() -> None:
     chains_b = _draw_panel(ax_b, bf16, blist,
                 f"BF16 Baseline  ·  {len(bf16['bufs'])} bufs  ·  "
                 f"peak {pk_b:.0f} MiB @ P{bf16['peak']['phase']}",
-                show_ylabel=True, mode_key="bf16")
+                mode_key="bf16", show_ylabels=True)
     chains_f = _draw_panel(ax_f, fp8, blist,
                 f"FP8 Frontier  ·  {len(fp8['bufs'])} bufs  ·  "
                 f"peak {pk_f:.0f} MiB @ P{fp8['peak']['phase']}",
-                show_ylabel=False, mode_key="fp8")
+                mode_key="fp8", show_ylabels=False)
 
-    # Shared legend (bar states + buffer classes + chain flows)
+    # Shared legend (R/W/L states + buffer class colours)
     leg = [
-        mpatches.Patch(fc=_S["W"], label="W  Write (produce)"),
-        mpatches.Patch(fc=_S["R"], label="R  Read (consume)"),
+        mpatches.Patch(fc=_S["R"], label="Read (R)"),
+        mpatches.Patch(fc=_S["W"], label="Write (W)"),
         mpatches.Patch(fc=_S["L"], alpha=0.28, label="Live (idle)"),
     ]
     for cls in ["data", "weight", "grad", "quant", "meta"]:
         leg.append(mpatches.Patch(fc="white", ec=_C[cls], lw=2.5,
                                   label=cls.title()))
-    # Chain flow entries (deduplicate by name across BF16/FP8)
-    seen_names: set[str] = set()
-    for ch in chains_b + chains_f:
-        if ch["name"] not in seen_names:
-            seen_names.add(ch["name"])
-            ls = (0, (5, 3)) if ch["d"] else "-"
-            leg.append(mlines.Line2D([0], [0], color=ch["c"], lw=2.0,
-                                     ls=ls, alpha=0.7,
-                                     label=f"⟶ {ch['name']}"))
-    ax_f.legend(handles=leg, fontsize=F["leg"], loc="lower right",
+    ax_b.legend(handles=leg, fontsize=F["leg"], loc="lower left",
                 ncol=2, framealpha=0.92, handlelength=1.4,
                 handletextpad=0.4, columnspacing=0.8,
-                bbox_to_anchor=(1.0, 0.0))
+                bbox_to_anchor=(0.0, 0.0))
 
     # ── Row 2: Operator-flow table (full width) ──
     ax_tbl = fig.add_subplot(gs[1, :])
