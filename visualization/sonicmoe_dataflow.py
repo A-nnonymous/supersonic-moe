@@ -68,6 +68,81 @@ def _load_profiling_data():
     return mem, kern
 
 
+def _load_manifest() -> Optional[dict]:
+    """Load introspection manifest if available.
+
+    The manifest is produced by ``tools/introspect.py`` and contains
+    auto-extracted tensor lifecycle, memory trajectory, kernel timing,
+    and precision data.  When present, visualization figures can derive
+    data from it instead of hardcoded constants.
+    """
+    manifest_path = ROOT / "manifest.json"
+    if not manifest_path.exists():
+        return None
+    try:
+        m = json.loads(manifest_path.read_text())
+        if m.get("version", 0) >= 1:
+            return m
+    except (json.JSONDecodeError, KeyError):
+        pass
+    return None
+
+
+def _manifest_bufs(manifest: dict, mode: str) -> Optional[list]:
+    """Convert manifest tensor records to _Buf objects for fig9.
+
+    Filters out trivially small tensors (< 0.1 MiB) to keep the Gantt
+    chart readable — they contribute negligible memory pressure.
+    Returns None if manifest doesn't have the required data.
+    """
+    mode_data = manifest.get("modes", {}).get(mode)
+    if not mode_data or "tensors" not in mode_data:
+        return None
+
+    _MIN_MIB = 0.1  # omit buffers below this threshold
+
+    bufs = []
+    for t in mode_data["tensors"]:
+        size = t.get("size_mib", 0)
+        if size < _MIN_MIB:
+            continue
+        dtype_map = {
+            "torch.bfloat16": "BF16",
+            "torch.float8_e4m3fn": "FP8",
+            "torch.float32": "FP32",
+            "torch.int32": "INT32",
+            "torch.uint8": "SCALE",
+        }
+        dtype_str = dtype_map.get(t["dtype"], "BF16")
+        shape_str = "×".join(str(s) for s in t["shape"])
+        alive = (t.get("create_phase", 0), t.get("free_phase", 5))
+        events = []
+        for ev in t.get("events", []):
+            if "prequant" in ev:
+                phase = alive[0]
+                events.append((phase, "\u26a1"))
+            elif "recomp" in ev.lower():
+                events.append((alive[0], "\u21bb"))
+        bufs.append(_Buf(
+            name=t["name"], dtype=dtype_str, shape=shape_str,
+            mib=size, alive=alive, events=events,
+        ))
+    return bufs if bufs else None
+
+
+def _manifest_memory_trajectory(manifest: dict, mode: str) -> Optional[dict]:
+    """Extract memory trajectory from manifest for a given mode."""
+    mode_data = manifest.get("modes", {}).get(mode)
+    if not mode_data:
+        return None
+    return mode_data.get("memory_trajectory")
+
+
+def _manifest_precision_audit(manifest: dict) -> Optional[dict]:
+    """Extract precision audit data from manifest."""
+    return manifest.get("precision_audit")
+
+
 def _categorize_kernel(name: str) -> str:
     """Map torch.profiler kernel name to a human-readable category."""
     if "GemmDefault" in name and "Sm100" in name:
@@ -943,10 +1018,22 @@ def fig7_precision_profile() -> None:
                                                  "width_ratios": [2, 1]})
     fig.subplots_adjust(top=0.82, bottom=0.16)
 
+    # Try manifest precision data, fall back to hardcoded
+    manifest = _load_manifest()
+    pa = _manifest_precision_audit(manifest) if manifest else None
+    if pa and "rrmse_pct" in pa:
+        rr = pa["rrmse_pct"]
+        vals_a = [rr.get("output", 6.60), rr.get("dx", 7.48),
+                  rr.get("dw1", 0.45), rr.get("dw2", 0.50)]
+        cs = pa.get("cosine_sim", {})
+        vals_b = [cs.get("output", 0.998), cs.get("dx", 0.997)]
+    else:
+        vals_a = [6.60, 7.48, 0.45, 0.50]
+        vals_b = [0.998, 0.997]
+
     # ── (a) Relative Error ───────────────────────────────────────────────
     metrics_a = ["output\nRRMSE", "$\\partial x$\nRRMSE",
                  "$\\partial w_1$\nnorm rel err", "$\\partial w_2$\nnorm rel err"]
-    vals_a = [6.60, 7.48, 0.45, 0.50]
     x = np.arange(len(metrics_a))
     bars = ax1.bar(x, vals_a, 0.52, color=C_FP8, edgecolor="white",
                    linewidth=1.2, zorder=3, alpha=0.85)
@@ -969,7 +1056,6 @@ def fig7_precision_profile() -> None:
 
     # ── (b) Cosine Similarity ────────────────────────────────────────────
     metrics_b = ["output", "$\\partial x$"]
-    vals_b = [0.998, 0.997]
     x2 = np.arange(len(metrics_b))
     bars2 = ax2.bar(x2, vals_b, 0.42, color=C_ACCENT, edgecolor="white",
                     linewidth=1.2, zorder=3, alpha=0.85)
@@ -1264,7 +1350,15 @@ def _draw_gantt(ax: plt.Axes, bufs: list[_Buf], *,
 def fig9_buffer_lifecycle() -> None:
     """Per-buffer lifecycle Gantt with cumulative memory strip above each panel."""
     mem_data, _ = _load_profiling_data()
-    bf16, fp8 = _bf16_bufs(), _fp8_bufs()
+
+    # Try manifest-derived buffers first, fall back to hardcoded
+    manifest = _load_manifest()
+    bf16_m = _manifest_bufs(manifest, "bf16") if manifest else None
+    fp8_m = _manifest_bufs(manifest, "fp8") if manifest else None
+    bf16 = bf16_m if bf16_m else _bf16_bufs()
+    fp8 = fp8_m if fp8_m else _fp8_bufs()
+    data_source = "manifest" if bf16_m else "hardcoded"
+
     n_b, n_f = len(bf16), len(fp8)
 
     # Use profiled peak deltas (above pre-fwd) as measured reference
