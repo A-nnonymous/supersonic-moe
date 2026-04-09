@@ -19,7 +19,7 @@ import torch
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["bf16", "fp8"], required=True)
+    parser.add_argument("--mode", choices=["bf16", "fp8", "fp8_stash"], required=True)
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=10)
@@ -28,7 +28,7 @@ def main():
 
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
     os.environ["USE_QUACK_GEMM"] = "1"
-    if args.mode == "fp8":
+    if args.mode in ("fp8", "fp8_stash"):
         os.environ["SONIC_MOE_FP8_MODE"] = "perf"
     else:
         os.environ["SONIC_MOE_FP8_MODE"] = "off"
@@ -54,11 +54,20 @@ def main():
     dout = torch.randn(T, H, device=device, dtype=torch.bfloat16)
 
     # Warmup (JIT compile)
+    use_fp8 = args.mode in ("fp8", "fp8_stash")
+    use_stash = args.mode == "fp8_stash"
+    if use_fp8:
+        moe.refresh_fp8_shadow_weights()
     for i in range(args.warmup):
+        if use_stash:
+            moe.refresh_fp8_shadow_weights()
+            moe.stash_bf16_to_cpu()
         x = x_base.detach().clone().requires_grad_()
         with enable_quack_gemm(True):
-            o = moe(x)[0]
+            o = moe(x, use_fp8=use_fp8)[0]
         o.backward(dout)
+        if use_stash:
+            moe.unstash_bf16()
         del o, x
     gc.collect()
     torch.cuda.empty_cache()
@@ -83,6 +92,10 @@ def main():
             if p.grad is not None:
                 p.grad = None
 
+        if use_stash:
+            moe.refresh_fp8_shadow_weights()
+            moe.stash_bf16_to_cpu()
+
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
 
@@ -94,7 +107,7 @@ def main():
         fwd_start.record()
 
         with enable_quack_gemm(True):
-            o = moe(x)[0]
+            o = moe(x, use_fp8=use_fp8)[0]
 
         fwd_end.record()
         if not args.no_nsys:
@@ -123,6 +136,8 @@ def main():
         bwd_times.append(bwd_start.elapsed_time(bwd_end))
         bwd_peaks.append(bwd_peak)
 
+        if use_stash:
+            moe.unstash_bf16()
         del o, x
 
     if not args.no_nsys:

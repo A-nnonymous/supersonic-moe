@@ -174,6 +174,30 @@ Only two env vars needed: `USE_QUACK_GEMM=1` and `SONIC_MOE_FP8_MODE=perf`. All 
 
 39/39 contract + frontier tests pass. 3 seeds, subprocess-isolated. Shadow weights BIT-IDENTICAL. FP8+stash BIT-IDENTICAL to FP8 no-stash.
 
+### Weight Stash Training Loop
+
+For maximum memory savings, use the weight stash API (moves bf16 master weights to CPU during fwd+bwd):
+
+```python
+optimizer.step()
+moe.refresh_fp8_shadow_weights()  # bf16 → FP8 shadow caches
+moe.stash_bf16_to_cpu()           # -216 MiB GPU (bf16 → CPU)
+with enable_fp8():
+    output, aux_loss = moe(x, use_fp8=True)
+output.backward(dout)
+moe.unstash_bf16()                # +216 MiB GPU (CPU → bf16)
+```
+
+> Stash is opt-in. Without it, FP8 frontier still works (saves memory via FP8 activations) but bf16 params stay on GPU.
+
+#### Executive Summary (Session 42)
+
+![Session 42 Executive Summary](./assets/session42_executive_summary.png)
+
+#### Memory Waterfall
+
+![Memory Waterfall](./assets/session42_memory_waterfall.png)
+
 ### Read first
 
 | Resource | Path | Why |
