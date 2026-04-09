@@ -577,6 +577,22 @@ class TensorSpy:
             def pop(self, key, *args):
                 phase = spy.phase_tracker.current_phase
                 spy._prequant_events.append((key, "consume", phase))
+                # Extend lifecycle of tensors stored under this key
+                import torch
+                value = self.get(key)
+                if isinstance(value, tuple):
+                    for i, v in enumerate(value):
+                        if isinstance(v, torch.Tensor):
+                            suffix = f"_{i}" if len(value) > 1 else ""
+                            tname = f"prequant_{key}{suffix}"
+                            dtype_str = str(v.dtype)
+                            if "float8" in dtype_str:
+                                tname = f"{key}" if "fp8" in key else f"{key}_fp8"
+                            elif "uint8" in dtype_str:
+                                tname = f"{key}_scales"
+                            spy._record_tensor(tname, v, phase,
+                                               role="scale" if "scale" in tname else "activation",
+                                               event=f"prequant_consume@phase{phase}")
                 return super().pop(key, *args)
 
         monitored = _MonitoredDict(original_dict)
@@ -1239,6 +1255,21 @@ def run(mode: str = "trace") -> dict:
     MANIFEST_PATH.write_text(json.dumps(manifest, indent=2, default=str))
     size_kb = MANIFEST_PATH.stat().st_size / 1024
     print(f"  → {MANIFEST_PATH} ({size_kb:.1f} KB)")
+
+    # Auto-generate scoreboard.json from the manifest
+    scoreboard_path = ROOT / "tools" / "scoreboard.py"
+    if scoreboard_path.exists():
+        try:
+            print("  Generating scoreboard.json ...")
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("scoreboard", scoreboard_path)
+            sb_mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(sb_mod)
+            sb_mod.main()
+            print("  → scoreboard.json generated")
+        except Exception as e:
+            print(f"  [warn] scoreboard generation failed: {e}")
+
     print("=" * 60)
     print("Done. Visualization can now consume manifest.json:")
     print("  python -m visualization")
