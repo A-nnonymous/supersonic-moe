@@ -184,7 +184,7 @@ Only two env vars needed: `USE_QUACK_GEMM=1` and `SONIC_MOE_FP8_MODE=perf`. All 
 
 ## 📊 Architecture & Dataflow Visualization
 
-Ten publication-quality figures auto-generated from Session 41 measurements.
+Ten publication-quality figures + unified scoreboard auto-generated from profiling data.
 Run `python -m visualization` to regenerate all figures into `assets/`.
 
 ### Key Figures
@@ -201,6 +201,7 @@ Run `python -m visualization` to regenerate all figures into `assets/`.
 | 8 | Optimization Design Space | Shipped gains vs dead ends (memory impact) |
 | **9** | **Buffer Lifecycle Gantt** | **Per-buffer lifetime bars, dtype-coloured, event markers, peak MiB** |
 | **10** | **Dtype Transformation Flow** | **Operator-level FP8 quantization pipeline with I/O dtype boxes** |
+| **11** | **Unified Scoreboard** | **Twin BF16/FP8 Gantt + memory envelope + DAG flow + operator R/W table** |
 
 #### Buffer Lifecycle (fig 9) — per-tensor lifetime, dtype & memory
 ![Buffer Lifecycle](./assets/fig9_buffer_lifecycle.png)
@@ -210,6 +211,24 @@ Run `python -m visualization` to regenerate all figures into `assets/`.
 
 #### Precision State Matrix (fig 6) — tensor dtype at each execution phase
 ![Precision Flow](./assets/fig6_precision_flow.png)
+
+#### Unified Buffer Scoreboard (fig 11) — lifecycle × operator × memory DAG
+![Scoreboard](./assets/scoreboard_unified.png)
+
+### Introspection Pipeline
+
+The visualization suite is powered by a zero-code-change introspection engine:
+
+```bash
+# 1. Generate manifest.json (auto-extracts tensor lifecycle, memory, kernels)
+python tools/introspect.py --mode trace
+
+# 2. Generate scoreboard.json (buffer DAG + phase-state matrix)
+python tools/scoreboard.py
+
+# 3. Render all figures (reads manifest + scoreboard when available)
+python -m visualization
+```
 
 ## 🤝 Contributing
 
