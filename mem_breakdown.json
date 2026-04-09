@@ -5,21 +5,87 @@
       "base": 0.0,
       "after_model": 216.05,
       "after_input": 360.05,
-      "pre_fwd": 1816.3,
-      "post_fwd": 2441.8,
-      "peak_fwd": 2825.67,
-      "pre_bwd": 2441.8,
-      "post_bwd": 2752.34,
-      "peak_bwd": 3212.17,
-      "post_cleanup": 2488.3
+      "pre_fwd": 3016.3,
+      "post_fwd": 3449.8,
+      "peak_fwd": 4025.67,
+      "pre_bwd": 3449.8,
+      "post_bwd": 3760.34,
+      "peak_bwd": 4220.17,
+      "post_cleanup": 3496.3
+    },
+    "detailed_snapshots": {
+      "base": {
+        "allocated_MiB": 0.0,
+        "peak_allocated_MiB": 0.0,
+        "reserved_MiB": 0.0,
+        "peak_reserved_MiB": 0.0,
+        "num_allocs": 0,
+        "num_alloc_total": 0
+      },
+      "after_model": {
+        "allocated_MiB": 216.0469,
+        "peak_allocated_MiB": 576.0469,
+        "reserved_MiB": 578.0,
+        "peak_reserved_MiB": 578.0,
+        "num_allocs": 3,
+        "num_alloc_total": 6
+      },
+      "after_input": {
+        "allocated_MiB": 360.0469,
+        "peak_allocated_MiB": 576.0469,
+        "reserved_MiB": 578.0,
+        "peak_reserved_MiB": 578.0,
+        "num_allocs": 6,
+        "num_alloc_total": 10
+      },
+      "pre_fwd": {
+        "allocated_MiB": 3016.2969,
+        "peak_allocated_MiB": 3016.2969,
+        "reserved_MiB": 3394.0,
+        "peak_reserved_MiB": 3394.0,
+        "num_allocs": 28,
+        "num_alloc_total": 415
+      },
+      "post_fwd": {
+        "allocated_MiB": 3449.7998,
+        "peak_allocated_MiB": 4025.6729,
+        "reserved_MiB": 4356.0,
+        "peak_reserved_MiB": 4356.0,
+        "num_allocs": 42,
+        "num_alloc_total": 441
+      },
+      "pre_bwd": {
+        "allocated_MiB": 3449.7998,
+        "peak_allocated_MiB": 3449.7998,
+        "reserved_MiB": 4356.0,
+        "peak_reserved_MiB": 4356.0,
+        "num_allocs": 42,
+        "num_alloc_total": 441
+      },
+      "post_bwd": {
+        "allocated_MiB": 3760.3447,
+        "peak_allocated_MiB": 4220.1743,
+        "reserved_MiB": 4356.0,
+        "peak_reserved_MiB": 4356.0,
+        "num_allocs": 37,
+        "num_alloc_total": 482
+      },
+      "cleanup": {
+        "allocated_MiB": 3496.2969,
+        "peak_allocated_MiB": 3496.2969,
+        "reserved_MiB": 3970.0,
+        "peak_reserved_MiB": 3970.0,
+        "num_allocs": 31,
+        "num_alloc_total": 482
+      }
     },
     "deltas": {
-      "model_params": 216.05,
+      "model_params": 216.0469,
       "input_tensors": 144.0,
-      "fwd_activation_delta": 625.5,
-      "fwd_peak_above_pre": 1009.37,
-      "bwd_peak_above_pre": 770.37,
-      "bwd_residual_delta": 310.54
+      "fwd_activation": 433.5029,
+      "fwd_peak_above_pre": 1009.376,
+      "bwd_peak_above_pre": 770.3745,
+      "bwd_residual": 310.5449
     },
     "param_sizes_mib": {
       "router.weight": 0.0469,
@@ -31,7 +97,6 @@
       "c_fc.weight": 144.0,
       "c_proj.weight": 72.0
     },
-    "fp8_caches_after_fwd": {},
     "fp8_caches_after_bwd": {},
     "theoretical_sizes_mib": {
       "x_input_bf16": 48.0,
@@ -60,8 +125,7 @@
       "w2_fp8_E_I_H": 36.0,
       "w2_fp8_scales": 1.1248,
       "w1T_fp8_E_H_2I": 72.0,
-      "routing_metadata_total": 1.75,
-      "colvec_reduce_partial_fp32": 12.0
+      "routing_metadata_total": 1.75
     }
   },
   "fp8": {
@@ -70,21 +134,87 @@
       "base": 0.0,
       "after_model": 216.05,
       "after_input": 360.05,
-      "pre_fwd": 775.67,
-      "post_fwd": 986.05,
-      "peak_fwd": 1625.67,
-      "pre_bwd": 986.05,
-      "post_bwd": 1135.72,
-      "peak_bwd": 1751.05,
-      "post_cleanup": 871.67
+      "pre_fwd": 1207.67,
+      "post_fwd": 1418.05,
+      "peak_fwd": 2057.67,
+      "pre_bwd": 1418.05,
+      "post_bwd": 1567.72,
+      "peak_bwd": 2183.05,
+      "post_cleanup": 1303.67
+    },
+    "detailed_snapshots": {
+      "base": {
+        "allocated_MiB": 0.0,
+        "peak_allocated_MiB": 0.0,
+        "reserved_MiB": 0.0,
+        "peak_reserved_MiB": 0.0,
+        "num_allocs": 0,
+        "num_alloc_total": 0
+      },
+      "after_model": {
+        "allocated_MiB": 216.0469,
+        "peak_allocated_MiB": 576.0469,
+        "reserved_MiB": 578.0,
+        "peak_reserved_MiB": 578.0,
+        "num_allocs": 3,
+        "num_alloc_total": 6
+      },
+      "after_input": {
+        "allocated_MiB": 360.0469,
+        "peak_allocated_MiB": 576.0469,
+        "reserved_MiB": 578.0,
+        "peak_reserved_MiB": 578.0,
+        "num_allocs": 6,
+        "num_alloc_total": 10
+      },
+      "pre_fwd": {
+        "allocated_MiB": 1207.6719,
+        "peak_allocated_MiB": 1207.6719,
+        "reserved_MiB": 1794.0,
+        "peak_reserved_MiB": 1794.0,
+        "num_allocs": 27,
+        "num_alloc_total": 508
+      },
+      "post_fwd": {
+        "allocated_MiB": 1418.0498,
+        "peak_allocated_MiB": 2057.6729,
+        "reserved_MiB": 2372.0,
+        "peak_reserved_MiB": 2372.0,
+        "num_allocs": 40,
+        "num_alloc_total": 545
+      },
+      "pre_bwd": {
+        "allocated_MiB": 1418.0498,
+        "peak_allocated_MiB": 1418.0498,
+        "reserved_MiB": 2372.0,
+        "peak_reserved_MiB": 2372.0,
+        "num_allocs": 40,
+        "num_alloc_total": 545
+      },
+      "post_bwd": {
+        "allocated_MiB": 1567.7197,
+        "peak_allocated_MiB": 2183.0493,
+        "reserved_MiB": 2372.0,
+        "peak_reserved_MiB": 2372.0,
+        "num_allocs": 35,
+        "num_alloc_total": 593
+      },
+      "cleanup": {
+        "allocated_MiB": 1303.6719,
+        "peak_allocated_MiB": 1303.6719,
+        "reserved_MiB": 1986.0,
+        "peak_reserved_MiB": 1986.0,
+        "num_allocs": 29,
+        "num_alloc_total": 593
+      }
     },
     "deltas": {
-      "model_params": 216.05,
+      "model_params": 216.0469,
       "input_tensors": 144.0,
-      "fwd_activation_delta": 210.38,
-      "fwd_peak_above_pre": 850.0,
-      "bwd_peak_above_pre": 765.0,
-      "bwd_residual_delta": 149.67
+      "fwd_activation": 210.3779,
+      "fwd_peak_above_pre": 850.001,
+      "bwd_peak_above_pre": 764.9995,
+      "bwd_residual": 149.6699
     },
     "param_sizes_mib": {
       "router.weight": 0.0469,
@@ -95,9 +225,6 @@
       "router.weight": 0.0469,
       "c_fc.weight": 144.0,
       "c_proj.weight": 72.0
-    },
-    "fp8_caches_after_fwd": {
-      "VARLEN_(3072, 3072, 8)": 74.25
     },
     "fp8_caches_after_bwd": {
       "VARLEN_(3072, 3072, 8)": 74.25,
@@ -130,8 +257,12 @@
       "w2_fp8_E_I_H": 36.0,
       "w2_fp8_scales": 1.1248,
       "w1T_fp8_E_H_2I": 72.0,
-      "routing_metadata_total": 1.75,
-      "colvec_reduce_partial_fp32": 12.0
+      "routing_metadata_total": 1.75
     }
+  },
+  "_metadata": {
+    "source": "idle B200 GPU0 @ 10.51.200.142 (0 MiB, 0% util)",
+    "profiler": "torch.cuda.memory_stats()",
+    "note": "subprocess-isolated, reset_peak_memory_stats per phase"
   }
 }

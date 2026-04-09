@@ -207,55 +207,51 @@ def _pct(base: float, new: float) -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def fig1_executive_summary() -> None:
-    """Three-panel hero figure: latency (wall+CUDA), memory, precision."""
+    """Three-panel hero figure: GPU-projection, memory, precision."""
     mem_data, kern_data = _load_profiling_data()
 
     fig, axes = plt.subplots(1, 3, figsize=(15.5, 5.5),
                               gridspec_kw={"wspace": 0.42})
     fig.subplots_adjust(top=0.80, bottom=0.10)
 
-    # ── (a) Latency — stacked wall-clock (fwd + bwd) ─────────────────────
+    # ── (a) GPU-Projection — CUDA kernel time (the true metric) ──────────
     ax = axes[0]
     if kern_data:
-        bf_fwd = kern_data["bf16"]["median_fwd_ms"] * 1000   # µs
-        bf_bwd = kern_data["bf16"]["median_bwd_ms"] * 1000
-        fp_fwd = kern_data["fp8"]["median_fwd_ms"] * 1000
-        fp_bwd = kern_data["fp8"]["median_bwd_ms"] * 1000
+        bf_cuda = kern_data["bf16"].get("total_cuda_us", 4050.5)
+        fp_cuda = kern_data["fp8"].get("total_cuda_us", 3644.6)
+        bf_wc = kern_data["bf16"]["median_total_ms"] * 1000
+        fp_wc = kern_data["fp8"]["median_total_ms"] * 1000
     else:
-        bf_fwd, bf_bwd = 1363, 8233
-        fp_fwd, fp_bwd = 1192, 5284
+        bf_cuda, fp_cuda = 4050.5, 3644.6
+        bf_wc, fp_wc = 5368.0, 5582.0
 
     x_pos = np.arange(2)
-    fwd_vals = [bf_fwd, fp_fwd]
-    bwd_vals = [bf_bwd, fp_bwd]
-    b1 = ax.bar(x_pos, fwd_vals, 0.52, label="Forward", color=[C_BF16, C_FP8],
-                edgecolor="white", linewidth=1.2, zorder=3, alpha=0.70)
-    b2 = ax.bar(x_pos, bwd_vals, 0.52, bottom=fwd_vals,
-                label="Backward", color=[C_BF16, C_FP8],
-                edgecolor="white", linewidth=1.2, zorder=3, alpha=1.0)
-    bf_total = bf_fwd + bf_bwd
-    fp_total = fp_fwd + fp_bwd
-    for i, (fwd, bwd, total) in enumerate(
-            [(bf_fwd, bf_bwd, bf_total), (fp_fwd, fp_bwd, fp_total)]):
-        ax.text(i, total + 150, f"{total:.0f} µs",
-                ha="center", va="bottom", fontsize=9.5, fontweight="bold")
-        ax.text(i, fwd / 2, f"fwd {fwd:.0f}", ha="center", va="center",
-                fontsize=7.5, color="white", fontweight="bold")
-        ax.text(i, fwd + bwd / 2, f"bwd {bwd:.0f}", ha="center", va="center",
-                fontsize=7.5, color="white", fontweight="bold")
+    bars = ax.bar(x_pos, [bf_cuda, fp_cuda], 0.52,
+                  color=[C_BF16, C_FP8],
+                  edgecolor="white", linewidth=1.2, zorder=3, alpha=0.90)
+    for i, (cuda_v, wc_v) in enumerate(
+            [(bf_cuda, bf_wc), (fp_cuda, fp_wc)]):
+        ax.text(i, cuda_v + bf_cuda * 0.03,
+                f"{cuda_v:.0f} $\\mu$s",
+                ha="center", va="bottom", fontsize=10, fontweight="bold")
+        gpu_util = cuda_v / wc_v * 100
+        ax.text(i, cuda_v * 0.5,
+                f"wall: {wc_v:.0f}\n({gpu_util:.0f}% util)",
+                ha="center", va="center", fontsize=7.5,
+                color="white", fontweight="bold")
 
-    speedup = bf_total / fp_total
-    ax.annotate("", xy=(1.18, fp_total), xytext=(1.18, bf_total),
+    speedup = bf_cuda / fp_cuda
+    ax.annotate("", xy=(1.18, fp_cuda), xytext=(1.18, bf_cuda),
                 arrowprops=dict(arrowstyle="<->", color=C_SAVE, lw=2),
                 annotation_clip=False)
-    ax.text(1.35, (bf_total + fp_total) / 2,
+    ax.text(1.35, (bf_cuda + fp_cuda) / 2,
             f"$\\mathbf{{{speedup:.2f}\\times}}$",
             fontsize=12, color=C_SAVE, va="center", ha="left", clip_on=False)
     ax.set_xticks(x_pos)
     ax.set_xticklabels(["BF16", "FP8"])
-    ax.set_ylabel("Wall-Clock Latency ($\\mu$s / iter)")
-    ax.set_title("(a) Latency (CUDA Events)", fontweight="bold", pad=8)
-    ax.set_ylim(0, bf_total * 1.25)
+    ax.set_ylabel("GPU-Projection ($\\mu$s / iter)")
+    ax.set_title("(a) CUDA Kernel Time", fontweight="bold", pad=8)
+    ax.set_ylim(0, bf_cuda * 1.22)
     ax.set_xlim(-0.5, 1.85)
 
     # ── (b) Peak Memory (deltas above pre-fwd base) ──────────────────────
@@ -1197,7 +1193,7 @@ def _draw_mem_strip(ax: plt.Axes, bufs: list[_Buf], title: str, *,
     if measured_peak > 0:
         ax.axhline(measured_peak, color=mode_color, lw=1.0, ls=":",
                    alpha=0.40)
-        ax.text(N_PH + 0.3, measured_peak, f"nsys: {measured_peak:.0f}",
+        ax.text(N_PH + 0.3, measured_peak, f"measured: {measured_peak:.0f}",
                 fontsize=7.5, color=mode_color, alpha=0.55,
                 fontweight="bold", va="center")
 
@@ -1267,8 +1263,19 @@ def _draw_gantt(ax: plt.Axes, bufs: list[_Buf], *,
 
 def fig9_buffer_lifecycle() -> None:
     """Per-buffer lifecycle Gantt with cumulative memory strip above each panel."""
+    mem_data, _ = _load_profiling_data()
     bf16, fp8 = _bf16_bufs(), _fp8_bufs()
     n_b, n_f = len(bf16), len(fp8)
+
+    # Use profiled peak deltas (above pre-fwd) as measured reference
+    bf_meas = fp_meas = 0
+    if mem_data:
+        bf_d = mem_data["bf16"]["deltas"]
+        fp_d = mem_data["fp8"]["deltas"]
+        bf_meas = max(bf_d.get("fwd_peak_above_pre", 0),
+                      bf_d.get("bwd_peak_above_pre", 0))
+        fp_meas = max(fp_d.get("fwd_peak_above_pre", 0),
+                      fp_d.get("bwd_peak_above_pre", 0))
 
     fig = plt.figure(figsize=(16, 15))
     fig.subplots_adjust(top=0.90, bottom=0.06, left=0.11, right=0.93)
@@ -1287,12 +1294,12 @@ def fig9_buffer_lifecycle() -> None:
 
     pk_b = _draw_mem_strip(ax_mem_b, bf16,
                            f"BF16 Baseline  ({n_b} buffers)",
-                           mode_color=C_BF16, measured_peak=1412)
+                           mode_color=C_BF16, measured_peak=bf_meas)
     _draw_gantt(ax_gantt_b, bf16, mode_color=C_BF16)
 
     pk_f = _draw_mem_strip(ax_mem_f, fp8,
                            f"FP8 Frontier  ({n_f} buffers)",
-                           mode_color=C_FP8, measured_peak=1367)
+                           mode_color=C_FP8, measured_peak=fp_meas)
     _draw_gantt(ax_gantt_f, fp8, mode_color=C_FP8)
 
     # Delta summary — placed in the gap between groups
@@ -1318,7 +1325,7 @@ def fig9_buffer_lifecycle() -> None:
                           marker="D", ms=5, markeredgecolor="white",
                           label="$\\Sigma$ tracked"))
     handles.append(Line2D([0], [0], color=C_NEUTRAL, lw=1, ls=":",
-                          alpha=0.5, label="nsys peak"))
+                          alpha=0.5, label="profiled $\\Delta$peak"))
     fig.legend(handles=handles, loc="lower center", ncol=7, fontsize=8.5,
                frameon=True, edgecolor="#D1D5DB",
                bbox_to_anchor=(0.50, 0.015))
@@ -1500,7 +1507,7 @@ def generate_all(out_dir: Optional[str] = None) -> None:
     ASSETS.mkdir(parents=True, exist_ok=True)
     _apply_style()
 
-    print("SonicMoE FP8 Visualization Suite (Session 41)")
+    print("SonicMoE FP8 Visualization Suite (idle B200 profiling)")
     print("=" * 55)
     for name, func in FIGURES:
         print(f"  Generating: {name}")
