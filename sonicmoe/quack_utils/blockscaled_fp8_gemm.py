@@ -3100,32 +3100,38 @@ def quantize_and_pack_weight_iso32(
 
 def _quantize_weight_3d_triton(
     w_enk: torch.Tensor,
+    *, isotropic: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize a contiguous 3D (E, N, K) weight tensor using the fast Triton kernel.
+
+    When isotropic=True (default), uses 32×32 block quantization where all 32
+    rows in a block share the same E8M0 scale.  This makes the quantized data
+    transpose-compatible: the transposed fp8 tensor has valid scales (same value
+    for both row and column access patterns within each 32×32 tile).
+
+    When isotropic=False, falls back to standard 1×32 row-wise quantization.
 
     Exploits the fact that when N % SF_TILE_M == 0, the ISA scale tile boundaries
     align perfectly at expert boundaries. So (E, N, K) can be reshaped to (E*N, K),
     quantized as a single 2D tensor, and reshaped back — producing identical results
     to per-expert quantization but in a single kernel launch.
 
-    Falls back to per-expert loop when N is not tile-aligned.
-
     Returns (w_fp8 (E, N, K), packed_scales) with ISA-packed E8M0 scales.
     """
     E, N, K = w_enk.shape
     assert w_enk.is_contiguous(), "Weight must be contiguous (E, N, K)"
 
+    quant_fn = quantize_and_pack_weight_iso32 if isotropic else quantize_and_pack_activation
+
     if N % _SF_TILE_M == 0:
-        # Fast path: single kernel launch for all experts
         w_2d = w_enk.reshape(E * N, K)
-        fp8_2d, packed_scales = quantize_and_pack_activation(w_2d)
+        fp8_2d, packed_scales = quant_fn(w_2d)
         return fp8_2d.reshape(E, N, K), packed_scales
     else:
-        # Fallback: per-expert loop (still much faster than PyTorch eager)
         fp8_slices = []
         scale_slices = []
         for e in range(E):
-            fp8_e, scales_e = quantize_and_pack_activation(w_enk[e])
+            fp8_e, scales_e = quant_fn(w_enk[e])
             fp8_slices.append(fp8_e)
             scale_slices.append(scales_e)
         return torch.stack(fp8_slices), torch.cat(scale_slices, dim=-1)
