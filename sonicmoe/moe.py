@@ -325,9 +325,10 @@ class MoE(nn.Module):
             "FP8 shadow weights must be populated before stashing. "
             "Call refresh_fp8_shadow_weights() first."
         )
-        # Save bf16 data to CPU (non-blocking for overlap with compute)
-        self._cpu_w1 = self.c_fc.weight.data.to('cpu', non_blocking=True)
-        self._cpu_w2 = self.c_proj.weight.data.to('cpu', non_blocking=True)
+        # Save bf16 data to pinned CPU memory (non-blocking D2H copy).
+        # pin_memory allows the subsequent H2D in unstash to also be non-blocking.
+        self._cpu_w1 = self.c_fc.weight.data.to('cpu', non_blocking=True).pin_memory()
+        self._cpu_w2 = self.c_proj.weight.data.to('cpu', non_blocking=True).pin_memory()
 
         # Publish fp8 references to the functional layer so that forward/backward
         # can bypass global cache lookups (whose keys depend on data_ptr which
@@ -358,9 +359,11 @@ class MoE(nn.Module):
         """
         if not getattr(self, '_stashed', False):
             return  # nothing to restore
-        torch.cuda.synchronize()  # ensure CPU copy finished
-        self.c_fc.weight.data = self._cpu_w1.to(self.c_fc.weight.device)
-        self.c_proj.weight.data = self._cpu_w2.to(self.c_proj.weight.device)
+        # Non-blocking H2D: the copy overlaps with subsequent CPU work
+        # (e.g. optimizer state prep). Caller must synchronize before reading.
+        device = self.c_fc.weight.device
+        self.c_fc.weight.data = self._cpu_w1.to(device, non_blocking=True)
+        self.c_proj.weight.data = self._cpu_w2.to(device, non_blocking=True)
         del self._cpu_w1, self._cpu_w2
         # Clear stashed fp8 references — next forward should use global cache
         from .functional import _STASHED_FP8_WEIGHTS

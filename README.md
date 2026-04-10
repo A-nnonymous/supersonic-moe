@@ -151,16 +151,16 @@ Only two env vars needed: `USE_QUACK_GEMM=1` and `SONIC_MOE_FP8_MODE=perf`. All 
 
 | Config | GPU µs/iter | vs BF16 |
 |--------|------------|---------|
-| BF16 baseline | 3840 | baseline |
-| **FP8 frontier** | **3442** | **1.12× faster** |
+| BF16 baseline | 3990 | baseline |
+| **FP8 frontier** | **3581** | **1.11× faster** |
 
-### Memory (subprocess-isolated, B200, Ernie shape)
+### Memory (subprocess-isolated, idle B200, 3 seeds × 3 repeats, std=0)
 
 | Metric | BF16 | FP8 | FP8 + stash | vs BF16 |
 |--------|------|-----|-------------|---------|
-| Forward peak | 1365 MiB | 1440 MiB | **1159 MiB** | **−206 MiB (−15.1%)** |
-| Backward peak | 1343 MiB | 1492 MiB | **1239 MiB** | **−105 MiB (−7.8%)** |
-| Base alloc | 489 MiB | 600 MiB | **384 MiB** | **−105 MiB (−21.4%)** |
+| Forward peak | 1386 MiB | 1440 MiB | **1272 MiB** | **−114 MiB (−8.2%)** |
+| Backward peak | 1412 MiB | 1492 MiB | **1314 MiB** | **−98 MiB (−7.0%)** |
+| Base alloc | 377 MiB | 600 MiB | **496 MiB** | +120 MiB (FP8 caches) |
 
 > Backward peak fully audited: 100% accounted (1368 MiB theoretical vs 1367 measured).
 > See `HANDOFF.md §1` for tensor-level breakdown.
@@ -190,13 +190,17 @@ moe.unstash_bf16()                # +216 MiB GPU (CPU → bf16)
 
 > Stash is opt-in. Without it, FP8 frontier still works (saves memory via FP8 activations) but bf16 params stay on GPU.
 
-#### Executive Summary (Session 42)
+#### Executive Summary
 
 ![Session 42 Executive Summary](./assets/session42_executive_summary.png)
 
 #### Memory Waterfall
 
 ![Memory Waterfall](./assets/session42_memory_waterfall.png)
+
+#### Kernel Breakdown (nsys GPU Projection)
+
+![Kernel Breakdown](./assets/session42_kernel_breakdown.png)
 
 ### Read first
 

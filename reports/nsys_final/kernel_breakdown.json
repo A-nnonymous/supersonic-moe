@@ -1,0 +1,210 @@
+{
+  "BF16": {
+    "total_us": 39899,
+    "per_iter_us": 3990,
+    "n_kernels": 400,
+    "n_iters": 10,
+    "kernels": [
+      {
+        "name": "kernel_cutlass_kernel_quackgemm_default_epiGemmDefaultSm100_",
+        "total_us": 22920,
+        "count": 40,
+        "avg_us": 573,
+        "pct": 57.4,
+        "per_iter_us": 2292
+      },
+      {
+        "name": "kernel_cutlass_kernel_sonicmoequack_utilsgemm_gatedGemmGated",
+        "total_us": 7422,
+        "count": 10,
+        "avg_us": 742,
+        "pct": 18.6,
+        "per_iter_us": 742
+      },
+      {
+        "name": "kernel_cutlass_kernel_sonicmoequack_utilsgemm_dgatedGemmDGat",
+        "total_us": 4830,
+        "count": 10,
+        "avg_us": 483,
+        "pct": 12.1,
+        "per_iter_us": 483
+      },
+      {
+        "name": "elementwise_kernel",
+        "total_us": 1613,
+        "count": 30,
+        "avg_us": 54,
+        "pct": 4.0,
+        "per_iter_us": 161
+      },
+      {
+        "name": "token_gather_sum_kernel",
+        "total_us": 1411,
+        "count": 20,
+        "avg_us": 71,
+        "pct": 3.5,
+        "per_iter_us": 141
+      },
+      {
+        "name": "vectorized_elementwise_kernel",
+        "total_us": 324,
+        "count": 70,
+        "avg_us": 5,
+        "pct": 0.8,
+        "per_iter_us": 32
+      },
+      {
+        "name": "reduce_kernel",
+        "total_us": 314,
+        "count": 60,
+        "avg_us": 5,
+        "pct": 0.8,
+        "per_iter_us": 31
+      },
+      {
+        "name": "unrolled_elementwise_kernel",
+        "total_us": 170,
+        "count": 40,
+        "avg_us": 4,
+        "pct": 0.4,
+        "per_iter_us": 17
+      },
+      {
+        "name": "index_elementwise_kernel",
+        "total_us": 154,
+        "count": 20,
+        "avg_us": 8,
+        "pct": 0.4,
+        "per_iter_us": 15
+      },
+      {
+        "name": "nvjet_sm100_tst_128x192_64x7_2x1_2cta_v_bz_NNT",
+        "total_us": 140,
+        "count": 10,
+        "avg_us": 14,
+        "pct": 0.4,
+        "per_iter_us": 14
+      },
+      {
+        "name": "nvjet_sm100_tst_64x32_64x16_2x1_2cta_v_bz_splitK_NTT",
+        "total_us": 138,
+        "count": 10,
+        "avg_us": 14,
+        "pct": 0.3,
+        "per_iter_us": 14
+      },
+      {
+        "name": "_compute_col_partial_sum_kernel",
+        "total_us": 132,
+        "count": 10,
+        "avg_us": 13,
+        "pct": 0.3,
+        "per_iter_us": 13
+      }
+    ]
+  },
+  "FP8": {
+    "total_us": 35812,
+    "per_iter_us": 3581,
+    "n_kernels": 500,
+    "n_iters": 10,
+    "kernels": [
+      {
+        "name": "kernel_cutlass_kernel_quackgemm_default_epiGemmDefaultSm100_",
+        "total_us": 17819,
+        "count": 40,
+        "avg_us": 445,
+        "pct": 49.8,
+        "per_iter_us": 1782
+      },
+      {
+        "name": "kernel_cutlass_kernel_sonicmoequack_utilsgemm_sm100_fp8_zero",
+        "total_us": 8731,
+        "count": 20,
+        "avg_us": 437,
+        "pct": 24.4,
+        "per_iter_us": 873
+      },
+      {
+        "name": "_quantize_and_pack_kernel",
+        "total_us": 2817,
+        "count": 70,
+        "avg_us": 40,
+        "pct": 7.9,
+        "per_iter_us": 282
+      },
+      {
+        "name": "elementwise_kernel",
+        "total_us": 1598,
+        "count": 30,
+        "avg_us": 53,
+        "pct": 4.5,
+        "per_iter_us": 160
+      },
+      {
+        "name": "token_gather_sum_kernel",
+        "total_us": 1441,
+        "count": 20,
+        "avg_us": 72,
+        "pct": 4.0,
+        "per_iter_us": 144
+      },
+      {
+        "name": "_quantize_flat_blockscaled_kernel",
+        "total_us": 1213,
+        "count": 10,
+        "avg_us": 121,
+        "pct": 3.4,
+        "per_iter_us": 121
+      },
+      {
+        "name": "_gather_isa_packed_scales_kernel",
+        "total_us": 546,
+        "count": 20,
+        "avg_us": 27,
+        "pct": 1.5,
+        "per_iter_us": 55
+      },
+      {
+        "name": "vectorized_elementwise_kernel",
+        "total_us": 318,
+        "count": 70,
+        "avg_us": 5,
+        "pct": 0.9,
+        "per_iter_us": 32
+      },
+      {
+        "name": "reduce_kernel",
+        "total_us": 280,
+        "count": 60,
+        "avg_us": 5,
+        "pct": 0.8,
+        "per_iter_us": 28
+      },
+      {
+        "name": "unrolled_elementwise_kernel",
+        "total_us": 163,
+        "count": 40,
+        "avg_us": 4,
+        "pct": 0.5,
+        "per_iter_us": 16
+      },
+      {
+        "name": "index_elementwise_kernel",
+        "total_us": 156,
+        "count": 20,
+        "avg_us": 8,
+        "pct": 0.4,
+        "per_iter_us": 16
+      },
+      {
+        "name": "nvjet_sm100_tst_64x32_64x16_2x1_2cta_v_bz_splitK_NTT",
+        "total_us": 138,
+        "count": 10,
+        "avg_us": 14,
+        "pct": 0.4,
+        "per_iter_us": 14
+      }
+    ]
+  }
+}

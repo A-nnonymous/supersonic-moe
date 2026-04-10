@@ -1,0 +1,596 @@
+{
+  "shape": {
+    "T": 8192,
+    "H": 3072,
+    "I": 1536,
+    "E": 8,
+    "K": 8
+  },
+  "seeds": [
+    42,
+    123,
+    777
+  ],
+  "n_repeats": 3,
+  "warmup": 5,
+  "timing_iters": 30,
+  "results": [
+    {
+      "mode": "bf16",
+      "seed": 42,
+      "mem": {
+        "base": 376.5,
+        "fwd_peak": 1385.9,
+        "bwd_peak": 1412.3
+      },
+      "timing": {
+        "trimmed_ms": 4.9,
+        "min_ms": 4.837,
+        "p50_ms": 4.902,
+        "max_ms": 5.839
+      },
+      "precision": {},
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 0
+    },
+    {
+      "mode": "fp8",
+      "seed": 42,
+      "mem": {
+        "base": 600.0,
+        "fwd_peak": 1439.6,
+        "bwd_peak": 1491.7
+      },
+      "timing": {
+        "trimmed_ms": 4.608,
+        "min_ms": 4.556,
+        "p50_ms": 4.607,
+        "max_ms": 6.258
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.47,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 0
+    },
+    {
+      "mode": "fp8_stash",
+      "seed": 42,
+      "mem": {
+        "base": 496.4,
+        "fwd_peak": 1271.8,
+        "bwd_peak": 1313.8
+      },
+      "timing": {
+        "trimmed_ms": 4.396,
+        "min_ms": 4.344,
+        "p50_ms": 4.387,
+        "max_ms": 5.587
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.47,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 0
+    },
+    {
+      "mode": "bf16",
+      "seed": 123,
+      "mem": {
+        "base": 376.5,
+        "fwd_peak": 1385.9,
+        "bwd_peak": 1412.3
+      },
+      "timing": {
+        "trimmed_ms": 4.861,
+        "min_ms": 4.815,
+        "p50_ms": 4.862,
+        "max_ms": 5.93
+      },
+      "precision": {},
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 0
+    },
+    {
+      "mode": "fp8",
+      "seed": 123,
+      "mem": {
+        "base": 600.0,
+        "fwd_peak": 1439.6,
+        "bwd_peak": 1491.7
+      },
+      "timing": {
+        "trimmed_ms": 4.61,
+        "min_ms": 4.564,
+        "p50_ms": 4.611,
+        "max_ms": 5.813
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.48,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 0
+    },
+    {
+      "mode": "fp8_stash",
+      "seed": 123,
+      "mem": {
+        "base": 496.4,
+        "fwd_peak": 1271.8,
+        "bwd_peak": 1313.8
+      },
+      "timing": {
+        "trimmed_ms": 4.42,
+        "min_ms": 4.358,
+        "p50_ms": 4.416,
+        "max_ms": 5.512
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.48,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 0
+    },
+    {
+      "mode": "bf16",
+      "seed": 777,
+      "mem": {
+        "base": 376.5,
+        "fwd_peak": 1385.9,
+        "bwd_peak": 1412.3
+      },
+      "timing": {
+        "trimmed_ms": 4.87,
+        "min_ms": 4.808,
+        "p50_ms": 4.857,
+        "max_ms": 5.879
+      },
+      "precision": {},
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 0
+    },
+    {
+      "mode": "fp8",
+      "seed": 777,
+      "mem": {
+        "base": 600.0,
+        "fwd_peak": 1439.6,
+        "bwd_peak": 1491.7
+      },
+      "timing": {
+        "trimmed_ms": 4.73,
+        "min_ms": 4.693,
+        "p50_ms": 4.73,
+        "max_ms": 5.779
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.47,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 0
+    },
+    {
+      "mode": "fp8_stash",
+      "seed": 777,
+      "mem": {
+        "base": 496.4,
+        "fwd_peak": 1271.8,
+        "bwd_peak": 1313.8
+      },
+      "timing": {
+        "trimmed_ms": 4.407,
+        "min_ms": 4.362,
+        "p50_ms": 4.404,
+        "max_ms": 5.618
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.47,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 0
+    },
+    {
+      "mode": "bf16",
+      "seed": 42,
+      "mem": {
+        "base": 376.5,
+        "fwd_peak": 1385.9,
+        "bwd_peak": 1412.3
+      },
+      "timing": {
+        "trimmed_ms": 4.881,
+        "min_ms": 4.835,
+        "p50_ms": 4.881,
+        "max_ms": 6.01
+      },
+      "precision": {},
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 1
+    },
+    {
+      "mode": "fp8",
+      "seed": 42,
+      "mem": {
+        "base": 600.0,
+        "fwd_peak": 1439.6,
+        "bwd_peak": 1491.7
+      },
+      "timing": {
+        "trimmed_ms": 4.648,
+        "min_ms": 4.612,
+        "p50_ms": 4.648,
+        "max_ms": 5.983
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.47,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 1
+    },
+    {
+      "mode": "fp8_stash",
+      "seed": 42,
+      "mem": {
+        "base": 496.4,
+        "fwd_peak": 1271.8,
+        "bwd_peak": 1313.8
+      },
+      "timing": {
+        "trimmed_ms": 4.438,
+        "min_ms": 4.391,
+        "p50_ms": 4.438,
+        "max_ms": 5.89
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.47,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 1
+    },
+    {
+      "mode": "bf16",
+      "seed": 123,
+      "mem": {
+        "base": 376.5,
+        "fwd_peak": 1385.9,
+        "bwd_peak": 1412.3
+      },
+      "timing": {
+        "trimmed_ms": 4.901,
+        "min_ms": 4.837,
+        "p50_ms": 4.908,
+        "max_ms": 5.661
+      },
+      "precision": {},
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 1
+    },
+    {
+      "mode": "fp8",
+      "seed": 123,
+      "mem": {
+        "base": 600.0,
+        "fwd_peak": 1439.6,
+        "bwd_peak": 1491.7
+      },
+      "timing": {
+        "trimmed_ms": 4.54,
+        "min_ms": 4.502,
+        "p50_ms": 4.54,
+        "max_ms": 5.644
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.48,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 1
+    },
+    {
+      "mode": "fp8_stash",
+      "seed": 123,
+      "mem": {
+        "base": 496.4,
+        "fwd_peak": 1271.8,
+        "bwd_peak": 1313.8
+      },
+      "timing": {
+        "trimmed_ms": 4.389,
+        "min_ms": 4.34,
+        "p50_ms": 4.388,
+        "max_ms": 5.704
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.48,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 1
+    },
+    {
+      "mode": "bf16",
+      "seed": 777,
+      "mem": {
+        "base": 376.5,
+        "fwd_peak": 1385.9,
+        "bwd_peak": 1412.3
+      },
+      "timing": {
+        "trimmed_ms": 4.854,
+        "min_ms": 4.807,
+        "p50_ms": 4.855,
+        "max_ms": 11.638
+      },
+      "precision": {},
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 1
+    },
+    {
+      "mode": "fp8",
+      "seed": 777,
+      "mem": {
+        "base": 600.0,
+        "fwd_peak": 1439.6,
+        "bwd_peak": 1491.7
+      },
+      "timing": {
+        "trimmed_ms": 4.6,
+        "min_ms": 4.556,
+        "p50_ms": 4.598,
+        "max_ms": 5.949
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.47,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 1
+    },
+    {
+      "mode": "fp8_stash",
+      "seed": 777,
+      "mem": {
+        "base": 496.4,
+        "fwd_peak": 1271.8,
+        "bwd_peak": 1313.8
+      },
+      "timing": {
+        "trimmed_ms": 4.424,
+        "min_ms": 4.376,
+        "p50_ms": 4.421,
+        "max_ms": 5.546
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.47,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 1
+    },
+    {
+      "mode": "bf16",
+      "seed": 42,
+      "mem": {
+        "base": 376.5,
+        "fwd_peak": 1385.9,
+        "bwd_peak": 1412.3
+      },
+      "timing": {
+        "trimmed_ms": 4.921,
+        "min_ms": 4.82,
+        "p50_ms": 4.902,
+        "max_ms": 6.023
+      },
+      "precision": {},
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 2
+    },
+    {
+      "mode": "fp8",
+      "seed": 42,
+      "mem": {
+        "base": 600.0,
+        "fwd_peak": 1439.6,
+        "bwd_peak": 1491.7
+      },
+      "timing": {
+        "trimmed_ms": 4.58,
+        "min_ms": 4.535,
+        "p50_ms": 4.589,
+        "max_ms": 5.789
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.47,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 2
+    },
+    {
+      "mode": "fp8_stash",
+      "seed": 42,
+      "mem": {
+        "base": 496.4,
+        "fwd_peak": 1271.8,
+        "bwd_peak": 1313.8
+      },
+      "timing": {
+        "trimmed_ms": 4.415,
+        "min_ms": 4.34,
+        "p50_ms": 4.418,
+        "max_ms": 5.6
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.47,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 2
+    },
+    {
+      "mode": "bf16",
+      "seed": 123,
+      "mem": {
+        "base": 376.5,
+        "fwd_peak": 1385.9,
+        "bwd_peak": 1412.3
+      },
+      "timing": {
+        "trimmed_ms": 4.881,
+        "min_ms": 4.823,
+        "p50_ms": 4.881,
+        "max_ms": 6.199
+      },
+      "precision": {},
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 2
+    },
+    {
+      "mode": "fp8",
+      "seed": 123,
+      "mem": {
+        "base": 600.0,
+        "fwd_peak": 1439.6,
+        "bwd_peak": 1491.7
+      },
+      "timing": {
+        "trimmed_ms": 4.616,
+        "min_ms": 4.55,
+        "p50_ms": 4.611,
+        "max_ms": 6.022
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.48,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 2
+    },
+    {
+      "mode": "fp8_stash",
+      "seed": 123,
+      "mem": {
+        "base": 496.4,
+        "fwd_peak": 1271.8,
+        "bwd_peak": 1313.8
+      },
+      "timing": {
+        "trimmed_ms": 4.455,
+        "min_ms": 4.386,
+        "p50_ms": 4.457,
+        "max_ms": 5.772
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.48,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 2
+    },
+    {
+      "mode": "bf16",
+      "seed": 777,
+      "mem": {
+        "base": 376.5,
+        "fwd_peak": 1385.9,
+        "bwd_peak": 1412.3
+      },
+      "timing": {
+        "trimmed_ms": 4.876,
+        "min_ms": 4.828,
+        "p50_ms": 4.878,
+        "max_ms": 5.871
+      },
+      "precision": {},
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 2
+    },
+    {
+      "mode": "fp8",
+      "seed": 777,
+      "mem": {
+        "base": 600.0,
+        "fwd_peak": 1439.6,
+        "bwd_peak": 1491.7
+      },
+      "timing": {
+        "trimmed_ms": 4.576,
+        "min_ms": 4.535,
+        "p50_ms": 4.579,
+        "max_ms": 5.745
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.47,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 2
+    },
+    {
+      "mode": "fp8_stash",
+      "seed": 777,
+      "mem": {
+        "base": 496.4,
+        "fwd_peak": 1271.8,
+        "bwd_peak": 1313.8
+      },
+      "timing": {
+        "trimmed_ms": 4.421,
+        "min_ms": 4.369,
+        "p50_ms": 4.414,
+        "max_ms": 5.697
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.47,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 2
+    }
+  ],
+  "device": "CF-NG-BZZ2-O"
+}

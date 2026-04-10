@@ -1,26 +1,24 @@
 # Blockscaled FP8 MoE — Handoff
 
-> **Last updated:** 2026-04-09 (Session 42 — weight stash optimization)
+> **Last updated:** 2026-04-10 (Session 42 final — rigorous benchmark on idle B200)
 > **Branch:** `native-fp8-exploration`
-> **Status:** ✅ FP8 + weight stash. 1.12× speedup, −15.1% forward peak, 39/39 PASS.
+> **Status:** ✅ FP8 + weight stash. 1.11× speedup, −8.2% fwd peak, 40/40 PASS.
 
 ---
 
-## 0. Bottom Line
+## 0. Bottom Line (idle B200, subprocess-isolated, 3 seeds × 3 repeats, std=0)
 
-| Metric | Official BF16 | FP8 Frontier | FP8 + Stash | Delta (stash vs BF16) |
+| Metric | BF16 | FP8 | FP8 + Stash | Stash vs BF16 |
 |--------|:---:|:---:|:---:|:---:|
-| **Forward peak** | **1365 MiB** | 1440 MiB | **1159 MiB** | **−206 MiB (−15.1%)** |
-| **Backward peak** | **1343 MiB** | 1492 MiB | **1239 MiB** | **−105 MiB (−7.8%)** |
-| **Base alloc** | 489 MiB | 600 MiB | **384 MiB** | **−105 MiB (−21.4%)** |
-| nsys GPU kernel/iter | 3840 µs | 3442 µs | 3442 µs* | **1.12× faster** |
+| **nsys GPU Projection** | **3990 µs** | **3581 µs** | 3581 µs* | **1.11× faster** |
+| **Forward peak** | **1386 MiB** | 1440 MiB | **1272 MiB** | **−114 MiB (−8.2%)** |
+| **Backward peak** | **1412 MiB** | 1492 MiB | **1314 MiB** | **−98 MiB (−7.0%)** |
 | Output RRMSE | — | 6.60% | 6.60% | PASS (<10%) |
-| dx RRMSE | — | 7.48% | 7.48% | PASS (<10%) |
-| Test suite | — | 39/39 PASS | 39/39 PASS | ✅ |
+| dx RRMSE | — | 7.47% | 7.47% | PASS (<10%) |
+| Test suite | — | 40/40 PASS | 40/40 PASS | ✅ |
 | Stash vs no-stash | — | — | **BIT-IDENTICAL** | ✅ |
 
-> *Stash mode has zero latency impact — same kernels, same FP8 cache. Only memory differs.
-> All memory numbers are subprocess-isolated on B200 (Ernie shape T=8192 H=3072 I=1536 E=8 K=8).
+> *Stash mode uses identical GPU kernels — zero latency impact. Only memory footprint differs.
 
 ### Usage (with stash)
 ```python
