@@ -222,13 +222,16 @@ def _use_fused_zy1_quant() -> bool:
 def _use_fp8_wgrad() -> bool:
     """Check if FP8 weight gradients are enabled.
 
-    When enabled, wgrad GEMMs use blockscaled FP8 via varlen_k CUTLASS scheduling.
-    This allows freeing dz_bf16 before wgrad (−384 MiB at Ernie shape).
-    Performance is neutral at I=1536, positive at I≥2048.
-    Default: disabled at I≤1536 (colwise quant overhead 977µs > bf16 GEMM 1125µs).
-    Enable with SONIC_MOE_FP8_WGRAD=1 for I≥2048 where GEMM savings exceed quant cost.
+    Auto-enabled at I≥2048 where GEMM compute savings exceed colwise quant cost.
+    At I=1536 (Ernie), colwise quant overhead (977µs) exceeds bf16 GEMM savings.
+    Override with SONIC_MOE_FP8_WGRAD=0/1.
     """
-    return os.getenv("SONIC_MOE_FP8_WGRAD", "0").lower() in {"1", "true", "yes", "on"}
+    val = os.getenv("SONIC_MOE_FP8_WGRAD", "").lower()
+    if val in {"1", "true", "yes", "on"}:
+        return True
+    if val in {"0", "false", "no", "off"}:
+        return False
+    return False  # default OFF; auto-detect happens at _FP8Config init
 
 
 def _save_z_fp8() -> bool:
@@ -457,7 +460,13 @@ class _FP8Config:
         self.fused_swiglu_quant: bool = _use_fused_swiglu_quant()
         self.epilogue_quant: bool = _use_epilogue_quant()
         self.fp8_wgrad: bool = _use_fp8_wgrad()
-        self.alignment_assumed: bool = False  # set after alignment check
+        self.alignment_assumed: bool = False
+
+    def resolve_wgrad(self, I: int) -> None:
+        """Auto-enable FP8 wgrad at I≥2048 if not explicitly set."""
+        if os.getenv("SONIC_MOE_FP8_WGRAD", ""):
+            return  # explicit override
+        self.fp8_wgrad = I >= 2048
 
     @staticmethod
     def disabled() -> "_FP8Config":
@@ -739,6 +748,7 @@ class _UpProjection(torch.autograd.Function):
             assert is_glu_activation, "QuACK GEMM does not support non GLU activation yet"
             cfg = _get_fp8_config()
             if cfg.enabled:
+                cfg.resolve_wgrad(w1.shape[0] // 2)  # w1 is (2I, H, E), I = shape[0]/2
                 global _ALIGNMENT_ASSUMED
                 _evict_per_tensor_caches_once()
                 aligned = _all_segments_128_aligned(expert_frequency_offset)

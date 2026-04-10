@@ -472,6 +472,70 @@ def _quantize_flat_blockscaled_kernel(
         tl.store(scale_ptrs, e8m0_byte, mask=row_mask_1d)
 
 
+@triton.jit
+def _quantize_flat_v2_kernel(
+    src_ptr, dst_fp8_ptr, dst_scale_ptr,
+    rows, cols,
+    src_stride_row, src_stride_col,
+    dst_stride_row, dst_stride_col,
+    scale_stride_row, scale_stride_col,
+    fp8_max: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,       # 32
+    TILE_ROWS: tl.constexpr,        # 128
+    TILE_COLS: tl.constexpr,        # 256
+):
+    """High-BW blockscaled quantize: large tiles, vectorized, pipelined.
+
+    Each CTA processes TILE_ROWS × TILE_COLS elements.
+    Within each tile, processes TILE_COLS/GROUP_SIZE groups per row.
+    Uses vectorized loads for full memory bus utilization.
+
+    Grid: (ceil(rows/TILE_ROWS), ceil(cols/TILE_COLS))
+    """
+    pid_row = tl.program_id(0)
+    pid_col = tl.program_id(1)
+
+    row_base = pid_row * TILE_ROWS
+    col_base = pid_col * TILE_COLS
+
+    GROUPS_PER_TILE: tl.constexpr = TILE_COLS // GROUP_SIZE  # 256/32 = 8
+
+    row_offs = row_base + tl.arange(0, TILE_ROWS)
+    row_mask = row_offs < rows
+
+    for g in tl.range(0, GROUPS_PER_TILE):
+        col_offs = col_base + g * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+        col_mask = col_offs[None, :] < cols
+        mask = row_mask[:, None] & col_mask
+
+        # Vectorized load: (TILE_ROWS, GROUP_SIZE) bf16 tile
+        src_ptrs = src_ptr + row_offs[:, None] * src_stride_row + col_offs[None, :] * src_stride_col
+        values = tl.load(src_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+        # E8M0 per-row amax (reduce over GROUP_SIZE=32 cols)
+        amax = tl.max(tl.abs(values), axis=1)  # (TILE_ROWS,)
+        amax_i32 = amax.to(tl.int32, bitcast=True)
+        bexp = (amax_i32 >> 23) & 0xFF
+        mant = amax_i32 & 0x7FFFFF
+        carry = tl.where(mant > 0x600000, 1, 0)
+        e8m0 = tl.where(bexp > 0, bexp - 8 + carry, 0)
+        e8m0_byte = tl.maximum(e8m0, 0).to(tl.uint8)
+
+        # Quant scale
+        qexp = tl.maximum(tl.minimum(254 - e8m0, 254), 1)
+        qscale = (qexp.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+        quantized = (values * qscale[:, None]).to(tl.float8e4nv)
+
+        # Vectorized store: fp8 data
+        dst_ptrs = dst_fp8_ptr + row_offs[:, None] * dst_stride_row + col_offs[None, :] * dst_stride_col
+        tl.store(dst_ptrs, quantized, mask=mask)
+
+        # Store scale byte
+        group_id = (col_base // GROUP_SIZE) + g
+        scale_ptrs = dst_scale_ptr + row_offs * scale_stride_row + group_id * scale_stride_col
+        tl.store(scale_ptrs, e8m0_byte, mask=row_mask)
+
+
 def quantize_activation_blockscaled_fast(
     x: torch.Tensor,
     group_size: int = 32,
@@ -487,12 +551,10 @@ def quantize_activation_blockscaled_fast(
     fp8_out = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=x.device)
     scale_out = torch.empty(M, num_groups, dtype=torch.uint8, device=x.device)
 
-    # 2D grid: (row_blocks, col_blocks) for better SM utilization.
-    # BR=32, GPB=12 → ~16K blocks → 43% peak BW on B200 (vs 22% with BR=16, GPB=all).
-    BLOCK_ROWS = 32
-    GROUPS_PER_BLOCK = min(num_groups, 12)
-    grid = (_div_up(M, BLOCK_ROWS), _div_up(num_groups, GROUPS_PER_BLOCK))
-    _quantize_flat_blockscaled_kernel[grid](
+    TILE_ROWS = 32
+    TILE_COLS = min(K, 256)
+    grid = (_div_up(M, TILE_ROWS), _div_up(K, TILE_COLS))
+    _quantize_flat_v2_kernel[grid](
         x,
         fp8_out,
         scale_out,
@@ -504,12 +566,12 @@ def quantize_activation_blockscaled_fast(
         fp8_out.stride(1),
         scale_out.stride(0),
         scale_out.stride(1),
-        fp8_max=float(torch.finfo(torch.float8_e4m3fn).max),
+        fp8_max=_FP8_E4M3_MAX,
         GROUP_SIZE=group_size,
-        BLOCK_ROWS=BLOCK_ROWS,
-        GROUPS_PER_BLOCK=GROUPS_PER_BLOCK,
+        TILE_ROWS=TILE_ROWS,
+        TILE_COLS=TILE_COLS,
     )
-    return fp8_out, scale_out.view(torch.float8_e8m0fnu)
+    return fp8_out, scale_out
 
 
 # ---------------------------------------------------------------------------
