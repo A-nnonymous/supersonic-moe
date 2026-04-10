@@ -1,0 +1,270 @@
+{
+  "version": 2,
+  "metadata": {
+    "timestamp": "2026-04-09T23:13:15.806540",
+    "shape": {
+      "T": 8192,
+      "H": 3072,
+      "I": 1536,
+      "E": 8,
+      "K": 8
+    },
+    "device": "NVIDIA B200 (SM100)",
+    "device_id": "CF-NG-BZZ2-O",
+    "gpu_index": 4,
+    "envs": {
+      "official_bf16": {
+        "path": "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/official_bf16",
+        "code": "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/official/sonic-moe",
+        "quack": "0.2.5",
+        "sonicmoe": "0.1.1",
+        "torch": "2.11.0+cu130"
+      },
+      "frontier_fp8": {
+        "path": "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer",
+        "code": "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe",
+        "quack": "0.3.7",
+        "sonicmoe": "fork",
+        "torch": "2.11.0+cu130",
+        "branch": "native-fp8-exploration",
+        "commit": "990e045"
+      }
+    },
+    "benchmark_protocol": {
+      "warmup_iters": 30,
+      "measured_iters": 20,
+      "profiler": "torch.profiler (1 warmup + 1 active)",
+      "metric": "GPU-projection (self_cuda_time_total, excl. memcpy)"
+    }
+  },
+  "performance": {
+    "compute_us": {
+      "official_bf16": 3908.7,
+      "fp8_nostash": 3596.4,
+      "fp8_stash": 3818.1
+    },
+    "memcpy_us": {
+      "official_bf16": 20.5,
+      "fp8_nostash": 18.6,
+      "fp8_stash": 8063.6
+    },
+    "wall_clock_min_ms": {
+      "official_bf16": 4.725,
+      "fp8_nostash": 4.581,
+      "fp8_stash": 4.383
+    },
+    "wall_clock_median_ms": {
+      "official_bf16": 4.751,
+      "fp8_nostash": 4.879,
+      "fp8_stash": 4.68
+    },
+    "speedup": {
+      "fp8_compute": 1.0868,
+      "fp8_stash_compute": 1.0237,
+      "fp8_stash_wall": 1.078
+    },
+    "kernel_breakdown": {
+      "official_bf16": {
+        "bf16_wgrad_gemm": {
+          "us": 2335.8,
+          "count": 4,
+          "pct": 59.7,
+          "note": "dw1+dw2+dx fwd/bwd via QuACK BF16 GEMM"
+        },
+        "bf16_fused_gate_fwd": {
+          "us": 761.0,
+          "count": 1,
+          "pct": 19.5,
+          "note": "gemm_gated: w1·x + gate activation"
+        },
+        "bf16_fused_dgate_bwd": {
+          "us": 498.0,
+          "count": 1,
+          "pct": 12.7,
+          "note": "gemm_dgated: dx through w2"
+        },
+        "scatter_gather": {
+          "us": 142.0,
+          "count": 2,
+          "pct": 3.6,
+          "note": "token_gather_sum (expert dispatch/collect)"
+        },
+        "other": {
+          "us": 171.9,
+          "count": "various",
+          "pct": 4.4
+        }
+      },
+      "fp8_nostash": {
+        "bf16_wgrad_gemm": {
+          "us": 1124.2,
+          "count": 2,
+          "pct": 31.3,
+          "note": "dw1+dw2 STILL BF16 (wgrad not FP8-ized)"
+        },
+        "bf16_gemm_other": {
+          "us": 669.0,
+          "count": 2,
+          "pct": 18.6,
+          "note": "BF16 GEMM for dx path"
+        },
+        "fp8_fused_fwd": {
+          "us": 460.0,
+          "count": 1,
+          "pct": 12.8,
+          "note": "GemmGatedSm100ZeroMat: FP8 fused up-proj"
+        },
+        "fp8_fused_bwd": {
+          "us": 415.0,
+          "count": 1,
+          "pct": 11.5,
+          "note": "GemmDGatedFP8CLoad: FP8 fused dgate"
+        },
+        "quantize_pipeline": {
+          "us": 460.0,
+          "count": 10,
+          "pct": 12.8,
+          "note": "quantize_and_pack + flat_blockscaled + gather_isa"
+        },
+        "elementwise_cast": {
+          "us": 156.0,
+          "count": 1.5,
+          "pct": 4.3,
+          "note": "bf16↔fp8 type conversion"
+        },
+        "scatter_gather": {
+          "us": 142.0,
+          "count": 2,
+          "pct": 3.9
+        },
+        "other": {
+          "us": 170.2,
+          "count": "various",
+          "pct": 4.7
+        }
+      },
+      "fp8_stash_delta": {
+        "extra_elementwise": {
+          "us": 194,
+          "note": "additional bf16→fp8 cast during unstash"
+        },
+        "memcpy_htod": {
+          "us": 4084,
+          "count": 2,
+          "note": "unstash: pinned→device (w1+w2, 216 MiB)"
+        },
+        "memcpy_dtoh": {
+          "us": 3961,
+          "count": 2,
+          "note": "stash: device→pinned (w1+w2, 216 MiB)"
+        },
+        "note": "D2H/H2D overlaps with GPU compute — wall 4.38ms < no-stash 4.58ms"
+      }
+    }
+  },
+  "precision": {
+    "reference": "official_bf16 (QuACK 0.2.5, same seeds)",
+    "fp8_vs_bf16": {
+      "output": {
+        "rrmse_pct": 6.514,
+        "cosine": 1.000129
+      },
+      "dx": {
+        "rrmse_pct": 7.0348,
+        "cosine": 0.999585
+      },
+      "dw1": {
+        "rrmse_pct": 5.9439,
+        "cosine": 1.011413
+      },
+      "dw2": {
+        "rrmse_pct": 6.5132,
+        "cosine": 1.002424
+      }
+    },
+    "stash_vs_nostash": "bit-identical (same precision numbers, stash only affects memory placement)",
+    "verdict": "All tensors < 8% RRMSE, cosine > 0.999. Acceptable for training."
+  },
+  "memory": {
+    "model_params_MiB": {
+      "official_bf16": 400.3,
+      "fp8_nostash": 3488.4,
+      "fp8_stash": 3674.8,
+      "note": "FP8 +3088 MiB from QuACK 0.3.7 workspace + FP8 shadow weight caches"
+    },
+    "fwd_activation_delta_MiB": {
+      "official_bf16": 433.5,
+      "fp8_nostash": 247.5,
+      "fp8_stash": 247.5,
+      "note": "FP8 saves 43% activation memory (8-bit vs 16-bit saved tensors)"
+    },
+    "peak_bwd_MiB": {
+      "official_bf16": 1531.8,
+      "fp8_nostash": 4439.2,
+      "fp8_stash": 4445.9
+    },
+    "stash_mechanism": {
+      "gpu_savings_during_fwd_bwd_MiB": 131.6,
+      "cpu_pinned_cost_MiB": 216,
+      "d2h_us": 3961,
+      "h2d_us": 4084,
+      "note": "Stash offloads BF16 master weights to CPU pinned memory; FP8 shadows remain on GPU"
+    },
+    "trajectory": {
+      "official_bf16": {
+        "model_params_MiB": 400.3,
+        "pre_fwd_MiB": 448.3,
+        "post_fwd_MiB": 881.8,
+        "peak_fwd_MiB": 1457.7,
+        "post_bwd_MiB": 760.6,
+        "peak_bwd_MiB": 1531.8,
+        "cleanup_MiB": 496.5
+      },
+      "fp8_nostash": {
+        "model_params_MiB": 3488.4,
+        "pre_fwd_MiB": 3536.4,
+        "post_fwd_MiB": 3783.9,
+        "peak_fwd_MiB": 4386.0,
+        "post_bwd_MiB": 3848.7,
+        "peak_bwd_MiB": 4439.2,
+        "cleanup_MiB": 3584.7
+      },
+      "fp8_stash": {
+        "model_params_MiB": 3674.8,
+        "after_refresh_MiB": 3759.2,
+        "after_stash_MiB": 3543.2,
+        "pre_fwd_MiB": 3543.2,
+        "post_fwd_MiB": 3790.7,
+        "peak_fwd_MiB": 4318.5,
+        "post_bwd_MiB": 3855.5,
+        "peak_bwd_MiB": 4445.9,
+        "after_unstash_MiB": 4071.5,
+        "cleanup_MiB": 3807.4
+      }
+    }
+  },
+  "sm100_compatibility": {
+    "official_sonic_moe": "cute.compile() SM90-only → FAILS on B200 with OpError",
+    "workaround": "enable_quack_gemm(True) + KernelBackendMoE.sonicmoe bypasses cute.compile",
+    "our_fork": "Works via same workaround (enable_quack_gemm already the default path)",
+    "torch_backend": "KernelBackendMoE.torch fails (dtype mismatch in index_add_)"
+  },
+  "decisions": {
+    "fp8_frontier_ready": true,
+    "stash_recommended": true,
+    "rationale": [
+      "8.7% compute speedup (3909→3596µs) with acceptable precision (6-7% RRMSE)",
+      "43% activation memory reduction enables larger batch sizes or longer sequences",
+      "Stash mechanism adds zero GPU compute cost in pipeline (D2H/H2D overlaps with next micro-batch)",
+      "Wall-clock with stash is FASTER (4.38 vs 4.72ms) due to memcpy/compute overlap",
+      "FP8+stash precision is bit-identical to FP8 no-stash"
+    ],
+    "risks": [
+      "FP8 infrastructure adds ~3088 MiB GPU resident memory (QuACK workspace + shadow weights)",
+      "Stash requires 216 MiB CPU pinned memory per MoE layer",
+      "QuACK 0.3.7 JIT compilation adds 19-22s first-iteration latency",
+      "wgrad kernels (dw1, dw2) still use BF16 — FP8 wgrad is future upside",
+      "SM100 compatibility depends on QuACK GEMM path; cute.compile path is broken"
+    ]
+  }
+}

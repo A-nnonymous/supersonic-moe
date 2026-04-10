@@ -146,7 +146,25 @@
       "Bash(OUTDIR=/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/output/wgrad_ncu_v3 echo \"=== BF16 GemmDGated NCU ===\" ssh 10.51.203.82 \"ncu --import $OUTDIR/gemmdgated_bf16.ncu-rep --print-summary per-kernel 2>&1\")",
       "Bash(OUTDIR=/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/output/wgrad_ncu_v3 echo \"=== BF16 GemmDGated ===\" ssh 10.51.203.82 \"ncu --import $OUTDIR/gemmdgated_bf16.ncu-rep --page raw 2>&1\")",
       "Bash(OUTDIR=/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/output/wgrad_ncu_v3\nssh 10.51.203.82 \"ncu --import $OUTDIR/gemmdgated_bf16.ncu-rep --print-details all 2>&1\" | head -60)",
-      "Bash(git rm:*)"
+      "Bash(git rm:*)",
+      "Bash(git revert:*)",
+      "Bash(/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python -c \"import torch; print\\('torch version:', torch.__version__\\); print\\('CUDA available:', torch.cuda.is_available\\(\\)\\); print\\('CUDA version:', torch.version.cuda if torch.cuda.is_available\\(\\) else 'N/A'\\)\")",
+      "Bash(/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python -c \"import triton; print\\('triton version:', triton.__version__\\)\" 2>&1; /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python -c \"import cutlass; print\\('cutlass version:', cutlass.__version__\\)\" 2>&1)",
+      "Bash(/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python -c \"\nimport torch\nprint\\('PyTorch:', torch.__version__\\)\nprint\\('CUDA:', torch.version.cuda\\)\nprint\\('cuDNN:', torch.backends.cudnn.version\\(\\)\\)\nprint\\('GPU count:', torch.cuda.device_count\\(\\)\\)\nfor i in range\\(torch.cuda.device_count\\(\\)\\):\n    print\\(f'  GPU {i}: {torch.cuda.get_device_name\\(i\\)}, {torch.cuda.get_device_properties\\(i\\).total_mem / 1024**3:.1f} GiB'\\)\nprint\\('FP8 support \\(torch.float8_e4m3fn\\):', hasattr\\(torch, 'float8_e4m3fn'\\)\\)\n\")",
+      "Bash(/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python -c \"\nimport deep_gemm; print\\('deep_gemm:', deep_gemm.__version__ if hasattr\\(deep_gemm, '__version__'\\) else 'installed \\(no version\\)'\\)\n\" 2>&1; /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python -c \"\nimport sonicmoe; print\\('sonic_moe:', sonicmoe.__version__ if hasattr\\(sonicmoe, '__version__'\\) else 'installed \\(no version\\)'\\)\n\" 2>&1; /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python -c \"\ntry:\n    import mscclpp; print\\('mscclpp: installed'\\)\nexcept: print\\('mscclpp: import failed but .so present'\\)\n\" 2>&1)",
+      "Bash(/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/pip list:*)",
+      "Bash(VENV=/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer)",
+      "Bash($VENV/bin/python --version)",
+      "Read(//root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe/$VENV/lib/python*/**)",
+      "Bash($VENV/bin/python -c \"import torch; print\\(''''torch'''', torch.__version__\\)\")",
+      "Bash($VENV/bin/python -c \"import triton; print\\(''''triton'''', triton.__version__\\)\")",
+      "Bash($VENV/bin/python -c \"import cutlass; print\\(''''cutlass'''', cutlass.__version__\\)\")",
+      "Bash(/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python -c \"import torch; print\\('torch version:', torch.__version__\\); print\\('cuda available:', torch.cuda.is_available\\(\\)\\); print\\('device name:', torch.cuda.get_device_name\\(0\\) if torch.cuda.is_available\\(\\) else 'no gpu'\\)\")",
+      "Read(//root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe/$VENV/bin/**)",
+      "Bash($VENV/bin/python -c \"import site; print\\(site.getsitepackages\\(\\)\\)\")",
+      "Bash($VENV/bin/python -c \"import site; import os; sp=site.getsitepackages\\(\\)[0]; print\\(sp\\); entries=sorted\\(os.listdir\\(sp\\)\\); print\\(f''Total entries: {len\\(entries\\)}''\\); print\\(''\\\\n''.join\\(entries[:200]\\)\\)\")",
+      "Bash(VENV=/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer && $VENV/bin/python -c \"\nimport torch, triton, sys\nprint\\('Python:', sys.version\\)\nprint\\('torch:', torch.__version__\\)\nprint\\('triton:', triton.__version__\\)\ntry:\n    import cutlass\n    print\\('cutlass: installed \\(no __version__\\), dir:', [x for x in dir\\(cutlass\\) if not x.startswith\\('_'\\)][:20]\\)\nexcept Exception as e:\n    print\\('cutlass:', e\\)\ntry:\n    import cuda\n    print\\('cuda-python:', cuda.__version__\\)\nexcept Exception as e:\n    print\\('cuda-python: not available or', e\\)\nprint\\('torch.cuda.is_available\\(\\):', torch.cuda.is_available\\(\\)\\)\nif torch.cuda.is_available\\(\\):\n    print\\('GPU count:', torch.cuda.device_count\\(\\)\\)\n    for i in range\\(torch.cuda.device_count\\(\\)\\):\n        print\\(f'  GPU {i}:', torch.cuda.get_device_name\\(i\\)\\)\n    print\\('CUDA version \\(torch\\):', torch.version.cuda\\)\n    print\\('cuDNN version:', torch.backends.cudnn.version\\(\\)\\)\n\")",
+      "Bash(echo:*)"
     ]
   }
 }

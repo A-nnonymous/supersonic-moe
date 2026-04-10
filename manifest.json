@@ -1,7 +1,7 @@
 {
   "version": 1,
   "metadata": {
-    "timestamp": "2026-04-09T12:23:40",
+    "timestamp": "2026-04-09T18:37:32",
     "shape": {
       "T": 8192,
       "H": 3072,
@@ -137,6 +137,68 @@
           ]
         },
         {
+          "name": "fwd_fp8",
+          "dtype": "torch.float8_e4m3fn",
+          "shape": [
+            65536,
+            1536
+          ],
+          "size_mib": 96.0,
+          "role": "activation",
+          "create_phase": 1,
+          "free_phase": 2,
+          "events": [
+            "prequant_store@phase1",
+            "prequant_store@phase1",
+            "prequant_consume@phase2",
+            "prequant_consume@phase2",
+            "prequant_store@phase1",
+            "prequant_store@phase1",
+            "prequant_consume@phase2",
+            "prequant_consume@phase2",
+            "prequant_store@phase1",
+            "prequant_store@phase1",
+            "prequant_consume@phase2",
+            "prequant_consume@phase2",
+            "prequant_store@phase1",
+            "prequant_store@phase1",
+            "prequant_consume@phase2",
+            "prequant_consume@phase2",
+            "prequant_store@phase1",
+            "prequant_store@phase1",
+            "prequant_consume@phase2",
+            "prequant_consume@phase2"
+          ]
+        },
+        {
+          "name": "prequant_fwd_0",
+          "dtype": "torch.bfloat16",
+          "shape": [
+            65536,
+            1536
+          ],
+          "size_mib": 192.0,
+          "role": "activation",
+          "create_phase": 1,
+          "free_phase": 2,
+          "events": [
+            "prequant_store@phase1",
+            "prequant_consume@phase2",
+            "prequant_store@phase1",
+            "created@UpProj",
+            "prequant_consume@phase2",
+            "prequant_store@phase1",
+            "created@UpProj",
+            "prequant_consume@phase2",
+            "prequant_store@phase1",
+            "created@UpProj",
+            "prequant_consume@phase2",
+            "prequant_store@phase1",
+            "created@UpProj",
+            "prequant_consume@phase2"
+          ]
+        },
+        {
           "name": "s_reverse_scatter_idx",
           "dtype": "torch.int32",
           "shape": [
@@ -197,10 +259,6 @@
           "create_phase": 1,
           "free_phase": 2,
           "events": [
-            "created@UpProj",
-            "created@UpProj",
-            "created@UpProj",
-            "created@UpProj",
             "created@UpProj"
           ]
         },
@@ -214,15 +272,51 @@
           "size_mib": 384.0,
           "role": "activation",
           "create_phase": 1,
-          "free_phase": 3,
+          "free_phase": 2,
           "events": [
             "created@UpProj",
-            "saved@phase2",
-            "restored@phase3",
             "created@UpProj",
             "created@UpProj",
             "created@UpProj",
             "created@UpProj"
+          ]
+        },
+        {
+          "name": "z_fp8",
+          "dtype": "torch.float8_e4m3fn",
+          "shape": [
+            65536,
+            3072
+          ],
+          "size_mib": 192.0,
+          "role": "activation",
+          "create_phase": 1,
+          "free_phase": 3,
+          "events": [
+            "prequant_store@phase1",
+            "prequant_store@phase1",
+            "prequant_consume@phase2",
+            "prequant_consume@phase2",
+            "saved@phase2",
+            "saved@phase2",
+            "restored@phase3",
+            "restored@phase3",
+            "prequant_store@phase1",
+            "prequant_store@phase1",
+            "prequant_consume@phase2",
+            "prequant_consume@phase2",
+            "prequant_store@phase1",
+            "prequant_store@phase1",
+            "prequant_consume@phase2",
+            "prequant_consume@phase2",
+            "prequant_store@phase1",
+            "prequant_store@phase1",
+            "prequant_consume@phase2",
+            "prequant_consume@phase2",
+            "prequant_store@phase1",
+            "prequant_store@phase1",
+            "prequant_consume@phase2",
+            "prequant_consume@phase2"
           ]
         },
         {
@@ -325,6 +419,40 @@
           ]
         },
         {
+          "name": "bwd_fp8",
+          "dtype": "torch.float8_e4m3fn",
+          "shape": [
+            65536,
+            3072
+          ],
+          "size_mib": 192.0,
+          "role": "activation",
+          "create_phase": 3,
+          "free_phase": 4,
+          "events": [
+            "prequant_store@phase3",
+            "prequant_store@phase3",
+            "prequant_consume@phase4",
+            "prequant_consume@phase4",
+            "prequant_store@phase3",
+            "prequant_store@phase3",
+            "prequant_consume@phase4",
+            "prequant_consume@phase4",
+            "prequant_store@phase3",
+            "prequant_store@phase3",
+            "prequant_consume@phase4",
+            "prequant_consume@phase4",
+            "prequant_store@phase3",
+            "prequant_store@phase3",
+            "prequant_consume@phase4",
+            "prequant_consume@phase4",
+            "prequant_store@phase3",
+            "prequant_store@phase3",
+            "prequant_consume@phase4",
+            "prequant_consume@phase4"
+          ]
+        },
+        {
           "name": "dout",
           "dtype": "torch.bfloat16",
           "shape": [
@@ -352,19 +480,32 @@
           "events": []
         },
         {
-          "name": "dz",
+          "name": "prequant_bwd_0",
           "dtype": "torch.bfloat16",
           "shape": [
             65536,
             3072
           ],
           "size_mib": 384.0,
-          "role": "grad",
+          "role": "activation",
           "create_phase": 3,
           "free_phase": 4,
           "events": [
+            "prequant_store@phase3",
             "created@DnProj_bwd",
-            "created@DnProj_bwd"
+            "prequant_consume@phase4",
+            "prequant_store@phase3",
+            "created@DnProj_bwd",
+            "prequant_consume@phase4",
+            "prequant_store@phase3",
+            "created@DnProj_bwd",
+            "prequant_consume@phase4",
+            "prequant_store@phase3",
+            "created@DnProj_bwd",
+            "prequant_consume@phase4",
+            "prequant_store@phase3",
+            "created@DnProj_bwd",
+            "prequant_consume@phase4"
           ]
         },
         {
@@ -399,54 +540,54 @@
         {
           "phase_id": 0,
           "phase_name": "Router & Meta",
-          "allocated_mib": 2537.67,
-          "peak_mib": 2537.67,
-          "reserved_mib": 2866.0
+          "allocated_mib": 921.05,
+          "peak_mib": 921.05,
+          "reserved_mib": 1546.0
         },
         {
           "phase_id": 1,
           "phase_name": "UpProj Fwd",
-          "allocated_mib": 3113.67,
-          "peak_mib": 3113.67,
-          "reserved_mib": 3442.0
+          "allocated_mib": 1292.92,
+          "peak_mib": 1769.92,
+          "reserved_mib": 2124.0
         },
         {
           "phase_id": 2,
           "phase_name": "DnProj Fwd",
-          "allocated_mib": 3161.67,
-          "peak_mib": 3545.67,
-          "reserved_mib": 3826.0
+          "allocated_mib": 1129.92,
+          "peak_mib": 1650.05,
+          "reserved_mib": 2124.0
         },
         {
           "phase_id": 3,
           "phase_name": "DnProj Bwd",
-          "allocated_mib": 3858.17,
-          "peak_mib": 3932.17,
-          "reserved_mib": 4020.0
+          "allocated_mib": 1863.55,
+          "peak_mib": 1895.05,
+          "reserved_mib": 2124.0
         },
         {
           "phase_id": 4,
           "phase_name": "UpBwd (wgrad)",
-          "allocated_mib": 3809.67,
-          "peak_mib": 3809.67,
-          "reserved_mib": 4020.0
+          "allocated_mib": 1815.05,
+          "peak_mib": 1815.05,
+          "reserved_mib": 2124.0
         },
         {
           "phase_id": 5,
           "phase_name": "UpBwd (actgrad)",
-          "allocated_mib": 3857.67,
-          "peak_mib": 3857.67,
-          "reserved_mib": 4020.0
+          "allocated_mib": 1863.05,
+          "peak_mib": 1863.05,
+          "reserved_mib": 2124.0
         }
       ],
       "memory_trajectory": {
-        "pre_fwd": 3208.3,
-        "peak_fwd": 4265.67,
-        "pre_bwd": 3881.8,
-        "peak_bwd": 4577.67,
-        "cleanup": 3928.3,
-        "fwd_peak_above_pre": 1057.38,
-        "bwd_peak_above_pre": 695.87
+        "pre_fwd": 1015.67,
+        "peak_fwd": 1794.05,
+        "pre_bwd": 1274.05,
+        "peak_bwd": 2007.05,
+        "cleanup": 1159.67,
+        "fwd_peak_above_pre": 778.38,
+        "bwd_peak_above_pre": 733.0
       },
       "precision_matrix": [
         [
@@ -507,6 +648,22 @@
         ],
         [
           0,
+          2,
+          2,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          1,
+          1,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
           4,
           4,
           4,
@@ -541,7 +698,15 @@
           0,
           1,
           1,
-          1,
+          0,
+          0,
+          0
+        ],
+        [
+          0,
+          2,
+          2,
+          2,
           0,
           0
         ],
@@ -591,6 +756,14 @@
           3,
           0,
           0,
+          0
+        ],
+        [
+          0,
+          0,
+          0,
+          2,
+          2,
           0
         ],
         [
@@ -1057,12 +1230,16 @@
           "size_mib": 96.0,
           "role": "activation",
           "create_phase": 1,
-          "free_phase": 1,
+          "free_phase": 2,
           "events": [
             "prequant_store@phase1",
             "prequant_store@phase1",
+            "prequant_consume@phase2",
+            "prequant_consume@phase2",
             "prequant_store@phase1",
-            "prequant_store@phase1"
+            "prequant_store@phase1",
+            "prequant_consume@phase2",
+            "prequant_consume@phase2"
           ]
         },
         {
@@ -1075,10 +1252,13 @@
           "size_mib": 192.0,
           "role": "activation",
           "create_phase": 1,
-          "free_phase": 1,
+          "free_phase": 2,
           "events": [
             "prequant_store@phase1",
-            "prequant_store@phase1"
+            "prequant_consume@phase2",
+            "prequant_store@phase1",
+            "created@UpProj",
+            "prequant_consume@phase2"
           ]
         },
         {
@@ -1142,7 +1322,6 @@
           "create_phase": 1,
           "free_phase": 2,
           "events": [
-            "created@UpProj",
             "created@UpProj"
           ]
         },
@@ -1176,12 +1355,16 @@
           "events": [
             "prequant_store@phase1",
             "prequant_store@phase1",
+            "prequant_consume@phase2",
+            "prequant_consume@phase2",
             "saved@phase2",
             "saved@phase2",
             "restored@phase3",
             "restored@phase3",
             "prequant_store@phase1",
-            "prequant_store@phase1"
+            "prequant_store@phase1",
+            "prequant_consume@phase2",
+            "prequant_consume@phase2"
           ]
         },
         {
@@ -1258,7 +1441,7 @@
           "size_mib": 48.0,
           "role": "activation",
           "create_phase": 2,
-          "free_phase": 2,
+          "free_phase": 5,
           "events": [
             "DnProj_out",
             "DnProj_out"
@@ -1290,12 +1473,16 @@
           "size_mib": 192.0,
           "role": "activation",
           "create_phase": 3,
-          "free_phase": 3,
+          "free_phase": 4,
           "events": [
             "prequant_store@phase3",
             "prequant_store@phase3",
+            "prequant_consume@phase4",
+            "prequant_consume@phase4",
             "prequant_store@phase3",
-            "prequant_store@phase3"
+            "prequant_store@phase3",
+            "prequant_consume@phase4",
+            "prequant_consume@phase4"
           ]
         },
         {
@@ -1339,8 +1526,10 @@
           "events": [
             "prequant_store@phase3",
             "created@DnProj_bwd",
+            "prequant_consume@phase4",
             "prequant_store@phase3",
-            "created@DnProj_bwd"
+            "created@DnProj_bwd",
+            "prequant_consume@phase4"
           ]
         },
         {
@@ -1375,54 +1564,54 @@
         {
           "phase_id": 0,
           "phase_name": "Router & Meta",
-          "allocated_mib": 4521.67,
-          "peak_mib": 4521.67,
-          "reserved_mib": 4858.0
+          "allocated_mib": 1641.05,
+          "peak_mib": 1641.05,
+          "reserved_mib": 2314.0
         },
         {
           "phase_id": 1,
           "phase_name": "UpProj Fwd",
-          "allocated_mib": 4893.67,
-          "peak_mib": 5369.92,
-          "reserved_mib": 5628.0
+          "allocated_mib": 2012.3,
+          "peak_mib": 2489.3,
+          "reserved_mib": 2892.0
         },
         {
           "phase_id": 2,
           "phase_name": "DnProj Fwd",
-          "allocated_mib": 4729.92,
-          "peak_mib": 5250.8,
-          "reserved_mib": 5628.0
+          "allocated_mib": 1849.92,
+          "peak_mib": 2370.05,
+          "reserved_mib": 2892.0
         },
         {
           "phase_id": 3,
           "phase_name": "DnProj Bwd",
-          "allocated_mib": 5464.17,
-          "peak_mib": 5495.67,
-          "reserved_mib": 5628.0
+          "allocated_mib": 2583.55,
+          "peak_mib": 2615.05,
+          "reserved_mib": 2892.0
         },
         {
           "phase_id": 4,
           "phase_name": "UpBwd (wgrad)",
-          "allocated_mib": 5415.67,
-          "peak_mib": 5415.67,
-          "reserved_mib": 5628.0
+          "allocated_mib": 2535.05,
+          "peak_mib": 2535.05,
+          "reserved_mib": 2892.0
         },
         {
           "phase_id": 5,
           "phase_name": "UpBwd (actgrad)",
-          "allocated_mib": 5463.67,
-          "peak_mib": 5463.67,
-          "reserved_mib": 5628.0
+          "allocated_mib": 2583.05,
+          "peak_mib": 2583.05,
+          "reserved_mib": 2892.0
         }
       ],
       "memory_trajectory": {
-        "pre_fwd": 4616.3,
-        "peak_fwd": 5394.8,
-        "pre_bwd": 4874.05,
-        "peak_bwd": 5607.67,
-        "cleanup": 4760.3,
-        "fwd_peak_above_pre": 778.5,
-        "bwd_peak_above_pre": 733.62
+        "pre_fwd": 1735.67,
+        "peak_fwd": 2514.05,
+        "pre_bwd": 1994.05,
+        "peak_bwd": 2727.05,
+        "cleanup": 1879.67,
+        "fwd_peak_above_pre": 778.38,
+        "bwd_peak_above_pre": 733.0
       },
       "precision_matrix": [
         [
@@ -1484,7 +1673,7 @@
         [
           0,
           2,
-          0,
+          2,
           0,
           0,
           0
@@ -1492,7 +1681,7 @@
         [
           0,
           1,
-          0,
+          1,
           0,
           0,
           0
@@ -1598,7 +1787,7 @@
           0,
           0,
           2,
-          0,
+          2,
           0
         ],
         [

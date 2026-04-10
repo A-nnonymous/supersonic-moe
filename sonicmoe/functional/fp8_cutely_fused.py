@@ -4,13 +4,21 @@
 
 import torch
 
-from cutify import (
-    fused_act_dequant_best,
-    fused_weighted_swiglu_act_quant_best,
-)
-
 from .fp8_protocol import FP8Protocol, validate_fp8_runtime_support
 from .fp8_quant import dequantize_activation_blockwise, quantize_activation_blockwise, round_scale_to_e8m0
+
+
+def _get_cutify():
+    """Lazy import cutify — only needed for non-aligned preact path."""
+    try:
+        from cutify import fused_act_dequant_best, fused_weighted_swiglu_act_quant_best
+    except ImportError:
+        raise ImportError(
+            "cutify is required for the non-aligned preact FP8 path. "
+            "Install it or ensure all expert segments are 128-aligned "
+            "(which bypasses cutify via the Triton-based quant kernels)."
+        )
+    return fused_weighted_swiglu_act_quant_best, fused_act_dequant_best
 
 
 def _pad_postact_tensor(x: torch.Tensor, group_size: int) -> tuple[torch.Tensor, int]:
@@ -93,6 +101,7 @@ def apply_preact_activation_fp8_protocol_cutely_fused(
             scale_out=scale_out,
         )
     padded_preact, original_postact_width = _pad_preact_for_group_size(preact, protocol.group_size)
+    fused_weighted_swiglu_act_quant_best, fused_act_dequant_best = _get_cutify()
     quantized, packed_scales = fused_weighted_swiglu_act_quant_best(
         padded_preact,
         prob=None,

@@ -332,11 +332,63 @@ def forward(self, x, ...):
 | 工程复杂度 | 中 | ~100 行核心改动 |
 
 ### P1-P3 (unchanged)
-- **P1**: GEMM Epilogue FP8 Output (−166µs)
-- **P2**: Training Validation (loss curve)
-- **P3**: FP8 Wgrad at I≥2048
+- **P1**: Quant kernel fusion — 10 launches → 2-3 (−200 µs, 5.6%)
+- **P2**: CUTLASS epilogue z-quant — GemmGated 内嵌 z→z_fp8 (−120 µs, 3.4%)
+- **P3**: FP8 Wgrad at I≥2048 (memory+perf win)
+- **P4**: Training Validation (loss curve)
 
 ---
+
+## 10. Scaling Analysis (H=3072, I=1536, E=8, K=8, variable T)
+
+### Performance: FP8 vs BF16
+
+Model: `time(T) = α × T + β`, where α is per-token GPU compute rate.
+
+| Parameter | BF16 | FP8 | FP8 advantage |
+|-----------|:---:|:---:|:---:|
+| α (µs/token) | 0.4556 | 0.4066 | **10.7% cheaper** |
+| β (fixed, µs) | 258 | 250 | ~same |
+| Asymptotic (T→∞) | — | — | **1.120×** |
+
+| T | BF16 µs | FP8 µs | Speedup |
+|--:|--:|--:|--:|
+| 1024 | 724 | 666 | 1.087× |
+| 8192 | 3990 | 3581 | **1.114×** |
+| 65536 | 30114 | 26898 | 1.120× |
+
+**FP8 加速比单调递增，在所有 T 值下始终领先 BF16。**
+
+### Memory: FP8+stash vs BF16
+
+绝对节省 ~96 MiB 不随 T 变化（z fp8 节省 − fp8 cache 开销 ≈ 常数）。
+百分比优势随 T 减小而增大（小 T 时固定节省占比更大）。
+
+| T | BF16 bwd MiB | FP8+stash MiB | Savings |
+|--:|--:|--:|--:|
+| 1024 | 624 | 528 | −96 (−15.4%) |
+| 8192 | 1549 | 1453 | −96 (−6.2%) |
+| 65536 | 8946 | 8850 | −96 (−1.1%) |
+
+### Kernel Bottleneck Breakdown (FP8 3581 µs/iter at T=8192)
+
+| Category | µs | % | Optimization |
+|----------|:---:|:---:|------------|
+| BF16 wgrad (dw1+dw2) | 1124 | 31% | → FP8 wgrad (I≥2048) |
+| FP8 fwd GEMM | 694 | 19% | epilogue z-quant fusion |
+| FP8 Quant (10 kernels) | 459 | 13% | kernel fusion → 2-3 |
+| FP8 bwd actgrad+dgated | 850 | 24% | near peak (2700-2970 TFLOPS) |
+| Routing+Other | 454 | 13% | limited room |
+
+### FP8 Wgrad Detailed Assessment
+
+**Memory**: wgrad 阶段可提前释放 dz_bf16 (TK×2I×2 bytes)，节省 384 MiB @T=8192。
+Overall backward peak 不变（由 dgated 阶段决定），但下游 watermark 更低。
+
+**Performance @ I=1536**: transpose-quant 634 µs > GEMM 节省 259 µs → **净慢 375 µs**。
+**Performance @ I≥2048**: quant 开销被摊薄 → **净快**。
+
+**精度**: wgrad 精度直接影响收敛，需 loss curve 验证。
 
 ## 10. Key Files
 
