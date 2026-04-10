@@ -178,7 +178,32 @@ FP8 achieves 10.7% per-token advantage. Speedup monotonically increases from 1.0
 | `sonicmoe/quack_utils/gemm_sm100_fp8_zeromat.py` | Zero-materialization GEMM classes |
 | `sonicmoe/quack_utils/swiglu_triton.py` | Fused SwiGLU + quant Triton kernels |
 
-## 9. Dead Ends (verified, do NOT retry)
+## 10. Future: 32×32 Isotropic Weight Quantization
+
+### Problem
+4 different FP8 weight cache layouts needed (w1_fused, w2_varlen, w2_dgated, w1T_varlen) = ~120 MiB.
+Each uses different physical layout + different 1×32 scale grouping direction.
+
+### Solution
+Use 32×32 block quantization for weights (one E8M0 scale per 32×32 tile).
+Store as standard 1×32 ISA format with **row broadcast** (32 identical scale bytes per atom row).
+
+**Why this works:**
+- 32×32 block: scale is isotropic — covers 32 rows AND 32 columns
+- Forward GEMM reads groups along K (dim1): 32-element groups → exactly one 32×32 block's column
+- Backward actgrad reads groups along K (dim0 of transposed): 32-element groups → exactly one 32×32 block's row
+- Same scale value in both directions → **1 fp8 data + 2 scale packs (original + transposed ISA)**
+- Transpose scale re-pack is a pure index operation (no data read, no re-quantize)
+
+**Constraints:**
+- Activations MUST use 1×32 (hardware ISA requirement for `tcgen05.mma`)
+- Only weights benefit from 32×32 (used in both forward and backward GEMM)
+- Quantization precision slightly lower (amax over 1024 elements vs 32)
+
+**Expected savings:**
+- 4 weight cache layouts → 1 fp8 data + 2 ISA scale packs
+- ~120 MiB cache → ~37 MiB (fp8 data) + ~4 MiB (scales) = ~41 MiB
+- Net: **−79 MiB** weight cache reduction
 
 | Approach | Why it fails |
 |----------|-------------|
