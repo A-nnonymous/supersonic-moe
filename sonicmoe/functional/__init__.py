@@ -1546,18 +1546,18 @@ class _DownProjection(torch.autograd.Function):
                     del y1s
                     _log_stage_memory("backward:down-proj-weight")
 
-                    # Pre-quantize dz: single HBM read produces BOTH:
-                    # - row_fp8 + scales (for actgrad in UpProj backward)
-                    # - col_fp8 + scales (for FP8 wgrad in UpProj backward)
+                    # Pre-quantize dz: row_fp8 (actgrad) + col_fp8 (wgrad).
+                    # Split strategy: CuTe colwise + standard rowwise (faster than fused dual).
+                    # L2 cache is hot after colwise, so rowwise rarely touches HBM again.
                     if ctx._fp8_cfg.fp8_wgrad:
-                        from ..quack_utils.blockscaled_fp8_gemm import dual_quantize_varlen
-                        dz_fp8, dz_packed_scales, dz_col_fp8, dz_col_scales = (
-                            dual_quantize_varlen(dz, TK=dz.shape[0], dim=dz.shape[1])
+                        from ..quack_utils.cute_blockscaled_quant import colwise_quantize_cute
+                        dz_col_fp8, dz_col_scales = colwise_quantize_cute(
+                            dz, logical_rows=dz.shape[1], logical_cols=dz.shape[0],
+                            isa_pack=True,
                         )
-                        # Free dz_bf16 NOW — FP8 wgrad uses col_fp8, actgrad uses row_fp8.
-                        # Neither needs dz_bf16 after dual-quant.
+                        dz_fp8, dz_packed_scales = quantize_and_pack_activation(dz)
                         _PREQUANTIZED_SCALES["bwd"] = (dz, dz_fp8, dz_packed_scales)
-                        dz.untyped_storage().resize_(0)  # −384 MiB!
+                        dz.untyped_storage().resize_(0)
                         _PREQUANTIZED_SCALES["bwd_col"] = (dz_col_fp8, dz_col_scales)
                     else:
                         dz_fp8, dz_packed_scales = quantize_and_pack_activation(dz)
