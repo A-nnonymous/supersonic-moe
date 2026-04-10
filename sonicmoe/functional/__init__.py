@@ -200,7 +200,7 @@ def _use_epilogue_quant() -> bool:
     This eliminates the standalone quantize_activation_blockscaled_fast kernel
     for z (−122 µs) and allows earlier z_bf16 freeing (−384 MiB transient).
     """
-    return os.getenv("SONIC_MOE_FP8_EPILOGUE_QUANT", "1").lower() in {"1", "true", "yes", "on"}
+    return os.getenv("SONIC_MOE_FP8_EPILOGUE_QUANT", "0").lower() in {"1", "true", "yes", "on"}
 
 
 def _use_fused_swiglu_quant() -> bool:
@@ -1205,11 +1205,8 @@ class _DownProjection(torch.autograd.Function):
                             out_dtype=torch.bfloat16,
                             assume_aligned=True,
                         )
-                # Eagerly release w2 FP8 weight cache (~37 MiB) — down-proj GEMM
-                # is done, and in training the optimizer step will invalidate
-                # the cache anyway (w._version increment).
-                from ..quack_utils.blockscaled_fp8_gemm import evict_fp8_weight_cache_entry
-                evict_fp8_weight_cache_entry(w2)
+                # Keep w2 varlen cache — iso32 re-quant is expensive (~87µs/iter).
+                # Cache auto-invalidates via w._version at optimizer step.
                 router_perm = s_reverse_scatter_idx
                 y2_for_router = y2
             else:
