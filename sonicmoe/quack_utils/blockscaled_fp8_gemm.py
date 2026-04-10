@@ -2979,6 +2979,125 @@ def quantize_and_pack_activation_varlen(
     return fp8_data, packed
 
 
+@triton.jit
+def _quantize_and_pack_iso32_kernel(
+    src_ptr, dst_fp8_ptr, dst_packed_scale_ptr,
+    rows, cols, src_stride_row, src_stride_col,
+    dst_stride_row, dst_stride_col, k_tiles,
+    fp8_max: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,       # 32
+    BLOCK_ROWS: tl.constexpr,       # 32
+    NUM_GROUPS: tl.constexpr,
+    SF_TILE_M: tl.constexpr,
+    SF_TILE_STORAGE: tl.constexpr,
+    GROUPS_PER_K_TILE: tl.constexpr,
+):
+    """32×32 isotropic block quantize + ISA pack with row-broadcast scales.
+
+    Same as _quantize_and_pack_kernel but computes amax over the entire
+    32×32 tile (32 rows × 32 cols) instead of per-row (1×32).  All 32 rows
+    in a block share the same E8M0 scale.
+
+    This makes the quantized fp8 data suitable for BOTH row-major and
+    col-major GEMM: after transpose, the 32-column groups map to 32-row
+    groups with the same scale value.
+    """
+    row_base = tl.program_id(0) * BLOCK_ROWS
+    k_tile_idx = tl.program_id(1)
+    row_ids = row_base + tl.arange(0, BLOCK_ROWS)
+    row_mask = row_ids < rows
+
+    row_tiles = row_ids // SF_TILE_M
+    row_in_tile = row_ids % SF_TILE_M
+    row_base_offset = (row_in_tile % 32) * 16 + (row_in_tile // 32) * 4
+
+    packed_scale_i32 = tl.zeros([BLOCK_ROWS], dtype=tl.int32)
+
+    for g in tl.range(0, GROUPS_PER_K_TILE):
+        group_id = k_tile_idx * GROUPS_PER_K_TILE + g
+        col_offsets = group_id * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+        col_mask = col_offsets[None, :] < cols
+        mask = row_mask[:, None] & col_mask
+
+        src_ptrs = src_ptr + row_ids[:, None] * src_stride_row + col_offsets[None, :] * src_stride_col
+        values = tl.load(src_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+        # 32×32 isotropic amax: reduce over BOTH axes
+        row_amax = tl.max(tl.abs(values), axis=1)        # (32,) per-row max
+        tile_amax = tl.max(row_amax)                       # scalar: max over all 32 rows
+        amax_bits = tile_amax.to(tl.int32, bitcast=True)
+        biased_exp = (amax_bits >> 23) & 0xFF
+        mantissa_bits = amax_bits & 0x7FFFFF
+        carry = tl.where(mantissa_bits > 0x600000, 1, 0)
+        e8m0_i32 = biased_exp - 8 + carry
+        e8m0_i32 = tl.where(biased_exp > 0, e8m0_i32, 0)
+        e8m0_clamped = tl.maximum(e8m0_i32, 0)
+
+        quant_exp = 254 - e8m0_i32
+        quant_exp = tl.maximum(tl.minimum(quant_exp, 254), 1)
+        quant_scale = (quant_exp.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+        quantized = (values * quant_scale).to(tl.float8e4nv)
+
+        dst_ptrs = dst_fp8_ptr + row_ids[:, None] * dst_stride_row + col_offsets[None, :] * dst_stride_col
+        tl.store(dst_ptrs, quantized, mask=mask)
+
+        # Broadcast: all 32 rows get the SAME scale byte
+        e8m0_broadcast = tl.full([BLOCK_ROWS], e8m0_clamped.to(tl.int32), dtype=tl.int32)
+        packed_scale_i32 = packed_scale_i32 | ((e8m0_broadcast & 0xFF) << (g * 8))
+
+    tile_base = (row_tiles * k_tiles + k_tile_idx) * SF_TILE_STORAGE
+    packed_offset_i32 = (tile_base + row_base_offset) // 4
+    scale_ptr_i32 = dst_packed_scale_ptr.to(tl.pointer_type(tl.int32))
+    tl.store(scale_ptr_i32 + packed_offset_i32, packed_scale_i32, mask=row_mask)
+
+
+def quantize_and_pack_weight_iso32(
+    w: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """32×32 isotropic blockscaled quantize for weights.
+
+    Same interface as quantize_and_pack_activation but uses 32×32 block amax
+    (all 32 rows share the same scale).  This enables transpose without
+    re-quantization: the transposed fp8 data has compatible scales.
+
+    Parameters
+    ----------
+    w : (M, K) bf16 contiguous weight tensor (M and K should be multiples of 32).
+
+    Returns
+    -------
+    fp8_data : (M, K) float8_e4m3fn
+    packed_scales : (1, packed_size) float8_e8m0fnu ISA-packed
+    """
+    w = w.contiguous()
+    M, K = w.shape
+    GROUP_SIZE = _SF_VEC_SIZE  # 32
+    BLOCK_ROWS = 32
+    k_tiles = _div_up(K, _SF_TILE_K)
+    groups_per_k_tile = _SF_TILE_K // GROUP_SIZE
+    num_groups = _div_up(K, GROUP_SIZE)
+
+    fp8_out = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=w.device)
+    per_batch = _storage_per_batch(M, K)
+    if M % _SF_TILE_M == 0 and K % _SF_TILE_K == 0:
+        packed = torch.empty((1, per_batch), dtype=torch.uint8, device=w.device)
+    else:
+        packed = torch.full((1, per_batch), 127, dtype=torch.uint8, device=w.device)
+
+    grid = (_div_up(M, BLOCK_ROWS), k_tiles)
+    _quantize_and_pack_iso32_kernel[grid](
+        w, fp8_out, packed,
+        M, K, w.stride(0), w.stride(1),
+        fp8_out.stride(0), fp8_out.stride(1), k_tiles,
+        fp8_max=_FP8_E4M3_MAX,
+        GROUP_SIZE=GROUP_SIZE, BLOCK_ROWS=BLOCK_ROWS,
+        NUM_GROUPS=num_groups,
+        SF_TILE_M=_SF_TILE_M, SF_TILE_STORAGE=_SF_TILE_STORAGE,
+        GROUPS_PER_K_TILE=groups_per_k_tile,
+    )
+    return fp8_out, packed.view(torch.float8_e8m0fnu)
+
+
 def _quantize_weight_3d_triton(
     w_enk: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
