@@ -120,9 +120,13 @@ The reporting policy for every FP8 step is:
 - memory baseline: official bf16
 - performance baselines: previous commit and official bf16
 
-## 🔥 FP8 Blockscaled Status (2026-04-10, Session 42)
+## 🔥 FP8 Blockscaled Status (2026-04-10, Session 43)
 
-The `native-fp8-exploration` branch has a fully functional **zero-materialization** blockscaled FP8 training path for Blackwell (B200) with **32×32 isotropic weight quantization** and **weight stash** memory optimization. No TK-sized FP8 activation is materialized — follows SonicMoE's core design.
+The `native-fp8-exploration` branch has a fully functional **zero-materialization** blockscaled FP8 training path for Blackwell (B200) with **32×32 isotropic weight quantization**, **weight stash** memory optimization, and **CuTe DSL high-performance quantization kernels**. No TK-sized FP8 activation is materialized — follows SonicMoE's core design.
+
+### Session 43 Highlights: CuTe DSL Colwise Quant
+
+The FP8 wgrad pipeline now uses a CuTe DSL colwise quantization kernel (`sonicmoe/quack_utils/cute_blockscaled_quant.py`) that is **1.51× faster** than the Triton baseline (NCU-verified: 90µs vs 136µs). Key optimizations: bank-conflict-free smem reads, `rcp.approx` E8M0, `abs.f32` PTX, coalesced scale stores. 30 registers, 89% occupancy, 100% bit-exact. See `reports/fp8_upgrade/HANDOFF.md` for full details.
 
 ### Quick Start
 

@@ -119,3 +119,28 @@
 17. **Lazy bwd weights don't reduce peak** — bwd weights must exist during backward regardless of when they're allocated. Lazy allocation just shifts the allocation point, not the peak.
 18. **Per-element FP8 cast ≠ blockscaled FP8** — GEMM epilogue's `.to(fp8)` is a simple saturating cast without per-group scaling. Blockscaled quantization (per-32-element amax → E8M0 → scale-aware cast) is required for precision. The two are NOT interchangeable.
 19. **Epilogue blockscaled quant requires warp-level group reduction** — CUTLASS MMA register fragments are scattered across threads. Computing per-32-element amax needs `__shfl_xor_sync` within the epilogue, which is possible but requires knowledge of the SM100 MMA register-to-thread mapping.
+
+## Phase 12: CuTe DSL Colwise Quant + Wgrad Integration (Session 43)
+
+- **CuTe DSL `colwise_quantize_cute`**: 90µs vs Triton 136µs = 1.51× (NCU, clock-control=none, 65536×1536)
+  - Bank conflicts: 11.1M → 110K (101× reduction) via row-major smem reads
+  - Registers: 48 → 30/thread, occupancy: 60% → 89%
+  - rcp.approx E8M0: bit-exact vs integer bitops, verified across all float32 ranges
+  - abs.f32 PTX: 1 instruction vs fmax(x,-x) = 2, saves 5.9% total instructions
+  - Coalesced (num_groups, dim) scale store: L1 store traffic -48%
+  - ISA-packed scale output: 100% bit-exact vs Triton
+  - gather_idx support: verified for x operand in wgrad path
+- **Integrated into `functional/__init__.py`**: wgrad path uses CuTe DSL for both dz fallback and x colwise quant
+- **Dead ends discovered**: smem fp8 store (+96% L1), 1D smem view (+18 regs), double-buffer (SM-bound), full unroll (64 regs)
+- NCU profile of Triton `dual_quantize_varlen`: same bank-conflict pattern (84%, 11.2M), confirming CuTe DSL approach generalizes
+
+### Lessons (Session 43)
+
+20. **Row-major smem reads are the key to bank-conflict-free column-wise quant** — 32 lanes reading `sSrc[tk, lane]` = 32 consecutive bf16 bytes = coalesced, zero bank conflict. Column-wise reads cause 6.4-way conflicts.
+21. **rcp.approx is bit-exact for E8M0** — mantissa is masked away in E8M0 encoding, so ≤1 ULP mantissa error in rcp.approx has zero effect on the scale byte.
+22. **Scale layout matters for coalescing** — `(num_groups, dim)` is coalesced for warp writes; `(dim, num_groups)` causes 97% sector waste (stride = num_groups between lanes).
+23. **Smem-mediated vectorized store can be WORSE** — writing fp8 to smem then gmem = double the L1 traffic. Only useful if store coalescing is terrible (not our case — fp8 stores are already 32-byte aligned).
+24. **Runtime loops beat full unroll when occupancy matters** — 30 regs (89% occ) > 64 regs (44% occ) for this workload. The extra warps hide ALU latency better than ILP from unrolling.
+25. **CuTe DSL `cute.make_tensor` creates register overhead** — each tensor object stores pointer + layout metadata in registers. Avoid creating temporary tensors in hot loops.
+26. **NCU `--clock-control=none` is essential on contested nodes** — fixed clocks produce inconsistent results when GPU boost is affected by thermal throttling from other workloads.
+
