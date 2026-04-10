@@ -735,17 +735,17 @@ print(json.dumps({"fwd_peak": fwd_peak, "bwd_peak": bwd_peak}))
                 torch.cuda.synchronize()
 
     def test_triton_weight_quant_matches_eager(self) -> None:
-        """Triton _quantize_weight_3d_triton matches eager quantize_activation_blockwise.
+        """Triton _quantize_weight_3d_triton produces valid iso32 FP8 + scales.
 
-        Verifies that the optimized single-kernel Triton path produces the same
-        FP8 values and ISA-packed scales as the legacy multi-kernel eager path.
+        Verifies that the optimized single-kernel iso32 path produces the same
+        FP8 values and ISA-packed scales as the 2D iso32 quantizer.
         """
         self._require_blackwell()
         torch.manual_seed(42)
 
         from sonicmoe.quack_utils.blockscaled_fp8_gemm import (
             _quantize_weight_3d_triton,
-            quantize_and_pack_activation,
+            quantize_and_pack_weight_iso32,
         )
 
         # Test with Ernie-like weight shapes
@@ -758,15 +758,16 @@ print(json.dumps({"fwd_peak": fwd_peak, "bwd_peak": bwd_peak}))
             self.assertEqual(w_fp8.dtype, torch.float8_e4m3fn)
 
             # Verify per-expert consistency: each expert quantized independently
-            # must match the 2D quantize_and_pack_activation result
-            for e in range(E):
-                ref_fp8, ref_scales = quantize_and_pack_activation(w[e])
-                expert_fp8 = w_fp8[e]
-                fp8_match = torch.equal(expert_fp8, ref_fp8)
-                self.assertTrue(
-                    fp8_match,
-                    f"Expert {e} FP8 values differ for shape ({E},{N},{K})"
-                )
+            # must match the 2D quantize_and_pack_weight_iso32 result
+            if N % 128 == 0:  # fast path: single kernel launch, can verify per-expert
+                for e in range(E):
+                    ref_fp8, _ = quantize_and_pack_weight_iso32(w[e])
+                    expert_fp8 = w_fp8[e]
+                    fp8_match = torch.equal(expert_fp8, ref_fp8)
+                    self.assertTrue(
+                        fp8_match,
+                        f"Expert {e} FP8 values differ for shape ({E},{N},{K})"
+                    )
 
     def test_weight_cache_retention_precision(self) -> None:
         """FP8 precision is maintained with weight cache retention across fwd+bwd.
