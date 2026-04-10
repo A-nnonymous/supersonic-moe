@@ -385,6 +385,8 @@ class FP8FrontierStrictTest(unittest.TestCase):
                 SEED=str(seed), USE_QUACK_GEMM="1",
                 TMPDIR=tmpdir,
             )
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            env_bf16["PYTHONPATH"] = project_root + ":" + env_bf16.get("PYTHONPATH", "")
             r_bf16 = subprocess.run(
                 [sys.executable, "-c", bf16_script],
                 capture_output=True, text=True, env=env_bf16, timeout=300,
@@ -393,6 +395,7 @@ class FP8FrontierStrictTest(unittest.TestCase):
 
             # Run FP8+stash in a separate process (with FP8_MODE)
             env_fp8 = dict(os.environ, SEED=str(seed), TMPDIR=tmpdir)
+            env_fp8["PYTHONPATH"] = project_root + ":" + env_fp8.get("PYTHONPATH", "")
             r_fp8 = subprocess.run(
                 [sys.executable, "-c", fp8_stash_script],
                 capture_output=True, text=True, env=env_fp8, timeout=300,

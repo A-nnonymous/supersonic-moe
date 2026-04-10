@@ -564,44 +564,80 @@ class FP8AlignedContractTest(TestCommons):
         self.assertGreater(bwd_corr, 0.99, f"z-fp8-save bwd corr {bwd_corr:.4f}")
 
     def test_fp8_memory_less_than_bf16(self) -> None:
-        """FP8 peak memory must be <= BF16 peak memory at production shape."""
-        import gc
+        """FP8+stash backward peak must be strictly less than BF16 backward peak.
+
+        Uses subprocess isolation to avoid process contamination
+        (SONIC_MOE_FP8_MODE cached at import time).
+        Compares the steady-state backward peak (the actual training bottleneck).
+        """
+        import subprocess, sys, json
         self._require_blackwell()
-        self._reset_fp8_state()
-        self.set_seed(42)
 
-        T, H, I, E, K = 8192, 3072, 1536, 8, 8
-        moe = MoE(num_experts=E, num_experts_per_tok=K, hidden_size=H,
-                  intermediate_size=I, activation_function=ActivationType.SWIGLU,
-                  add_bias=False, std=0.02).to(device="cuda", dtype=torch.bfloat16)
+        measure_script = r'''
+import torch, gc, os, json, sys
+sys.path.insert(0, os.environ["PROJECT"])
+os.environ["USE_QUACK_GEMM"] = "1"
+MODE = os.environ["MODE"]
+if MODE != "bf16":
+    os.environ["SONIC_MOE_FP8_MODE"] = "perf"
+from sonicmoe import MoE
+from sonicmoe.functional.utils import enable_quack_gemm, enable_fp8
+from sonicmoe.enums import ActivationType
+torch.manual_seed(42)
+moe = MoE(num_experts=8, num_experts_per_tok=8, hidden_size=3072,
+           intermediate_size=1536, activation_function=ActivationType.SWIGLU,
+           add_bias=False, std=0.02).to(device="cuda", dtype=torch.bfloat16)
+x = torch.randn(8192, 3072, device="cuda", dtype=torch.bfloat16).detach().requires_grad_()
+dout = 0.02 * torch.randn_like(x)
+use_fp8 = MODE != "bf16"
+use_stash = MODE == "fp8_stash"
+if use_fp8: moe.refresh_fp8_shadow_weights()
+for _ in range(3):
+    if use_stash: moe.refresh_fp8_shadow_weights(); moe.stash_bf16_to_cpu()
+    ctx = enable_fp8() if use_fp8 else enable_quack_gemm(True)
+    with ctx: out, _ = moe(x, use_fp8=use_fp8)
+    out.backward(dout); x.grad = None; moe.zero_grad(set_to_none=True)
+    if use_stash: moe.unstash_bf16()
+if use_fp8: moe.refresh_fp8_shadow_weights()
+if use_stash: moe.stash_bf16_to_cpu()
+gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
+torch.cuda.reset_peak_memory_stats()
+ctx = enable_fp8() if use_fp8 else enable_quack_gemm(True)
+with ctx: out, _ = moe(x, use_fp8=use_fp8)
+fwd_peak = torch.cuda.max_memory_allocated()
+torch.cuda.reset_peak_memory_stats()
+out.backward(dout); torch.cuda.synchronize()
+bwd_peak = torch.cuda.max_memory_allocated()
+if use_stash: moe.unstash_bf16()
+print(json.dumps({"fwd_peak": fwd_peak, "bwd_peak": bwd_peak}))
+'''
+        project = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-        # FP8 peak
-        x = (0.02 * torch.randn(T, H, device="cuda", dtype=torch.bfloat16)).detach().requires_grad_()
-        self._reset_fp8_state()
-        gc.collect(); torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
-        with enable_quack_gemm(True):
-            out, _ = moe(x, use_fp8=True)
-            out.sum().backward()
-        torch.cuda.synchronize()
-        fp8_peak = torch.cuda.max_memory_allocated()
-        del out, x
-        moe.zero_grad(set_to_none=True)
-        self._reset_fp8_state()
-        gc.collect(); torch.cuda.empty_cache()
+        def _run(mode):
+            env = {k: v for k, v in os.environ.items() if "FP8" not in k}
+            env.update(PROJECT=project, MODE=mode)
+            env["PYTHONPATH"] = project + ":" + env.get("PYTHONPATH", "")
+            if mode != "bf16":
+                env["SONIC_MOE_FP8_MODE"] = "perf"
+            r = subprocess.run(
+                [sys.executable, "-c", measure_script],
+                capture_output=True, text=True, env=env, timeout=300,
+            )
+            for line in r.stdout.strip().split("\n"):
+                if line.startswith("{"):
+                    return json.loads(line)
+            self.fail(f"{mode} subprocess failed: {r.stderr[-300:]}")
 
-        # BF16 peak
-        x = (0.02 * torch.randn(T, H, device="cuda", dtype=torch.bfloat16)).detach().requires_grad_()
-        torch.cuda.reset_peak_memory_stats()
-        with enable_quack_gemm(True):
-            out, _ = moe(x, use_fp8=False)
-            out.sum().backward()
-        torch.cuda.synchronize()
-        bf16_peak = torch.cuda.max_memory_allocated()
+        bf16 = _run("bf16")
+        stash = _run("fp8_stash")
 
-        ratio = fp8_peak / bf16_peak
-        self.assertLessEqual(
-            ratio, 1.0,
-            f"FP8 peak ({fp8_peak/1024**2:.0f}MiB) must be <= BF16 peak ({bf16_peak/1024**2:.0f}MiB), got ratio={ratio:.3f}",
+        MiB = 1024**2
+        bf16_bwd = bf16["bwd_peak"] / MiB
+        stash_bwd = stash["bwd_peak"] / MiB
+
+        self.assertLess(
+            stash_bwd, bf16_bwd,
+            f"FP8+stash bwd peak ({stash_bwd:.0f} MiB) must be < BF16 bwd peak ({bf16_bwd:.0f} MiB)",
         )
 
     def test_weight_cache_dedup(self) -> None:

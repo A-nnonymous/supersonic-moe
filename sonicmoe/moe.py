@@ -368,6 +368,10 @@ class MoE(nn.Module):
         # Clear stashed fp8 references — next forward should use global cache
         from .functional import _STASHED_FP8_WEIGHTS
         _STASHED_FP8_WEIGHTS.clear()
+        # Clear FP8 weight caches — data_ptr changed after restore, old cache
+        # entries would be stale and leak memory on next refresh.
+        from .functional import clear_all_fp8_weight_caches
+        clear_all_fp8_weight_caches()
         self._stashed = False
 
     def forward(

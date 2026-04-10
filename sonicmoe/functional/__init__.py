@@ -193,13 +193,14 @@ def _fused_blockscaled_gated_forward(
 
 
 def _use_epilogue_quant() -> bool:
-    """Check if epilogue blockscaled quant of z is enabled (default: disabled).
+    """Check if epilogue blockscaled quant of z is enabled (default: enabled).
 
     When enabled, the GemmGated epilogue computes blockscaled FP8 quantization
     of z in registers (integer+carry E8M0, matching Triton/Paddle reference).
-    This eliminates the standalone fused_z_save_y1_quant kernel for z.
+    This eliminates the standalone quantize_activation_blockscaled_fast kernel
+    for z (−122 µs) and allows earlier z_bf16 freeing (−384 MiB transient).
     """
-    return os.getenv("SONIC_MOE_FP8_EPILOGUE_QUANT", "").lower() in {"1", "true", "yes", "on"}
+    return os.getenv("SONIC_MOE_FP8_EPILOGUE_QUANT", "1").lower() in {"1", "true", "yes", "on"}
 
 
 def _use_fused_swiglu_quant() -> bool:
@@ -757,6 +758,10 @@ class _UpProjection(torch.autograd.Function):
                             z.untyped_storage().resize_(0)
                             y1_fp8, y1_packed_scales = quantize_and_pack_activation(y1)
                     else:
+                        # z_fp8 already populated (epilogue quant wrote it inside
+                        # _fused_blockscaled_gated_forward).  Free z_bf16 now (−384 MiB).
+                        if cfg.save_z_fp8:
+                            z.untyped_storage().resize_(0)
                         y1_fp8, y1_packed_scales = quantize_and_pack_activation(y1)
                     _PREQUANTIZED_SCALES["fwd"] = (y1, y1_fp8, y1_packed_scales)
                     y1.untyped_storage().resize_(0)
