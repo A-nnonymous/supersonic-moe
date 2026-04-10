@@ -999,22 +999,27 @@ class _UpProjection(torch.autograd.Function):
                         colwise_quantize_and_pack,
                         _run_cutlass_blockscaled_gemm_varlen_k,
                     )
+                    from ..quack_utils.cute_blockscaled_quant import (
+                        colwise_quantize_cute,
+                    )
                     bwd_col = _PREQUANTIZED_SCALES.pop("bwd_col", None)
                     if bwd_col is not None:
                         # Use pre-computed col-fp8 from dual quant (zero extra HBM read)
                         dz_col_fp8, dz_col_scales = bwd_col
                     else:
-                        # Fallback: compute col-fp8 now
-                        dz_col_fp8, dz_col_scales = colwise_quantize_and_pack(
+                        # Fallback: compute col-fp8 now (CuTe DSL: 1.5× faster than Triton)
+                        dz_col_fp8, dz_col_scales = colwise_quantize_cute(
                             dz_bf16, logical_rows=w1_shape[0], logical_cols=TK,
+                            isa_pack=True,
                         )
                     # FREE dz_bf16 NOW (−384 MiB before wgrad GEMM!)
                     dz.untyped_storage().resize_(0)
                     del dz_bf16
-                    # Colwise-quant x (small: T × H = 48 MiB bf16)
-                    x_col_fp8, x_col_scales = colwise_quantize_and_pack(
+                    # Colwise-quant x (CuTe DSL with gather support)
+                    x_col_fp8, x_col_scales = colwise_quantize_cute(
                         x, logical_rows=H, logical_cols=TK,
                         gather_idx=x_gather_idx,
+                        isa_pack=True,
                     )
                     # CUTLASS wgrad GEMM
                     dw1_base = _run_cutlass_blockscaled_gemm_varlen_k(
