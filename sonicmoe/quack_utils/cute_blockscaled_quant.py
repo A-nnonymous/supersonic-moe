@@ -52,14 +52,20 @@ TILE_TK = 256
 TILE_DIM = 32
 NUM_THREADS = 256
 FP8_MAX = 448.0
+# ISA scale packing constants (SM100 blockscaled MX format)
+SF_TILE_M = 128
+SF_TILE_K = 128
+SF_TILE_STORAGE = SF_TILE_M * (SF_TILE_K // GROUP_SIZE)  # 512
+SF_GROUPS_PER_K_TILE = SF_TILE_K // GROUP_SIZE  # 4
 
 
 class ColwiseQuantOp:
-    def __init__(self, dtype, TK):
+    def __init__(self, dtype, TK, isa_pack=True):
         self.dtype = dtype
         self.TK = TK
         self.num_groups_total = TK // GROUP_SIZE
         self.groups_per_tile = TILE_TK // GROUP_SIZE
+        self.isa_pack = isa_pack
 
     @cute.jit
     def __call__(self, mSrc: cute.Tensor, mFp8: cute.Tensor, mScale: cute.Tensor,
@@ -146,35 +152,89 @@ class ColwiseQuantOp:
                     if abs_tk < TK_val:
                         mFp8[abs_tk, abs_dim_row] = rFp8[k]
 
-        # Scale store (coalesced: num_groups × dim layout)
-        abs_group = (tk_base // GROUP_SIZE) + warp_id
+        # ─── Scale store ───
+        abs_group = (tk_base // const_expr(GROUP_SIZE)) + warp_id
         if dim_valid:
             if abs_group < self.num_groups_total:
-                mScale[abs_group, abs_dim_row] = cute.Uint8(e8m0)
+                if const_expr(self.isa_pack):
+                    # ISA-packed scale layout for SM100 blockscaled MX format
+                    # Logical (dim, TK) layout → ISA tile (128, 128) → 512 bytes per tile
+                    dim_row = abs_dim_row
+                    group_idx = abs_group
+                    row_tiles = dim_row // const_expr(SF_TILE_M)
+                    row_in_tile = dim_row % const_expr(SF_TILE_M)
+                    k_tiles_idx = group_idx // const_expr(SF_GROUPS_PER_K_TILE)
+                    k_in_tile = group_idx % const_expr(SF_GROUPS_PER_K_TILE)
+                    k_tiles = const_expr((self.TK + SF_TILE_K - 1) // SF_TILE_K)
+                    tile_base = (row_tiles * k_tiles + k_tiles_idx) * const_expr(SF_TILE_STORAGE)
+                    row_base = (row_in_tile % Int32(32)) * Int32(16) + (row_in_tile // Int32(32)) * Int32(4)
+                    isa_index = tile_base + row_base + k_in_tile
+                    mScale[isa_index] = cute.Uint8(e8m0)
+                else:
+                    # Raw (num_groups, dim) layout
+                    mScale[abs_group, abs_dim_row] = cute.Uint8(e8m0)
 
 
 @jit_cache
-def _compile_colwise_quant(dtype_width, TK, dim):
+def _compile_colwise_quant(dtype_width, TK, dim, isa_pack=True):
     assert TK % 32 == 0
     dtype = cute.BFloat16 if dtype_width == 16 else cute.Float16
     TK_sym, dim_sym, ng_sym = cute.sym_int(), cute.sym_int(), cute.sym_int()
     div = 128 // dtype.width
     mSrc = make_fake_tensor(dtype, (TK_sym, dim_sym), divisibility=div)
     mFp8 = make_fake_tensor(cute.Float8E4M3FN, (TK_sym, dim_sym), divisibility=div)
-    mScale = make_fake_tensor(cute.Uint8, (ng_sym, dim_sym), divisibility=div)
-    op = ColwiseQuantOp(dtype, TK)
+    if isa_pack:
+        # ISA-packed: flat 1D buffer
+        scale_sym = cute.sym_int()
+        mScale = cute.runtime.make_fake_tensor(
+            cute.Uint8, (scale_sym,), stride=(1,), assumed_align=1,
+        )
+    else:
+        mScale = make_fake_tensor(cute.Uint8, (ng_sym, dim_sym), divisibility=div)
+    op = ColwiseQuantOp(dtype, TK, isa_pack=isa_pack)
     return cute.compile(op, mSrc, mFp8, mScale,
                         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
                         options="--enable-tvm-ffi")
 
 
-def colwise_quantize_cute(src: Tensor, logical_rows: int, logical_cols: int):
+def _storage_per_batch(rows: int, cols: int) -> int:
+    return math.ceil(rows / SF_TILE_M) * math.ceil(cols / SF_TILE_K) * SF_TILE_STORAGE
+
+
+def colwise_quantize_cute(src: Tensor, logical_rows: int, logical_cols: int,
+                           isa_pack: bool = False):
+    """CuTe DSL colwise blockscaled FP8 quantize.
+
+    Args:
+        src: (TK, dim) bf16 contiguous
+        logical_rows: dim (rows of logical (dim, TK) matrix)
+        logical_cols: TK
+        isa_pack: if True, output ISA-packed scales compatible with CUTLASS GEMM
+
+    Returns:
+        fp8_data: (TK, dim) fp8
+        scales: ISA-packed (1, storage) e8m0fnu if isa_pack, else (dim, num_groups) uint8
+    """
     assert src.dim() == 2 and src.is_contiguous() and src.is_cuda
     TK, dim = src.shape
     assert TK % 32 == 0
     num_groups = TK // 32
+
     fp8_out = torch.empty(TK, dim, dtype=torch.float8_e4m3fn, device=src.device)
-    scale_out = torch.empty(num_groups, dim, dtype=torch.uint8, device=src.device)
-    dtype_width = 16 if src.dtype in (torch.bfloat16, torch.float16) else 32
-    _compile_colwise_quant(dtype_width, TK, dim)(src, fp8_out, scale_out)
-    return fp8_out, scale_out.t().contiguous()
+
+    if isa_pack:
+        per_batch_storage = _storage_per_batch(logical_rows, logical_cols)
+        if dim % SF_TILE_M == 0 and TK % SF_TILE_K == 0:
+            scale_out = torch.empty((1, per_batch_storage), dtype=torch.uint8, device=src.device)
+        else:
+            scale_out = torch.full((1, per_batch_storage), 127, dtype=torch.uint8, device=src.device)
+        dtype_width = 16 if src.dtype in (torch.bfloat16, torch.float16) else 32
+        _compile_colwise_quant(dtype_width, TK, dim, isa_pack=True)(
+            src, fp8_out, scale_out.view(-1))
+        return fp8_out, scale_out.view(torch.float8_e8m0fnu)
+    else:
+        scale_out = torch.empty(num_groups, dim, dtype=torch.uint8, device=src.device)
+        dtype_width = 16 if src.dtype in (torch.bfloat16, torch.float16) else 32
+        _compile_colwise_quant(dtype_width, TK, dim, isa_pack=False)(
+            src, fp8_out, scale_out)
+        return fp8_out, scale_out.t().contiguous()
