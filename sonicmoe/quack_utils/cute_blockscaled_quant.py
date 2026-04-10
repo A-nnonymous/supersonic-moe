@@ -131,7 +131,8 @@ class ColwiseQuantOp:
         e8m0 = Int32(254) - qexp
         e8m0 = e8m0 if cutlass.Boolean(e8m0 > Int32(0)) else Int32(0)
 
-        # Phase 3: re-read, scale, cast, store (runtime loop × 4-unrolled inner)
+        # Phase 3: re-read, scale, cast, store fp8 to gmem directly
+        # Direct gmem store is faster than smem→gmem (tested: smem mediation adds L1 traffic)
         for j4 in cutlass.range(const_expr(GROUP_SIZE // 4)):
             base_j = group_tk_base + j4 * 4
             r4 = cute.make_rmem_tensor(4, cute.Float32)
