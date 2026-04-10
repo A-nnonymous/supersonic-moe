@@ -225,8 +225,8 @@ def _use_fp8_wgrad() -> bool:
     When enabled, wgrad GEMMs use blockscaled FP8 via varlen_k CUTLASS scheduling.
     This allows freeing dz_bf16 before wgrad (−384 MiB at Ernie shape).
     Performance is neutral at I=1536, positive at I≥2048.
-    Default: disabled (memory overhead from dual col-fp8 at I=1536 exceeds savings).
-    Enable with SONIC_MOE_FP8_WGRAD=1 for memory benefit at I≥2048 or perf testing.
+    Default: disabled at I≤1536 (colwise quant overhead 977µs > bf16 GEMM 1125µs).
+    Enable with SONIC_MOE_FP8_WGRAD=1 for I≥2048 where GEMM savings exceed quant cost.
     """
     return os.getenv("SONIC_MOE_FP8_WGRAD", "0").lower() in {"1", "true", "yes", "on"}
 
@@ -1499,24 +1499,36 @@ class _DownProjection(torch.autograd.Function):
                     del w2_fp8_enk, w2_scales
 
                     # Weight-grad: dw2 = dout.T @ y1s (per expert).
-                    # Use BF16 wgrad for dw2: FP8 wgrad's colwise_quant of y1s (96 MiB fp8)
-                    # + dout (192 MiB fp8) adds transient peak that negates memory savings.
-                    # The UpProj wgrad is where FP8 wgrad shines (frees dz_bf16 early).
                     _log_stage_memory("backward:down-proj-dgated")
                     _reset_stage_memory_probe()
-                    dw2_base = torch.empty((w2_shape[2], w2_shape[0], w2_shape[1]), dtype=w2_dtype, device=w2_device)
-                    dw2 = dw2_base.permute(1, 2, 0)
-                    y1s_wgrad = y1s if y1s.dtype == torch.bfloat16 else y1s.to(torch.bfloat16)
-                    gemm(
-                        dout.T,
-                        y1s_wgrad,
-                        out=dw2.permute(2, 0, 1),
-                        cu_seqlens_k=expert_frequency_offset,
-                        A_idx=x_gather_idx,
-                        batch_idx_permute=None,
-                        dynamic_scheduler=False,
-                    )
-                    del y1s_wgrad, y1s
+                    if ctx._fp8_cfg.fp8_wgrad:
+                        from ..quack_utils import blockscaled_fp8_wgrad_varlen_k
+                        # dW2[e] = dout_e^T @ y1s_e = (H, TK_e) @ (TK_e, I) = (H, I)
+                        # blockscaled_fp8_wgrad_varlen_k: a=(TK,M), b=(TK,N) → (E,M,N)
+                        # So a=y1s (TK,I=M), b=dout (T,H=N) with b_gather_idx
+                        # Result: (E, I, H). But we need dw2 as (H, I, E).
+                        # Swap: a=dout, b=y1s → (E, H, I) → dw2 = .permute(1,2,0)
+                        dw2_base = blockscaled_fp8_wgrad_varlen_k(
+                            dout, y1s, cu_seqlens_k=expert_frequency_offset,
+                            M=dout.shape[1], N=y1s.shape[1],
+                            a_gather_idx=x_gather_idx,
+                        )
+                        dw2 = dw2_base.permute(1, 2, 0)
+                    else:
+                        dw2_base = torch.empty((w2_shape[2], w2_shape[0], w2_shape[1]), dtype=w2_dtype, device=w2_device)
+                        dw2 = dw2_base.permute(1, 2, 0)
+                        y1s_wgrad = y1s if y1s.dtype == torch.bfloat16 else y1s.to(torch.bfloat16)
+                        gemm(
+                            dout.T,
+                            y1s_wgrad,
+                            out=dw2.permute(2, 0, 1),
+                            cu_seqlens_k=expert_frequency_offset,
+                            A_idx=x_gather_idx,
+                            batch_idx_permute=None,
+                            dynamic_scheduler=False,
+                        )
+                        del y1s_wgrad
+                    del y1s
                     _log_stage_memory("backward:down-proj-weight")
 
                     # Pre-quantize dz: single HBM read produces BOTH:
