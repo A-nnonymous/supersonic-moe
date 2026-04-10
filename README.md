@@ -120,9 +120,9 @@ The reporting policy for every FP8 step is:
 - memory baseline: official bf16
 - performance baselines: previous commit and official bf16
 
-## 🔥 FP8 Blockscaled Status (2026-04-09, Session 42)
+## 🔥 FP8 Blockscaled Status (2026-04-10, Session 42)
 
-The `native-fp8-exploration` branch has a fully functional **zero-materialization** blockscaled FP8 training path for Blackwell (B200) with **weight stash** memory optimization. No TK-sized FP8 activation is materialized — follows SonicMoE's core design.
+The `native-fp8-exploration` branch has a fully functional **zero-materialization** blockscaled FP8 training path for Blackwell (B200) with **32×32 isotropic weight quantization** and **weight stash** memory optimization. No TK-sized FP8 activation is materialized — follows SonicMoE's core design.
 
 ### Quick Start
 
@@ -151,16 +151,15 @@ Only two env vars needed: `USE_QUACK_GEMM=1` and `SONIC_MOE_FP8_MODE=perf`. All 
 
 | Config | GPU µs/iter | vs BF16 |
 |--------|------------|---------|
-| BF16 baseline | 3990 | baseline |
-| **FP8 frontier** | **3581** | **1.11× faster** |
+| BF16 baseline | 3993 | baseline |
+| **FP8 frontier (iso32)** | **3564** | **1.12× faster** |
 
 ### Memory (subprocess-isolated, idle B200, 3 seeds × 3 repeats, std=0)
 
 | Metric | BF16 | FP8 | FP8 + stash | vs BF16 |
 |--------|------|-----|-------------|---------|
-| Forward peak | 1386 MiB | 1440 MiB | **1272 MiB** | **−114 MiB (−8.2%)** |
-| Backward peak | 1412 MiB | 1492 MiB | **1314 MiB** | **−98 MiB (−7.0%)** |
-| Base alloc | 377 MiB | 600 MiB | **496 MiB** | +120 MiB (FP8 caches) |
+| Forward peak | 1386 MiB | 1440 MiB | **1271 MiB** | **−115 MiB (−8.3%)** |
+| Backward peak | 1412 MiB | 1492 MiB | **1239 MiB** | **−173 MiB (−12.3%)** |
 
 > Backward peak fully audited: 100% accounted (1368 MiB theoretical vs 1367 measured).
 > See `HANDOFF.md §1` for tensor-level breakdown.
