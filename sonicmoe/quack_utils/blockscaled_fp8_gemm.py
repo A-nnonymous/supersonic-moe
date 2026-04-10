@@ -1728,6 +1728,187 @@ def colwise_quantize_and_pack(
     return fp8_out, packed_scales.view(torch.float8_e8m0fnu)
 
 
+
+# ---------------------------------------------------------------------------
+# Dual row+col quantize for fused actgrad+wgrad data prep
+# ---------------------------------------------------------------------------
+
+@triton.jit
+def _dual_varlen_quantize_kernel(
+    src_ptr,            # (TK, dim) bf16
+    # Row output: (TK, dim) fp8 + ISA scales (groups along dim)
+    row_fp8_ptr, row_scales_ptr,
+    # Col output: (TK, dim) fp8 + ISA scales (groups along TK)
+    col_fp8_ptr, col_scales_ptr,
+    TK, dim,
+    src_stride_row, src_stride_col,
+    row_k_tiles,        # ceil(dim / SF_TILE_K)
+    col_k_tiles,        # ceil(TK / SF_TILE_K)
+    fp8_max: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,       # 32
+    BLOCK_DIM: tl.constexpr,        # 128
+    SF_TILE_M: tl.constexpr,        # 128
+    SF_TILE_K: tl.constexpr,        # 128
+    SF_TILE_STORAGE: tl.constexpr,  # 512
+):
+    """Read (32, 128) bf16 tile once, produce both row-major and col-major fp8.
+
+    Row: groups of 32 along dim (contiguous, for actgrad A×B where K=dim).
+    Col: groups of 32 along TK (strided groups, for wgrad A^T×B where K=TK).
+
+    Grid: (ceil(TK/GROUP_SIZE), ceil(dim/BLOCK_DIM))
+    """
+    pid_tk_group = tl.program_id(0)   # TK group index (col groups)
+    pid_dim_block = tl.program_id(1)  # dim block index
+
+    tk_offs = pid_tk_group * GROUP_SIZE + tl.arange(0, GROUP_SIZE)   # (32,)
+    dim_offs = pid_dim_block * BLOCK_DIM + tl.arange(0, BLOCK_DIM)  # (128,)
+
+    tk_mask = tk_offs < TK
+    dim_mask = dim_offs < dim
+    mask_2d = tk_mask[:, None] & dim_mask[None, :]
+
+    # ── Single HBM read: (32, 128) bf16 tile ──
+    src_ptrs = src_ptr + tk_offs[:, None].to(tl.int64) * src_stride_row + dim_offs[None, :].to(tl.int64) * src_stride_col
+    values = tl.load(src_ptrs, mask=mask_2d, other=0.0).to(tl.float32)  # (32, 128)
+
+    # ── Col-major quantize: groups of 32 along TK ──
+    # For each of the 128 dim elements, find amax across 32 TK rows
+    values_t = tl.trans(values)   # (128, 32)
+    col_amax = tl.max(tl.abs(values_t), axis=1)  # (128,)
+    col_bits = col_amax.to(tl.int32, bitcast=True)
+    col_bexp = (col_bits >> 23) & 0xFF
+    col_mant = col_bits & 0x7FFFFF
+    col_carry = tl.where(col_mant > 0x600000, 1, 0)
+    col_e8m0 = tl.where(col_bexp > 0, col_bexp - 8 + col_carry, 0)
+    col_e8m0 = tl.maximum(col_e8m0, 0).to(tl.uint8)
+    col_qexp = tl.maximum(tl.minimum(254 - col_e8m0.to(tl.int32), 254), 1)
+    col_qscale = (col_qexp << 23).to(tl.float32, bitcast=True)
+    col_fp8 = (values_t * col_qscale[:, None]).to(tl.float8e4nv)  # (128, 32)
+
+    # Write col fp8: same physical (TK, dim) layout, just different quant
+    col_fp8_t = tl.trans(col_fp8)  # (32, 128) — back to (TK, dim) order
+    col_out_ptrs = col_fp8_ptr + tk_offs[:, None].to(tl.int64) * dim + dim_offs[None, :].to(tl.int64)
+    tl.store(col_out_ptrs, col_fp8_t, mask=mask_2d)
+
+    # Write col ISA scales (dim rows, TK cols in logical layout)
+    GROUPS_PER_K: tl.constexpr = SF_TILE_K // GROUP_SIZE
+    col_row_tiles = dim_offs // SF_TILE_M
+    col_row_in_tile = dim_offs % SF_TILE_M
+    col_k_tile_idx = pid_tk_group // GROUPS_PER_K
+    col_k_in_tile = pid_tk_group % GROUPS_PER_K
+    col_tile_base = (col_row_tiles * col_k_tiles + col_k_tile_idx) * SF_TILE_STORAGE
+    col_row_base = (col_row_in_tile % 32) * 16 + (col_row_in_tile // 32) * 4
+    col_isa_offs = col_tile_base + col_row_base + col_k_in_tile
+    tl.store(col_scales_ptr + col_isa_offs.to(tl.int64), col_e8m0, mask=dim_mask)
+
+    # ── Row-major quantize: groups of 32 along dim ──
+    # Process 4 groups of 32 within the 128-dim block.
+    # Re-reads from source (L2 cache hot from the initial load above).
+    GROUPS_PER_DIM: tl.constexpr = BLOCK_DIM // GROUP_SIZE  # 4
+    row_row_tiles = tk_offs // SF_TILE_M
+    row_row_in_tile = tk_offs % SF_TILE_M
+    row_row_base = (row_row_in_tile % 32) * 16 + (row_row_in_tile // 32) * 4
+
+    packed_i32 = tl.zeros([GROUP_SIZE], dtype=tl.int32)
+
+    for g in tl.range(0, GROUPS_PER_DIM):
+        g_dim_offs = pid_dim_block * BLOCK_DIM + g * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+        g_mask = tk_mask[:, None] & (g_dim_offs[None, :] < dim)
+        g_ptrs = src_ptr + tk_offs[:, None].to(tl.int64) * src_stride_row + g_dim_offs[None, :].to(tl.int64) * src_stride_col
+        g_vals = tl.load(g_ptrs, mask=g_mask, other=0.0).to(tl.float32)
+
+        # E8M0 quant per TK row (amax over 32 dim cols)
+        row_amax = tl.max(tl.abs(g_vals), axis=1)  # (32,)
+        row_bits = row_amax.to(tl.int32, bitcast=True)
+        row_bexp = (row_bits >> 23) & 0xFF
+        row_mant = row_bits & 0x7FFFFF
+        row_carry = tl.where(row_mant > 0x600000, 1, 0)
+        row_e8m0 = tl.where(row_bexp > 0, row_bexp - 8 + row_carry, 0)
+        row_e8m0 = tl.maximum(row_e8m0, 0)
+        row_qexp = tl.maximum(tl.minimum(254 - row_e8m0, 254), 1)
+        row_qscale = (row_qexp << 23).to(tl.float32, bitcast=True)
+        row_fp8_g = (g_vals * row_qscale[:, None]).to(tl.float8e4nv)
+
+        # Write row fp8
+        row_out_ptrs = row_fp8_ptr + tk_offs[:, None].to(tl.int64) * dim + g_dim_offs[None, :].to(tl.int64)
+        tl.store(row_out_ptrs, row_fp8_g, mask=g_mask)
+
+        # Pack ISA scale byte
+        packed_i32 = packed_i32 | ((row_e8m0 & 0xFF) << (g * 8))
+
+    # Write row ISA packed scales as uint32
+    row_tile_base = (row_row_tiles * row_k_tiles + pid_dim_block) * SF_TILE_STORAGE
+    row_packed_offs = (row_tile_base + row_row_base) // 4
+    row_scale_i32 = row_scales_ptr.to(tl.pointer_type(tl.int32))
+    tl.store(row_scale_i32 + row_packed_offs.to(tl.int64), packed_i32, mask=tk_mask)
+
+
+def dual_quantize_varlen(
+    src: torch.Tensor,
+    TK: int,
+    dim: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Read bf16 once, produce both row-major and col-major fp8 + ISA scales.
+
+    For fused actgrad + wgrad data prep: one HBM read, two quantization outputs.
+
+    Parameters
+    ----------
+    src : (TK, dim) bf16 contiguous.
+    TK : total token count (rows).
+    dim : hidden/intermediate dim (cols).
+
+    Returns
+    -------
+    row_fp8 : (TK, dim) fp8 — row-quantized (groups along dim, for actgrad).
+    row_scales : (1, packed) e8m0fnu ISA-packed.
+    col_fp8 : (TK, dim) fp8 — col-quantized (groups along TK, for wgrad).
+    col_scales : (1, packed) e8m0fnu ISA-packed for logical (dim, TK).
+    """
+    src = src.contiguous()
+    device = src.device
+    GROUP_SIZE = _SF_VEC_SIZE
+    BLOCK_DIM = 128
+
+    # Row outputs
+    row_fp8 = torch.empty(TK, dim, dtype=torch.float8_e4m3fn, device=device)
+    row_per_batch = _storage_per_batch(TK, dim)
+    if TK % _SF_TILE_M == 0 and dim % _SF_TILE_K == 0:
+        row_scales = torch.empty((1, row_per_batch), dtype=torch.uint8, device=device)
+    else:
+        row_scales = torch.full((1, row_per_batch), 127, dtype=torch.uint8, device=device)
+
+    # Col outputs (ISA scales for logical (dim, TK) layout)
+    col_fp8 = torch.empty(TK, dim, dtype=torch.float8_e4m3fn, device=device)
+    col_per_batch = _storage_per_batch(dim, TK)
+    if dim % _SF_TILE_M == 0 and TK % _SF_TILE_K == 0:
+        col_scales = torch.empty((1, col_per_batch), dtype=torch.uint8, device=device)
+    else:
+        col_scales = torch.full((1, col_per_batch), 127, dtype=torch.uint8, device=device)
+
+    row_k_tiles = _div_up(dim, _SF_TILE_K)
+    col_k_tiles = _div_up(TK, _SF_TILE_K)
+
+    grid = (_div_up(TK, GROUP_SIZE), _div_up(dim, BLOCK_DIM))
+    _dual_varlen_quantize_kernel[grid](
+        src,
+        row_fp8, row_scales,
+        col_fp8, col_scales,
+        TK, dim,
+        src.stride(0), src.stride(1),
+        row_k_tiles, col_k_tiles,
+        fp8_max=float(torch.finfo(torch.float8_e4m3fn).max),
+        GROUP_SIZE=GROUP_SIZE, BLOCK_DIM=BLOCK_DIM,
+        SF_TILE_M=_SF_TILE_M, SF_TILE_K=_SF_TILE_K,
+        SF_TILE_STORAGE=_SF_TILE_STORAGE,
+    )
+    return (
+        row_fp8, row_scales.view(torch.float8_e8m0fnu),
+        col_fp8, col_scales.view(torch.float8_e8m0fnu),
+    )
+
+
 # ---------------------------------------------------------------------------
 # varlen_k blockscaled FP8 GEMM for weight gradients
 # ---------------------------------------------------------------------------

@@ -219,6 +219,18 @@ def _use_fused_zy1_quant() -> bool:
     return os.getenv("SONIC_MOE_FP8_FUSED_ZY1_QUANT", "").lower() in {"1", "true", "yes", "on"}
 
 
+def _use_fp8_wgrad() -> bool:
+    """Check if FP8 weight gradients are enabled.
+
+    When enabled, wgrad GEMMs use blockscaled FP8 via varlen_k CUTLASS scheduling.
+    This allows freeing dz_bf16 before wgrad (−384 MiB at Ernie shape).
+    Performance is neutral at I=1536, positive at I≥2048.
+    Default: disabled (memory overhead from dual col-fp8 at I=1536 exceeds savings).
+    Enable with SONIC_MOE_FP8_WGRAD=1 for memory benefit at I≥2048 or perf testing.
+    """
+    return os.getenv("SONIC_MOE_FP8_WGRAD", "0").lower() in {"1", "true", "yes", "on"}
+
+
 def _save_z_fp8() -> bool:
     """Check if z tensor should be stored in FP8 format to save memory (default: enabled).
 
@@ -435,7 +447,7 @@ class _FP8Config:
     """
     __slots__ = (
         "enabled", "fused_gated", "save_z_fp8", "fused_swiglu_quant",
-        "epilogue_quant", "alignment_assumed",
+        "epilogue_quant", "fp8_wgrad", "alignment_assumed",
     )
 
     def __init__(self) -> None:
@@ -444,6 +456,7 @@ class _FP8Config:
         self.save_z_fp8: bool = _save_z_fp8()
         self.fused_swiglu_quant: bool = _use_fused_swiglu_quant()
         self.epilogue_quant: bool = _use_epilogue_quant()
+        self.fp8_wgrad: bool = _use_fp8_wgrad()
         self.alignment_assumed: bool = False  # set after alignment check
 
     @staticmethod
@@ -455,6 +468,7 @@ class _FP8Config:
         cfg.save_z_fp8 = False
         cfg.fused_swiglu_quant = False
         cfg.epilogue_quant = False
+        cfg.fp8_wgrad = False
         cfg.alignment_assumed = False
         return cfg
 
@@ -931,8 +945,9 @@ class _UpProjection(torch.autograd.Function):
             w1_dtype = w1.dtype
             w1_device = w1.device
 
-        dw1_base = torch.empty((E, w1_shape[0], w1_shape[1]), dtype=w1_dtype, device=w1_device)
-        dw1 = dw1_base.permute(1, 2, 0)
+        # Defer dw1 allocation for FP8 wgrad path (blockscaled_fp8_wgrad_varlen_k
+        # allocates its own output).  BF16 path allocates below.
+        dw1_base = dw1 = None
         db1 = None if b1 is None else torch.empty_like(b1)
         _reset_stage_memory_probe()
 
@@ -955,27 +970,70 @@ class _UpProjection(torch.autograd.Function):
                 else:
                     w1T_fp8, w1T_scales = precompute_weight_fp8(w1.permute(1, 0, 2))
                 prequant_dz = _PREQUANTIZED_SCALES.pop("bwd", None)
-                has_prequant = (
-                    prequant_dz is not None
-                    and _matches_prequant_tensor(prequant_dz[0], dz)
-                )
+                if ctx._fp8_cfg.fp8_wgrad:
+                    # FP8 wgrad: dz_bf16 was already freed in DownProj via dual-quant.
+                    # Skip _matches_prequant_tensor (dz storage is 0).
+                    has_prequant = prequant_dz is not None
+                else:
+                    has_prequant = (
+                        prequant_dz is not None
+                        and _matches_prequant_tensor(prequant_dz[0], dz)
+                    )
 
-                # Phase 1: Wgrad on default stream.
-                gemm(
-                    x.T,
-                    dz_bf16,
-                    out=dw1_base.permute(0, 2, 1),
-                    cu_seqlens_k=expert_frequency_offset,
-                    A_idx=x_gather_idx,
-                    batch_idx_permute=None,
-                    dynamic_scheduler=False,
-                )
+                # Phase 1: Wgrad.
+                if ctx._fp8_cfg.fp8_wgrad:
+                    # FP8 wgrad with early dz_bf16 release.
+                    # dz_col_fp8 was pre-computed in DownProj via dual_quantize_varlen
+                    # (single HBM read of dz produced both row+col fp8).
+                    from ..quack_utils.blockscaled_fp8_gemm import (
+                        colwise_quantize_and_pack,
+                        _run_cutlass_blockscaled_gemm_varlen_k,
+                    )
+                    bwd_col = _PREQUANTIZED_SCALES.pop("bwd_col", None)
+                    if bwd_col is not None:
+                        # Use pre-computed col-fp8 from dual quant (zero extra HBM read)
+                        dz_col_fp8, dz_col_scales = bwd_col
+                    else:
+                        # Fallback: compute col-fp8 now
+                        dz_col_fp8, dz_col_scales = colwise_quantize_and_pack(
+                            dz_bf16, logical_rows=w1_shape[0], logical_cols=TK,
+                        )
+                    # FREE dz_bf16 NOW (−384 MiB before wgrad GEMM!)
+                    dz.untyped_storage().resize_(0)
+                    del dz_bf16
+                    # Colwise-quant x (small: T × H = 48 MiB bf16)
+                    x_col_fp8, x_col_scales = colwise_quantize_and_pack(
+                        x, logical_rows=H, logical_cols=TK,
+                        gather_idx=x_gather_idx,
+                    )
+                    # CUTLASS wgrad GEMM
+                    dw1_base = _run_cutlass_blockscaled_gemm_varlen_k(
+                        dz_col_fp8, dz_col_scales,
+                        x_col_fp8, x_col_scales,
+                        expert_frequency_offset,
+                        M=w1_shape[0], N=H, total_K=TK,
+                        num_experts=E, out_dtype=w1_dtype, device=x.device,
+                    )
+                    dw1 = dw1_base.permute(1, 2, 0)
+                    del dz_col_fp8, dz_col_scales, x_col_fp8, x_col_scales
+                else:
+                    dw1_base = torch.empty((E, w1_shape[0], w1_shape[1]), dtype=w1_dtype, device=w1_device)
+                    dw1 = dw1_base.permute(1, 2, 0)
+                    gemm(
+                        x.T,
+                        dz_bf16,
+                        out=dw1_base.permute(0, 2, 1),
+                        cu_seqlens_k=expert_frequency_offset,
+                        A_idx=x_gather_idx,
+                        batch_idx_permute=None,
+                        dynamic_scheduler=False,
+                    )
 
                 # Phase 2: Free dz bf16 storage (~384 MiB at Ernie shape).
-                # Wgrad is complete (synchronous on default stream).
-                # shape metadata preserved for autograd backward validation.
-                dz.untyped_storage().resize_(0)
-                del dz_bf16
+                # FP8 wgrad already freed it in step 2 above; BF16 path frees here.
+                if not ctx._fp8_cfg.fp8_wgrad:
+                    dz.untyped_storage().resize_(0)
+                    del dz_bf16
 
                 # Phase 3: Actgrad using FP8 dz (avoids dz_bf16 + dx_expanded coexistence).
                 if has_prequant:
@@ -1018,6 +1076,8 @@ class _UpProjection(torch.autograd.Function):
                         "Ensure _DownProjection backward creates bwd prequant."
                     )
             else:
+                dw1_base = torch.empty((E, w1_shape[0], w1_shape[1]), dtype=w1_dtype, device=w1_device)
+                dw1 = dw1_base.permute(1, 2, 0)
                 gemm(
                     x.T,
                     dz,
@@ -1441,10 +1501,12 @@ class _DownProjection(torch.autograd.Function):
                     # Keep w2 fused cache — avoids ~40µs re-quant on next iter.
                     del w2_fp8_enk, w2_scales
 
-                    # Weight-grad FIRST (frees y1s before dz prequant to reduce peak).
+                    # Weight-grad: dw2 = dout.T @ y1s (per expert).
+                    # Use BF16 wgrad for dw2: FP8 wgrad's colwise_quant of y1s (96 MiB fp8)
+                    # + dout (192 MiB fp8) adds transient peak that negates memory savings.
+                    # The UpProj wgrad is where FP8 wgrad shines (frees dz_bf16 early).
                     _log_stage_memory("backward:down-proj-dgated")
                     _reset_stage_memory_probe()
-                    # Deferred dw2 allocation: 72 MiB not present during dgated peak.
                     dw2_base = torch.empty((w2_shape[2], w2_shape[0], w2_shape[1]), dtype=w2_dtype, device=w2_device)
                     dw2 = dw2_base.permute(1, 2, 0)
                     y1s_wgrad = y1s if y1s.dtype == torch.bfloat16 else y1s.to(torch.bfloat16)
@@ -1460,9 +1522,22 @@ class _DownProjection(torch.autograd.Function):
                     del y1s_wgrad, y1s
                     _log_stage_memory("backward:down-proj-weight")
 
-                    # Pre-quantize dz AFTER wgrad (y1s freed → ~192 MiB less peak).
-                    dz_fp8, dz_packed_scales = quantize_and_pack_activation(dz)
-                    _PREQUANTIZED_SCALES["bwd"] = (dz, dz_fp8, dz_packed_scales)
+                    # Pre-quantize dz: single HBM read produces BOTH:
+                    # - row_fp8 + scales (for actgrad in UpProj backward)
+                    # - col_fp8 + scales (for FP8 wgrad in UpProj backward)
+                    if ctx._fp8_cfg.fp8_wgrad:
+                        from ..quack_utils.blockscaled_fp8_gemm import dual_quantize_varlen
+                        dz_fp8, dz_packed_scales, dz_col_fp8, dz_col_scales = (
+                            dual_quantize_varlen(dz, TK=dz.shape[0], dim=dz.shape[1])
+                        )
+                        # Free dz_bf16 NOW — FP8 wgrad uses col_fp8, actgrad uses row_fp8.
+                        # Neither needs dz_bf16 after dual-quant.
+                        _PREQUANTIZED_SCALES["bwd"] = (dz, dz_fp8, dz_packed_scales)
+                        dz.untyped_storage().resize_(0)  # −384 MiB!
+                        _PREQUANTIZED_SCALES["bwd_col"] = (dz_col_fp8, dz_col_scales)
+                    else:
+                        dz_fp8, dz_packed_scales = quantize_and_pack_activation(dz)
+                        _PREQUANTIZED_SCALES["bwd"] = (dz, dz_fp8, dz_packed_scales)
                     ds = ds[s_reverse_scatter_idx]
                 else:
                     w2_actgrad = w2.permute(1, 0, 2)  # (I, H, E)
