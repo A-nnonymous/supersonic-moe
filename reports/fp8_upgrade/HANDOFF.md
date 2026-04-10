@@ -1,7 +1,7 @@
 # Blockscaled FP8 MoE — Handoff
 
-> **Last updated:** 2026-04-10 (Session 43 — CuTe DSL colwise quant, wgrad integration)
-> **Branch:** `native-fp8-exploration`  **Latest commit:** `dd7fb5e`
+> **Last updated:** 2026-04-10 (Session 43 — CuTe DSL colwise quant, dual quant split, wgrad integration, full breakdown)
+> **Branch:** `native-fp8-exploration`  **Latest commit:** `8920c10`
 > **Status:** ✅ FP8 + iso32 weights + stash + CuTe DSL wgrad quant. 40/40 PASS.
 
 ---
@@ -45,6 +45,8 @@
 | **gather_idx support** | x operand indirect addressing for wgrad | `dd7fb5e` |
 | **Integrated into wgrad path** | functional/__init__.py uses CuTe colwise for both dz and x | `dd7fb5e` |
 | **Smem fp8 store (dead end)** | -44% instructions but +96% L1 store traffic → reverted | `297f7a4` |
+| **Dual quant split strategy** | CuTe col + Triton row beats fused dual (NCU 146µs vs 168µs) | `34b6899` |
+| **Full breakdown script** | Subprocess-isolated memory+precision+nsys GPU projection | `8920c10` |
 
 ---
 
@@ -84,13 +86,37 @@ Wgrad is NOW integrated with CuTe DSL colwise quant. Pipeline breakdown (wall-cl
 > Note: dz is usually pre-computed by `dual_quantize_varlen` (zero extra HBM read).
 > Real savings = x colwise only: 78 µs per backward step.
 
-### Remaining Optimization Targets
+### Dual Quant: Split Strategy (Session 43 cont'd)
 
-| Target | Current | Goal | Method |
+Fused dual quant (single kernel, both row+col) was attempted but:
+- CuTe fused: 300µs (288M instructions, 3.6× bloat from per-row warp shuffle + fp8 cast)
+- Triton fused: 168µs (84% bank conflicts, 95% L1 saturated)
+- **Split: CuTe col (84µs) + Triton row (62µs) = 146µs → 1.15× faster than Triton fused**
+
+Split wins because: L2 cache is hot after colwise, rowwise rarely touches HBM again. Two specialized kernels > one kernel doing two different reductions.
+
+Integrated in `functional/__init__.py` line 1552: dz pre-quant uses split strategy.
+
+### Authoritative Full Breakdown (Session 43, `tools/fp8_frontier_breakdown.py`)
+
+Subprocess-isolated measurement on busy B200 (8/8 GPUs active):
+
+**Memory:**
+| Mode | Fwd Peak | Bwd Peak | vs BF16 |
+|------|:---:|:---:|:---:|
+| BF16 | 1385.9 MiB | 1412.3 MiB | — |
+| FP8 | 1486.8 MiB | 1490.9 MiB | +7.3% / +5.6% |
+| FP8+stash | 1270.7 MiB | 1238.4 MiB | **-8.3% / -12.3%** |
+
+**Performance (nsys GPU busy):** FP8 5691µs vs BF16 8530µs = 1.50× (busy node, inflated). Idle-node reference: 3564 vs 3993 = 1.12× (more trustworthy).
+
+**Precision:**
+| Tensor | RRMSE | Cosine | Stash RRMSE |
 |--------|:---:|:---:|:---:|
-| `dual_quantize_varlen` | 163 µs | ~70 µs | CuTe DSL (same bank-conflict-free pattern) |
-| colwise quant SM compute | 79% (SM-bound) | 60% | Reduce address calc overhead |
-| Epilogue quant fusion | N/A | −62 µs | Quant in CUTLASS epilogue (blocked by fp8 D limitation) |
+| output | 6.604% | 1.000 | 6.604% (identical) |
+| dx | 7.471% | 0.999 | 7.471% |
+| dw1 | 6.408% | 1.012 | 6.408% |
+| dw2 | 6.852% | 1.003 | 6.852% |
 
 ---
 
@@ -133,6 +159,7 @@ Hardware only supports 1×32. Trick: compute amax over 32×32 tile, broadcast sa
 | `sonicmoe/moe.py` | MoE class, refresh_fp8, stash_bf16_to_cpu, unstash_bf16 |
 | `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` | Triton quant kernels (1×32, iso32, dual_varlen, colwise), weight caches, GEMM wrappers |
 | `sonicmoe/quack_utils/cute_blockscaled_quant.py` | **CuTe DSL colwise quant** — 1.51× faster, ISA pack, gather support |
+| `sonicmoe/quack_utils/cute_dual_quant.py` | **CuTe DSL dual quant** — fused (WIP) + split strategy entry point |
 | `sonicmoe/quack_utils/gemm_gated.py` | GemmGated CUTLASS DSL + BlockscaledScaleStore EpiOp |
 | `sonicmoe/quack_utils/gemm_dgated.py` | GemmDGated CUTLASS DSL + FP8PreActLoad EpiOp |
 | `docs/FP8_ARCH_SPEC.md` | **Start here** — full architecture spec, data flow, memory lifecycle |
@@ -173,6 +200,8 @@ CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
 
 | Approach | Why it fails | Session |
 |----------|-------------|---------|
+| Fused CuTe dual quant | 288M instructions (3.6× bloat). Per-row warp shuffle + rmem fp8 cast overhead. | 43 |
+| [32][33] padded smem for dual quant | Eliminates bank conflict but cp.async can't align to stride-33. Element-wise load too slow. | 43 |
 | Smem-mediated fp8 vectorized store | -44% instructions but +96% L1 traffic. Direct gmem store is faster. | 43 |
 | 1D smem tensor view for address opt | Adds 18 regs (30→48) for tensor state. Net negative due to occupancy drop. | 43 |
 | Double-buffer pipeline for colwise | Adds 16 regs, SM-bound kernel doesn't benefit from load/compute overlap. | 43 |
@@ -185,20 +214,20 @@ CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
 
 ## 8. Next Steps (prioritized)
 
-### P0: CuTe DSL `dual_quantize_varlen` (est. −93 µs)
-NCU confirms same bank-conflict pattern (84%, 11.2M conflicts, 95% L1). Same CuTe optimization (row-major smem reads, rcp.approx) should give ~1.5× speedup: 163→~70 µs. This is the highest-ROI next optimization.
+### P0: CuTe DSL fused dual quant (est. −22 µs vs split)
+Current split: CuTe col 84µs + Triton row 62µs = 146µs. Fused could eliminate 2nd HBM read. Key challenge: per-row warp shuffle + fp8 cast generates 3.6× instruction bloat. Need Paddle-style register-buffered approach with [128][129] or [32][33] padded smem. Reference: `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/Paddle_B/paddle/phi/kernels/legacy/gpu/fp8_quant_blockwise_kernel.cu` `quantize_1x128_kernel`.
 
-### P1: Further SM compute reduction for colwise quant
-Current bottleneck: ALU 52% (address calculation). Strategies:
-- Strength reduction in smem offset computation (compiler may already do this)
-- Reducing OOB checks for aligned shapes (TK%TILE_TK==0, dim%TILE_DIM==0)
-- Exploring `setmaxregister_decrease` for explicit register control
+### P1: CuTe DSL rowwise quant (est. −30 µs for activation quant)
+`_quantize_flat_v2_kernel` at 123µs has 16.5/32 store coalescing. CuTe version could improve with the same techniques as colwise (30 regs, 89% occ, coalesced stores).
 
-### P2: CUTLASS Epilogue FP8 Output
-`tcgen05.mma` D output must be ≥16-bit. No fp8 D support in SM100. Workaround: fused Triton/CuTe kernel that reads pre-scaled bf16 z and writes fp8 (skip PyTorch `to()` overhead).
+### P2: Reduce FP8 quant overhead further
+GEMM dominates at 85%. Quant is 7.7% (440µs). Remaining quant targets:
+- `_quantize_and_pack_kernel`: 197µs (ISA activation pack) — fuse with gather
+- `_gather_isa_packed_scales_kernel`: 54µs — eliminate via pre-packed scales
+- Epilogue quant fusion: blocked by SM100 fp8 D limitation
 
-### P3: End-to-end FP8 wgrad validation
-Run full forward+backward on idle B200 with CuTe colwise quant integrated. Verify precision unchanged and measure end-to-end speedup.
+### P3: End-to-end idle-node validation
+Run `tools/fp8_frontier_breakdown.py` on idle B200 (8/8 GPUs idle) for trustworthy absolute timing. Current busy-node nsys gives 1.50× but idle-node reference is 1.12×.
 
 ---
 

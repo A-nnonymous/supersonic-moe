@@ -143,4 +143,9 @@
 24. **Runtime loops beat full unroll when occupancy matters** — 30 regs (89% occ) > 64 regs (44% occ) for this workload. The extra warps hide ALU latency better than ILP from unrolling.
 25. **CuTe DSL `cute.make_tensor` creates register overhead** — each tensor object stores pointer + layout metadata in registers. Avoid creating temporary tensors in hot loops.
 26. **NCU `--clock-control=none` is essential on contested nodes** — fixed clocks produce inconsistent results when GPU boost is affected by thermal throttling from other workloads.
+27. **Split dual quant > fused dual quant** — CuTe col (84µs) + Triton row (62µs) = 146µs beats both Triton fused (168µs) and CuTe fused (300µs). L2 cache keeps 2nd read hot. Specialized kernels > one-kernel-does-all.
+28. **Fused dual quant instruction bloat 3.6×** — per-TK-row warp butterfly shuffle (5 stages × fmax) + per-row E8M0 (10 ALU ops) + per-element rmem fp8 cast (4-element alloc+cast) = 288M instructions vs 80M for separate. The fp8 vector cast requiring 4-element rmem round-trip is the core overhead.
+29. **[32][33] smem padding works for bank conflicts but breaks cp.async tiled_copy** — stride 33 is not multiple of 8, so 128-bit vector loads can't align. Element-wise load (no vectorization) is 10× slower.
+30. **nsys GPU busy time ≠ wall-clock** — on busy nodes, GPU busy/iter = 5691µs but wall = 8144µs (30% gaps from CPU launch delay). Use nsys `cuda_gpu_trace` → merge intervals → compute actual GPU busy time.
+31. **Paddle's `quantize_1x128_kernel`** — gold reference for fused dual quant. Key technique: load full 128×128 tile into registers, `ComputeRowScale` via warp shuffle + smem cross-warp reduce, `ComputeColumnScale` via smem tree reduce, transpose output via `shm[128][129]` (+1 padding). All data stays in registers — zero re-read from smem.
 
