@@ -1526,36 +1526,40 @@ class _DownProjection(torch.autograd.Function):
                         )
                         TK_wgrad = x_gather_idx.shape[0]
 
-                        # Memory lifecycle (Ernie TK=65536, H=3072, I=1536):
-                        # ── Post-dgated: dz(384M) + y1s(192M) alive ──────────
-                        # 1. y1s col-quant → +96M, free y1s → −192M  (480M)
-                        # 2. dz col-quant  → +192M                    (672M)
-                        # 3. dz row-quant  → +192M  ← transient peak  (864M)
-                        # 4. Free dz bf16  → −384M                    (480M)
-                        # 5. dout col-quant + dw2 GEMM → +192+72M     (744M)
+                        # Stream-overlapped wgrad pipeline:
+                        # Stream 0 (main):  y1s_col → dout_col → [wait S1] → dw2 GEMM
+                        # Stream 1 (side):  dz_col → dz_row → free dz → [done]
+                        # Critical path: max(91+267, 169+114) + 212 = 358+212 ≈ 570µs
+                        # vs serial: 91+169+114+267+212 = 853µs
 
-                        # Step 1: y1s col-quant first, free bf16 before dz quant
+                        # S0: y1s col-quant + free bf16 (−192M before dz quant)
                         y1s_col_fp8, y1s_col_sc = colwise_quantize_cute(
                             y1s, logical_rows=y1s.shape[1], logical_cols=TK_wgrad,
                             isa_pack=True,
                         )
                         del y1s
 
-                        # Steps 2-4: dz dual-quant (col + row), free dz bf16
-                        dz_col_fp8, dz_col_scales = colwise_quantize_cute(
-                            dz, logical_rows=dz.shape[1], logical_cols=dz.shape[0],
-                            isa_pack=True,
-                        )
-                        dz_fp8, dz_packed_scales = quantize_and_pack_activation(dz)
-                        _PREQUANTIZED_SCALES["bwd"] = (dz, dz_fp8, dz_packed_scales)
-                        dz.untyped_storage().resize_(0)
-                        _PREQUANTIZED_SCALES["bwd_col"] = (dz_col_fp8, dz_col_scales)
+                        # S1: dz dual-quant on side stream (overlaps with dout_col)
+                        _side = _get_dequant_stream()
+                        _side.wait_stream(torch.cuda.current_stream())
+                        with torch.cuda.stream(_side):
+                            dz_col_fp8, dz_col_scales = colwise_quantize_cute(
+                                dz, logical_rows=dz.shape[1], logical_cols=dz.shape[0],
+                                isa_pack=True,
+                            )
+                            dz_fp8, dz_packed_scales = quantize_and_pack_activation(dz)
+                            _PREQUANTIZED_SCALES["bwd"] = (dz, dz_fp8, dz_packed_scales)
+                            dz.untyped_storage().resize_(0)
+                            _PREQUANTIZED_SCALES["bwd_col"] = (dz_col_fp8, dz_col_scales)
 
-                        # Step 5: dout col-quant (Triton w/ gather) + CUTLASS GEMM
+                        # S0: dout col-quant (concurrent with S1 dz quant)
                         dout_col_fp8, dout_col_sc = _colwise_quant_triton(
                             dout, logical_rows=dout.shape[1], logical_cols=TK_wgrad,
                             gather_idx=x_gather_idx,
                         )
+
+                        # Sync: GEMM needs all quant outputs
+                        torch.cuda.current_stream().wait_stream(_side)
                         dw2_base = _run_cutlass_blockscaled_gemm_varlen_k(
                             dout_col_fp8, dout_col_sc,
                             y1s_col_fp8, y1s_col_sc,
