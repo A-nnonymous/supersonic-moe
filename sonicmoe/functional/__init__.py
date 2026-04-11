@@ -1015,11 +1015,11 @@ class _UpProjection(torch.autograd.Function):
                     # FREE dz_bf16 NOW (−384 MiB before wgrad GEMM!)
                     dz.untyped_storage().resize_(0)
                     del dz_bf16
-                    # Colwise-quant x (CuTe DSL with gather support)
-                    x_col_fp8, x_col_scales = colwise_quantize_cute(
+                    # Colwise-quant x (Triton handles gather efficiently;
+                    # CuTe DSL gather is ~4× slower due to indirect loads)
+                    x_col_fp8, x_col_scales = colwise_quantize_and_pack(
                         x, logical_rows=H, logical_cols=TK,
                         gather_idx=x_gather_idx,
-                        isa_pack=True,
                     )
                     # CUTLASS wgrad GEMM
                     dw1_base = _run_cutlass_blockscaled_gemm_varlen_k(
@@ -1517,18 +1517,48 @@ class _DownProjection(torch.autograd.Function):
                     _log_stage_memory("backward:down-proj-dgated")
                     _reset_stage_memory_probe()
                     if ctx._fp8_cfg.fp8_wgrad:
-                        from ..quack_utils import blockscaled_fp8_wgrad_varlen_k
-                        # dW2[e] = dout_e^T @ y1s_e = (H, TK_e) @ (TK_e, I) = (H, I)
-                        # blockscaled_fp8_wgrad_varlen_k: a=(TK,M), b=(TK,N) → (E,M,N)
-                        # So a=y1s (TK,I=M), b=dout (T,H=N) with b_gather_idx
-                        # Result: (E, I, H). But we need dw2 as (H, I, E).
-                        # Swap: a=dout, b=y1s → (E, H, I) → dw2 = .permute(1,2,0)
-                        dw2_base = blockscaled_fp8_wgrad_varlen_k(
-                            dout, y1s, cu_seqlens_k=expert_frequency_offset,
-                            M=dout.shape[1], N=y1s.shape[1],
-                            a_gather_idx=x_gather_idx,
+                        from ..quack_utils.blockscaled_fp8_gemm import (
+                            colwise_quantize_and_pack as _colwise_quant_triton,
+                            _run_cutlass_blockscaled_gemm_varlen_k,
+                        )
+                        from ..quack_utils.cute_blockscaled_quant import (
+                            colwise_quantize_cute,
+                        )
+                        TK_wgrad = x_gather_idx.shape[0]
+
+                        # Pre-quantize dz BEFORE wgrad: produce col_fp8 + row_fp8,
+                        # then free dz bf16 (~48 MiB) before dw2 allocation.
+                        dz_col_fp8, dz_col_scales = colwise_quantize_cute(
+                            dz, logical_rows=dz.shape[1], logical_cols=dz.shape[0],
+                            isa_pack=True,
+                        )
+                        dz_fp8, dz_packed_scales = quantize_and_pack_activation(dz)
+                        _PREQUANTIZED_SCALES["bwd"] = (dz, dz_fp8, dz_packed_scales)
+                        dz.untyped_storage().resize_(0)
+                        _PREQUANTIZED_SCALES["bwd_col"] = (dz_col_fp8, dz_col_scales)
+
+                        # y1s col-quant then free y1s bf16 before GEMM alloc.
+                        y1s_col_fp8, y1s_col_sc = colwise_quantize_cute(
+                            y1s, logical_rows=y1s.shape[1], logical_cols=TK_wgrad,
+                            isa_pack=True,
+                        )
+                        del y1s
+
+                        # dout col-quant: Triton handles gather efficiently (~41µs).
+                        dout_col_fp8, dout_col_sc = _colwise_quant_triton(
+                            dout, logical_rows=dout.shape[1], logical_cols=TK_wgrad,
+                            gather_idx=x_gather_idx,
+                        )
+                        dw2_base = _run_cutlass_blockscaled_gemm_varlen_k(
+                            dout_col_fp8, dout_col_sc,
+                            y1s_col_fp8, y1s_col_sc,
+                            expert_frequency_offset,
+                            M=dout.shape[1], N=w2_shape[1],
+                            total_K=TK_wgrad, num_experts=w2_shape[2],
+                            out_dtype=w2_dtype, device=dout.device,
                         )
                         dw2 = dw2_base.permute(1, 2, 0)
+                        del dout_col_fp8, dout_col_sc, y1s_col_fp8, y1s_col_sc
                     else:
                         dw2_base = torch.empty((w2_shape[2], w2_shape[0], w2_shape[1]), dtype=w2_dtype, device=w2_device)
                         dw2 = dw2_base.permute(1, 2, 0)
@@ -1543,23 +1573,12 @@ class _DownProjection(torch.autograd.Function):
                             dynamic_scheduler=False,
                         )
                         del y1s_wgrad
-                    del y1s
+                        del y1s
                     _log_stage_memory("backward:down-proj-weight")
 
-                    # Pre-quantize dz: row_fp8 (actgrad) + col_fp8 (wgrad).
-                    # Split strategy: CuTe colwise + standard rowwise (faster than fused dual).
-                    # L2 cache is hot after colwise, so rowwise rarely touches HBM again.
-                    if ctx._fp8_cfg.fp8_wgrad:
-                        from ..quack_utils.cute_blockscaled_quant import colwise_quantize_cute
-                        dz_col_fp8, dz_col_scales = colwise_quantize_cute(
-                            dz, logical_rows=dz.shape[1], logical_cols=dz.shape[0],
-                            isa_pack=True,
-                        )
-                        dz_fp8, dz_packed_scales = quantize_and_pack_activation(dz)
-                        _PREQUANTIZED_SCALES["bwd"] = (dz, dz_fp8, dz_packed_scales)
-                        dz.untyped_storage().resize_(0)
-                        _PREQUANTIZED_SCALES["bwd_col"] = (dz_col_fp8, dz_col_scales)
-                    else:
+                    # Pre-quantize dz for UpProj.backward (non-wgrad path only;
+                    # wgrad path already did this above before dw2 allocation).
+                    if not ctx._fp8_cfg.fp8_wgrad:
                         dz_fp8, dz_packed_scales = quantize_and_pack_activation(dz)
                         _PREQUANTIZED_SCALES["bwd"] = (dz, dz_fp8, dz_packed_scales)
                     ds = ds[s_reverse_scatter_idx]
