@@ -1526,8 +1526,22 @@ class _DownProjection(torch.autograd.Function):
                         )
                         TK_wgrad = x_gather_idx.shape[0]
 
-                        # Pre-quantize dz BEFORE wgrad: produce col_fp8 + row_fp8,
-                        # then free dz bf16 (~48 MiB) before dw2 allocation.
+                        # Memory lifecycle (Ernie TK=65536, H=3072, I=1536):
+                        # ── Post-dgated: dz(384M) + y1s(192M) alive ──────────
+                        # 1. y1s col-quant → +96M, free y1s → −192M  (480M)
+                        # 2. dz col-quant  → +192M                    (672M)
+                        # 3. dz row-quant  → +192M  ← transient peak  (864M)
+                        # 4. Free dz bf16  → −384M                    (480M)
+                        # 5. dout col-quant + dw2 GEMM → +192+72M     (744M)
+
+                        # Step 1: y1s col-quant first, free bf16 before dz quant
+                        y1s_col_fp8, y1s_col_sc = colwise_quantize_cute(
+                            y1s, logical_rows=y1s.shape[1], logical_cols=TK_wgrad,
+                            isa_pack=True,
+                        )
+                        del y1s
+
+                        # Steps 2-4: dz dual-quant (col + row), free dz bf16
                         dz_col_fp8, dz_col_scales = colwise_quantize_cute(
                             dz, logical_rows=dz.shape[1], logical_cols=dz.shape[0],
                             isa_pack=True,
@@ -1537,14 +1551,7 @@ class _DownProjection(torch.autograd.Function):
                         dz.untyped_storage().resize_(0)
                         _PREQUANTIZED_SCALES["bwd_col"] = (dz_col_fp8, dz_col_scales)
 
-                        # y1s col-quant then free y1s bf16 before GEMM alloc.
-                        y1s_col_fp8, y1s_col_sc = colwise_quantize_cute(
-                            y1s, logical_rows=y1s.shape[1], logical_cols=TK_wgrad,
-                            isa_pack=True,
-                        )
-                        del y1s
-
-                        # dout col-quant: Triton handles gather efficiently (~41µs).
+                        # Step 5: dout col-quant (Triton w/ gather) + CUTLASS GEMM
                         dout_col_fp8, dout_col_sc = _colwise_quant_triton(
                             dout, logical_rows=dout.shape[1], logical_cols=TK_wgrad,
                             gather_idx=x_gather_idx,
