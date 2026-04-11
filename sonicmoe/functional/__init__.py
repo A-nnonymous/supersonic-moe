@@ -1480,6 +1480,21 @@ class _DownProjection(torch.autograd.Function):
                         dtype=torch.float32,
                         device=dout.device,
                     )
+                    # Pre-quantize dout col for wgrad on side stream.
+                    # Memory-bound col-quant overlaps with compute-bound dgated GEMM.
+                    _pre_dout_col = None
+                    if ctx._fp8_cfg.fp8_wgrad:
+                        from ..quack_utils.blockscaled_fp8_gemm import (
+                            colwise_quantize_and_pack as _colwise_quant_triton,
+                        )
+                        _prequant_s = _get_dequant_stream()
+                        _prequant_s.wait_stream(torch.cuda.current_stream())
+                        with torch.cuda.stream(_prequant_s):
+                            _pre_dout_col = _colwise_quant_triton(
+                                dout, logical_rows=dout.shape[1],
+                                logical_cols=total_m,
+                                gather_idx=x_gather_idx,
+                            )
                     gemm_dgated_kernel(
                         dout_fp8,
                         w2_fp8_enk,
@@ -1527,10 +1542,10 @@ class _DownProjection(torch.autograd.Function):
                         TK_wgrad = x_gather_idx.shape[0]
 
                         # Stream-overlapped wgrad pipeline:
-                        # Stream 0 (main):  y1s_col → dout_col → [wait S1] → dw2 GEMM
-                        # Stream 1 (side):  dz_col → dz_row → free dz → [done]
-                        # Critical path: max(91+267, 169+114) + 212 = 358+212 ≈ 570µs
-                        # vs serial: 91+169+114+267+212 = 853µs
+                        # dout_col was pre-computed on side stream during dgated GEMM.
+                        # S0 (main):  y1s_col → [wait S1] → dw2 GEMM
+                        # S1 (side):  dz_col → dz_row → free dz → [done]
+                        # Critical path: max(91, 169+114) + 212 = 283+212 ≈ 495µs
 
                         # S0: y1s col-quant + free bf16 (−192M before dz quant)
                         y1s_col_fp8, y1s_col_sc = colwise_quantize_cute(
@@ -1539,7 +1554,7 @@ class _DownProjection(torch.autograd.Function):
                         )
                         del y1s
 
-                        # S1: dz dual-quant on side stream (overlaps with dout_col)
+                        # S1: dz dual-quant on side stream
                         _side = _get_dequant_stream()
                         _side.wait_stream(torch.cuda.current_stream())
                         with torch.cuda.stream(_side):
@@ -1552,13 +1567,11 @@ class _DownProjection(torch.autograd.Function):
                             dz.untyped_storage().resize_(0)
                             _PREQUANTIZED_SCALES["bwd_col"] = (dz_col_fp8, dz_col_scales)
 
-                        # S0: dout col-quant (concurrent with S1 dz quant)
-                        dout_col_fp8, dout_col_sc = _colwise_quant_triton(
-                            dout, logical_rows=dout.shape[1], logical_cols=TK_wgrad,
-                            gather_idx=x_gather_idx,
-                        )
+                        # dout col-quant: use pre-computed from dgated overlap
+                        assert _pre_dout_col is not None
+                        dout_col_fp8, dout_col_sc = _pre_dout_col
 
-                        # Sync: GEMM needs all quant outputs
+                        # Sync: GEMM needs all quant outputs (S1 dz + pre-computed dout)
                         torch.cuda.current_stream().wait_stream(_side)
                         dw2_base = _run_cutlass_blockscaled_gemm_varlen_k(
                             dout_col_fp8, dout_col_sc,
