@@ -149,3 +149,24 @@
 30. **nsys GPU busy time ≠ wall-clock** — on busy nodes, GPU busy/iter = 5691µs but wall = 8144µs (30% gaps from CPU launch delay). Use nsys `cuda_gpu_trace` → merge intervals → compute actual GPU busy time.
 31. **Paddle's `quantize_1x128_kernel`** — gold reference for fused dual quant. Key technique: load full 128×128 tile into registers, `ComputeRowScale` via warp shuffle + smem cross-warp reduce, `ComputeColumnScale` via smem tree reduce, transpose output via `shm[128][129]` (+1 padding). All data stays in registers — zero re-read from smem.
 
+## Phase 13: NCU-Guided CuTe Gather Optimization + Epilogue FP8 D Output (Sessions 47-48)
+
+- **23-kernel NCU report** (`/tmp/ncu_quant2.ncu-rep`): Full metrics for all quant kernels — time, regs, occupancy, DRAM%, LD efficiency, effective bandwidth
+- **CuTe colwise+gather root cause**: Original kernel had 2.1 bytes/sector LD efficiency (93% waste) because each thread loaded one row with 32 sequential element loads — no coalescing across threads in a warp
+- **Warp-cooperative coalesced gather**: Rewrote gather path so 32 lanes in a warp cooperatively load 32 consecutive columns of the same row (perfectly coalesced). 8 warps × 32 iterations = 256 rows = TILE_TK. Result: **154µs → 58µs** (2.7× improvement), LD efficiency 2.1→~16 bytes/sector
+- **Pre-gather NOT viable**: `torch.index_select` (24µs) + CuTe colwise (29µs) = 53µs > Triton fused (39µs). The extra HBM write+read of the 48 MiB gathered buffer costs more than in-register gather. Verified with NCU.
+- **Triton still wins gather** (39µs vs 58µs): Triton compiler generates efficient multi-address scatter-gather from `tl.load(ptr + offsets)`. CuTe element-wise `mSrc[row, col]` generates scalar loads.
+- **Epilogue FP8 D output**: GemmGated writes z directly as `float8_e4m3fn` (eliminates standalone z quant ~141µs + z.to(fp8) cast ~288µs). BF16 placeholder with `as_strided((0,0))` for autograd graph.
+- **Eager weight cache release**: After dgated GEMM, clear `_FUSED_WEIGHT_CACHE` + `_VARLEN_WEIGHT_CACHE`, `resize_(0)` consumed/unused weight caches (estimated -74 to -148 MiB peak)
+- **Single-stream wgrad pipeline**: Removed cross-stream overlap. Single-stream enables caching allocator block reuse. +50µs latency but better memory reuse.
+- **JIT cache trap discovered**: QuACK compiles CuTe kernels to `/tmp/root/quack_cache/<fingerprint>/*.o`. Fingerprint is based on quack package source, NOT user kernel source. Must manually clear `.o` files AND call `_compile_colwise_quant.cache_clear()` after editing CuTe kernels.
+- **34/34 tests pass** (verified)
+
+### Lessons (Sessions 47-48)
+
+32. **CuTe element-wise gather generates scalar loads** — `mSrc[row, col]` compiles to individual SASS LDG instructions. Even with warp-cooperative coalescing (all lanes access same row, different columns), CuTe can't vectorize across gather indices. Triton's `tl.load(ptr + offsets)` generates vectorized multi-address loads.
+33. **QuACK JIT disk cache is source-fingerprint-based** — the fingerprint covers `quack/` package source, not user kernel source. Editing CuTe kernels does NOT change the fingerprint. Must clear `/tmp/root/quack_cache/<hash>/*.o` manually.
+34. **Pre-gather is mathematically correct but performance-worse** — bit-exact match vs fused approach, but the extra 48 MiB HBM roundtrip (write gathered bf16 + read it back) exceeds the cost of in-kernel scattered loads.
+35. **Autograd + fp8 tensors = illegal memory access** — at large shapes, fp8 dtype tensors in the autograd graph cause segfaults in backward. Solution: store a bf16 placeholder with `as_strided((0,0))` (2-byte storage), actual fp8 data in a side dict.
+36. **Cross-stream memory reuse needs record_stream** — PyTorch caching allocator won't reuse blocks across streams without explicit `record_stream` calls. Single-stream is simpler and lets freed blocks be immediately reusable.
+

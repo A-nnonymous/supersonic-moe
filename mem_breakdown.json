@@ -5,13 +5,13 @@
       "base": 0.0,
       "after_model": 216.05,
       "after_input": 360.05,
-      "pre_fwd": 3016.3,
-      "post_fwd": 3449.8,
-      "peak_fwd": 4025.67,
-      "pre_bwd": 3449.8,
-      "post_bwd": 3760.34,
-      "peak_bwd": 4220.17,
-      "post_cleanup": 3496.3
+      "pre_fwd": 376.3,
+      "post_fwd": 809.8,
+      "peak_fwd": 1385.67,
+      "pre_bwd": 809.8,
+      "post_bwd": 688.34,
+      "peak_bwd": 1508.17,
+      "post_cleanup": 424.3
     },
     "detailed_snapshots": {
       "base": {
@@ -19,64 +19,64 @@
         "peak_allocated_MiB": 0.0,
         "reserved_MiB": 0.0,
         "peak_reserved_MiB": 0.0,
-        "num_allocs": 0,
-        "num_alloc_total": 0
+        "num_allocs": 0.0,
+        "num_alloc_total": 0.0
       },
       "after_model": {
         "allocated_MiB": 216.0469,
         "peak_allocated_MiB": 576.0469,
         "reserved_MiB": 578.0,
         "peak_reserved_MiB": 578.0,
-        "num_allocs": 3,
-        "num_alloc_total": 6
+        "num_allocs": 3.0,
+        "num_alloc_total": 6.0
       },
       "after_input": {
         "allocated_MiB": 360.0469,
         "peak_allocated_MiB": 576.0469,
         "reserved_MiB": 578.0,
         "peak_reserved_MiB": 578.0,
-        "num_allocs": 6,
-        "num_alloc_total": 10
+        "num_allocs": 6.0,
+        "num_alloc_total": 10.0
       },
       "pre_fwd": {
-        "allocated_MiB": 3016.2969,
-        "peak_allocated_MiB": 3016.2969,
-        "reserved_MiB": 3394.0,
-        "peak_reserved_MiB": 3394.0,
-        "num_allocs": 28,
-        "num_alloc_total": 415
+        "allocated_MiB": 376.2969,
+        "peak_allocated_MiB": 376.2969,
+        "reserved_MiB": 834.0,
+        "peak_reserved_MiB": 834.0,
+        "num_allocs": 8.0,
+        "num_alloc_total": 415.0
       },
       "post_fwd": {
-        "allocated_MiB": 3449.7998,
-        "peak_allocated_MiB": 4025.6729,
-        "reserved_MiB": 4356.0,
-        "peak_reserved_MiB": 4356.0,
-        "num_allocs": 42,
-        "num_alloc_total": 441
+        "allocated_MiB": 809.7998,
+        "peak_allocated_MiB": 1385.6729,
+        "reserved_MiB": 1604.0,
+        "peak_reserved_MiB": 1604.0,
+        "num_allocs": 22.0,
+        "num_alloc_total": 441.0
       },
       "pre_bwd": {
-        "allocated_MiB": 3449.7998,
-        "peak_allocated_MiB": 3449.7998,
-        "reserved_MiB": 4356.0,
-        "peak_reserved_MiB": 4356.0,
-        "num_allocs": 42,
-        "num_alloc_total": 441
+        "allocated_MiB": 809.7998,
+        "peak_allocated_MiB": 809.7998,
+        "reserved_MiB": 1604.0,
+        "peak_reserved_MiB": 1604.0,
+        "num_allocs": 22.0,
+        "num_alloc_total": 441.0
       },
       "post_bwd": {
-        "allocated_MiB": 3760.3447,
-        "peak_allocated_MiB": 4220.1743,
-        "reserved_MiB": 4356.0,
-        "peak_reserved_MiB": 4356.0,
-        "num_allocs": 37,
-        "num_alloc_total": 482
+        "allocated_MiB": 688.3447,
+        "peak_allocated_MiB": 1508.1743,
+        "reserved_MiB": 1604.0,
+        "peak_reserved_MiB": 1604.0,
+        "num_allocs": 15.0,
+        "num_alloc_total": 482.0
       },
       "cleanup": {
-        "allocated_MiB": 3496.2969,
-        "peak_allocated_MiB": 3496.2969,
-        "reserved_MiB": 3970.0,
-        "peak_reserved_MiB": 3970.0,
-        "num_allocs": 31,
-        "num_alloc_total": 482
+        "allocated_MiB": 424.2969,
+        "peak_allocated_MiB": 424.2969,
+        "reserved_MiB": 834.0,
+        "peak_reserved_MiB": 834.0,
+        "num_allocs": 9.0,
+        "num_alloc_total": 482.0
       }
     },
     "deltas": {
@@ -84,8 +84,8 @@
       "input_tensors": 144.0,
       "fwd_activation": 433.5029,
       "fwd_peak_above_pre": 1009.376,
-      "bwd_peak_above_pre": 770.3745,
-      "bwd_residual": 310.5449
+      "bwd_peak_above_pre": 698.3745,
+      "bwd_residual": -121.4551
     },
     "param_sizes_mib": {
       "router.weight": 0.0469,
@@ -134,13 +134,13 @@
       "base": 0.0,
       "after_model": 216.05,
       "after_input": 360.05,
-      "pre_fwd": 1207.67,
-      "post_fwd": 1418.05,
-      "peak_fwd": 2057.67,
-      "pre_bwd": 1418.05,
-      "post_bwd": 1567.72,
-      "peak_bwd": 2183.05,
-      "post_cleanup": 1303.67
+      "pre_fwd": 524.92,
+      "post_fwd": 772.42,
+      "peak_fwd": 1375.42,
+      "pre_bwd": 772.42,
+      "post_bwd": 836.97,
+      "peak_bwd": 1475.55,
+      "post_cleanup": 572.92
     },
     "detailed_snapshots": {
       "base": {
@@ -148,73 +148,73 @@
         "peak_allocated_MiB": 0.0,
         "reserved_MiB": 0.0,
         "peak_reserved_MiB": 0.0,
-        "num_allocs": 0,
-        "num_alloc_total": 0
+        "num_allocs": 0.0,
+        "num_alloc_total": 0.0
       },
       "after_model": {
         "allocated_MiB": 216.0469,
         "peak_allocated_MiB": 576.0469,
         "reserved_MiB": 578.0,
         "peak_reserved_MiB": 578.0,
-        "num_allocs": 3,
-        "num_alloc_total": 6
+        "num_allocs": 3.0,
+        "num_alloc_total": 6.0
       },
       "after_input": {
         "allocated_MiB": 360.0469,
         "peak_allocated_MiB": 576.0469,
         "reserved_MiB": 578.0,
         "peak_reserved_MiB": 578.0,
-        "num_allocs": 6,
-        "num_alloc_total": 10
+        "num_allocs": 6.0,
+        "num_alloc_total": 10.0
       },
       "pre_fwd": {
-        "allocated_MiB": 1207.6719,
-        "peak_allocated_MiB": 1207.6719,
-        "reserved_MiB": 1794.0,
-        "peak_reserved_MiB": 1794.0,
-        "num_allocs": 27,
-        "num_alloc_total": 508
+        "allocated_MiB": 524.9219,
+        "peak_allocated_MiB": 524.9219,
+        "reserved_MiB": 578.0,
+        "peak_reserved_MiB": 578.0,
+        "num_allocs": 14.0,
+        "num_alloc_total": 500.0
       },
       "post_fwd": {
-        "allocated_MiB": 1418.0498,
-        "peak_allocated_MiB": 2057.6729,
-        "reserved_MiB": 2372.0,
-        "peak_reserved_MiB": 2372.0,
-        "num_allocs": 40,
-        "num_alloc_total": 545
+        "allocated_MiB": 772.4248,
+        "peak_allocated_MiB": 1375.4229,
+        "reserved_MiB": 1804.0,
+        "peak_reserved_MiB": 1804.0,
+        "num_allocs": 29.0,
+        "num_alloc_total": 538.0
       },
       "pre_bwd": {
-        "allocated_MiB": 1418.0498,
-        "peak_allocated_MiB": 1418.0498,
-        "reserved_MiB": 2372.0,
-        "peak_reserved_MiB": 2372.0,
-        "num_allocs": 40,
-        "num_alloc_total": 545
+        "allocated_MiB": 772.4248,
+        "peak_allocated_MiB": 772.4248,
+        "reserved_MiB": 1804.0,
+        "peak_reserved_MiB": 1804.0,
+        "num_allocs": 29.0,
+        "num_alloc_total": 538.0
       },
       "post_bwd": {
-        "allocated_MiB": 1567.7197,
-        "peak_allocated_MiB": 2183.0493,
-        "reserved_MiB": 2372.0,
-        "peak_reserved_MiB": 2372.0,
-        "num_allocs": 35,
-        "num_alloc_total": 593
+        "allocated_MiB": 836.9697,
+        "peak_allocated_MiB": 1475.5493,
+        "reserved_MiB": 1804.0,
+        "peak_reserved_MiB": 1804.0,
+        "num_allocs": 21.0,
+        "num_alloc_total": 583.0
       },
       "cleanup": {
-        "allocated_MiB": 1303.6719,
-        "peak_allocated_MiB": 1303.6719,
-        "reserved_MiB": 1986.0,
-        "peak_reserved_MiB": 1986.0,
-        "num_allocs": 29,
-        "num_alloc_total": 593
+        "allocated_MiB": 572.9219,
+        "peak_allocated_MiB": 572.9219,
+        "reserved_MiB": 770.0,
+        "peak_reserved_MiB": 770.0,
+        "num_allocs": 15.0,
+        "num_alloc_total": 583.0
       }
     },
     "deltas": {
       "model_params": 216.0469,
       "input_tensors": 144.0,
-      "fwd_activation": 210.3779,
-      "fwd_peak_above_pre": 850.001,
-      "bwd_peak_above_pre": 764.9995,
-      "bwd_residual": 149.6699
+      "fwd_activation": 247.5029,
+      "fwd_peak_above_pre": 850.501,
+      "bwd_peak_above_pre": 703.1245,
+      "bwd_residual": 64.5449
     },
     "param_sizes_mib": {
       "router.weight": 0.0469,
@@ -227,8 +227,9 @@
       "c_proj.weight": 72.0
     },
     "fp8_caches_after_bwd": {
-      "VARLEN_(3072, 3072, 8)": 74.25,
-      "FUSED_(3072, 1536, 8)": 37.125
+      "FUSED_(3072, 1536, 8)": 37.125,
+      "VARLEN_(3072, 1536, 8)": 37.125,
+      "VARLEN_(3072, 3072, 8)": 74.25
     },
     "theoretical_sizes_mib": {
       "x_input_bf16": 48.0,
@@ -260,9 +261,86 @@
       "routing_metadata_total": 1.75
     }
   },
+  "fp8_stash": {
+    "mode": "fp8_stash",
+    "summary": {
+      "n": 9,
+      "memory_mib": {
+        "base": {
+          "n": 9,
+          "mean": 495.4,
+          "std": 0.0,
+          "min": 495.4,
+          "max": 495.4
+        },
+        "fwd_peak": {
+          "n": 9,
+          "mean": 1270.8,
+          "std": 0.0,
+          "min": 1270.8,
+          "max": 1270.8
+        },
+        "bwd_peak": {
+          "n": 9,
+          "mean": 1238.6,
+          "std": 0.0,
+          "min": 1238.6,
+          "max": 1238.6
+        }
+      },
+      "timing_ms": {
+        "trimmed": {
+          "n": 9,
+          "mean": 5.836,
+          "std": 0.052,
+          "min": 5.788,
+          "max": 5.967
+        }
+      },
+      "precision": {
+        "output_rrmse_pct": {
+          "n": 9,
+          "mean": 6.6,
+          "std": 0.0,
+          "min": 6.6,
+          "max": 6.6
+        },
+        "output_corr": {
+          "n": 9,
+          "mean": 0.9978,
+          "std": 0.0,
+          "min": 0.9978,
+          "max": 0.9978
+        },
+        "dx_rrmse_pct": {
+          "n": 9,
+          "mean": 7.473,
+          "std": 0.005,
+          "min": 7.47,
+          "max": 7.48
+        },
+        "dx_corr": {
+          "n": 9,
+          "mean": 0.9972,
+          "std": 0.0,
+          "min": 0.9972,
+          "max": 0.9972
+        }
+      }
+    },
+    "comparison_vs_bf16": {
+      "fwd_peak_delta_mib": -115.1,
+      "bwd_peak_delta_mib": -173.7,
+      "fwd_peak_delta_pct": -8.305,
+      "bwd_peak_delta_pct": -12.299,
+      "timing_speedup": 1.0622,
+      "timing_delta_ms": -0.363
+    }
+  },
   "_metadata": {
-    "source": "idle B200 GPU0 @ 10.51.200.142 (0 MiB, 0% util)",
+    "source": "tools/rigorous_profiler.py",
     "profiler": "torch.cuda.memory_stats()",
-    "note": "subprocess-isolated, reset_peak_memory_stats per phase"
+    "profile_trials": 2,
+    "note": "subprocess-isolated and aggregated across profiler trials"
   }
 }

@@ -4,8 +4,8 @@ SonicMoE FP8 Blockscaled — Publication-Quality Visualization Suite
 ===================================================================
 
 Ten data-driven figures for the zero-materialization FP8 training path
-on Blackwell (B200).  All numerical data loaded from ground-truth JSON
-profiling files (``mem_breakdown.json``, ``kernel_breakdown.json``).
+on Blackwell (B200). All numerical data is loaded from artifact JSONs
+(``manifest.json``, ``mem_breakdown.json``, ``kernel_breakdown.json``).
 
 Figures
 -------
@@ -26,7 +26,7 @@ Usage
     python visualization/sonicmoe_dataflow.py
 
 Output: <repo_root>/assets/
-All data: idle B200, subprocess-isolated torch.profiler + CUDA events.
+Current checked-in artifacts come from a shared-cluster, low-util B200 rerun.
 """
 from __future__ import annotations
 
@@ -143,6 +143,11 @@ def _manifest_precision_audit(manifest: dict) -> Optional[dict]:
     return manifest.get("precision_audit")
 
 
+def _manifest_benchmark_summary(manifest: dict) -> Optional[dict]:
+    """Extract repeated benchmark summary from manifest."""
+    return manifest.get("benchmark_summary")
+
+
 def _categorize_kernel(name: str) -> str:
     """Map torch.profiler kernel name to a human-readable category."""
     if "GemmDefault" in name and "Sm100" in name:
@@ -213,7 +218,7 @@ class MoEShape:
 SHAPE = MoEShape()
 _SUB = (f"Ernie MoE  ($T$={SHAPE.T}, $H$={SHAPE.H}, $I$={SHAPE.I}, "
         f"$E$={SHAPE.E}, $K$={SHAPE.K})")
-_HW = "Blackwell B200, idle GPU, subprocess-isolated"
+_HW = "Blackwell B200, shared-cluster low-util rerun"
 
 # ── Publication colour palette ────────────────────────────────────────────
 
@@ -284,6 +289,9 @@ def _pct(base: float, new: float) -> str:
 def fig1_executive_summary() -> None:
     """Three-panel hero figure: GPU-projection, memory, precision."""
     mem_data, kern_data = _load_profiling_data()
+    manifest = _load_manifest()
+    pa = _manifest_precision_audit(manifest) if manifest else None
+    bench = _manifest_benchmark_summary(manifest) if manifest else None
 
     fig, axes = plt.subplots(1, 3, figsize=(15.5, 5.5),
                               gridspec_kw={"wspace": 0.42})
@@ -371,8 +379,16 @@ def fig1_executive_summary() -> None:
     # ── (c) Precision ────────────────────────────────────────────────────
     ax = axes[2]
     metrics = ["output\nRRMSE", "$\\partial x$\nRRMSE",
-               "$\\partial w_1$\nrel err", "$\\partial w_2$\nrel err"]
-    values = [6.60, 7.48, 0.45, 0.50]
+               "$\\partial w_1$\nRRMSE", "$\\partial w_2$\nRRMSE"]
+    rr = pa.get("rrmse_pct", {}) if pa else {}
+    fp8_precision = (((bench or {}).get("modes", {}).get("fp8", {})
+                      .get("precision", {})))
+    values = [
+        fp8_precision.get("output_rrmse_pct", {}).get("mean", rr.get("output", 6.60)),
+        fp8_precision.get("dx_rrmse_pct", {}).get("mean", rr.get("dx", 7.48)),
+        rr.get("dw1", 4.27),
+        rr.get("dw2", 4.72),
+    ]
     threshold = 10.0
     x_pos = np.arange(len(metrics))
     bars = ax.bar(x_pos, values, width=0.52, color=C_FP8, edgecolor="white",
@@ -389,7 +405,8 @@ def fig1_executive_summary() -> None:
     ax.set_title("(c) Precision", fontweight="bold", pad=8)
     ax.set_ylim(0, 14)
     ax.legend(loc="upper left", framealpha=0.9, fontsize=8)
-    ax.text(3, 12.5, "15/15 PASS", fontsize=10, fontweight="bold",
+    badge = "All tracked tensors PASS" if all(v < threshold for v in values) else "Precision gate failed"
+    ax.text(3, 12.5, badge, fontsize=10, fontweight="bold",
             color=C_SAVE, ha="center",
             bbox=dict(boxstyle="round,pad=0.3", fc="#ECFDF5", ec=C_SAVE,
                       lw=1.2, alpha=0.95))
@@ -1021,14 +1038,24 @@ def fig7_precision_profile() -> None:
     # Try manifest precision data, fall back to hardcoded
     manifest = _load_manifest()
     pa = _manifest_precision_audit(manifest) if manifest else None
+    bench = _manifest_benchmark_summary(manifest) if manifest else None
     if pa and "rrmse_pct" in pa:
         rr = pa["rrmse_pct"]
-        vals_a = [rr.get("output", 6.60), rr.get("dx", 7.48),
-                  rr.get("dw1", 0.45), rr.get("dw2", 0.50)]
+        fp8_precision = (((bench or {}).get("modes", {}).get("fp8", {})
+                          .get("precision", {})))
+        vals_a = [
+            fp8_precision.get("output_rrmse_pct", {}).get("mean", rr.get("output", 6.60)),
+            fp8_precision.get("dx_rrmse_pct", {}).get("mean", rr.get("dx", 7.48)),
+            rr.get("dw1", 4.27),
+            rr.get("dw2", 4.72),
+        ]
         cs = pa.get("cosine_sim", {})
-        vals_b = [cs.get("output", 0.998), cs.get("dx", 0.997)]
+        vals_b = [
+            fp8_precision.get("output_corr", {}).get("mean", cs.get("output", 0.998)),
+            fp8_precision.get("dx_corr", {}).get("mean", cs.get("dx", 0.997)),
+        ]
     else:
-        vals_a = [6.60, 7.48, 0.45, 0.50]
+        vals_a = [6.60, 7.48, 4.27, 4.72]
         vals_b = [0.998, 0.997]
 
     # ── (a) Relative Error ───────────────────────────────────────────────
@@ -1077,7 +1104,7 @@ def fig7_precision_profile() -> None:
 
     # pass badge — placed below the figure via fig.text
     fig.text(0.5, 0.02,
-             "31/31 contract tests PASS  |  3 seeds, subprocess-isolated  |  "
+             "Contract suite PASS  |  3 seeds, subprocess-isolated  |  "
              "Shadow weights BIT-IDENTICAL",
              ha="center", fontsize=9, fontweight="bold", color=C_SAVE,
              bbox=dict(boxstyle="round,pad=0.3", fc="#ECFDF5", ec=C_SAVE,
@@ -1601,7 +1628,7 @@ def generate_all(out_dir: Optional[str] = None) -> None:
     ASSETS.mkdir(parents=True, exist_ok=True)
     _apply_style()
 
-    print("SonicMoE FP8 Visualization Suite (idle B200 profiling)")
+    print("SonicMoE FP8 Visualization Suite (artifact-driven refresh)")
     print("=" * 55)
     for name, func in FIGURES:
         print(f"  Generating: {name}")

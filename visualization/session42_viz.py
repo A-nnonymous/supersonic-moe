@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Session 42 Final Visualization: rigorous benchmark data."""
+"""Executive summary triptych from refreshed benchmark and profiler data."""
 import json, os
 import matplotlib
 matplotlib.use("Agg")
@@ -41,7 +41,7 @@ FP8_GPU_US = kern["FP8"]["per_iter_us"]
 # Figure 1: Executive Summary (3 panels)
 # ═══════════════════════════════════════════════════════════════════════
 fig, axes = plt.subplots(1, 3, figsize=(16, 5.5))
-fig.suptitle("FP8 Frontier — Rigorous Benchmark (idle B200, 3 seeds × 3 repeats)",
+fig.suptitle("FP8 Frontier — Refreshed Benchmark (shared-cluster low-util B200, 3 seeds × 3 repeats)",
              fontsize=13, fontweight="bold", y=0.98)
 
 # Panel 1: Memory
@@ -102,7 +102,7 @@ plt.close()
 # Figure 2: Kernel Breakdown (BF16 vs FP8 side by side)
 # ═══════════════════════════════════════════════════════════════════════
 fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
-fig.suptitle("Kernel-Level GPU Time Breakdown (nsys, idle B200, 10 iters)", fontsize=13, fontweight="bold")
+fig.suptitle("Kernel-Level GPU Time Breakdown (nsys, shared-cluster low-util B200, 10 iters)", fontsize=13, fontweight="bold")
 
 for ax, label, cmap_base in [(ax1, "BF16", "#4472C4"), (ax2, "FP8", "#ED7D31")]:
     kd = kern[label]

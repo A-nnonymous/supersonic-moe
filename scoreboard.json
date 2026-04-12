@@ -246,7 +246,7 @@
         "producer": "dn_fwd",
         "consumers": [],
         "alive": [
-          1,
+          2,
           2
         ]
       },
@@ -792,7 +792,6 @@
         "state": {
           "expert_freq_offset": "R",
           "num_activated_expert_offset": "R",
-          "output": "L",
           "router_w": "L",
           "s_reverse_scatter_idx": "R",
           "s_scatter_idx": "L",
@@ -805,7 +804,7 @@
           "y1": "W",
           "z": "W"
         },
-        "alloc_mib": 889.3,
+        "alloc_mib": 841.3,
         "freeable": [
           "router_w"
         ]
@@ -1295,7 +1294,7 @@
         "consumers": [],
         "alive": [
           1,
-          1
+          2
         ]
       },
       "router_w": {
@@ -2007,7 +2006,6 @@
         },
         "alloc_mib": 1321.3,
         "freeable": [
-          "prequant_fwd_0",
           "router_w"
         ]
       },
@@ -2020,6 +2018,7 @@
           "fwd_fp8": "R",
           "num_activated_expert_offset": "L",
           "output": "W",
+          "prequant_fwd_0": "L",
           "router_w": "L",
           "s_reverse_scatter_idx": "R",
           "s_scatter_idx": "R",
@@ -2033,9 +2032,10 @@
           "z": "L",
           "z_fp8": "R"
         },
-        "alloc_mib": 1177.3,
+        "alloc_mib": 1369.3,
         "freeable": [
           "output",
+          "prequant_fwd_0",
           "router_w",
           "z"
         ]
@@ -2119,9 +2119,9 @@
       }
     ],
     "peak": {
-      "phase": 1,
-      "name": "UpProj Fwd",
-      "alloc_mib": 1321.3,
+      "phase": 2,
+      "name": "DnProj Fwd",
+      "alloc_mib": 1369.3,
       "top": [
         [
           "z",
@@ -2152,7 +2152,7 @@
           72.0
         ],
         [
-          "x",
+          "output",
           48.0
         ]
       ]

@@ -158,7 +158,7 @@ def _fused_blockscaled_gated_forward(
     # which gathers A rows inside the kernel (no TK FP8 materialization).
     # When epilogue quant is enabled, D output is fp8 directly (no bf16 round-trip).
     # The epilogue multiplies z by quant_scale in registers → hardware fp8 saturating
-    # cast writes z_fp8 to D. This eliminates the standalone z.to(fp8) cast kernel
+    # cast writes z_fp8 to D. This eliminates the standalone z quant kernel
     # and halves D bandwidth (192MB fp8 vs 384MB bf16).
     cfg = _get_fp8_config()
     epilogue_quant = cfg.epilogue_quant and cfg.save_z_fp8
@@ -168,10 +168,19 @@ def _fused_blockscaled_gated_forward(
     else:
         z_scale_out = None
 
+    # CUTLASS fp8 D output: writes z directly as fp8, epilogue computes
+    # blockscaled e8m0 scales in registers.  Eliminates standalone z quant
+    # kernel (~141µs) and halves D write bandwidth (192MB fp8 vs 384MB bf16).
+    # The fp8 z is stored ONLY in the prequant cache — the autograd graph
+    # sees a lightweight bf16 placeholder (storage freed) to avoid fp8-dtype
+    # tensors in the autograd chain which cause illegal memory access in
+    # backward at large shapes.
+    z_out_dtype = torch.float8_e4m3fn if epilogue_quant else torch.bfloat16
+
     z, y1 = gemm_gated(
         x_fp8, w1_fp8,
         activation="swiglu",
-        out_dtype=torch.bfloat16,
+        out_dtype=z_out_dtype,
         postact_dtype=torch.bfloat16,
         cu_seqlens_m=expert_frequency_offset,
         A_idx=x_gather_idx,
@@ -184,10 +193,19 @@ def _fused_blockscaled_gated_forward(
     del x_fp8, x_scales_tk_e8m0
 
     if epilogue_quant:
-        # Epilogue wrote scales + modified D (scaled z values).
-        # Cast bf16 → fp8 for ctx memory saving.
-        z_fp8 = z.to(torch.float8_e4m3fn)
-        _PREQUANTIZED_SCALES["z_fp8"] = (z_fp8, z_scale_out.view(torch.float8_e8m0fnu))
+        # z is fp8 from CUTLASS.  Store in prequant cache for backward,
+        # then replace with a lightweight bf16 placeholder for autograd.
+        z_fp8 = z
+        z_scales = z_scale_out.view(torch.float8_e8m0fnu)
+        _PREQUANTIZED_SCALES["z_fp8"] = (z_fp8, z_scales)
+        # Lightweight bf16 placeholder: 2 bytes of storage, broadcast to (TK, 2I)
+        # via zero strides.  autograd only needs the tensor as a graph node;
+        # _DownProjection.forward reads z.device/z.dtype for metadata and gets
+        # actual fp8 data from the prequant cache.  This avoids a 384 MiB
+        # momentary peak from allocating a full-size bf16 tensor.
+        z = torch.empty(1, dtype=torch.bfloat16, device=z_fp8.device).as_strided(
+            z_fp8.shape, (0, 0)
+        )
 
     return z, y1
 
@@ -291,18 +309,23 @@ def _padded_blockscaled_gated_forward(
 
 
 def _use_epilogue_quant() -> bool:
-    """Check if epilogue blockscaled quant of z is enabled (default: disabled).
+    """Check if epilogue blockscaled quant of z is enabled (default: enabled).
 
     When enabled, the GemmGated epilogue computes blockscaled FP8 quantization
-    of z in registers (integer+carry E8M0, matching Triton/Paddle reference).
-    This eliminates the standalone quantize_activation_blockscaled_fast kernel
-    for z (-122 us) and allows earlier z_bf16 freeing (-384 MiB transient).
+    of z in registers (integer+carry E8M0, matching Triton/Paddle reference)
+    AND writes z directly as fp8 to D (out_dtype=float8_e4m3fn).
+
+    Benefits:
+    - Eliminates standalone _quantize_flat_v2_kernel (~141 µs)
+    - Eliminates z.to(fp8) cast (~288 µs)
+    - Never allocates bf16 z (saves 384 MiB allocation + write bandwidth)
+    - Direct fp32→fp8 path is more precise than fp32→bf16→fp8 (one less rounding)
     """
     from ..config import get_active_config
     cfg = get_active_config()
     if cfg is not None and cfg.epilogue_quant is not None:
         return cfg.epilogue_quant
-    return os.getenv("SONIC_MOE_FP8_EPILOGUE_QUANT", "0").lower() in {"1", "true", "yes", "on"}
+    return os.getenv("SONIC_MOE_FP8_EPILOGUE_QUANT", "1").lower() in {"1", "true", "yes", "on"}
 
 
 def _use_fused_swiglu_quant() -> bool:
@@ -916,10 +939,10 @@ class _UpProjection(torch.autograd.Function):
                             z.untyped_storage().resize_(0)
                             y1_fp8, y1_packed_scales = quantize_and_pack_activation(y1)
                     else:
-                        # z_fp8 already populated (epilogue quant wrote it inside
-                        # _fused_blockscaled_gated_forward).  Free z_bf16 now (−384 MiB).
-                        if cfg.save_z_fp8:
-                            z.untyped_storage().resize_(0)
+                        # z_fp8 already populated by epilogue quant inside
+                        # _fused_blockscaled_gated_forward.  z is a bf16 placeholder
+                        # with freed storage (for autograd graph only).
+                        # No resize needed — storage is already 0.
                         y1_fp8, y1_packed_scales = quantize_and_pack_activation(y1)
                     _PREQUANTIZED_SCALES["fwd"] = (y1, y1_fp8, y1_packed_scales)
                     y1.untyped_storage().resize_(0)
@@ -1386,7 +1409,8 @@ class _DownProjection(torch.autograd.Function):
                 "Non-QuACK GEMM path is removed. Set USE_QUACK_GEMM=1."
             )
 
-        o = torch.empty(T, H, device=z.device, dtype=z.dtype)
+        # Output must always be bf16 (z may be fp8 when epilogue_quant is active).
+        o = torch.empty(T, H, device=z.device, dtype=torch.bfloat16)
         topk_scores = topk_scores.flatten()
 
         _router_forward(
@@ -1438,11 +1462,20 @@ class _DownProjection(torch.autograd.Function):
                     "z storage was freed for memory optimization but prequant "
                     "cache miss — this should not happen"
                 )
-                assert z.dtype == torch.bfloat16, (
+                assert z.dtype in (torch.bfloat16, torch.float8_e4m3fn), (
                     f"z_is_fp8=True but no prequant cache and z.dtype={z.dtype} "
-                    f"(expected bf16 for inline quantization)"
+                    f"(expected bf16 or fp8 for inline quantization)"
                 )
-                z_fp8, z_raw_scales = quantize_activation_blockscaled_fast(z)
+                if z.dtype == torch.float8_e4m3fn:
+                    # fp8 D output from CUTLASS but cache was cleared.
+                    # This shouldn't happen in normal flow but handle gracefully.
+                    z_fp8 = z
+                    z_raw_scales = torch.ones(
+                        z.shape[0], z.shape[1] // 32,
+                        dtype=torch.float8_e8m0fnu, device=z.device
+                    )
+                else:
+                    z_fp8, z_raw_scales = quantize_activation_blockscaled_fast(z)
             if _w2_decouple:
                 # Eagerly look up w2 dgated fp8 cache for backward.
                 _w2_dgated_fp8, _w2_dgated_scales = _STASHED_FP8_WEIGHTS.get("w2_dgated", None) or precompute_weight_fp8_for_direct_fused_dgated(w2)
@@ -1633,21 +1666,6 @@ class _DownProjection(torch.autograd.Function):
                         dtype=torch.float32,
                         device=dout.device,
                     )
-                    # Pre-quantize dout col for wgrad on side stream.
-                    # Memory-bound col-quant overlaps with compute-bound dgated GEMM.
-                    _pre_dout_col = None
-                    if ctx._fp8_cfg.fp8_wgrad:
-                        from ..quack_utils.blockscaled_fp8_gemm import (
-                            colwise_quantize_and_pack as _colwise_quant_triton,
-                        )
-                        _prequant_s = _get_dequant_stream()
-                        _prequant_s.wait_stream(torch.cuda.current_stream())
-                        with torch.cuda.stream(_prequant_s):
-                            _pre_dout_col = _colwise_quant_triton(
-                                dout, logical_rows=dout.shape[1],
-                                logical_cols=total_m,
-                                gather_idx=x_gather_idx,
-                            )
                     gemm_dgated_kernel(
                         dout_fp8,
                         w2_fp8_enk,
@@ -1678,8 +1696,33 @@ class _DownProjection(torch.autograd.Function):
                     # The dgated GEMM is done; these are no longer needed.
                     if use_fp8_preact:
                         del z_fp8, z_raw_scales_u8
-                    # Keep w2 fused cache — avoids ~40µs re-quant on next iter.
                     del w2_fp8_enk, w2_scales
+
+                    # ── Eager release of consumed/unused FP8 weight caches ──
+                    # During wgrad only w1T_varlen is needed (for UpProj
+                    # actgrad via ctx._w1T_fp8, a direct reference).
+                    # Free everything else to cut peak by ~74-148 MiB:
+                    #   w2_dgated  — consumed by dgated GEMM above
+                    #   w2_varlen  — forward down-proj only
+                    #   w1_fused   — forward up-proj only
+                    # Must clear internal caches FIRST to avoid stale hits
+                    # (resize_(0) corrupts storage, but the cache key persists;
+                    # a future tensor at the same GPU address would get a hit).
+                    # refresh_fp8_shadow_weights() re-creates them next iter.
+                    from ..quack_utils.blockscaled_fp8_gemm import (
+                        _FUSED_WEIGHT_CACHE, _VARLEN_WEIGHT_CACHE,
+                    )
+                    _FUSED_WEIGHT_CACHE.clear()
+                    _VARLEN_WEIGHT_CACHE.clear()
+                    if ctx._w2_decoupled:
+                        ctx._w2_dgated_fp8.untyped_storage().resize_(0)
+                        ctx._w2_dgated_scales.untyped_storage().resize_(0)
+                    for _cache_key in ("w2_varlen", "w1_fused"):
+                        _entry = _STASHED_FP8_WEIGHTS.get(_cache_key)
+                        if _entry is not None:
+                            for _t in _entry:
+                                if isinstance(_t, torch.Tensor):
+                                    _t.untyped_storage().resize_(0)
 
                     # Weight-grad: dw2 = dout.T @ y1s (per expert).
                     _log_stage_memory("backward:down-proj-dgated")
@@ -1694,38 +1737,35 @@ class _DownProjection(torch.autograd.Function):
                         )
                         TK_wgrad = x_gather_idx.shape[0]
 
-                        # Stream-overlapped wgrad pipeline:
-                        # dout_col was pre-computed on side stream during dgated GEMM.
-                        # S0 (main):  y1s_col → [wait S1] → dw2 GEMM
-                        # S1 (side):  dz_col → dz_row → free dz → [done]
-                        # Critical path: max(91, 169+114) + 212 = 283+212 ≈ 495µs
+                        # Memory-optimized wgrad pipeline (all main stream):
+                        # Single-stream execution lets the caching allocator reuse
+                        # freed blocks (cross-stream reuse requires record_stream).
+                        # Order: y1s_col → free y1s(-192M) → dz_col(reuses 192M) →
+                        #         dz_row → free dz(-384M) → dout_col(reuses 384M) → GEMM
+                        # Latency: ~426µs serial (+50µs vs overlapped; 0.6% of total)
+                        # Peak: background + dz(384) + y1s_col(96) + dz_col/dz_row(192)
 
-                        # S0: y1s col-quant + free bf16 (−192M before dz quant)
                         y1s_col_fp8, y1s_col_sc = colwise_quantize_cute(
                             y1s, logical_rows=y1s.shape[1], logical_cols=TK_wgrad,
                             isa_pack=True,
                         )
                         del y1s
 
-                        # S1: dz dual-quant on side stream
-                        _side = _get_dequant_stream()
-                        _side.wait_stream(torch.cuda.current_stream())
-                        with torch.cuda.stream(_side):
-                            dz_col_fp8, dz_col_scales = colwise_quantize_cute(
-                                dz, logical_rows=dz.shape[1], logical_cols=dz.shape[0],
-                                isa_pack=True,
-                            )
-                            dz_fp8, dz_packed_scales = quantize_and_pack_activation(dz)
-                            _PREQUANTIZED_SCALES["bwd"] = (dz, dz_fp8, dz_packed_scales)
-                            dz.untyped_storage().resize_(0)
-                            _PREQUANTIZED_SCALES["bwd_col"] = (dz_col_fp8, dz_col_scales)
+                        dz_col_fp8, dz_col_scales = colwise_quantize_cute(
+                            dz, logical_rows=dz.shape[1], logical_cols=dz.shape[0],
+                            isa_pack=True,
+                        )
+                        dz_fp8, dz_packed_scales = quantize_and_pack_activation(dz)
+                        _PREQUANTIZED_SCALES["bwd"] = (dz, dz_fp8, dz_packed_scales)
+                        _PREQUANTIZED_SCALES["bwd_col"] = (dz_col_fp8, dz_col_scales)
+                        dz.untyped_storage().resize_(0)
 
-                        # dout col-quant: use pre-computed from dgated overlap
-                        assert _pre_dout_col is not None
-                        dout_col_fp8, dout_col_sc = _pre_dout_col
+                        dout_col_fp8, dout_col_sc = _colwise_quant_triton(
+                            dout, logical_rows=dout.shape[1],
+                            logical_cols=TK_wgrad,
+                            gather_idx=x_gather_idx,
+                        )
 
-                        # Sync: GEMM needs all quant outputs (S1 dz + pre-computed dout)
-                        torch.cuda.current_stream().wait_stream(_side)
                         dw2_base = _run_cutlass_blockscaled_gemm_varlen_k(
                             dout_col_fp8, dout_col_sc,
                             y1s_col_fp8, y1s_col_sc,

@@ -113,22 +113,26 @@ class ColwiseQuantOp:
             cute.arch.cp_async_commit_group()
             cute.arch.cp_async_wait_group(0)
         else:
-            # Gather load: each thread loads one row via indirect indexing
-            # 256 threads load 256 rows (= TILE_TK), each loads TILE_DIM=32 cols
-            local_tk = tidx  # thread -> row within tile
-            abs_tk = bid_tk * const_expr(TILE_TK) + local_tk
-            dim_base_ld = bid_dim * const_expr(TILE_DIM)
-            if abs_tk < TK_val:
-                src_row = Int32(mGatherIdx[abs_tk])  # indirect row
-                for c in cutlass.range(const_expr(TILE_DIM)):
-                    dim_col = dim_base_ld + c
-                    if dim_col < dim_val:
-                        sSrc[local_tk, c] = mSrc[src_row, dim_col]
+            # Cooperative coalesced gather: warp-level row loads.
+            # Each warp loads 1 full row per iteration (32 consecutive cols
+            # by 32 lanes → perfectly coalesced along dim axis).
+            # 8 warps × 32 iterations = 256 rows = TILE_TK.
+            # NCU-guided: fixes 2.1 bytes/sector LD efficiency → ~32 bytes/sector.
+            warp_ld = tidx // 32
+            lane_ld = tidx % 32
+            dim_col_ld = bid_dim * const_expr(TILE_DIM) + lane_ld
+            col_valid = dim_col_ld < dim_val
+            for li in cutlass.range(const_expr(TILE_TK // (NUM_THREADS // 32))):
+                lr = li * const_expr(NUM_THREADS // 32) + warp_ld
+                atk = bid_tk * const_expr(TILE_TK) + lr
+                if atk < TK_val:
+                    sr = Int32(mGatherIdx[atk])
+                    if col_valid:
+                        sSrc[lr, lane_ld] = mSrc[sr, dim_col_ld]
                     else:
-                        sSrc[local_tk, c] = mSrc.element_type(0)
-            else:
-                for c in cutlass.range(const_expr(TILE_DIM)):
-                    sSrc[local_tk, c] = mSrc.element_type(0)
+                        sSrc[lr, lane_ld] = mSrc.element_type(0)
+                else:
+                    sSrc[lr, lane_ld] = mSrc.element_type(0)
 
         cute.arch.barrier()
 

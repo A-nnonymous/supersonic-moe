@@ -120,18 +120,17 @@ The reporting policy for every FP8 step is:
 - memory baseline: official bf16
 - performance baselines: previous commit and official bf16
 
-## 🔥 FP8 Blockscaled Status (2026-04-13, Session 46)
+## 🔥 FP8 Blockscaled Status (2026-04-14, Session 48)
 
-The `native-fp8-exploration` branch has a fully functional **zero-materialization** blockscaled FP8 training path for Blackwell (B200) with **32×32 isotropic weight quantization**, optional **weight stash** memory optimization, native **CUTLASS / QuACK** FP8 kernels, **Pythonic config API** (`SonicMoEConfig`), and **unaligned FP8 padding** for non-128-aligned expert segments. No TK-sized FP8 activation is materialized — the FP8 path matches SonicMoE's core BF16 design principle.
+The `native-fp8-exploration` branch has a fully functional **zero-materialization** blockscaled FP8 training path for Blackwell (B200) with **32×32 isotropic weight quantization**, optional **weight stash** memory optimization, native **CUTLASS / QuACK** FP8 kernels, **Pythonic config API** (`SonicMoEConfig`), **unaligned FP8 padding**, **epilogue FP8 D output** (z written directly as fp8 by CUTLASS), and **CuTe DSL colwise quant kernels** (1.3× faster than Triton without gather). No TK-sized FP8 activation is materialized — the FP8 path matches SonicMoE's core BF16 design principle.
 
-### Sessions 45–46 Highlights
+### Sessions 47–48 Highlights
 
-- **Pythonic Config API:** `SonicMoEConfig` dataclass replaces env-var flags. Thread-local, context-manager-based. Priority: config > context manager > env var.
-- **wgrad FP8 default-ON** at all shapes with stream-overlapped quant pipeline.
-- **NCU-driven quant analysis:** All 4 hot quant kernels at 89–99% HBM bandwidth — ceiling reached.
-- **Unaligned FP8 padding:** `_padded_blockscaled_gated_forward()` pads expert segments to 128 for FP8 GEMM.
-- **TILE_ROWS tuning:** 32→128 for quantize/gather kernels, 16→32 for pad kernel.
-- **Idle-GPU benchmarks** on truly idle B200 (0% util) with CUDA events and 5-seed precision audit.
+- **Epilogue FP8 D output:** GemmGated writes z directly as fp8, eliminating standalone z quant (~141µs) and z.to(fp8) cast (~288µs). BF16 placeholder for autograd graph safety.
+- **NCU-guided CuTe gather optimization:** Warp-cooperative coalesced loads improved CuTe colwise+gather from 154µs → 58µs (2.7×). Still behind Triton's 39µs for gather cases.
+- **Eager weight cache eviction** after dgated GEMM (expected -74 to -148 MiB peak memory).
+- **Single-stream wgrad pipeline** for better memory reuse (removed cross-stream overlap).
+- **34/34 tests + 20 subtests PASS** (verified).
 
 ### Quick Start (Pythonic Config — no env vars needed)
 
@@ -153,14 +152,14 @@ with cfg.activate():
 
 Alternatively, env vars still work: `USE_QUACK_GEMM=1` and `SONIC_MOE_FP8_MODE=perf`.
 
-### Performance (idle B200, CUDA events, 12 runs trimmed mean)
+### Performance (Session 46 CUDA events, idle B200 — re-benchmark needed for Session 48 changes)
 
 | Shape | BF16 | FP8 | Speedup | Takeaway |
 |-------|:----:|:---:|:-------:|----------|
 | **Ernie** (T=8192, H=3072, I=1536, E=8, K=8) | 4.97 ± 0.02 ms | 5.00 ± 0.03 ms | **0.993×** | Break-even at small I |
 | **I=2048** (T=8192, H=3072, I=2048, E=8, K=8) | 6.56 ± 0.01 ms | **5.82 ± 0.01 ms** | **1.127×** | Speedup grows with I |
 
-> FP8 speedup scales with intermediate size. At I=1536, quant overhead matches GEMM savings. At I=2048+, FP8 wins clearly.
+> Session 48 added epilogue FP8 D output + eager weight cache eviction. These should improve speed and memory but have not yet been re-benchmarked on an idle GPU.
 
 ### Memory (subprocess-isolated peak)
 
@@ -180,7 +179,7 @@ FP8 uses more memory due to weight caches. Use **FP8 + stash** (moves bf16 weigh
 | dw1 | 4.69% | 4.72% | — | ✓ PASS |
 | dw2 | 4.84% | 4.88% | — | ✓ PASS |
 
-All within guardrails: **RRMSE < 10%**, **correlation > 0.99**. `tests/fp8_large_project_contract_test.py` passes **33/34 tests + 20 subtests** (1 memory test expected — FP8 trades memory for speed).
+All within guardrails: **RRMSE < 10%**, **correlation > 0.99**. `tests/fp8_large_project_contract_test.py` passes **34/34 tests + 20 subtests**.
 
 ### Weight Stash Training Loop
 
