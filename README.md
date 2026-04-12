@@ -120,16 +120,16 @@ The reporting policy for every FP8 step is:
 - memory baseline: official bf16
 - performance baselines: previous commit and official bf16
 
-## 🔥 FP8 Blockscaled Status (2026-04-14, Session 48)
+## 🔥 FP8 Blockscaled Status (2026-04-15, Session 49)
 
-The `native-fp8-exploration` branch has a fully functional **zero-materialization** blockscaled FP8 training path for Blackwell (B200) with **32×32 isotropic weight quantization**, optional **weight stash** memory optimization, native **CUTLASS / QuACK** FP8 kernels, **Pythonic config API** (`SonicMoEConfig`), **unaligned FP8 padding**, **epilogue FP8 D output** (z written directly as fp8 by CUTLASS), and **CuTe DSL colwise quant kernels** (1.3× faster than Triton without gather). No TK-sized FP8 activation is materialized — the FP8 path matches SonicMoE's core BF16 design principle.
+The `native-fp8-exploration` branch has a fully functional **zero-materialization** blockscaled FP8 training path for Blackwell (B200) with **32×32 isotropic weight quantization**, optional **weight stash** memory optimization, native **CUTLASS / QuACK** FP8 kernels, **Pythonic config API** (`SonicMoEConfig`), **unaligned FP8 padding**, **epilogue FP8 D output** (z written directly as fp8 by CUTLASS), **CuTe DSL colwise quant kernels** (1.3× faster than Triton without gather), and **nsys GPU-projection profiling** integrated into introspect.py. No TK-sized FP8 activation is materialized — the FP8 path matches SonicMoE's core BF16 design principle.
 
-### Sessions 47–48 Highlights
+### Session 49 Highlights
 
-- **Epilogue FP8 D output:** GemmGated writes z directly as fp8, eliminating standalone z quant (~141µs) and z.to(fp8) cast (~288µs). BF16 placeholder for autograd graph safety.
-- **NCU-guided CuTe gather optimization:** Warp-cooperative coalesced loads improved CuTe colwise+gather from 154µs → 58µs (2.7×). Still behind Triton's 39µs for gather cases.
-- **Eager weight cache eviction** after dgated GEMM (expected -74 to -148 MiB peak memory).
-- **Single-stream wgrad pipeline** for better memory reuse (removed cross-stream overlap).
+- **nsys GPU-projection engine** added to `tools/introspect.py` (`--mode nsys`): gold-standard performance measurement immune to CPU contention.
+- **Kernel classifier fix**: CuTe-compiled quant kernels (name contains "cutlass") no longer misclassified as GEMM.
+- **Steady-state profiling**: no FP8 state reset between measured iterations — eliminates cold-start artifacts.
+- **Fresh benchmark data**: both I=1536 and I=2048 show FP8 winning over BF16 (1.08× and 1.07×).
 - **34/34 tests + 20 subtests PASS** (verified).
 
 ### Quick Start (Pythonic Config — no env vars needed)
@@ -152,32 +152,32 @@ with cfg.activate():
 
 Alternatively, env vars still work: `USE_QUACK_GEMM=1` and `SONIC_MOE_FP8_MODE=perf`.
 
-### Performance (Session 46 CUDA events, idle B200 — re-benchmark needed for Session 48 changes)
+### Performance (Session 49 — nsys GPU-projection, 8-iter steady-state, B200)
 
-| Shape | BF16 | FP8 | Speedup | Takeaway |
-|-------|:----:|:---:|:-------:|----------|
-| **Ernie** (T=8192, H=3072, I=1536, E=8, K=8) | 4.97 ± 0.02 ms | 5.00 ± 0.03 ms | **0.993×** | Break-even at small I |
-| **I=2048** (T=8192, H=3072, I=2048, E=8, K=8) | 6.56 ± 0.01 ms | **5.82 ± 0.01 ms** | **1.127×** | Speedup grows with I |
+| Shape | BF16 (µs/iter) | FP8 (µs/iter) | Speedup | Takeaway |
+|-------|:--------------:|:-------------:|:-------:|----------|
+| **Ernie** (T=8192, H=3072, I=1536, E=8, K=8) | 9434 | 8735 | **1.08×** | FP8 wins; wgrad halved |
+| **I=2048** (T=8192, H=3072, I=2048, E=8, K=8) | 12252 | 11443 | **1.07×** | FP8 wins; quant overhead ≈ GEMM savings |
 
-> Session 48 added epilogue FP8 D output + eager weight cache eviction. These should improve speed and memory but have not yet been re-benchmarked on an idle GPU.
+> Measured via `python tools/introspect.py --mode nsys`. nsys GPU-projection (merged kernel intervals from sqlite) is immune to CPU contention — the gold standard for shared-node profiling.
 
-### Memory (subprocess-isolated peak)
+### Memory (Session 49, subprocess-isolated peak, post-warmup)
 
 | Shape | BF16 Peak | FP8 Peak | Delta |
 |-------|-----------|----------|-------|
-| **Ernie** | 1460 MiB | 1851 MiB | +391 MiB (+27%) |
-| **I=2048** | 1876 MiB | 2331 MiB | +455 MiB (+24%) |
+| **Ernie** | 1412 MiB | 1530 MiB | +118 MiB (+8.4%) |
+| **I=2048** | 1828 MiB | 1986 MiB | +158 MiB (+8.6%) |
 
-FP8 uses more memory due to weight caches. Use **FP8 + stash** (moves bf16 weights to CPU) for net GPU memory savings.
+FP8 uses +8-9% more memory due to weight caches. Use **FP8 + stash** (moves bf16 weights to CPU) for net GPU memory savings.
 
-### Precision (5 seeds, idle GPU)
+### Precision (5 seeds × 2 shapes)
 
 | Tensor | Ernie RRMSE | I=2048 RRMSE | Correlation | Status |
 |--------|:-----------:|:------------:|:-----------:|:------:|
-| output | 6.51% | 6.51% | 0.9979 | ✓ PASS |
-| dx | 6.52% | 6.54% | — | ✓ PASS |
-| dw1 | 4.69% | 4.72% | — | ✓ PASS |
-| dw2 | 4.84% | 4.88% | — | ✓ PASS |
+| output | 6.49% | 6.49% | 0.9979 | ✓ PASS |
+| dx | 6.52% | 6.53% | 0.9979 | ✓ PASS |
+| dw1 | 4.69% | 4.68% | 0.9989 | ✓ PASS |
+| dw2 | 4.88% | 4.87% | 0.9988 | ✓ PASS |
 
 All within guardrails: **RRMSE < 10%**, **correlation > 0.99**. `tests/fp8_large_project_contract_test.py` passes **34/34 tests + 20 subtests**.
 

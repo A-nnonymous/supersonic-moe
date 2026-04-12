@@ -22,12 +22,15 @@ Modes
   trace   — shapes / dtypes / lifecycle / memory (~3 s)
   profile — trace + kernel timing via torch.profiler (~30 s)
   full    — trace + profile + precision audit (~60 s)
+  nsys    — nsys GPU-projection profiling (~120 s per shape×mode)
 
 Usage
 -----
     python tools/introspect.py                        # trace mode
     python tools/introspect.py --mode profile         # + kernel timing
     python tools/introspect.py --mode full            # everything
+    python tools/introspect.py --mode nsys            # gold-standard GPU timing
+    python tools/introspect.py --mode nsys --nsys-shapes 8192,3072,1536,8,8 8192,3072,2048,8,8
 
 Output: ``manifest.json`` at repo root.
 """
@@ -41,6 +44,7 @@ import inspect
 import json
 import math
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -63,12 +67,15 @@ BENCHMARK_FINAL_PATH = ROOT / "benchmark_final.json"
 MEM_BREAKDOWN_PATH = ROOT / "mem_breakdown.json"
 KERNEL_BREAKDOWN_ROOT_PATH = ROOT / "kernel_breakdown.json"
 KERNEL_BREAKDOWN_COMPAT_PATH = ROOT / "reports" / "nsys_final" / "kernel_breakdown.json"
+NSYS_BREAKDOWN_PATH = ROOT / "reports" / "nsys_final" / "nsys_gpu_projection.json"
 
 # Default Ernie shape
 SHAPE = {"T": 8192, "H": 3072, "I": 1536, "E": 8, "K": 8}
 DEFAULT_SHAPE = dict(SHAPE)
 DEFAULT_PRECISION_SEEDS = [42, 123, 456, 789, 1024]
 DEFAULT_BENCH_REPEATS = 3
+DEFAULT_NSYS_WARMUP = 5
+DEFAULT_NSYS_ITERS = 8
 PERSISTENT_TMP_ROOT = Path("/root/paddlejob/share-storage/gpfs/system-public/panzhaowu")
 
 # Map _log_stage_memory stage names → visualization phase IDs (0-5)
@@ -1266,7 +1273,26 @@ print("__KERNEL_JSON__" + json.dumps(result))
 
 
 def _categorize_kernel(name: str) -> str:
-    """Map torch.profiler kernel name to human-readable category."""
+    """Map kernel name to human-readable category.
+
+    Works with both torch.profiler names and nsys demangled names.
+    Order matters: quant checks MUST precede CUTLASS/GEMM checks because
+    CuTe-compiled quant kernels have "cutlass" in their name
+    (e.g. ``kernel_cutlass_..._blockscaled_quantColwise_quantize_cute_kernel``).
+    """
+    nl = name.lower()
+    # ── FP8 quantization family (check BEFORE GEMM/cutlass) ──────────
+    if "blockscaled_quant" in nl or "BlockscaledQuant" in name:
+        return "Blockscaled Quant"
+    if "colwise" in nl and ("quant" in nl or "quantize" in nl):
+        return "Blockscaled Quant"
+    if "flat_quant" in nl or "FlatQuant" in name:
+        return "Flat Quant"
+    if "_quantize_and_pack" in nl:
+        return "Row Quant"
+    if "gather_isa" in nl or "ISAGather" in name:
+        return "ISA Scale Gather"
+    # ── GEMM family ──────────────────────────────────────────────────
     if "GemmDefault" in name and "Sm100" in name:
         return "Wgrad GEMM"
     if "GemmGated" in name and "ZeroMat" not in name:
@@ -1277,21 +1303,293 @@ def _categorize_kernel(name: str) -> str:
         return "GemmGated ZeroMat (fwd)"
     if "GemmDGated" in name and "ZeroMat" in name:
         return "GemmDGated ZeroMat (bwd)"
-    if "blockscaled_quant" in name.lower() or "BlockscaledQuant" in name:
-        return "Blockscaled Quant"
-    if "flat_quant" in name.lower() or "FlatQuant" in name:
-        return "Flat Quant"
-    if "gather_isa" in name.lower() or "ISAGather" in name:
-        return "ISA Scale Gather"
-    if "swiglu" in name.lower() or "SwiGLU" in name:
+    if "cutlass" in nl and "gemm" in nl:
+        return "GEMM (other)"
+    # ── Activation / routing ─────────────────────────────────────────
+    if "swiglu" in nl or "SwiGLU" in name:
         return "SwiGLU"
-    if "scatter" in name.lower() and "token" in name.lower():
+    if "scatter" in nl and "token" in nl:
         return "Token Scatter"
-    if "topk" in name.lower():
+    if "gather" in nl and "token" in nl:
+        return "Token Gather"
+    if "topk" in nl:
         return "TopK Router"
-    if "softmax" in name.lower():
+    if "softmax" in nl:
         return "Softmax"
     return "Other"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# nsys GPU-Projection Profiling Engine
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Gold-standard performance measurement: runs nsys profile on a steady-state
+# workload, then parses the sqlite output to compute GPU-projection time
+# (merge overlapping kernel intervals) and per-kernel breakdown.
+#
+# Unlike torch.profiler, this is immune to CPU contention artifacts and
+# gives true GPU busy time.
+
+_NSYS_WORKLOAD_TEMPLATE = textwrap.dedent(r'''
+import os, sys, json, torch, gc
+sys.path.insert(0, "{root}")
+os.environ["CUDA_VISIBLE_DEVICES"] = "{gpu}"
+os.environ["USE_QUACK_GEMM"] = "1"
+
+from sonicmoe import MoE, enable_fp8, enable_quack_gemm
+from sonicmoe.enums import ActivationType
+import sonicmoe.functional as functional
+
+T, H, I, E, K = {T}, {H}, {I}, {E}, {K}
+mode = "{mode}"
+
+# Reset FP8 state cleanly, then let it build up during warmup
+functional.clear_all_fp8_weight_caches()
+functional._ALIGNMENT_ASSUMED = False
+functional._ALIGNMENT_STREAK = 0
+
+torch.manual_seed(42)
+device = torch.device("cuda:0")
+moe = MoE(num_experts=E, num_experts_per_tok=K, hidden_size=H,
+           intermediate_size=I, activation_function=ActivationType.SWIGLU,
+           add_bias=False, std=0.02).to(device=device, dtype=torch.bfloat16)
+x = (0.02 * torch.randn(T, H, device=device, dtype=torch.bfloat16)).detach().requires_grad_()
+
+if mode == "fp8":
+    os.environ["SONIC_MOE_FP8_MODE"] = "perf"
+    enable_fp8(True)
+enable_quack_gemm(True)
+
+# Warm up ({warmup} iters) — build alignment streak, JIT, weight caches
+for _ in range({warmup}):
+    out, aux = moe(x)
+    loss = out.sum() + aux
+    loss.backward()
+    moe.zero_grad(set_to_none=True)
+    if x.grad is not None:
+        x.grad = None
+torch.cuda.synchronize()
+gc.collect()
+torch.cuda.empty_cache()
+
+# Measured iterations — nsys captures this range via cudaProfilerApi
+torch.cuda.cudart().cudaProfilerStart()
+for _ in range({iters}):
+    out, aux = moe(x)
+    loss = out.sum() + aux
+    loss.backward()
+    moe.zero_grad(set_to_none=True)
+    if x.grad is not None:
+        x.grad = None
+torch.cuda.synchronize()
+torch.cuda.cudart().cudaProfilerStop()
+print("NSYS_DONE", flush=True)
+''')
+
+
+def _nsys_categorize_kernel(name: str) -> str:
+    """Categorize nsys kernel names into high-level groups.
+
+    Same logic as _categorize_kernel but also handles nsys-mangled names
+    where CuTe-compiled quant kernels have "cutlass" in the demangled name.
+    """
+    return _categorize_kernel(name)
+
+
+def _nsys_parse_sqlite(
+    db_path: str, num_iters: int,
+) -> dict[str, Any]:
+    """Parse nsys sqlite export for GPU-projection and kernel breakdown.
+
+    Returns dict with:
+      - gpu_projection_us: total GPU busy time (merged overlapping intervals)
+      - per_iter_us: gpu_projection_us / num_iters
+      - kernel_breakdown: list of {name, category, total_us, count, per_iter_us}
+    """
+    conn = sqlite3.connect(db_path)
+
+    # Resolve string IDs (nsys stores names as integer references)
+    string_map: dict[int, str] = {}
+    try:
+        for row in conn.execute("SELECT id, value FROM StringIds"):
+            string_map[row[0]] = row[1]
+    except sqlite3.OperationalError:
+        pass
+
+    # Read all GPU kernel events
+    kernels: list[tuple[int, int, int, int]] = []  # (start, end, nameId, demangledId)
+    try:
+        for row in conn.execute(
+            "SELECT start, end, demangledName, shortName "
+            "FROM CUPTI_ACTIVITY_KIND_KERNEL"
+        ):
+            kernels.append((row[0], row[1], row[2], row[3]))
+    except sqlite3.OperationalError:
+        conn.close()
+        return {"error": "No kernel data in sqlite"}
+
+    conn.close()
+
+    if not kernels:
+        return {"error": "No kernels found"}
+
+    # Compute GPU-projection (merge overlapping intervals)
+    kernels.sort(key=lambda x: x[0])
+    merged_ns = 0
+    cur_start, cur_end = kernels[0][0], kernels[0][1]
+    for start, end, _, _ in kernels[1:]:
+        if start <= cur_end:
+            cur_end = max(cur_end, end)
+        else:
+            merged_ns += cur_end - cur_start
+            cur_start, cur_end = start, end
+    merged_ns += cur_end - cur_start
+    gpu_projection_us = merged_ns / 1000.0
+
+    # Per-kernel breakdown
+    kernel_stats: dict[str, dict[str, Any]] = {}
+    for start, end, demangled_id, short_id in kernels:
+        # Prefer demangled name, fall back to short name
+        name = string_map.get(demangled_id, string_map.get(short_id, f"unknown_{demangled_id}"))
+        dur_us = (end - start) / 1000.0
+        if name not in kernel_stats:
+            kernel_stats[name] = {"total_us": 0.0, "count": 0}
+        kernel_stats[name]["total_us"] += dur_us
+        kernel_stats[name]["count"] += 1
+
+    breakdown = []
+    for name, stats in sorted(kernel_stats.items(), key=lambda x: -x[1]["total_us"]):
+        cat = _nsys_categorize_kernel(name)
+        breakdown.append({
+            "name": name[:120],  # truncate very long kernel names
+            "category": cat,
+            "total_us": round(stats["total_us"], 1),
+            "count": stats["count"],
+            "per_iter_us": round(stats["total_us"] / num_iters, 1),
+            "per_call_us": round(stats["total_us"] / stats["count"], 1),
+        })
+
+    # Category summary
+    cat_totals: dict[str, float] = collections.defaultdict(float)
+    for k in breakdown:
+        cat_totals[k["category"]] += k["per_iter_us"]
+
+    return {
+        "gpu_projection_us": round(gpu_projection_us, 1),
+        "per_iter_us": round(gpu_projection_us / num_iters, 1),
+        "num_iters": num_iters,
+        "num_kernels": len(kernels),
+        "kernel_breakdown": breakdown[:50],  # top 50 kernels
+        "category_summary": dict(sorted(cat_totals.items(), key=lambda x: -x[1])),
+    }
+
+
+def run_nsys_profile(
+    gpu: int = 0,
+    warmup: int = DEFAULT_NSYS_WARMUP,
+    iters: int = DEFAULT_NSYS_ITERS,
+    shapes: list[dict[str, int]] | None = None,
+) -> dict[str, Any]:
+    """Run nsys GPU-projection profiling for BF16 and FP8.
+
+    This is the gold-standard profiling method:
+    - Steady-state measurement (no FP8 cache reset between iterations)
+    - GPU-projection time (merged kernel intervals, immune to CPU contention)
+    - Per-kernel breakdown with category classification
+
+    Args:
+        gpu: GPU device index
+        warmup: warmup iterations before measurement
+        iters: measured iterations
+        shapes: list of shape dicts (default: [SHAPE])
+
+    Returns:
+        dict with per-shape, per-mode results
+    """
+    env_path = "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer"
+    python_bin = os.path.join(env_path, "bin", "python")
+    nsys_bin = "nsys"
+
+    if shapes is None:
+        shapes = [SHAPE]
+
+    results: dict[str, Any] = {"shapes": {}}
+
+    for shape in shapes:
+        shape_key = f"I{shape['I']}"
+        shape_results: dict[str, Any] = {"shape": shape}
+
+        for mode in ("bf16", "fp8"):
+            label = f"{mode}/{shape_key}"
+            print(f"  nsys profiling [{label}] ({warmup}w+{iters}m) ...", flush=True)
+
+            script = _NSYS_WORKLOAD_TEMPLATE.format(
+                root=str(ROOT), gpu=str(gpu), mode=mode,
+                warmup=warmup, iters=iters, **shape,
+            )
+
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".py", delete=False, prefix=f"nsys_{mode}_{shape_key}_"
+            ) as f:
+                f.write(script)
+                script_path = f.name
+
+            sqlite_path = script_path.replace(".py", "")
+
+            try:
+                cmd = [
+                    nsys_bin, "profile",
+                    "--capture-range=cudaProfilerApi",
+                    "--capture-range-end=stop",
+                    f"--output={sqlite_path}",
+                    "--export=sqlite",
+                    "--force-overwrite=true",
+                    python_bin, script_path,
+                ]
+                proc = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=600,
+                    env={**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu)},
+                )
+                if proc.returncode != 0:
+                    print(f"  [WARN] nsys failed for {label}: {proc.stderr[-300:]}", flush=True)
+                    shape_results[mode] = {"error": proc.stderr[-500:]}
+                    continue
+
+                db_file = f"{sqlite_path}.sqlite"
+                if not os.path.exists(db_file):
+                    print(f"  [WARN] sqlite not found for {label}", flush=True)
+                    shape_results[mode] = {"error": "sqlite output missing"}
+                    continue
+
+                parsed = _nsys_parse_sqlite(db_file, iters)
+                parsed["mode"] = mode
+                parsed["shape"] = shape
+                shape_results[mode] = parsed
+                print(
+                    f"    {label}: {parsed.get('per_iter_us', '?')} µs/iter "
+                    f"({parsed.get('num_kernels', '?')} kernels)",
+                    flush=True,
+                )
+            except subprocess.TimeoutExpired:
+                print(f"  [WARN] nsys timed out for {label}", flush=True)
+                shape_results[mode] = {"error": "timeout"}
+            finally:
+                for p in [script_path, f"{sqlite_path}.nsys-rep", f"{sqlite_path}.sqlite"]:
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
+
+        # Compute speedup if both modes succeeded
+        bf16_us = shape_results.get("bf16", {}).get("per_iter_us")
+        fp8_us = shape_results.get("fp8", {}).get("per_iter_us")
+        if bf16_us and fp8_us and fp8_us > 0:
+            shape_results["speedup"] = round(bf16_us / fp8_us, 4)
+            print(f"    {shape_key} speedup: {shape_results['speedup']}×", flush=True)
+
+        results["shapes"][shape_key] = shape_results
+
+    return results
 
 
 def run_kernel_profile(gpu: int = 0) -> dict[str, Any]:
@@ -1802,13 +2100,16 @@ def run(
     precision_seeds: list[int] | None = None,
     bench_repeats: int = DEFAULT_BENCH_REPEATS,
     profile_trials: int = 1,
+    nsys_warmup: int = DEFAULT_NSYS_WARMUP,
+    nsys_iters: int = DEFAULT_NSYS_ITERS,
+    nsys_shapes: list[dict[str, int]] | None = None,
 ) -> dict:
     """Main entry point: run introspection and write manifest.json.
 
     Parameters
     ----------
     mode : str
-        "trace" | "profile" | "full"
+        "trace" | "profile" | "full" | "nsys"
     """
     import torch
 
@@ -1844,6 +2145,39 @@ def run(
     print(f"  Device: {gpu_name}")
     print(f"  Shape: T={SHAPE['T']}, H={SHAPE['H']}, I={SHAPE['I']}, "
           f"E={SHAPE['E']}, K={SHAPE['K']}")
+
+    # ── nsys mode: standalone GPU-projection profiling ──
+    if mode == "nsys":
+        shapes = nsys_shapes or [SHAPE]
+        print(f"\n  nsys GPU-projection profiling ({len(shapes)} shape(s)) ...")
+        nsys_data = run_nsys_profile(
+            gpu=gpu, warmup=nsys_warmup, iters=nsys_iters, shapes=shapes,
+        )
+        nsys_data["metadata"] = metadata
+
+        # Write nsys results
+        nsys_out = NSYS_BREAKDOWN_PATH
+        nsys_out.parent.mkdir(parents=True, exist_ok=True)
+        nsys_out.write_text(json.dumps(nsys_data, indent=2, default=str))
+        print(f"\n  → {nsys_out} ({nsys_out.stat().st_size / 1024:.1f} KB)")
+
+        # Print summary table
+        print("\n" + "=" * 60)
+        print("  nsys GPU-Projection Summary")
+        print("=" * 60)
+        for shape_key, shape_res in nsys_data.get("shapes", {}).items():
+            bf16_us = shape_res.get("bf16", {}).get("per_iter_us", "?")
+            fp8_us = shape_res.get("fp8", {}).get("per_iter_us", "?")
+            speedup = shape_res.get("speedup", "?")
+            print(f"  {shape_key}: BF16={bf16_us} µs  FP8={fp8_us} µs  → {speedup}×")
+
+            # Print category breakdown
+            for m in ("bf16", "fp8"):
+                cats = shape_res.get(m, {}).get("category_summary")
+                if cats:
+                    print(f"    [{m}] {', '.join(f'{k}={v:.0f}µs' for k, v in list(cats.items())[:6])}")
+        print("=" * 60)
+        return nsys_data
 
     # ── Trace BF16 ──
     print("\n[1/5] Tracing BF16 (subprocess-isolated) ...", flush=True)
@@ -1979,13 +2313,15 @@ def main():
               trace   — isolated tensor lifecycle + memory manifest
               profile — trace + lightweight kernel timing
               full    — trace + repeated benchmark/profiler + precision audit
+              nsys    — nsys GPU-projection profiling (gold standard for perf)
 
             Example:
               python tools/introspect.py --mode full
+              python tools/introspect.py --mode nsys --nsys-shapes 8192,3072,1536,8,8 8192,3072,2048,8,8
         """),
     )
     parser.add_argument(
-        "--mode", choices=["trace", "profile", "full"], default="trace",
+        "--mode", choices=["trace", "profile", "full", "nsys"], default="trace",
         help="Introspection depth (default: trace)",
     )
     parser.add_argument(
@@ -2007,6 +2343,18 @@ def main():
     parser.add_argument(
         "--profile-trials", type=int, default=1,
         help="How many times to repeat the rigorous profiler in full mode (default: 1)",
+    )
+    parser.add_argument(
+        "--nsys-warmup", type=int, default=DEFAULT_NSYS_WARMUP,
+        help="nsys mode: warmup iterations before measurement (default: 5)",
+    )
+    parser.add_argument(
+        "--nsys-iters", type=int, default=DEFAULT_NSYS_ITERS,
+        help="nsys mode: measured iterations (default: 8)",
+    )
+    parser.add_argument(
+        "--nsys-shapes", nargs="+", type=str, default=None,
+        help="nsys mode: shapes as T,H,I,E,K (space-separated, e.g. '8192,3072,1536,8,8 8192,3072,2048,8,8')",
     )
     parser.add_argument("--_worker-trace", choices=["bf16", "fp8"], help=argparse.SUPPRESS)
     parser.add_argument("--_worker-collect", choices=["bf16", "fp8"], help=argparse.SUPPRESS)
@@ -2031,12 +2379,25 @@ def main():
         return
 
     precision_seeds = [int(seed.strip()) for seed in args.precision_seeds.split(",") if seed.strip()]
+
+    # Parse nsys shapes
+    nsys_shapes = None
+    if args.nsys_shapes:
+        nsys_shapes = []
+        for s in args.nsys_shapes:
+            parts = [int(x) for x in s.split(",")]
+            assert len(parts) == 5, f"Expected T,H,I,E,K but got {len(parts)} values in '{s}'"
+            nsys_shapes.append(dict(zip(("T", "H", "I", "E", "K"), parts)))
+
     run(
         mode=args.mode,
         gpu=args.gpu,
         precision_seeds=precision_seeds,
         bench_repeats=args.bench_repeats,
         profile_trials=args.profile_trials,
+        nsys_warmup=args.nsys_warmup,
+        nsys_iters=args.nsys_iters,
+        nsys_shapes=nsys_shapes,
     )
 
 
