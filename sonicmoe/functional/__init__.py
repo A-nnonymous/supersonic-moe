@@ -931,9 +931,6 @@ class _UpProjection(torch.autograd.Function):
                             # Split quantization: z first, free z bf16, then y1.
                             # This avoids z_bf16+y1_bf16+z_fp8+y1_fp8 all coexisting
                             # and reduces forward peak by ~96 MiB at Ernie shape.
-                            from ..quack_utils.blockscaled_fp8_gemm import (
-                                quantize_activation_blockscaled_fast,
-                            )
                             z_fp8, z_raw_scales = quantize_activation_blockscaled_fast(z)
                             _PREQUANTIZED_SCALES["z_fp8"] = (z_fp8, z_raw_scales)
                             z.untyped_storage().resize_(0)
@@ -1599,6 +1596,27 @@ class _DownProjection(torch.autograd.Function):
 
             s = topk_scores[s_scatter_idx]
             if ctx._fp8_enabled_flag and ctx._alignment_assumed_flag:
+                # ── Early eviction: free forward-only FP8 weight caches ──
+                # Clears w2_varlen (~37 MiB freeable, forward down-proj only)
+                # and w1_fused dict entries at backward entry.
+                # At I=1536 this doesn't reduce peak (wgrad dominates), but
+                # at larger shapes where dgated peak exceeds wgrad peak,
+                # this saves ~37 MiB.
+                # Backward-needed caches survive via ctx references:
+                #   w2_dgated  → ctx._w2_dgated_fp8 (DownProj dgated)
+                #   w1T_varlen → UpProj ctx._w1T_fp8 (actgrad)
+                from ..quack_utils.blockscaled_fp8_gemm import (
+                    _FUSED_WEIGHT_CACHE, _VARLEN_WEIGHT_CACHE,
+                )
+                _FUSED_WEIGHT_CACHE.clear()
+                _VARLEN_WEIGHT_CACHE.clear()
+                for _evict_name in ("w1_fused", "w2_varlen"):
+                    _evict_entry = _STASHED_FP8_WEIGHTS.pop(_evict_name, None)
+                    if _evict_entry is not None:
+                        for _t in _evict_entry:
+                            if isinstance(_t, torch.Tensor) and _t.untyped_storage().size() > 0:
+                                _t.untyped_storage().resize_(0)
+
                 # All segments aligned: use blockscaled FP8 path.
                 if ctx._use_fused_blockscaled_gated_flag:
                     # Zero-materialization FP8 dgated: T-quant + scale_gather + A_idx
@@ -1698,31 +1716,17 @@ class _DownProjection(torch.autograd.Function):
                         del z_fp8, z_raw_scales_u8
                     del w2_fp8_enk, w2_scales
 
-                    # ── Eager release of consumed/unused FP8 weight caches ──
-                    # During wgrad only w1T_varlen is needed (for UpProj
-                    # actgrad via ctx._w1T_fp8, a direct reference).
-                    # Free everything else to cut peak by ~74-148 MiB:
-                    #   w2_dgated  — consumed by dgated GEMM above
-                    #   w2_varlen  — forward down-proj only
-                    #   w1_fused   — forward up-proj only
-                    # Must clear internal caches FIRST to avoid stale hits
-                    # (resize_(0) corrupts storage, but the cache key persists;
-                    # a future tensor at the same GPU address would get a hit).
-                    # refresh_fp8_shadow_weights() re-creates them next iter.
-                    from ..quack_utils.blockscaled_fp8_gemm import (
-                        _FUSED_WEIGHT_CACHE, _VARLEN_WEIGHT_CACHE,
-                    )
-                    _FUSED_WEIGHT_CACHE.clear()
-                    _VARLEN_WEIGHT_CACHE.clear()
+                    # ── Eager release of w2_dgated (consumed by dgated GEMM above) ──
+                    # w1_fused and w2_varlen were already freed at backward entry
+                    # (early eviction). Only w2_dgated remains to clean up here.
                     if ctx._w2_decoupled:
                         ctx._w2_dgated_fp8.untyped_storage().resize_(0)
                         ctx._w2_dgated_scales.untyped_storage().resize_(0)
-                    for _cache_key in ("w2_varlen", "w1_fused"):
-                        _entry = _STASHED_FP8_WEIGHTS.get(_cache_key)
-                        if _entry is not None:
-                            for _t in _entry:
-                                if isinstance(_t, torch.Tensor):
-                                    _t.untyped_storage().resize_(0)
+                    _w2d_stash = _STASHED_FP8_WEIGHTS.pop("w2_dgated", None)
+                    if _w2d_stash is not None:
+                        for _t in _w2d_stash:
+                            if isinstance(_t, torch.Tensor) and _t.untyped_storage().size() > 0:
+                                _t.untyped_storage().resize_(0)
 
                     # Weight-grad: dw2 = dout.T @ y1s (per expert).
                     _log_stage_memory("backward:down-proj-dgated")
