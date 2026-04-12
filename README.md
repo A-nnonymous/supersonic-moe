@@ -120,17 +120,17 @@ The reporting policy for every FP8 step is:
 - memory baseline: official bf16
 - performance baselines: previous commit and official bf16
 
-## 🔥 FP8 Blockscaled Status (2026-04-15, Session 49)
+## 🔥 FP8 Blockscaled Status (2026-04-15, Session 50)
 
-The `native-fp8-exploration` branch has a fully functional **zero-materialization** blockscaled FP8 training path for Blackwell (B200) with **32×32 isotropic weight quantization**, optional **weight stash** memory optimization, native **CUTLASS / QuACK** FP8 kernels, **Pythonic config API** (`SonicMoEConfig`), **unaligned FP8 padding**, **epilogue FP8 D output** (z written directly as fp8 by CUTLASS), **CuTe DSL colwise quant kernels** (1.3× faster than Triton without gather), and **nsys GPU-projection profiling** integrated into introspect.py. No TK-sized FP8 activation is materialized — the FP8 path matches SonicMoE's core BF16 design principle.
+The `native-fp8-exploration` branch has a fully functional **zero-materialization** blockscaled FP8 training path for Blackwell (B200) with **32×32 isotropic weight quantization**, optional **weight stash** memory optimization, native **CUTLASS / QuACK** FP8 kernels, **Pythonic config API** (`SonicMoEConfig`), **unaligned FP8 padding**, **epilogue FP8 D output** (z written directly as fp8 by CUTLASS), **CuTe DSL colwise quant kernels** (1.3× faster than Triton without gather), **early weight cache eviction**, and **nsys GPU-projection profiling** integrated into introspect.py. No TK-sized FP8 activation is materialized — the FP8 path matches SonicMoE's core BF16 design principle.
 
-### Session 49 Highlights
+### Session 50 Highlights
 
-- **nsys GPU-projection engine** added to `tools/introspect.py` (`--mode nsys`): gold-standard performance measurement immune to CPU contention.
-- **Kernel classifier fix**: CuTe-compiled quant kernels (name contains "cutlass") no longer misclassified as GEMM.
-- **Steady-state profiling**: no FP8 state reset between measured iterations — eliminates cold-start artifacts.
-- **Fresh benchmark data**: both I=1536 and I=2048 show FP8 winning over BF16 (1.08× and 1.07×).
-- **34/34 tests + 20 subtests PASS** (verified).
+- **Memory deep-dive**: Analyzed backward peak structure. BF16 and FP8 have identical forward tensor layouts (both use QuACK GEMM). The +118 MiB backward overhead is purely from wgrad quantization temporaries.
+- **Early weight cache eviction**: Clears weight caches at backward entry (before dgated). Frees ~37 MiB at I=1536 (no peak reduction — wgrad dominates).
+- **Env-var contamination fix**: Documented critical bug where `SONIC_MOE_FP8_MODE=perf` leaked into bf16 runs.
+- **Clean benchmarks with nsys GPU-projection**: 1.028× at I=1536, 1.049× at I=2048.
+- **34/34 tests + 20 subtests PASS** (verified 3×).
 
 ### Quick Start (Pythonic Config — no env vars needed)
 
@@ -152,23 +152,26 @@ with cfg.activate():
 
 Alternatively, env vars still work: `USE_QUACK_GEMM=1` and `SONIC_MOE_FP8_MODE=perf`.
 
-### Performance (Session 49 — nsys GPU-projection, 8-iter steady-state, B200)
+### Performance (Session 50 — nsys GPU-projection, 10-iter steady-state, B200)
 
 | Shape | BF16 (µs/iter) | FP8 (µs/iter) | Speedup | Takeaway |
 |-------|:--------------:|:-------------:|:-------:|----------|
-| **Ernie** (T=8192, H=3072, I=1536, E=8, K=8) | 9434 | 8735 | **1.08×** | FP8 wins; wgrad halved |
-| **I=2048** (T=8192, H=3072, I=2048, E=8, K=8) | 12252 | 11443 | **1.07×** | FP8 wins; quant overhead ≈ GEMM savings |
+| **Ernie** (T=8192, H=3072, I=1536, E=8, K=8) | 9658 | 9396 | **1.028×** | Break-even; GEMM savings ≈ quant overhead |
+| **I=2048** (T=8192, H=3072, I=2048, E=8, K=8) | 12622 | 12036 | **1.049×** | FP8 wins; wgrad GEMM savings > quant overhead |
 
 > Measured via `python tools/introspect.py --mode nsys`. nsys GPU-projection (merged kernel intervals from sqlite) is immune to CPU contention — the gold standard for shared-node profiling.
 
-### Memory (Session 49, subprocess-isolated peak, post-warmup)
+### Memory (Session 50, subprocess-isolated peak, env-var decontaminated)
 
-| Shape | BF16 Peak | FP8 Peak | Delta |
-|-------|-----------|----------|-------|
-| **Ernie** | 1412 MiB | 1530 MiB | +118 MiB (+8.4%) |
-| **I=2048** | 1828 MiB | 1986 MiB | +158 MiB (+8.6%) |
+| Config | I=1536 Fwd | I=1536 Bwd | I=2048 Fwd | I=2048 Bwd |
+|--------|-----------|----------|----------|----------|
+| **BF16** | 1290 MiB | 1412 MiB | 1554 MiB | 1828 MiB |
+| **FP8** | 1232 MiB | 1530 MiB | 1476 MiB | 1985 MiB |
+| **FP8+Stash** | 1018 MiB | 1314 MiB | 1192 MiB | 1697 MiB |
 
-FP8 uses +8-9% more memory due to weight caches. Use **FP8 + stash** (moves bf16 weights to CPU) for net GPU memory savings.
+FP8 saves on forward peak (z_fp8) but costs on backward peak (wgrad quant temps). **FP8+Stash** wins everywhere (−272/−98 MiB vs BF16 at I=1536).
+
+> **⚠️ CRITICAL:** Previous Session 49 memory numbers were contaminated. The env var `SONIC_MOE_FP8_MODE=perf` leaked into bf16 runs. Session 50 fixed this.
 
 ### Precision (5 seeds × 2 shapes)
 
