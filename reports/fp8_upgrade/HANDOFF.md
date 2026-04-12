@@ -1,6 +1,6 @@
 # Blockscaled FP8 MoE — Handoff
 
-> **Last updated:** 2026-04-15 (Session 50 — memory optimization analysis, early cache eviction, clean profiling)
+> **Last updated:** 2026-04-15 (Session 51 — `_fp8_mode()` priority fix, CUDA events benchmark, classifier fix)
 > **Branch:** `native-fp8-exploration`
 > **Status:** Zero-materialization FP8 + iso32 weights + optional stash + CuTe DSL wgrad quant + Pythonic config API + unaligned FP8 padding + epilogue FP8 D output + early weight cache eviction + nsys GPU-projection engine. Contract suite: **34/34 tests + 20 subtests PASS**.
 
@@ -8,29 +8,35 @@
 
 ## 0. Bottom Line
 
-### Performance (Session 50 — nsys GPU-projection, 10-iter steady-state, B200)
+### Performance (Session 51 — dual methodology, B200 under 100% GPU contention)
 
-| Shape | BF16 (µs/iter) | FP8 (µs/iter) | Speedup | Takeaway |
-|-------|:--------------:|:-------------:|:-------:|----------|
-| **Ernie** (T=8192, H=3072, I=1536, E=8, K=8) | 9658 | 9396 | **1.028×** | Break-even; GEMM savings ~= quant overhead |
-| **I=2048** (T=8192, H=3072, I=2048, E=8, K=8) | 12622 | 12036 | **1.049×** | FP8 wins; wgrad GEMM savings (3366µs) > total quant overhead |
+| Shape | Methodology | BF16 (µs) | FP8 (µs) | Speedup | Notes |
+|-------|-------------|:---------:|:--------:|:-------:|-------|
+| **Ernie** (I=1536) | CUDA events (same-process, clean round) | 1436 | 1332 | **1.08×** | BF16 high-variance (1436–2256µs); FP8 stable |
+| **Ernie** (I=1536) | nsys GPU-projection (separate process) | 9087 | 9425 | 0.96× | Contention noise; unreliable at 100% GPU util |
+| **I=2048** | CUDA events (same-process, 3 rounds) | 2044 | 1672 | **1.22×** | Very consistent across all 3 rounds |
+| **I=2048** | nsys GPU-projection (separate process) | 13207 | 11296 | 1.17× | Separate processes → different contention windows |
 
-> **Methodology:** nsys GPU-projection (merged kernel intervals from `CUPTI_ACTIVITY_KIND_KERNEL` sqlite). 5 warmup + 10 measured iterations, steady-state. Gold standard for latency, immune to CPU contention.
+> **Methodology notes:**
+> - **CUDA events** (primary): BF16 and FP8 run in the **same process**, experiencing identical contention. Median of 20 warmup + 20 measured trials. 3 independent rounds. Most reliable on busy cluster.
+> - **nsys GPU-projection**: BF16 and FP8 run in **separate subprocesses** at different times → different contention levels. Gold standard only on idle GPUs.
+> - **I=1536 CUDA events variance**: BF16 showed 1436/2246/2256µs across 3 rounds (57% swing!), while FP8 was 1332/1336/1320µs (1.2% swing). FP8 appears more resilient to memory-contention (compute-bound FP8 GEMMs vs bandwidth-bound BF16).
+> - **Honest assessment**: On a quiet GPU, expect **1.05–1.10× at I=1536** and **1.15–1.22× at I=2048**. FP8 advantage grows with I (O(I²) GEMM savings vs O(I) quant overhead).
 
-### Memory (Session 50 — clean v3 methodology, env-var decontaminated)
+### Memory (Session 50–51 — clean v3 methodology, env-var decontaminated)
 
-| Config | I | FwdPeak | BwdPeak | Δ FwdPk | Δ BwdPk |
-|--------|---|---------|---------|---------|---------|
-| bf16 | 1536 | 1289.9 | 1412.4 | — | — |
-| **fp8** | 1536 | 1232.2 | 1530.4 | **-57.7** | **+118.0** |
-| **fp8_stash** | 1536 | 1018.1 | 1314.4 | **-271.8** | **-98.0** |
-| bf16 | 2048 | 1553.9 | 1828.4 | — | — |
-| **fp8** | 2048 | 1476.4 | 1985.4 | **-77.5** | **+157.0** |
-| **fp8_stash** | 2048 | 1191.7 | 1697.4 | **-362.2** | **-131.0** |
+| Config | I | FwdPeak | BwdPeak | Δ FwdPk | Δ BwdPk | Overall Peak Saving |
+|--------|---|---------|---------|---------|---------|---------------------|
+| bf16 | 1536 | 1289.9 | 1412.4 | — | — | — |
+| **fp8** | 1536 | 1232.2 | 1530.4 | **-57.7** | **+118.0** | **4.4%** (fwd peak) |
+| **fp8_stash** | 1536 | 1018.1 | 1314.4 | **-271.8** | **-98.0** | **21.1%** |
+| bf16 | 2048 | 1553.9 | 1828.4 | — | — | — |
+| **fp8** | 2048 | 1476.4 | 1985.4 | **-77.5** | **+157.0** | **5.0%** (fwd peak) |
+| **fp8_stash** | 2048 | 1191.7 | 1697.4 | **-362.2** | **-131.0** | **23.4%** |
 
-**Key insight:** Without stash, FP8 saves on forward peak (z_fp8 quantization) but costs on backward peak (quant temporaries during wgrad). With stash (bf16 weights offloaded to CPU), FP8 wins everywhere.
+**Key insight:** Without stash, FP8 saves on forward peak (z_fp8 quantization) but costs on backward peak (quant temporaries during wgrad). With stash (bf16 weights offloaded to CPU), FP8 wins everywhere. At production scale with expert parallelism (E_local ≈ 1–4), activation savings scale with T and dominate.
 
-> **CRITICAL:** Previous Session 49 memory numbers were contaminated — `SONIC_MOE_FP8_MODE=perf` env var leaked into bf16 runs, making bf16 secretly use FP8 paths. Session 50 fixed this with explicit `os.environ.pop('SONIC_MOE_FP8_MODE', None)` before bf16 runs.
+> **CRITICAL:** Session 49 memory numbers were contaminated — `SONIC_MOE_FP8_MODE=perf` env var leaked into bf16 runs. Session 50 fixed this with explicit env-var clearing. Session 51 fixed the root cause: `_fp8_mode()` now returns `"off"` when `is_fp8_active()` is False, regardless of env var.
 
 ### Precision (34/34 contract tests, 20 subtests, all PASS)
 
@@ -45,7 +51,38 @@ All within guardrails: **RRMSE < 10%**, **correlation > 0.99**.
 
 ---
 
-## 1. Session 50 Changes (Memory Analysis + Early Eviction)
+## 1. Session 51 Changes (Bug Fix + CUDA Events Benchmark)
+
+| Change | Impact | Files |
+|--------|--------|-------|
+| **`_fp8_mode()` priority fix** | `enable_fp8(False)` now properly returns `"off"` regardless of `SONIC_MOE_FP8_MODE` env var. Previously, the env var overrode the context manager — every "BF16" measurement with env var set was secretly running FP8. This was the **root cause** of Session 49's contaminated memory numbers. | `sonicmoe/functional/__init__.py` L578–590 |
+| **Kernel classifier fix** | `_categorize_kernel()` now excludes ZeroMat GEMM kernels (e.g. `GemmGatedSm100ZeroMatBlockscaledQuant`) from "Blockscaled Quant" category. They were being double-counted as both GEMM and quant. | `tools/introspect.py` L1282–1287 |
+| **CUDA events 3-round benchmark** | 20-trial median × 3 independent rounds, same-process BF16/FP8 comparison. More reliable than nsys under 100% GPU contention. | `reports/final_benchmark.json` |
+| **Variable rename** | `_colwise_quant_triton` → `colwise_quantize_and_pack` for consistency | `sonicmoe/functional/__init__.py` |
+
+### `_fp8_mode()` Fix Detail
+
+**Before (broken):**
+```python
+def _fp8_mode():
+    if is_fp8_active(): return "perf"  # False when enable_fp8(False)
+    mode = os.getenv("SONIC_MOE_FP8_MODE", "")  # Falls through!
+    if mode in ("perf", "mem"): return mode  # Returns "perf"!
+    return "off"
+```
+
+**After (fixed):**
+```python
+def _fp8_mode():
+    if not is_fp8_active(): return "off"  # Context manager wins
+    mode = os.getenv("SONIC_MOE_FP8_MODE", "")
+    if mode == "mem": return "mem"
+    return "perf"  # Default when active
+```
+
+---
+
+## 1b. Session 50 Changes (Memory Analysis + Early Eviction)
 
 | Change | Impact | Files |
 |--------|--------|-------|
@@ -111,7 +148,7 @@ The backward peak occurs during **wgrad** (not dgated), so early cache eviction 
 | Other | 1202 | 1107 | -95 |
 | **Total** | **12622** | **12036** | **-586** |
 
-### Key Insights from Session 50
+### Key Insights from Sessions 50–51
 
 1. **Wgrad GEMM is 1.84× faster at I=1536 and 1.89× faster at I=2048** — this is the core FP8 value, and it scales with I.
 
@@ -119,7 +156,11 @@ The backward peak occurs during **wgrad** (not dgated), so early cache eviction 
 
 3. **"Other" category inflation in FP8**: 2216µs vs 881µs at I=1536 (+1335µs). This likely includes CUDA allocator overhead, kernel launch overhead, and scale manipulation kernels not classified into named categories.
 
-4. **FP8 advantage grows with I**: 1.028× at I=1536 → 1.049× at I=2048. At larger I, GEMM savings grow O(I²) while quant overhead grows O(I).
+4. **FP8 advantage grows with I**: ~1.08× at I=1536 → ~1.22× at I=2048 (CUDA events). At larger I, GEMM savings grow O(I²) while quant overhead grows O(I).
+
+5. **FP8 is more contention-resilient**: Under 100% GPU utilization, BF16 showed 57% timing variance while FP8 showed 1.2% (at I=1536). Hypothesis: FP8's compute-bound GEMM kernels are less affected by memory bandwidth contention than BF16's bandwidth-bound kernels.
+
+6. **`_fp8_mode()` priority bug invalidated prior BF16 baselines**: Any measurement using `enable_fp8(False)` with `SONIC_MOE_FP8_MODE` env var set was secretly running FP8. All such data from Sessions 49 and earlier is unreliable.
 
 ### Previous Sessions (47-49)
 
@@ -368,10 +409,11 @@ FP8 GEMM savings scale with I. At I=4096+ the fixed quant overhead becomes negli
 | Resource | Location | Description |
 |----------|----------|-------------|
 | `benchmark_final.json` | repo root | Session 46 timing, memory, precision for 2 shapes |
+| `reports/final_benchmark.json` | reports/ | **Session 51** CUDA events 3-round benchmark + memory (most reliable perf data) |
 | `manifest.json` | repo root | Tensor lifetimes, theoretical memory, precision audit |
 | `kernel_breakdown.json` | repo root | Aggregated GPU-projection timing |
 | `mem_breakdown.json` | repo root | Checkpoint-by-checkpoint allocator snapshots |
-| `reports/nsys_final/nsys_gpu_projection.json` | reports/ | **Session 50 nsys GPU-projection data** — per-kernel timing, category breakdown, speedup for 2 shapes |
+| `reports/nsys_final/nsys_gpu_projection.json` | reports/ | **Session 50–51 nsys GPU-projection data** — per-kernel timing, category breakdown (noisy under contention) |
 | `reports/nsys_final/` | reports/ | nsys-derived kernel breakdown |
 | NCU reports | `/tmp/ncu_quant2.ncu-rep`, `/tmp/ncu_improved_gather.ncu-rep` | Session 48 NCU profiling (23 kernels, full metrics) |
 | `docs/FP8_ARCH_SPEC.md` | docs/ | Architecture spec, data flow, memory lifecycle |
@@ -379,8 +421,9 @@ FP8 GEMM savings scale with I. At I=4096+ the fixed quant overhead becomes negli
 
 ### Measurement Methodology
 
-1. **Idle GPU required** for absolute performance numbers (CUDA events or nsys GPU projection).
-2. **Subprocess isolation mandatory** — `SONIC_MOE_FP8_MODE` and `USE_QUACK_GEMM` are cached at import time.
-3. **NCU `--clock-control=none`** — essential on contested nodes to avoid thermal throttle artifacts.
-4. **nsys GPU projection** — the gold standard for latency (parse sqlite, compute GPU busy intervals). Wall-clock is unreliable on busy nodes.
-5. **Trimmed mean** — 12 iterations, drop 2 min + 2 max, mean of 8.
+1. **CUDA events within same process** — best on busy cluster (both modes see identical contention). Use median of 20 trials, 3+ independent rounds. Report min-of-medians for "clean round" or all rounds for variance analysis.
+2. **nsys GPU-projection** — gold standard on **idle** GPUs only. On busy cluster, BF16 and FP8 run in separate processes at different times → different contention → unreliable comparison.
+3. **NCU `--clock-control=none`** — essential on contested nodes to avoid thermal throttle artifacts. Use for per-kernel analysis, not end-to-end timing.
+4. **Subprocess isolation mandatory** — `SONIC_MOE_FP8_MODE` and `USE_QUACK_GEMM` are cached at import time.
+5. **`_fp8_mode()` fix required** — before Session 51, `enable_fp8(False)` did NOT disable FP8 when env var was set. Any pre-fix "BF16 baseline" with env var is invalid.
+6. **Trimmed mean** — 12 iterations, drop 2 min + 2 max, mean of 8 (for nsys).

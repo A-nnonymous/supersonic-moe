@@ -1282,7 +1282,9 @@ def _categorize_kernel(name: str) -> str:
     """
     nl = name.lower()
     # ── FP8 quantization family (check BEFORE GEMM/cutlass) ──────────
-    if "blockscaled_quant" in nl or "BlockscaledQuant" in name:
+    # Exclude ZeroMat GEMM kernels whose name includes "BlockscaledQuant"
+    # (e.g. GemmGatedSm100ZeroMatBlockscaledQuant — the epilogue-quant fwd GEMM)
+    if ("blockscaled_quant" in nl or "BlockscaledQuant" in name) and "Gemm" not in name:
         return "Blockscaled Quant"
     if "colwise" in nl and ("quant" in nl or "quantize" in nl):
         return "Blockscaled Quant"

@@ -579,13 +579,15 @@ def _fp8_mode() -> str:
     """Return FP8 mode: 'off', 'perf' (cache+speed), or 'mem' (no-cache+savings).
 
     Priority: SonicMoEConfig > enable_fp8() context > SONIC_MOE_FP8_MODE env var.
+    When is_fp8_active() returns False (e.g. enable_fp8(False)), this returns
+    'off' regardless of the env var — the context manager takes precedence.
     """
-    if is_fp8_active():
-        return "perf"
+    if not is_fp8_active():
+        return "off"
     mode = os.getenv("SONIC_MOE_FP8_MODE", "").strip().lower()
-    if mode in ("perf", "mem"):
-        return mode
-    return "off"
+    if mode == "mem":
+        return "mem"
+    return "perf"
 
 
 def _fp8_enabled() -> bool:
@@ -1154,7 +1156,7 @@ class _UpProjection(torch.autograd.Function):
 
                     # Stream-overlapped quant pipeline:
                     # S0 (main): dz_col (if not pre-computed) → free dz_bf16 → wait S1 → GEMM
-                    # S1 (side): x_col (Triton, handles gather)
+                    # S1 (side): x_col (Triton, handles gather — 1.5× faster than CuTe gather)
                     _side_stream = _get_dequant_stream()
                     _side_stream.wait_stream(torch.cuda.current_stream())
                     with torch.cuda.stream(_side_stream):
@@ -1733,7 +1735,7 @@ class _DownProjection(torch.autograd.Function):
                     _reset_stage_memory_probe()
                     if ctx._fp8_cfg.fp8_wgrad:
                         from ..quack_utils.blockscaled_fp8_gemm import (
-                            colwise_quantize_and_pack as _colwise_quant_triton,
+                            colwise_quantize_and_pack,
                             _run_cutlass_blockscaled_gemm_varlen_k,
                         )
                         from ..quack_utils.cute_blockscaled_quant import (
@@ -1746,7 +1748,6 @@ class _DownProjection(torch.autograd.Function):
                         # freed blocks (cross-stream reuse requires record_stream).
                         # Order: y1s_col → free y1s(-192M) → dz_col(reuses 192M) →
                         #         dz_row → free dz(-384M) → dout_col(reuses 384M) → GEMM
-                        # Latency: ~426µs serial (+50µs vs overlapped; 0.6% of total)
                         # Peak: background + dz(384) + y1s_col(96) + dz_col/dz_row(192)
 
                         y1s_col_fp8, y1s_col_sc = colwise_quantize_cute(
@@ -1764,7 +1765,8 @@ class _DownProjection(torch.autograd.Function):
                         _PREQUANTIZED_SCALES["bwd_col"] = (dz_col_fp8, dz_col_scales)
                         dz.untyped_storage().resize_(0)
 
-                        dout_col_fp8, dout_col_sc = _colwise_quant_triton(
+                        # Triton colwise quant with gather (faster than CuTe for indirect access)
+                        dout_col_fp8, dout_col_sc = colwise_quantize_and_pack(
                             dout, logical_rows=dout.shape[1],
                             logical_cols=TK_wgrad,
                             gather_idx=x_gather_idx,

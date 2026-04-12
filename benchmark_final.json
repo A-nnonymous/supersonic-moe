@@ -1,38 +1,596 @@
 {
-  "version": 3,
-  "session": 46,
-  "method": "CUDA-event trimmed mean (12 runs, drop 2 min + 2 max), subprocess-isolated, idle B200",
-  "shapes": {
-    "Ernie": {
-      "shape": "T=8192,H=3072,I=1536,E=8,K=8",
-      "bf16": {"mean_ms": 4.969, "std_ms": 0.016, "peak_mib": 1460.2},
-      "fp8":  {"mean_ms": 5.003, "std_ms": 0.033, "peak_mib": 1851.3},
-      "speedup": 0.993,
-      "mem_delta_mib": 391.1
-    },
-    "I=2048": {
-      "shape": "T=8192,H=3072,I=2048,E=8,K=8",
-      "bf16": {"mean_ms": 6.564, "std_ms": 0.012, "peak_mib": 1876.2},
-      "fp8":  {"mean_ms": 5.825, "std_ms": 0.010, "peak_mib": 2331.0},
-      "speedup": 1.127,
-      "mem_delta_mib": 454.9
-    }
+  "shape": {
+    "T": 8192,
+    "H": 3072,
+    "I": 1536,
+    "E": 8,
+    "K": 8
   },
-  "precision_audit": {
-    "seeds": [42, 123, 456, 789, 1024],
-    "Ernie": {
-      "fwd_relrmse_pct": 6.51, "fwd_correlation": 0.9979,
-      "dx_relrmse_pct": 6.52, "dw1_relrmse_pct": 4.69, "dw2_relrmse_pct": 4.84
+  "seeds": [
+    42,
+    123,
+    256
+  ],
+  "n_repeats": 3,
+  "warmup": 5,
+  "timing_iters": 30,
+  "results": [
+    {
+      "mode": "bf16",
+      "seed": 42,
+      "mem": {
+        "base": 376.5,
+        "fwd_peak": 1385.9,
+        "bwd_peak": 1412.3
+      },
+      "timing": {
+        "trimmed_ms": 9.484,
+        "min_ms": 9.396,
+        "p50_ms": 9.502,
+        "max_ms": 12.43
+      },
+      "precision": {},
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 0
     },
-    "I=2048": {
-      "fwd_relrmse_pct": 6.51, "fwd_correlation": 0.9979,
-      "dx_relrmse_pct": 6.54, "dw1_relrmse_pct": 4.72, "dw2_relrmse_pct": 4.88
+    {
+      "mode": "fp8",
+      "seed": 42,
+      "mem": {
+        "base": 674.3,
+        "fwd_peak": 1513.8,
+        "bwd_peak": 1678.8
+      },
+      "timing": {
+        "trimmed_ms": 8.949,
+        "min_ms": 8.572,
+        "p50_ms": 8.985,
+        "max_ms": 11.731
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.46,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 0
+    },
+    {
+      "mode": "fp8_stash",
+      "seed": 42,
+      "mem": {
+        "base": 457.6,
+        "fwd_peak": 1187.9,
+        "bwd_peak": 1313.6
+      },
+      "timing": {
+        "trimmed_ms": 6.028,
+        "min_ms": 5.998,
+        "p50_ms": 6.028,
+        "max_ms": 8.611
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.46,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 0
+    },
+    {
+      "mode": "bf16",
+      "seed": 123,
+      "mem": {
+        "base": 376.5,
+        "fwd_peak": 1385.9,
+        "bwd_peak": 1412.3
+      },
+      "timing": {
+        "trimmed_ms": 5.719,
+        "min_ms": 5.369,
+        "p50_ms": 5.705,
+        "max_ms": 11.622
+      },
+      "precision": {},
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 0
+    },
+    {
+      "mode": "fp8",
+      "seed": 123,
+      "mem": {
+        "base": 674.3,
+        "fwd_peak": 1513.8,
+        "bwd_peak": 1678.8
+      },
+      "timing": {
+        "trimmed_ms": 8.956,
+        "min_ms": 8.899,
+        "p50_ms": 8.989,
+        "max_ms": 11.149
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.47,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 0
+    },
+    {
+      "mode": "fp8_stash",
+      "seed": 123,
+      "mem": {
+        "base": 457.6,
+        "fwd_peak": 1187.9,
+        "bwd_peak": 1313.6
+      },
+      "timing": {
+        "trimmed_ms": 6.031,
+        "min_ms": 6.018,
+        "p50_ms": 6.031,
+        "max_ms": 8.622
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.47,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 0
+    },
+    {
+      "mode": "bf16",
+      "seed": 256,
+      "mem": {
+        "base": 376.5,
+        "fwd_peak": 1385.9,
+        "bwd_peak": 1412.3
+      },
+      "timing": {
+        "trimmed_ms": 9.478,
+        "min_ms": 9.414,
+        "p50_ms": 9.473,
+        "max_ms": 11.326
+      },
+      "precision": {},
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 0
+    },
+    {
+      "mode": "fp8",
+      "seed": 256,
+      "mem": {
+        "base": 674.3,
+        "fwd_peak": 1513.8,
+        "bwd_peak": 1678.8
+      },
+      "timing": {
+        "trimmed_ms": 8.974,
+        "min_ms": 8.796,
+        "p50_ms": 8.992,
+        "max_ms": 9.056
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.47,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 0
+    },
+    {
+      "mode": "fp8_stash",
+      "seed": 256,
+      "mem": {
+        "base": 457.6,
+        "fwd_peak": 1187.9,
+        "bwd_peak": 1313.6
+      },
+      "timing": {
+        "trimmed_ms": 6.023,
+        "min_ms": 5.996,
+        "p50_ms": 6.022,
+        "max_ms": 8.596
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.47,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 0
+    },
+    {
+      "mode": "bf16",
+      "seed": 42,
+      "mem": {
+        "base": 376.5,
+        "fwd_peak": 1385.9,
+        "bwd_peak": 1412.3
+      },
+      "timing": {
+        "trimmed_ms": 5.859,
+        "min_ms": 5.626,
+        "p50_ms": 5.824,
+        "max_ms": 26.871
+      },
+      "precision": {},
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 1
+    },
+    {
+      "mode": "fp8",
+      "seed": 42,
+      "mem": {
+        "base": 674.3,
+        "fwd_peak": 1513.8,
+        "bwd_peak": 1678.8
+      },
+      "timing": {
+        "trimmed_ms": 8.953,
+        "min_ms": 8.569,
+        "p50_ms": 8.983,
+        "max_ms": 9.286
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.46,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 1
+    },
+    {
+      "mode": "fp8_stash",
+      "seed": 42,
+      "mem": {
+        "base": 457.6,
+        "fwd_peak": 1187.9,
+        "bwd_peak": 1313.6
+      },
+      "timing": {
+        "trimmed_ms": 6.023,
+        "min_ms": 6.016,
+        "p50_ms": 6.023,
+        "max_ms": 27.896
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.46,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 1
+    },
+    {
+      "mode": "bf16",
+      "seed": 123,
+      "mem": {
+        "base": 376.5,
+        "fwd_peak": 1385.9,
+        "bwd_peak": 1412.3
+      },
+      "timing": {
+        "trimmed_ms": 5.745,
+        "min_ms": 5.603,
+        "p50_ms": 5.724,
+        "max_ms": 9.844
+      },
+      "precision": {},
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 1
+    },
+    {
+      "mode": "fp8",
+      "seed": 123,
+      "mem": {
+        "base": 674.3,
+        "fwd_peak": 1513.8,
+        "bwd_peak": 1678.8
+      },
+      "timing": {
+        "trimmed_ms": 8.965,
+        "min_ms": 8.561,
+        "p50_ms": 8.983,
+        "max_ms": 9.214
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.47,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 1
+    },
+    {
+      "mode": "fp8_stash",
+      "seed": 123,
+      "mem": {
+        "base": 457.6,
+        "fwd_peak": 1187.9,
+        "bwd_peak": 1313.6
+      },
+      "timing": {
+        "trimmed_ms": 6.026,
+        "min_ms": 6.002,
+        "p50_ms": 6.027,
+        "max_ms": 8.605
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.47,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 1
+    },
+    {
+      "mode": "bf16",
+      "seed": 256,
+      "mem": {
+        "base": 376.5,
+        "fwd_peak": 1385.9,
+        "bwd_peak": 1412.3
+      },
+      "timing": {
+        "trimmed_ms": 5.892,
+        "min_ms": 4.78,
+        "p50_ms": 5.758,
+        "max_ms": 12.304
+      },
+      "precision": {},
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 1
+    },
+    {
+      "mode": "fp8",
+      "seed": 256,
+      "mem": {
+        "base": 674.3,
+        "fwd_peak": 1513.8,
+        "bwd_peak": 1678.8
+      },
+      "timing": {
+        "trimmed_ms": 8.971,
+        "min_ms": 8.9,
+        "p50_ms": 8.984,
+        "max_ms": 23.913
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.47,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 1
+    },
+    {
+      "mode": "fp8_stash",
+      "seed": 256,
+      "mem": {
+        "base": 457.6,
+        "fwd_peak": 1187.9,
+        "bwd_peak": 1313.6
+      },
+      "timing": {
+        "trimmed_ms": 6.027,
+        "min_ms": 6.022,
+        "p50_ms": 6.026,
+        "max_ms": 8.6
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.47,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 1
+    },
+    {
+      "mode": "bf16",
+      "seed": 42,
+      "mem": {
+        "base": 376.5,
+        "fwd_peak": 1385.9,
+        "bwd_peak": 1412.3
+      },
+      "timing": {
+        "trimmed_ms": 9.488,
+        "min_ms": 4.13,
+        "p50_ms": 9.504,
+        "max_ms": 12.821
+      },
+      "precision": {},
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 2
+    },
+    {
+      "mode": "fp8",
+      "seed": 42,
+      "mem": {
+        "base": 674.3,
+        "fwd_peak": 1513.8,
+        "bwd_peak": 1678.8
+      },
+      "timing": {
+        "trimmed_ms": 8.962,
+        "min_ms": 8.572,
+        "p50_ms": 8.991,
+        "max_ms": 9.289
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.46,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 2
+    },
+    {
+      "mode": "fp8_stash",
+      "seed": 42,
+      "mem": {
+        "base": 457.6,
+        "fwd_peak": 1187.9,
+        "bwd_peak": 1313.6
+      },
+      "timing": {
+        "trimmed_ms": 6.032,
+        "min_ms": 6.022,
+        "p50_ms": 6.033,
+        "max_ms": 8.61
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.46,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 2
+    },
+    {
+      "mode": "bf16",
+      "seed": 123,
+      "mem": {
+        "base": 376.5,
+        "fwd_peak": 1385.9,
+        "bwd_peak": 1412.3
+      },
+      "timing": {
+        "trimmed_ms": 9.508,
+        "min_ms": 9.487,
+        "p50_ms": 9.508,
+        "max_ms": 11.574
+      },
+      "precision": {},
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 2
+    },
+    {
+      "mode": "fp8",
+      "seed": 123,
+      "mem": {
+        "base": 674.3,
+        "fwd_peak": 1513.8,
+        "bwd_peak": 1678.8
+      },
+      "timing": {
+        "trimmed_ms": 9.169,
+        "min_ms": 4.978,
+        "p50_ms": 9.113,
+        "max_ms": 9.843
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.47,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 2
+    },
+    {
+      "mode": "fp8_stash",
+      "seed": 123,
+      "mem": {
+        "base": 457.6,
+        "fwd_peak": 1187.9,
+        "bwd_peak": 1313.6
+      },
+      "timing": {
+        "trimmed_ms": 6.028,
+        "min_ms": 6.02,
+        "p50_ms": 6.028,
+        "max_ms": 8.603
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.47,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 2
+    },
+    {
+      "mode": "bf16",
+      "seed": 256,
+      "mem": {
+        "base": 376.5,
+        "fwd_peak": 1385.9,
+        "bwd_peak": 1412.3
+      },
+      "timing": {
+        "trimmed_ms": 9.505,
+        "min_ms": 9.474,
+        "p50_ms": 9.506,
+        "max_ms": 36.368
+      },
+      "precision": {},
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 2
+    },
+    {
+      "mode": "fp8",
+      "seed": 256,
+      "mem": {
+        "base": 674.3,
+        "fwd_peak": 1513.8,
+        "bwd_peak": 1678.8
+      },
+      "timing": {
+        "trimmed_ms": 8.972,
+        "min_ms": 8.543,
+        "p50_ms": 8.987,
+        "max_ms": 9.105
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.47,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 2
+    },
+    {
+      "mode": "fp8_stash",
+      "seed": 256,
+      "mem": {
+        "base": 457.6,
+        "fwd_peak": 1187.9,
+        "bwd_peak": 1313.6
+      },
+      "timing": {
+        "trimmed_ms": 5.515,
+        "min_ms": 3.812,
+        "p50_ms": 5.262,
+        "max_ms": 9.173
+      },
+      "precision": {
+        "out_rrmse": 6.6,
+        "out_corr": 0.9978,
+        "dx_rrmse": 7.47,
+        "dx_corr": 0.9972
+      },
+      "device": "CF-NG-BZZ2-O",
+      "repeat": 2
     }
-  },
-  "environment": {
-    "gpu": "B200 (CF-NG-BZZ2-O)",
-    "condition": "idle (0% util, 182 GiB free)",
-    "torch": "2.11.0+cu130",
-    "quack": "0.3.7"
-  }
+  ],
+  "device": "CF-NG-BZZ2-O"
 }

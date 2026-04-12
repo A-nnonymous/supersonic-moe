@@ -134,13 +134,13 @@
       "base": 0.0,
       "after_model": 216.05,
       "after_input": 360.05,
-      "pre_fwd": 524.92,
-      "post_fwd": 772.42,
-      "peak_fwd": 1375.42,
-      "pre_bwd": 772.42,
-      "post_bwd": 836.97,
-      "peak_bwd": 1475.55,
-      "post_cleanup": 572.92
+      "pre_fwd": 376.3,
+      "post_fwd": 773.05,
+      "peak_fwd": 1327.92,
+      "pre_bwd": 773.05,
+      "post_bwd": 763.34,
+      "peak_bwd": 1626.17,
+      "post_cleanup": 424.3
     },
     "detailed_snapshots": {
       "base": {
@@ -168,53 +168,53 @@
         "num_alloc_total": 10.0
       },
       "pre_fwd": {
-        "allocated_MiB": 524.9219,
-        "peak_allocated_MiB": 524.9219,
+        "allocated_MiB": 376.2969,
+        "peak_allocated_MiB": 376.2969,
         "reserved_MiB": 578.0,
         "peak_reserved_MiB": 578.0,
-        "num_allocs": 14.0,
-        "num_alloc_total": 500.0
+        "num_allocs": 8.0,
+        "num_alloc_total": 570.0
       },
       "post_fwd": {
-        "allocated_MiB": 772.4248,
-        "peak_allocated_MiB": 1375.4229,
-        "reserved_MiB": 1804.0,
-        "peak_reserved_MiB": 1804.0,
+        "allocated_MiB": 773.0498,
+        "peak_allocated_MiB": 1327.9233,
+        "reserved_MiB": 1516.0,
+        "peak_reserved_MiB": 1516.0,
         "num_allocs": 29.0,
-        "num_alloc_total": 538.0
+        "num_alloc_total": 613.0
       },
       "pre_bwd": {
-        "allocated_MiB": 772.4248,
-        "peak_allocated_MiB": 772.4248,
-        "reserved_MiB": 1804.0,
-        "peak_reserved_MiB": 1804.0,
+        "allocated_MiB": 773.0498,
+        "peak_allocated_MiB": 773.0498,
+        "reserved_MiB": 1516.0,
+        "peak_reserved_MiB": 1516.0,
         "num_allocs": 29.0,
-        "num_alloc_total": 538.0
+        "num_alloc_total": 613.0
       },
       "post_bwd": {
-        "allocated_MiB": 836.9697,
-        "peak_allocated_MiB": 1475.5493,
-        "reserved_MiB": 1804.0,
-        "peak_reserved_MiB": 1804.0,
-        "num_allocs": 21.0,
-        "num_alloc_total": 583.0
+        "allocated_MiB": 763.3447,
+        "peak_allocated_MiB": 1626.1743,
+        "reserved_MiB": 2304.0,
+        "peak_reserved_MiB": 2304.0,
+        "num_allocs": 17.0,
+        "num_alloc_total": 668.0
       },
       "cleanup": {
-        "allocated_MiB": 572.9219,
-        "peak_allocated_MiB": 572.9219,
-        "reserved_MiB": 770.0,
-        "peak_reserved_MiB": 770.0,
-        "num_allocs": 15.0,
-        "num_alloc_total": 583.0
+        "allocated_MiB": 424.2969,
+        "peak_allocated_MiB": 424.2969,
+        "reserved_MiB": 578.0,
+        "peak_reserved_MiB": 578.0,
+        "num_allocs": 9.0,
+        "num_alloc_total": 668.0
       }
     },
     "deltas": {
       "model_params": 216.0469,
       "input_tensors": 144.0,
-      "fwd_activation": 247.5029,
-      "fwd_peak_above_pre": 850.501,
-      "bwd_peak_above_pre": 703.1245,
-      "bwd_residual": 64.5449
+      "fwd_activation": 396.7529,
+      "fwd_peak_above_pre": 951.6264,
+      "bwd_peak_above_pre": 853.1245,
+      "bwd_residual": -9.7051
     },
     "param_sizes_mib": {
       "router.weight": 0.0469,
@@ -226,11 +226,7 @@
       "c_fc.weight": 144.0,
       "c_proj.weight": 72.0
     },
-    "fp8_caches_after_bwd": {
-      "FUSED_(3072, 1536, 8)": 37.125,
-      "VARLEN_(3072, 1536, 8)": 37.125,
-      "VARLEN_(3072, 3072, 8)": 74.25
-    },
+    "fp8_caches_after_bwd": {},
     "theoretical_sizes_mib": {
       "x_input_bf16": 48.0,
       "z_bf16_TK_2I": 384.0,
@@ -268,33 +264,33 @@
       "memory_mib": {
         "base": {
           "n": 9,
-          "mean": 495.4,
+          "mean": 457.6,
           "std": 0.0,
-          "min": 495.4,
-          "max": 495.4
+          "min": 457.6,
+          "max": 457.6
         },
         "fwd_peak": {
           "n": 9,
-          "mean": 1270.8,
+          "mean": 1187.9,
           "std": 0.0,
-          "min": 1270.8,
-          "max": 1270.8
+          "min": 1187.9,
+          "max": 1187.9
         },
         "bwd_peak": {
           "n": 9,
-          "mean": 1238.6,
+          "mean": 1313.6,
           "std": 0.0,
-          "min": 1238.6,
-          "max": 1238.6
+          "min": 1313.6,
+          "max": 1313.6
         }
       },
       "timing_ms": {
         "trimmed": {
           "n": 9,
-          "mean": 5.836,
-          "std": 0.052,
-          "min": 5.788,
-          "max": 5.967
+          "mean": 5.97,
+          "std": 0.171,
+          "min": 5.515,
+          "max": 6.032
         }
       },
       "precision": {
@@ -314,10 +310,10 @@
         },
         "dx_rrmse_pct": {
           "n": 9,
-          "mean": 7.473,
+          "mean": 7.467,
           "std": 0.005,
-          "min": 7.47,
-          "max": 7.48
+          "min": 7.46,
+          "max": 7.47
         },
         "dx_corr": {
           "n": 9,
@@ -329,18 +325,18 @@
       }
     },
     "comparison_vs_bf16": {
-      "fwd_peak_delta_mib": -115.1,
-      "bwd_peak_delta_mib": -173.7,
-      "fwd_peak_delta_pct": -8.305,
-      "bwd_peak_delta_pct": -12.299,
-      "timing_speedup": 1.0622,
-      "timing_delta_ms": -0.363
+      "fwd_peak_delta_mib": -198.0,
+      "bwd_peak_delta_mib": -98.7,
+      "fwd_peak_delta_pct": -14.287,
+      "bwd_peak_delta_pct": -6.989,
+      "timing_speedup": 1.3154,
+      "timing_delta_ms": -1.883
     }
   },
   "_metadata": {
     "source": "tools/rigorous_profiler.py",
     "profiler": "torch.cuda.memory_stats()",
-    "profile_trials": 2,
+    "profile_trials": 1,
     "note": "subprocess-isolated and aggregated across profiler trials"
   }
 }
