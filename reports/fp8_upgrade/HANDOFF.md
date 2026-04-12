@@ -1,6 +1,6 @@
 # Blockscaled FP8 MoE — Handoff
 
-> **Last updated:** 2026-04-15 (Session 51 — `_fp8_mode()` priority fix, CUDA events benchmark, classifier fix)
+> **Last updated:** 2026-04-12 (Session 51 — `_fp8_mode()` priority fix, CUDA events benchmark, classifier fix, documentation cleanup)
 > **Branch:** `native-fp8-exploration`
 > **Status:** Zero-materialization FP8 + iso32 weights + optional stash + CuTe DSL wgrad quant + Pythonic config API + unaligned FP8 padding + epilogue FP8 D output + early weight cache eviction + nsys GPU-projection engine. Contract suite: **34/34 tests + 20 subtests PASS**.
 
@@ -119,6 +119,8 @@ The backward peak occurs during **wgrad** (not dgated), so early cache eviction 
 - Net result: +24.8 MiB WORSE at both shapes. Reverted.
 
 ### nsys Category Breakdown (Session 50, per-iter, µs)
+
+> **Note:** These are from a specific nsys capture. Totals may differ from the performance table above because each nsys run captures a different contention window on the shared cluster. The **relative proportions** within each mode are the valuable signal, not the absolute totals.
 
 **I=1536:**
 
@@ -387,6 +389,28 @@ FP8 backward peak is +118 MiB over BF16 due to wgrad quantization temporaries. S
 
 ### P3: Larger shapes (I=4096, I=8192)
 FP8 GEMM savings scale with I. At I=4096+ the fixed quant overhead becomes negligible and speedup should exceed 1.2×.
+
+---
+
+## 8b. High-Value Lessons for Next Agent
+
+These lessons represent days of debugging distilled into actionable rules:
+
+1. **BF16 baselines MUST use subprocess isolation OR the `_fp8_mode()` fix.** The env var `SONIC_MOE_FP8_MODE` is cached at import time. If set, `enable_fp8(False)` context manager was broken before Session 51. After the fix, the context manager properly returns "off". But subprocess isolation (clearing env var before BF16 runs) is still the safest approach.
+
+2. **Measurement hierarchy on busy cluster:** CUDA events same-process > nsys on idle GPU > nsys on busy GPU > wall-clock. On a busy cluster, nsys runs BF16/FP8 in separate processes at different times with different contention — this can produce up to 10% noise in cross-mode comparison.
+
+3. **Quant overhead is the only remaining optimization target.** FP8 GEMM savings (1.84–1.89× on wgrad) are substantial, but quant overhead consumes 25–42% of FP8 time. row_quant is at HBM ceiling (97% occ, 4613 GB/s). CuTe colwise is 29µs (no gather) / 58µs (with gather); Triton gather is 39µs. The gather gap (CuTe 58µs vs Triton 39µs) is due to CuTe scalar gather loads — vectorized multi-address loads are needed.
+
+4. **FP8 advantage scales with I.** At I=1536 quant overhead nearly cancels GEMM savings (1.08×). At I=2048 the gap widens (1.22×). Mathematical model: GEMM savings ∝ O(I²), quant overhead ∝ O(I). Crossover is ~I=1536 on B200.
+
+5. **Weight stash is the dominant memory win.** FP8 alone saves only 4–5% peak (weight caches nearly offset activation savings). FP8+Stash saves 21–23% by freeing bf16 master weights during fwd+bwd (FP8 caches serve backward).
+
+6. **At production scale (expert parallelism), activations dominate weights.** When E_local ≈ 1–4, weights are small and FP8 activation savings (∝ T × I) become the primary benefit. The weight cache cost (∝ E × H × I) becomes negligible.
+
+7. **The "Other" category in nsys FP8 is inflated by +1335µs at I=1536.** This includes CUDA allocator overhead, kernel launch overhead, scale manipulation kernels, and other un-categorized operations. Reducing this requires either: (a) fusing more operations, (b) better categorization in introspect.py to identify the real culprits, or (c) reducing the number of kernel launches.
+
+8. **QuACK JIT cache fingerprint is package-source-based, NOT user-kernel-source-based.** After editing CuTe kernels, you MUST clear `/tmp/root/quack_cache/<hash>/*.o` AND call `_compile_colwise_quant.cache_clear()`. Forgetting this will silently run stale kernels.
 
 ---
 

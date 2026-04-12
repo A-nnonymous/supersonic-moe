@@ -120,7 +120,7 @@ The reporting policy for every FP8 step is:
 - memory baseline: official bf16
 - performance baselines: previous commit and official bf16
 
-## 🔥 FP8 Blockscaled Status (2026-04-15, Session 51)
+## 🔥 FP8 Blockscaled Status (2026-04-12, Session 51)
 
 The `native-fp8-exploration` branch has a fully functional **zero-materialization** blockscaled FP8 training path for Blackwell (B200) with **32×32 isotropic weight quantization**, optional **weight stash** memory optimization, native **CUTLASS / QuACK** FP8 kernels, **Pythonic config API** (`SonicMoEConfig`), **unaligned FP8 padding**, **epilogue FP8 D output** (z written directly as fp8 by CUTLASS), **CuTe DSL colwise quant kernels** (1.3× faster than Triton without gather), **early weight cache eviction**, and **nsys GPU-projection profiling** integrated into introspect.py. No TK-sized FP8 activation is materialized — the FP8 path matches SonicMoE's core BF16 design principle.
 
@@ -151,14 +151,14 @@ with cfg.activate():
 
 Alternatively, env vars still work: `USE_QUACK_GEMM=1` and `SONIC_MOE_FP8_MODE=perf`.
 
-### Performance (Session 51 — CUDA events + nsys, B200 under contention)
+### Performance (Session 51 — CUDA events, B200 under 100% GPU contention)
 
-| Shape | Method | BF16 (µs) | FP8 (µs) | Speedup |
-|-------|--------|:---------:|:--------:|:-------:|
-| **Ernie** (I=1536) | CUDA events (clean round) | 1436 | 1332 | **1.08×** |
-| **I=2048** | CUDA events (3 rounds avg) | 2044 | 1672 | **1.22×** |
+| Shape | BF16 (µs) | FP8 (µs) | Speedup | Variance |
+|-------|:---------:|:--------:|:-------:|----------|
+| **Ernie** (I=1536) | 1436 | 1332 | **1.08×** | BF16 highly variable (1436–2256µs across rounds); FP8 stable (1320–1336µs) |
+| **I=2048** | 2044 | 1672 | **1.22×** | Very consistent across all 3 rounds |
 
-> CUDA events measured in same process (both modes see identical contention). Median of 20 trials × 3 rounds. On a quiet GPU, expect ~1.05–1.10× at I=1536, ~1.15–1.22× at I=2048. FP8 advantage grows with I.
+> **Methodology:** CUDA events, same-process (both modes experience identical GPU contention). Median of 20 trials × 3 independent rounds. I=1536 uses the clean round (lowest BF16 contention); the 3-round average is 1.49× but inflated by BF16 contention spikes. See HANDOFF.md for full breakdown.
 
 ### Memory (Session 50–51, subprocess-isolated peak, env-var decontaminated)
 
@@ -209,9 +209,9 @@ moe.unstash_bf16()                # +216 MiB GPU (CPU → bf16)
 
 | Resource | Path | Why |
 |----------|------|-----|
+| **Agent context** | `AGENTS.md` / `agent.md` | Cold-start for new agents — status, API, key files, lessons |
 | **Handoff** | `reports/fp8_upgrade/HANDOFF.md` | Complete project state, bugs, measurements, next steps |
-| **Benchmark report** | `reports/fp8_upgrade/FP8_BENCHMARK_REPORT.md` | Detailed performance/precision/memory analysis (Chinese) |
-| Engineering log | `reports/fp8_upgrade/engineering_log.md` | Phase-by-phase development history |
+| Engineering log | `reports/fp8_upgrade/engineering_log.md` | Phase-by-phase development history (Phases 1–16) |
 | Frontier tests | `tests/fp8_large_project_contract_test.py` | 34-test contract gate (+20 subtests) |
 
 ## 📊 Architecture & Dataflow Visualization

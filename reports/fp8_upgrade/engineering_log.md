@@ -170,3 +170,42 @@
 35. **Autograd + fp8 tensors = illegal memory access** — at large shapes, fp8 dtype tensors in the autograd graph cause segfaults in backward. Solution: store a bf16 placeholder with `as_strided((0,0))` (2-byte storage), actual fp8 data in a side dict.
 36. **Cross-stream memory reuse needs record_stream** — PyTorch caching allocator won't reuse blocks across streams without explicit `record_stream` calls. Single-stream is simpler and lets freed blocks be immediately reusable.
 
+## Phase 14: Pythonic Config + Unaligned Padding + nsys Engine (Sessions 44–46)
+
+- **nsys GPU-projection engine** (Session 44): Integrated into `tools/introspect.py --mode nsys`. Launches separate BF16/FP8 subprocesses under nsys, parses `CUPTI_ACTIVITY_KIND_KERNEL` from sqlite, merges kernel intervals → per-iteration GPU busy time. Gold standard for latency measurement on idle GPUs.
+- **Pythonic Config API** (`SonicMoEConfig`, Sessions 45–46): Dataclass with 10 fields + thread-local context manager. Priority: config > context managers > env vars. Replaced env-var-only control.
+- **wgrad FP8 default-ON** (Session 45): `_use_fp8_wgrad()` returns True at all shapes. Trades ~19% slower wgrad GEMM for memory savings (early bf16 dz freeing).
+- **Unaligned FP8 padding** (Session 45): `_padded_blockscaled_gated_forward()` pads expert segments to 128 for FP8 GEMM alignment. Backward stays BF16 (QuACK BF16 handles unaligned natively).
+- **CuTe DSL colwise quant** (Session 43, continued): 29µs vs Triton 39µs = 1.3× faster without gather. 30 regs, 89–93% occupancy.
+- **Wall-clock unreliable** (Session 44+): Established that shared-node contention swamps kernel-time signal in wall-clock measurements.
+
+## Phase 15: Epilogue FP8 + CuTe Gather + NCU Profiling (Sessions 47–48)
+
+- **Epilogue FP8 D output**: GemmGated writes z as `float8_e4m3fn` directly. Eliminates standalone z quant (~141µs) + z.to(fp8) cast (~288µs). No bf16 z allocation (saves 384 MiB transient).
+- **BF16 autograd placeholder**: z stored as `as_strided((0,0))` bf16 (2 bytes). Actual fp8 z in `_PREQUANTIZED_SCALES["z_fp8"]`. Avoids fp8 tensors in autograd graph (segfaults at large shapes).
+- **CuTe colwise+gather optimization**: Warp-cooperative coalesced loads — 154µs → 58µs (2.7×). Still behind Triton's 39µs for gather case.
+- **23-kernel NCU report**: `/tmp/ncu_quant2.ncu-rep` with clock-control=none. Authoritative per-kernel metrics (time, regs, occ%, DRAM%, LD efficiency, effective BW).
+- **Pre-gather proven suboptimal**: index_select(24µs) + CuTe colwise(29µs) = 53µs > Triton fused(39µs).
+- **row_quant at ceiling**: 97% occupancy, 4613 GB/s. No further optimization possible.
+- **Single-stream wgrad**: Removed cross-stream overlap. +50µs latency but better memory reuse via caching allocator.
+- 34/34 tests pass.
+
+## Phase 16: Memory Analysis + Env-Var Fix + `_fp8_mode()` Fix (Sessions 49–51)
+
+- **Session 49**: First memory comparison attempted. **CONTAMINATED** by `SONIC_MOE_FP8_MODE=perf` env var leaking into "BF16" runs. All Session 49 data is invalid.
+- **Session 50**: Fixed contamination via explicit `os.environ.pop('SONIC_MOE_FP8_MODE', None)` before BF16 measurement. Clean memory data obtained: FP8 saves 4–5% peak (fwd), +118 MiB bwd (wgrad quant temps). FP8+Stash saves 21–23% overall.
+- **Session 50**: Backward memory deep-dive — peak is at wgrad (not dgated), so early cache eviction before dgated doesn't help at I=1536. Cache structure: only 37 MiB freeable (w2_varlen; w1T held by ctx reference).
+- **Session 50**: "Save x as fp8" attempted and reverted — dequant creates +24.8 MiB transient spike.
+- **Session 51**: **`_fp8_mode()` priority fix** — the actual root cause of Session 49 contamination. When `is_fp8_active()` returned False, the function fell through to env var check and returned "perf". Fix: return "off" immediately when `is_fp8_active()` is False.
+- **Session 51**: CUDA events 3-round benchmark (20-trial median × 3 rounds, same-process). I=1536: 1.08× (BF16 high-variance), I=2048: 1.22× (consistent). CUDA events proved more reliable than nsys under 100% GPU contention.
+- **Session 51**: Kernel classifier fix — ZeroMat GEMM kernels excluded from "Blockscaled Quant" category.
+
+### Lessons (Sessions 44–51)
+
+37. **env vars are process-global and cached at import** — `_IS_FP8_ACTIVE` is set once from env var. Same-process BF16/FP8 comparison with env var set will produce incorrect BF16 baselines.
+38. **Context manager must override env var** — the `_fp8_mode()` priority chain must be: config > context manager > env var. A "False" context manager must short-circuit before reaching env var.
+39. **CUDA events same-process is most reliable under contention** — both modes experience identical contention. nsys runs separate processes at different times with different contention levels.
+40. **FP8 is more contention-resilient** — under 100% GPU util, BF16 showed 57% timing variance while FP8 showed 1.2% at I=1536. Compute-bound FP8 GEMMs are less affected by memory bandwidth contention.
+41. **Weight stash is the dominant memory optimization** — 21–23% peak savings vs 4–5% from FP8 alone. The stash strategy works because FP8 caches serve backward, making bf16 master weights redundant during forward+backward.
+42. **FP8 backward peak > BF16 backward peak without stash** — wgrad quant creates ~118 MiB temporaries. This is fundamental to blockscaled FP8 wgrad and cannot be eliminated without fusing quant into the GEMM epilogue.
+
