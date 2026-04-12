@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .config import SonicMoEConfig, set_active_config
 from .count_cumsum import count_cumsum
 from .enums import ActivationType, KernelBackendMoE, is_glu
 from .functional import FP8Protocol, moe_TC_softmax_topk_layer, clear_all_fp8_weight_caches
@@ -184,6 +185,7 @@ class MoE(nn.Module):
         activation_function: ActivationType,
         add_bias: bool,
         std: float,
+        config: SonicMoEConfig | None = None,
     ) -> None:
         super().__init__()
 
@@ -192,6 +194,8 @@ class MoE(nn.Module):
 
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
+
+        self.config = config
 
         self.router = nn.Linear(in_features=self.hidden_size, out_features=num_experts, bias=False)
 
@@ -381,13 +385,19 @@ class MoE(nn.Module):
         is_inference_mode: bool = False,
         fp8_protocol: FP8Protocol | None = None,
         use_fp8: bool = False,
+        config: SonicMoEConfig | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         original_shape = hidden_states.shape
 
         # hidden_states -> (batch_size, query_length, hidden_size)
         hidden_states = hidden_states.view(-1, self.hidden_size)
 
+        # Resolve config: forward arg > instance attr > None
+        active_config = config or self.config
+
         with ExitStack() as stack:
+            if active_config is not None:
+                stack.enter_context(active_config.activate())
             if use_fp8:
                 stack.enter_context(enable_fp8())
 

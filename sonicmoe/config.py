@@ -1,0 +1,186 @@
+# ********************************************************************************
+# Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
+# ********************************************************************************
+
+"""Pythonic configuration for SonicMoE FP8 and GEMM settings.
+
+Replaces environment-variable-based configuration with a structured dataclass.
+Environment variables are still respected as the lowest-priority fallback.
+
+Priority order (highest → lowest):
+  1. Explicit field values in ``SonicMoEConfig``
+  2. ``enable_fp8()`` / ``enable_quack_gemm()`` context managers
+  3. Environment variables (``SONIC_MOE_FP8_MODE``, ``USE_QUACK_GEMM``, etc.)
+
+Usage::
+
+    from sonicmoe import MoE, SonicMoEConfig
+
+    cfg = SonicMoEConfig(use_fp8=True, fp8_wgrad=True)
+    moe = MoE(..., config=cfg)
+    out, loss = moe(x)           # FP8 enabled via config, no env vars needed
+
+    # Or use context manager for temporary override:
+    cfg2 = SonicMoEConfig(use_fp8=True, save_z_fp8=False)
+    with cfg2.activate():
+        out, loss = moe(x)
+"""
+
+from __future__ import annotations
+
+import os
+import threading
+from contextlib import contextmanager
+from dataclasses import dataclass, field, fields
+from typing import Optional
+
+
+def _env_bool(name: str, default: Optional[bool] = None) -> Optional[bool]:
+    """Read a boolean from an environment variable. Returns None if unset."""
+    val = os.getenv(name, "").strip().lower()
+    if val in ("1", "true", "yes", "on"):
+        return True
+    if val in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
+@dataclass
+class SonicMoEConfig:
+    """Configuration for SonicMoE FP8 and GEMM behavior.
+
+    All fields default to ``None``, meaning "use env var or built-in default".
+    Set a field explicitly to override the corresponding env var.
+
+    Attributes:
+        use_fp8: Enable the FP8 fast path. Env: ``SONIC_MOE_FP8_MODE``.
+        use_quack_gemm: Enable QuACK GEMM backend. Env: ``USE_QUACK_GEMM``.
+            Auto-enabled when ``use_fp8=True``.
+        fp8_wgrad: Enable FP8 weight gradients. Env: ``SONIC_MOE_FP8_WGRAD``.
+            Default: auto (ON at I>=2048, OFF at I<2048).
+        fused_gated: Use fused gemm_gated/dgated CUTLASS kernels.
+            Env: ``SONIC_MOE_FP8_FUSED_GATED``. Default: True.
+        save_z_fp8: Save z tensor in FP8 to reduce memory.
+            Env: ``SONIC_MOE_FP8_SAVE_Z_FP8``. Default: True.
+        fused_swiglu_quant: Use fused SwiGLU+quantize kernels.
+            Env: ``SONIC_MOE_FP8_FUSED_SWIGLU_QUANT``. Default: True.
+        epilogue_quant: Enable epilogue blockscaled quant of z.
+            Env: ``SONIC_MOE_FP8_EPILOGUE_QUANT``. Default: False.
+        fused_zy1_quant: Enable fused z+y1 quantization.
+            Env: ``SONIC_MOE_FP8_FUSED_ZY1_QUANT``. Default: False.
+        assume_aligned: Force alignment assumption (skip D2H check).
+            Env: ``SONIC_MOE_FP8_ASSUME_ALIGNED``. Default: False.
+        stagewise_memory: Enable per-stage memory logging.
+            Env: ``SONIC_MOE_STAGEWISE_MEMORY``. Default: False.
+    """
+
+    use_fp8: Optional[bool] = None
+    use_quack_gemm: Optional[bool] = None
+    fp8_wgrad: Optional[bool] = None
+    fused_gated: Optional[bool] = None
+    save_z_fp8: Optional[bool] = None
+    fused_swiglu_quant: Optional[bool] = None
+    epilogue_quant: Optional[bool] = None
+    fused_zy1_quant: Optional[bool] = None
+    assume_aligned: Optional[bool] = None
+    stagewise_memory: Optional[bool] = None
+
+    def __post_init__(self) -> None:
+        # Auto-enable quack_gemm when fp8 is explicitly enabled.
+        if self.use_fp8 is True and self.use_quack_gemm is None:
+            self.use_quack_gemm = True
+
+    # --- Resolution: config field > env var > built-in default ---------------
+
+    def resolve_use_fp8(self) -> bool:
+        if self.use_fp8 is not None:
+            return self.use_fp8
+        return _env_bool("SONIC_MOE_FP8_MODE", False) or False
+
+    def resolve_use_quack_gemm(self) -> bool:
+        if self.use_quack_gemm is not None:
+            return self.use_quack_gemm
+        return os.getenv("USE_QUACK_GEMM", "0") == "1"
+
+    def resolve_fp8_wgrad(self) -> Optional[bool]:
+        """Return True/False if explicitly set, None for auto-detect."""
+        if self.fp8_wgrad is not None:
+            return self.fp8_wgrad
+        return _env_bool("SONIC_MOE_FP8_WGRAD")
+
+    def resolve_fused_gated(self) -> bool:
+        if self.fused_gated is not None:
+            return self.fused_gated
+        return _env_bool("SONIC_MOE_FP8_FUSED_GATED", True) or False
+
+    def resolve_save_z_fp8(self) -> bool:
+        if self.save_z_fp8 is not None:
+            return self.save_z_fp8
+        return _env_bool("SONIC_MOE_FP8_SAVE_Z_FP8", True) or False
+
+    def resolve_fused_swiglu_quant(self) -> bool:
+        if self.fused_swiglu_quant is not None:
+            return self.fused_swiglu_quant
+        return _env_bool("SONIC_MOE_FP8_FUSED_SWIGLU_QUANT", True) or False
+
+    def resolve_epilogue_quant(self) -> bool:
+        if self.epilogue_quant is not None:
+            return self.epilogue_quant
+        return _env_bool("SONIC_MOE_FP8_EPILOGUE_QUANT", False) or False
+
+    def resolve_fused_zy1_quant(self) -> bool:
+        if self.fused_zy1_quant is not None:
+            return self.fused_zy1_quant
+        return _env_bool("SONIC_MOE_FP8_FUSED_ZY1_QUANT", False) or False
+
+    def resolve_assume_aligned(self) -> bool:
+        if self.assume_aligned is not None:
+            return self.assume_aligned
+        return _env_bool("SONIC_MOE_FP8_ASSUME_ALIGNED", False) or False
+
+    def resolve_stagewise_memory(self) -> bool:
+        if self.stagewise_memory is not None:
+            return self.stagewise_memory
+        return _env_bool("SONIC_MOE_STAGEWISE_MEMORY", False) or False
+
+    # --- Context manager for temporary activation ----------------------------
+
+    @contextmanager
+    def activate(self):
+        """Context manager: push this config as the active thread-local config.
+
+        Usage::
+
+            cfg = SonicMoEConfig(use_fp8=True, fp8_wgrad=True)
+            with cfg.activate():
+                out, loss = moe(x)
+        """
+        prev = get_active_config()
+        set_active_config(self)
+        try:
+            yield self
+        finally:
+            set_active_config(prev)
+
+    def replace(self, **kwargs) -> "SonicMoEConfig":
+        """Return a new config with selected fields overridden."""
+        from dataclasses import asdict
+        d = asdict(self)
+        d.update(kwargs)
+        return SonicMoEConfig(**d)
+
+
+# ---------------------------------------------------------------------------
+# Thread-local active config — set by SonicMoEConfig.activate() or directly
+# ---------------------------------------------------------------------------
+_active_config = threading.local()
+
+
+def get_active_config() -> Optional[SonicMoEConfig]:
+    """Return the currently active SonicMoEConfig, or None."""
+    return getattr(_active_config, "config", None)
+
+
+def set_active_config(cfg: Optional[SonicMoEConfig]) -> None:
+    """Set the active SonicMoEConfig for the current thread."""
+    _active_config.config = cfg

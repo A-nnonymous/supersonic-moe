@@ -551,7 +551,7 @@ def quantize_activation_blockscaled_fast(
     fp8_out = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=x.device)
     scale_out = torch.empty(M, num_groups, dtype=torch.uint8, device=x.device)
 
-    TILE_ROWS = 32
+    TILE_ROWS = 128  # Larger tile: fewer CTAs, better wave occupancy
     TILE_COLS = min(K, 256)
     grid = (_div_up(M, TILE_ROWS), _div_up(K, TILE_COLS))
     _quantize_flat_v2_kernel[grid](
@@ -2801,7 +2801,7 @@ def fast_gather_quantize_and_pack_activation(
             (1, per_batch_storage_tk), 127, dtype=torch.uint8, device=x.device
         )
 
-    BLOCK_ROWS = 32
+    BLOCK_ROWS = 128  # Larger blocks: fewer CTAs for lightweight gather
     grid = (_div_up(TK, BLOCK_ROWS), k_tiles)
     groups_per_k_tile = _SF_TILE_K // group_size  # typically 4
     _gather_isa_packed_scales_kernel[grid](
@@ -2947,7 +2947,7 @@ def pad_quantize_and_pack_activation(
     per_batch_storage = _storage_per_batch(padded_total, K)
     packed_scales = torch.zeros((1, per_batch_storage), dtype=torch.uint8, device=a.device)
 
-    BLOCK_ROWS = 16  # Production-shape: consistent with gather_quantize optimizations
+    BLOCK_ROWS = 32  # Larger block vs 16: fewer CTAs, better for padded path
     grid = (_div_up(padded_total, BLOCK_ROWS),)
     _pad_quantize_and_pack_kernel[grid](
         a,

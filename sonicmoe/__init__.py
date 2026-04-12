@@ -27,5 +27,6 @@ from .functional import (
     validate_fp8_protocol,
     validate_fp8_runtime_support,
 )
+from .config import SonicMoEConfig, get_active_config, set_active_config
 from .moe import MoE
 from .quack_utils import make_blockscaled_grouped_reverse_scatter_idx, pack_blockscaled_1x32_scales

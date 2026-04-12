@@ -10,6 +10,13 @@ visualization suite (``python -m visualization``).
 instrumentation uses PyTorch's public hook APIs + monkey-patching
 of autograd Function boundaries.
 
+Session 46 improvements:
+  - 15-iteration warmup (was 3/5) for Triton JIT stability
+  - CUDA-event timing alongside wallclock in kernel profiler
+  - 5-seed precision audit (was 3)
+  - 300s subprocess timeout (was 120) for JIT compilation
+  - Compatible with SonicMoEConfig Pythonic config API
+
 Modes
 -----
   trace   — shapes / dtypes / lifecycle / memory (~3 s)
@@ -29,11 +36,14 @@ from __future__ import annotations
 import argparse
 import collections
 import gc
+import importlib.util
 import inspect
 import json
+import math
 import os
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 import weakref
@@ -48,10 +58,18 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST_PATH = ROOT / "manifest.json"
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
+BENCHMARK_FINAL_PATH = ROOT / "benchmark_final.json"
+MEM_BREAKDOWN_PATH = ROOT / "mem_breakdown.json"
+KERNEL_BREAKDOWN_ROOT_PATH = ROOT / "kernel_breakdown.json"
+KERNEL_BREAKDOWN_COMPAT_PATH = ROOT / "reports" / "nsys_final" / "kernel_breakdown.json"
 
 # Default Ernie shape
 SHAPE = {"T": 8192, "H": 3072, "I": 1536, "E": 8, "K": 8}
+DEFAULT_SHAPE = dict(SHAPE)
+DEFAULT_PRECISION_SEEDS = [42, 123, 456, 789, 1024]
+DEFAULT_BENCH_REPEATS = 3
+PERSISTENT_TMP_ROOT = Path("/root/paddlejob/share-storage/gpfs/system-public/panzhaowu")
 
 # Map _log_stage_memory stage names → visualization phase IDs (0-5)
 STAGE_TO_PHASE = {
@@ -144,6 +162,7 @@ class ModeManifest:
     total_cuda_us: float = 0.0
     wall_clock_ms: float = 0.0
     precision_matrix: list[list[int]] = field(default_factory=list)
+    theoretical_memory: dict[str, Any] = field(default_factory=dict)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -175,6 +194,104 @@ def _tensor_size_mib(t) -> float:
     if t is None:
         return 0.0
     return t.nelement() * t.element_size() / (1024 ** 2)
+
+
+def _shape_tuple(shape: dict[str, int]) -> tuple[int, int, int, int, int]:
+    return tuple(shape[k] for k in ("T", "H", "I", "E", "K"))
+
+
+def _is_default_shape() -> bool:
+    return _shape_tuple(SHAPE) == _shape_tuple(DEFAULT_SHAPE)
+
+
+def _safe_mean(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _safe_std(values: list[float]) -> float:
+    if len(values) <= 1:
+        return 0.0
+    mu = _safe_mean(values)
+    return math.sqrt(sum((v - mu) ** 2 for v in values) / (len(values) - 1))
+
+
+def _stat_summary(values: list[float], digits: int = 3) -> dict[str, float]:
+    if not values:
+        return {"n": 0, "mean": 0.0, "std": 0.0, "min": 0.0, "max": 0.0}
+    return {
+        "n": len(values),
+        "mean": round(_safe_mean(values), digits),
+        "std": round(_safe_std(values), digits),
+        "min": round(min(values), digits),
+        "max": round(max(values), digits),
+    }
+
+
+def _load_python_module(module_name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load module from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _build_subprocess_env(mode: str, gpu: int) -> dict[str, str]:
+    env = os.environ.copy()
+    env["USE_QUACK_GEMM"] = "1"
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    env["PYTHONPATH"] = str(ROOT) + (":" + env.get("PYTHONPATH", "") if env.get("PYTHONPATH") else "")
+    if mode == "fp8":
+        env["SONIC_MOE_FP8_MODE"] = "perf"
+    else:
+        env.pop("SONIC_MOE_FP8_MODE", None)
+        env.pop("SONIC_MOE_FP8_DOUBLE_QUANT", None)
+    return env
+
+
+def _persistent_tempdir():
+    temp_root = PERSISTENT_TMP_ROOT if PERSISTENT_TMP_ROOT.exists() else None
+    return tempfile.TemporaryDirectory(dir=str(temp_root) if temp_root else None)
+
+
+def _build_model_and_input(device):
+    import torch
+    from sonicmoe import MoE
+    from sonicmoe.enums import ActivationType
+
+    torch.manual_seed(42)
+    model = MoE(
+        SHAPE["E"], SHAPE["K"], SHAPE["H"], SHAPE["I"],
+        ActivationType.SWIGLU, False, 0.02,
+    ).to(device).to(torch.bfloat16)
+    x = 0.02 * torch.randn(
+        SHAPE["T"], SHAPE["H"],
+        dtype=torch.bfloat16, device=device, requires_grad=True,
+    )
+    return model, x
+
+
+def _warmup_mode(model, x, use_fp8: bool, iters: int = 15) -> None:
+    import torch
+    from sonicmoe.functional.utils import enable_fp8, enable_quack_gemm
+
+    if use_fp8 and hasattr(model, "refresh_fp8_shadow_weights"):
+        model.refresh_fp8_shadow_weights()
+
+    for _ in range(iters):
+        xw = x.detach().clone().requires_grad_(True)
+        with enable_quack_gemm(True):
+            if use_fp8:
+                with enable_fp8(True):
+                    ow, lw = model(xw, use_fp8=True)
+            else:
+                ow, lw = model(xw)
+        (ow.sum() + lw).backward()
+        model.zero_grad(set_to_none=True)
+        del ow, lw, xw
+
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -670,6 +787,36 @@ def _build_precision_matrix(tensors: list[TensorRecord], n_phases: int = 6) -> l
     return matrix
 
 
+def _compute_theoretical_memory(
+    tensors: list[TensorRecord],
+    phase_memory: list[PhaseMemory],
+    n_phases: int = 6,
+) -> dict[str, dict[str, Any]]:
+    """Estimate tracked live memory per phase from tensor lifetimes."""
+    phase_map = {pm.phase_id: pm for pm in phase_memory}
+    theory: dict[str, dict[str, Any]] = {}
+    for phase in range(n_phases):
+        alive = [t for t in tensors if t.create_phase <= phase <= t.free_phase]
+        total_mib = round(sum(t.size_mib for t in alive), 2)
+        top_tensors = sorted(alive, key=lambda t: -t.size_mib)[:5]
+        entry: dict[str, Any] = {
+            "phase_name": PHASE_NAMES[phase] if phase < len(PHASE_NAMES) else f"phase_{phase}",
+            "tracked_live_mib": total_mib,
+            "tensor_count": len(alive),
+            "top_tensors": [
+                {"name": t.name, "size_mib": round(t.size_mib, 2), "dtype": t.dtype}
+                for t in top_tensors
+            ],
+        }
+        measured = phase_map.get(phase)
+        if measured is not None:
+            entry["measured_allocated_mib"] = measured.allocated_mib
+            entry["measured_peak_mib"] = measured.peak_mib
+            entry["gap_vs_peak_mib"] = round(measured.peak_mib - total_mib, 2)
+        theory[str(phase)] = entry
+    return theory
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Memory Trajectory
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -691,6 +838,8 @@ def _capture_memory_trajectory(model, x, use_fp8: bool) -> dict[str, float]:
     x_run = x.detach().clone().requires_grad_(True)
     with enable_quack_gemm(True):
         if use_fp8:
+            if hasattr(model, "refresh_fp8_shadow_weights"):
+                model.refresh_fp8_shadow_weights()
             with enable_fp8(True):
                 out, loss_val = model(x_run, use_fp8=True)
         else:
@@ -774,6 +923,8 @@ def run_trace(mode: str, model, x, device,
 
     # Run instrumented forward + backward with saved_tensors_hooks
     x_run = x.detach().clone().requires_grad_(True)
+    if use_fp8 and hasattr(model, "refresh_fp8_shadow_weights"):
+        model.refresh_fp8_shadow_weights()
 
     # Pre-register input so F.linear's autograd save finds the correct name
     tensor_spy._record_tensor("x", x_run, phase=0)
@@ -808,8 +959,197 @@ def run_trace(mode: str, model, x, device,
     gc.collect()
     torch.cuda.empty_cache()
     manifest.memory_trajectory = _capture_memory_trajectory(model, x, use_fp8)
+    manifest.theoretical_memory = _compute_theoretical_memory(
+        manifest.tensors, manifest.phase_memory
+    )
 
     return manifest
+
+
+def _run_trace_worker(trace_mode: str) -> dict[str, Any]:
+    """Worker entrypoint used by the subprocess-isolated trace runner."""
+    import torch
+
+    device = torch.device("cuda:0")
+    torch.cuda.set_device(device)
+
+    model, x = _build_model_and_input(device)
+    _warmup_mode(model, x, use_fp8=(trace_mode == "fp8"))
+
+    phase_tracker = PhaseTracker()
+    tensor_spy = TensorSpy(phase_tracker)
+    phase_tracker.install()
+    tensor_spy.install(model)
+    try:
+        manifest = run_trace(trace_mode, model, x, device, phase_tracker, tensor_spy)
+    finally:
+        tensor_spy.uninstall()
+        phase_tracker.uninstall()
+
+    return {
+        "mode": manifest.mode,
+        "tensors": [asdict(t) for t in manifest.tensors],
+        "phase_memory": [asdict(pm) for pm in manifest.phase_memory],
+        "memory_trajectory": manifest.memory_trajectory,
+        "precision_matrix": manifest.precision_matrix,
+        "theoretical_memory": manifest.theoretical_memory,
+    }
+
+
+def run_trace_isolated(trace_mode: str, gpu: int) -> ModeManifest:
+    """Run one trace in a clean subprocess to avoid FP8 mode contamination."""
+    shape_arg = ",".join(str(SHAPE[k]) for k in ("T", "H", "I", "E", "K"))
+    env = _build_subprocess_env(trace_mode, gpu)
+    proc = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--shape", shape_arg,
+            "--_worker-trace", trace_mode,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        cwd=str(ROOT),
+        env=env,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"Trace worker [{trace_mode}] failed:\n"
+            f"{proc.stderr[-2000:] or proc.stdout[-2000:]}"
+        )
+
+    payload = None
+    for line in proc.stdout.splitlines():
+        if line.startswith("__TRACE_JSON__"):
+            payload = json.loads(line[len("__TRACE_JSON__"):])
+            break
+    if payload is None:
+        raise RuntimeError(f"Trace worker [{trace_mode}] emitted no JSON payload")
+
+    manifest = ModeManifest(mode=payload["mode"])
+    manifest.tensors = [TensorRecord(**t) for t in payload.get("tensors", [])]
+    manifest.phase_memory = [PhaseMemory(**pm) for pm in payload.get("phase_memory", [])]
+    manifest.memory_trajectory = payload.get("memory_trajectory", {})
+    manifest.precision_matrix = payload.get("precision_matrix", [])
+    manifest.theoretical_memory = payload.get("theoretical_memory", {})
+    return manifest
+
+
+def _run_collect_worker(mode: str, seed: int, out_path: Path) -> None:
+    """Worker entrypoint: materialize outputs and grads for precision audit."""
+    import torch
+    from sonicmoe.functional.utils import enable_fp8, enable_quack_gemm
+
+    device = torch.device("cuda:0")
+    torch.cuda.set_device(device)
+
+    model, _ = _build_model_and_input(device)
+    if mode == "fp8" and hasattr(model, "refresh_fp8_shadow_weights"):
+        model.refresh_fp8_shadow_weights()
+
+    torch.manual_seed(seed)
+    x = (0.02 * torch.randn(
+        SHAPE["T"], SHAPE["H"], dtype=torch.bfloat16, device=device
+    )).detach().requires_grad_(True)
+    with enable_quack_gemm(True):
+        if mode == "fp8":
+            with enable_fp8(True):
+                out, loss_val = model(x, use_fp8=True)
+        else:
+            out, loss_val = model(x)
+
+    loss = out.sum() + loss_val
+    loss.backward()
+    torch.cuda.synchronize()
+
+    payload = {
+        "output": out.detach().cpu(),
+        "dx": x.grad.detach().cpu() if x.grad is not None else None,
+        "dw1": model.c_fc.weight.grad.detach().cpu() if model.c_fc.weight.grad is not None else None,
+        "dw2": model.c_proj.weight.grad.detach().cpu() if model.c_proj.weight.grad is not None else None,
+    }
+    torch.save(payload, out_path)
+
+
+def run_precision_audit_isolated(gpu: int, seeds: list[int]) -> dict[str, Any]:
+    """Precision audit with one subprocess per mode/seed."""
+    import torch
+
+    def _collect(mode: str, seed: int, out_path: Path) -> None:
+        env = _build_subprocess_env(mode, gpu)
+        shape_arg = ",".join(str(SHAPE[k]) for k in ("T", "H", "I", "E", "K"))
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--shape", shape_arg,
+                "--_worker-collect", mode,
+                "--_worker-seed", str(seed),
+                "--_worker-output", str(out_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=600,
+            cwd=str(ROOT),
+            env=env,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"Precision worker [{mode}, seed={seed}] failed:\n"
+                f"{proc.stderr[-2000:] or proc.stdout[-2000:]}"
+            )
+
+    def _rrmse(a, b):
+        diff = (a.float() - b.float())
+        denom = b.float().norm().clamp(min=1e-8)
+        return float((diff.norm() / denom * 100).item())
+
+    def _cosine(a, b):
+        a_flat = a.flatten().double()
+        b_flat = b.flatten().double()
+        denom = (a_flat.norm() * b_flat.norm()).clamp(min=1e-12)
+        val = float((a_flat * b_flat).sum().item() / denom.item())
+        return max(-1.0, min(1.0, val))
+
+    metric_store: dict[str, dict[str, list[float]]] = {
+        "rrmse_pct": collections.defaultdict(list),
+        "cosine_sim": collections.defaultdict(list),
+    }
+
+    with _persistent_tempdir() as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        for seed in seeds:
+            bf16_path = tmpdir_path / f"bf16_s{seed}.pt"
+            fp8_path = tmpdir_path / f"fp8_s{seed}.pt"
+            _collect("bf16", seed, bf16_path)
+            _collect("fp8", seed, fp8_path)
+            bf16_out = torch.load(bf16_path, weights_only=False)
+            fp8_out = torch.load(fp8_path, weights_only=False)
+
+            for key in ["output", "dx", "dw1", "dw2"]:
+                ref = bf16_out.get(key)
+                test = fp8_out.get(key)
+                if ref is None or test is None:
+                    continue
+                metric_store["rrmse_pct"][key].append(_rrmse(test, ref))
+                metric_store["cosine_sim"][key].append(_cosine(test, ref))
+
+    audit = {
+        "seeds": seeds,
+        "rrmse_pct": {},
+        "cosine_sim": {},
+        "stats": {"rrmse_pct": {}, "cosine_sim": {}},
+    }
+    for group in ("rrmse_pct", "cosine_sim"):
+        for key, values in metric_store[group].items():
+            if not values:
+                continue
+            digits = 4 if group == "cosine_sim" else 3
+            audit[group][key] = round(_safe_mean(values), digits)
+            audit["stats"][group][key] = _stat_summary(values, digits=digits)
+
+    return audit
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -836,8 +1176,8 @@ x = 0.02 * torch.randn(T, H, dtype=torch.bfloat16, device=device, requires_grad=
 
 use_fp8 = (MODE == "fp8")
 
-# Warmup
-for _ in range(5):
+# Warmup (15 iterations for Triton JIT stability)
+for _ in range(15):
     xw = x.detach().clone().requires_grad_(True)
     with enable_quack_gemm(True):
         if use_fp8:
@@ -869,12 +1209,16 @@ with torch.profiler.profile(
         del op, lp, xp
     torch.cuda.synchronize()
 
-# Wall-clock timing
+# Wall-clock timing + CUDA-event timing
 times = []
+cuda_times = []
 for _ in range(20):
     xt = x.detach().clone().requires_grad_(True)
     torch.cuda.synchronize()
+    start_evt = torch.cuda.Event(enable_timing=True)
+    end_evt = torch.cuda.Event(enable_timing=True)
     t0 = time.perf_counter()
+    start_evt.record()
     with enable_quack_gemm(True):
         if use_fp8:
             with enable_fp8(True):
@@ -882,12 +1226,18 @@ for _ in range(20):
         else:
             ot, lt = model(xt)
     (ot.sum() + lt).backward()
+    end_evt.record()
     torch.cuda.synchronize()
     t1 = time.perf_counter()
     times.append((t1 - t0) * 1000)
+    cuda_times.append(start_evt.elapsed_time(end_evt))
     model.zero_grad(set_to_none=True)
     del ot, lt, xt
 gc.collect()
+
+# Trimmed mean: drop 4 (2 min + 2 max) from 20, mean of 16
+cuda_times.sort()
+trimmed_cuda = cuda_times[2:-2]
 
 # Aggregate kernels
 kernel_agg = defaultdict(lambda: {{"total_us": 0.0, "count": 0}})
@@ -905,6 +1255,7 @@ result = {{
     "mode": MODE,
     "total_cuda_us": round(total_cuda, 1),
     "wall_clock_ms": round(sum(times[5:]) / len(times[5:]), 3),
+    "cuda_event_ms": round(sum(trimmed_cuda) / len(trimmed_cuda), 3),
     "kernels": [
         {{"name": k, "cuda_time_us": round(v["total_us"], 2), "count": v["count"]}}
         for k, v in sorted_kernels if v["total_us"] > 1.0
@@ -943,7 +1294,7 @@ def _categorize_kernel(name: str) -> str:
     return "Other"
 
 
-def run_kernel_profile() -> dict[str, Any]:
+def run_kernel_profile(gpu: int = 0) -> dict[str, Any]:
     """Run kernel profiling in subprocess for both BF16 and FP8.
 
     Returns dict with "bf16" and "fp8" kernel data.
@@ -954,17 +1305,14 @@ def run_kernel_profile() -> dict[str, Any]:
     result = {}
     for mode in ("bf16", "fp8"):
         script = _KERNEL_PROFILE_SCRIPT.format(**SHAPE)
-        env = os.environ.copy()
+        env = _build_subprocess_env(mode, gpu)
         env["_PROFILER_MODE"] = mode
-        env["USE_QUACK_GEMM"] = "1"
-        if mode == "fp8":
-            env["SONIC_MOE_FP8_MODE"] = "perf"
 
         print(f"  Kernel profiling [{mode}] in subprocess ...", flush=True)
         try:
             proc = subprocess.run(
                 [python_bin, "-c", script],
-                capture_output=True, text=True, timeout=120, env=env,
+                capture_output=True, text=True, timeout=300, env=env,
                 cwd=str(ROOT),
             )
             # Extract JSON from output
@@ -986,6 +1334,320 @@ def run_kernel_profile() -> dict[str, Any]:
             print(f"  WARNING: Kernel profiling [{mode}] failed: {e}", flush=True)
 
     return result
+
+
+def run_rigorous_benchmark(gpu: int, seeds: list[int], repeats: int) -> dict[str, Any] | None:
+    """Run the repeated benchmark suite used by README/session figures."""
+    if not _is_default_shape():
+        print("  [skip] rigorous benchmark only supports the default Ernie shape", flush=True)
+        return None
+
+    bench_path = ROOT / "tools" / "rigorous_benchmark_s42.py"
+    if not bench_path.exists():
+        print("  [skip] rigorous benchmark script not found", flush=True)
+        return None
+
+    mod = _load_python_module(f"rigorous_benchmark_s42_{time.time_ns()}", bench_path)
+    all_results: list[dict[str, Any]] = []
+    with _persistent_tempdir() as tmpdir:
+        for repeat in range(repeats):
+            print(f"  Rigorous benchmark repeat {repeat + 1}/{repeats} ...", flush=True)
+            for seed in seeds:
+                for bench_mode in ("bf16", "fp8", "fp8_stash"):
+                    result = mod.run(bench_mode, seed, tmpdir, str(gpu))
+                    result["repeat"] = repeat
+                    all_results.append(result)
+
+    return {
+        "shape": dict(SHAPE),
+        "seeds": list(seeds),
+        "n_repeats": repeats,
+        "warmup": getattr(mod, "WARMUP", None),
+        "timing_iters": getattr(mod, "TIMING_ITERS", None),
+        "results": all_results,
+        "device": all_results[0].get("device", "unknown") if all_results else "unknown",
+    }
+
+
+def _summarize_benchmark_report(report: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not report:
+        return None
+
+    summary: dict[str, Any] = {
+        "shape": report.get("shape", {}),
+        "seeds": report.get("seeds", []),
+        "n_repeats": report.get("n_repeats", 0),
+        "modes": {},
+        "comparisons": {},
+        "note": (
+            "Memory/precision come from subprocess-isolated repeated runs. "
+            "Use kernel_breakdown.json for GPU-projection timing."
+        ),
+    }
+
+    for mode in ("bf16", "fp8", "fp8_stash"):
+        entries = [r for r in report.get("results", []) if r.get("mode") == mode]
+        if not entries:
+            continue
+        mode_summary: dict[str, Any] = {
+            "n": len(entries),
+            "memory_mib": {
+                "base": _stat_summary([r["mem"]["base"] for r in entries], digits=2),
+                "fwd_peak": _stat_summary([r["mem"]["fwd_peak"] for r in entries], digits=2),
+                "bwd_peak": _stat_summary([r["mem"]["bwd_peak"] for r in entries], digits=2),
+            },
+            "timing_ms": {
+                "trimmed": _stat_summary([r["timing"]["trimmed_ms"] for r in entries], digits=3),
+            },
+        }
+        prec_entries = [r.get("precision", {}) for r in entries if r.get("precision")]
+        if prec_entries:
+            mode_summary["precision"] = {
+                "output_rrmse_pct": _stat_summary([p["out_rrmse"] for p in prec_entries], digits=3),
+                "output_corr": _stat_summary([p["out_corr"] for p in prec_entries], digits=4),
+                "dx_rrmse_pct": _stat_summary([p["dx_rrmse"] for p in prec_entries], digits=3),
+                "dx_corr": _stat_summary([p["dx_corr"] for p in prec_entries], digits=4),
+            }
+        summary["modes"][mode] = mode_summary
+
+    def _mode_mean(mode: str, section: str, field: str) -> float | None:
+        mode_data = summary["modes"].get(mode, {})
+        section_data = mode_data.get(section, {})
+        field_data = section_data.get(field, {})
+        return field_data.get("mean")
+
+    bf16_fwd = _mode_mean("bf16", "memory_mib", "fwd_peak")
+    bf16_bwd = _mode_mean("bf16", "memory_mib", "bwd_peak")
+    bf16_t = _mode_mean("bf16", "timing_ms", "trimmed")
+    for mode in ("fp8", "fp8_stash"):
+        fwd = _mode_mean(mode, "memory_mib", "fwd_peak")
+        bwd = _mode_mean(mode, "memory_mib", "bwd_peak")
+        total_ms = _mode_mean(mode, "timing_ms", "trimmed")
+        if bf16_fwd is None or bf16_bwd is None or fwd is None or bwd is None:
+            continue
+        comparison = {
+            "fwd_peak_delta_mib": round(fwd - bf16_fwd, 2),
+            "bwd_peak_delta_mib": round(bwd - bf16_bwd, 2),
+            "fwd_peak_delta_pct": round((fwd - bf16_fwd) / bf16_fwd * 100, 3),
+            "bwd_peak_delta_pct": round((bwd - bf16_bwd) / bf16_bwd * 100, 3),
+        }
+        if bf16_t and total_ms:
+            comparison["timing_speedup"] = round(bf16_t / total_ms, 4)
+            comparison["timing_delta_ms"] = round(total_ms - bf16_t, 3)
+        summary["comparisons"][f"{mode}_vs_bf16"] = comparison
+
+    return summary
+
+
+def run_rigorous_profiler(gpu: int, repeats: int = 1) -> list[dict[str, Any]] | None:
+    """Run the subprocess-isolated profiler used for kernel/memory JSON assets."""
+    if not _is_default_shape():
+        print("  [skip] rigorous profiler only supports the default Ernie shape", flush=True)
+        return None
+
+    profiler_path = ROOT / "tools" / "rigorous_profiler.py"
+    if not profiler_path.exists():
+        print("  [skip] rigorous profiler script not found", flush=True)
+        return None
+
+    mod = _load_python_module(f"rigorous_profiler_{time.time_ns()}", profiler_path)
+    runs: list[dict[str, Any]] = []
+    for trial in range(repeats):
+        print(f"  Rigorous profiler trial {trial + 1}/{repeats} ...", flush=True)
+        bf16 = mod.run_mode("bf16", str(gpu))
+        fp8 = mod.run_mode("fp8", str(gpu))
+        if bf16 and fp8:
+            runs.append({"bf16": bf16, "fp8": fp8})
+    return runs or None
+
+
+def _aggregate_profiler_mode_runs(mode: str, mode_runs: list[dict[str, Any]]) -> dict[str, Any]:
+    kernel_groups: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
+    total_cuda_vals: list[float] = []
+    fwd_ms_vals: list[float] = []
+    bwd_ms_vals: list[float] = []
+    total_ms_vals: list[float] = []
+    for run in mode_runs:
+        total_cuda_vals.append(run["kernel_profiling"]["total_cuda_us"])
+        fwd_ms_vals.append(run["wall_clock_ms"]["median_fwd_ms"])
+        bwd_ms_vals.append(run["wall_clock_ms"]["median_bwd_ms"])
+        total_ms_vals.append(run["wall_clock_ms"]["median_total_ms"])
+        for kernel in run["kernel_profiling"]["kernels"]:
+            kernel_groups[kernel["name"]].append(kernel)
+
+    kernels = []
+    for name, entries in kernel_groups.items():
+        kernels.append({
+            "name": name,
+            "avg_cuda_us": round(_safe_mean([e["avg_cuda_us"] for e in entries]), 2),
+            "median_cuda_us": round(_safe_mean([e["median_cuda_us"] for e in entries]), 2),
+            "avg_count": round(_safe_mean([e["avg_count"] for e in entries]), 2),
+            "std_us": round(_safe_std([e["avg_cuda_us"] for e in entries]), 2),
+        })
+    kernels.sort(key=lambda item: -item["avg_cuda_us"])
+
+    ref = mode_runs[0]
+    return {
+        "label": mode.upper(),
+        "profile_trials": len(mode_runs),
+        "profile_iters": ref["kernel_profiling"].get("profile_iters", 1),
+        "median_fwd_ms": round(_safe_mean(fwd_ms_vals), 4),
+        "median_bwd_ms": round(_safe_mean(bwd_ms_vals), 4),
+        "median_total_ms": round(_safe_mean(total_ms_vals), 4),
+        "total_cuda_us": round(_safe_mean(total_cuda_vals), 2),
+        "total_cuda_us_std": round(_safe_std(total_cuda_vals), 2),
+        "kernels": kernels,
+        "runs": mode_runs,
+    }
+
+
+def _build_manifest_kernel_data(profiler_runs: list[dict[str, Any]] | None) -> dict[str, Any] | None:
+    if not profiler_runs:
+        return None
+    aggregated = {}
+    for mode in ("bf16", "fp8"):
+        mode_runs = [run[mode] for run in profiler_runs if run.get(mode)]
+        if not mode_runs:
+            continue
+        agg = _aggregate_profiler_mode_runs(mode, mode_runs)
+        aggregated[mode] = {
+            "label": agg["label"],
+            "profile_trials": agg["profile_trials"],
+            "profile_iters": agg["profile_iters"],
+            "median_fwd_ms": agg["median_fwd_ms"],
+            "median_bwd_ms": agg["median_bwd_ms"],
+            "median_total_ms": agg["median_total_ms"],
+            "wall_clock_ms": agg["median_total_ms"],
+            "total_cuda_us": agg["total_cuda_us"],
+            "total_cuda_us_std": agg["total_cuda_us_std"],
+            "kernels": agg["kernels"],
+        }
+    if "bf16" in aggregated and "fp8" in aggregated and aggregated["fp8"]["total_cuda_us"] > 0:
+        speedup = round(aggregated["bf16"]["total_cuda_us"] / aggregated["fp8"]["total_cuda_us"], 4)
+        aggregated["bf16"]["gpu_projection_speedup"] = 1.0
+        aggregated["fp8"]["gpu_projection_speedup"] = speedup
+    return aggregated
+
+
+def _build_mem_breakdown_json(
+    profiler_runs: list[dict[str, Any]] | None,
+    benchmark_summary: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    if not profiler_runs:
+        return None
+
+    def _avg_snapshot(mode_runs: list[dict[str, Any]], snap_name: str) -> dict[str, float]:
+        keys = mode_runs[0]["memory_lifecycle"]["snapshots"][snap_name].keys()
+        return {
+            key: round(_safe_mean([
+                float(run["memory_lifecycle"]["snapshots"][snap_name][key]) for run in mode_runs
+            ]), 4)
+            for key in keys
+        }
+
+    result: dict[str, Any] = {}
+    for mode in ("bf16", "fp8"):
+        mode_runs = [run[mode] for run in profiler_runs if run.get(mode)]
+        if not mode_runs:
+            continue
+        detailed = {
+            snap: _avg_snapshot(mode_runs, snap)
+            for snap in ("base", "after_model", "after_input", "pre_fwd", "post_fwd", "pre_bwd", "post_bwd", "cleanup")
+        }
+        deltas_src = [run["memory_lifecycle"]["deltas_MiB"] for run in mode_runs]
+        delta_keys = deltas_src[0].keys()
+        deltas = {
+            key: round(_safe_mean([float(delta[key]) for delta in deltas_src]), 4)
+            for key in delta_keys
+        }
+        cache_keys = set()
+        for run in mode_runs:
+            cache_keys.update(run["memory_lifecycle"]["fp8_cache_after_bwd"].keys())
+        fp8_cache = {
+            key: round(_safe_mean([
+                float(run["memory_lifecycle"]["fp8_cache_after_bwd"].get(key, 0.0)) for run in mode_runs
+            ]), 4)
+            for key in sorted(cache_keys)
+        }
+        result[mode] = {
+            "mode": mode,
+            "checkpoints": {
+                "base": round(detailed["base"]["allocated_MiB"], 2),
+                "after_model": round(detailed["after_model"]["allocated_MiB"], 2),
+                "after_input": round(detailed["after_input"]["allocated_MiB"], 2),
+                "pre_fwd": round(detailed["pre_fwd"]["allocated_MiB"], 2),
+                "post_fwd": round(detailed["post_fwd"]["allocated_MiB"], 2),
+                "peak_fwd": round(detailed["post_fwd"]["peak_allocated_MiB"], 2),
+                "pre_bwd": round(detailed["pre_bwd"]["allocated_MiB"], 2),
+                "post_bwd": round(detailed["post_bwd"]["allocated_MiB"], 2),
+                "peak_bwd": round(detailed["post_bwd"]["peak_allocated_MiB"], 2),
+                "post_cleanup": round(detailed["cleanup"]["allocated_MiB"], 2),
+            },
+            "detailed_snapshots": detailed,
+            "deltas": deltas,
+            "param_sizes_mib": mode_runs[0]["memory_lifecycle"]["param_sizes_MiB"],
+            "grad_sizes_mib": mode_runs[0]["memory_lifecycle"]["grad_sizes_MiB"],
+            "fp8_caches_after_bwd": fp8_cache,
+            "theoretical_sizes_mib": mode_runs[0]["memory_lifecycle"]["theoretical_sizes_MiB"],
+        }
+
+    if benchmark_summary and "modes" in benchmark_summary:
+        fp8_stash = benchmark_summary["modes"].get("fp8_stash")
+        if fp8_stash:
+            result["fp8_stash"] = {
+                "mode": "fp8_stash",
+                "summary": fp8_stash,
+                "comparison_vs_bf16": benchmark_summary.get("comparisons", {}).get("fp8_stash_vs_bf16", {}),
+            }
+
+    result["_metadata"] = {
+        "source": "tools/rigorous_profiler.py",
+        "profiler": "torch.cuda.memory_stats()",
+        "profile_trials": len(profiler_runs),
+        "note": "subprocess-isolated and aggregated across profiler trials",
+    }
+    return result
+
+
+def _build_compat_kernel_breakdown(kernel_data: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not kernel_data:
+        return None
+
+    compat: dict[str, Any] = {}
+    for mode, label in (("bf16", "BF16"), ("fp8", "FP8")):
+        entry = kernel_data.get(mode)
+        if not entry:
+            continue
+        n_iters = int(entry.get("profile_iters", 1))
+        kernels = []
+        for kernel in entry.get("kernels", []):
+            total_us = kernel["avg_cuda_us"] * n_iters
+            count = int(round(kernel["avg_count"] * n_iters))
+            avg_us = total_us / count if count else kernel["avg_cuda_us"]
+            pct = (kernel["avg_cuda_us"] / entry["total_cuda_us"] * 100) if entry["total_cuda_us"] else 0.0
+            kernels.append({
+                "name": kernel["name"],
+                "total_us": round(total_us),
+                "count": count,
+                "avg_us": round(avg_us),
+                "pct": round(pct, 1),
+                "per_iter_us": round(kernel["avg_cuda_us"]),
+            })
+        compat[label] = {
+            "total_us": round(entry["total_cuda_us"] * n_iters),
+            "per_iter_us": round(entry["total_cuda_us"]),
+            "n_kernels": sum(k["count"] for k in kernels),
+            "n_iters": n_iters,
+            "kernels": kernels[:12],
+        }
+    return compat
+
+
+def _write_json_artifact(path: Path, payload: dict[str, Any] | None) -> None:
+    if payload is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1034,9 +1696,10 @@ def run_precision_audit(model, x) -> dict[str, Any]:
     def _cosine(a, b):
         if a is None or b is None:
             return None
-        a_flat, b_flat = a.flatten().float(), b.flatten().float()
-        return float(torch.nn.functional.cosine_similarity(
-            a_flat.unsqueeze(0), b_flat.unsqueeze(0)).item())
+        a_flat, b_flat = a.flatten().double(), b.flatten().double()
+        denom = (a_flat.norm() * b_flat.norm()).clamp(min=1e-12)
+        val = float((a_flat * b_flat).sum().item() / denom.item())
+        return max(-1.0, min(1.0, val))
 
     audit = {"rrmse_pct": {}, "cosine_sim": {}}
 
@@ -1067,6 +1730,7 @@ def _serialize_manifest(
     fp8_manifest: ModeManifest | None,
     kernel_data: dict | None,
     precision_audit: dict | None,
+    benchmark_summary: dict | None = None,
     metadata: dict | None = None,
 ) -> dict:
     """Assemble all data into the final manifest dict."""
@@ -1084,6 +1748,7 @@ def _serialize_manifest(
             "phase_memory": [asdict(pm) for pm in m.phase_memory],
             "memory_trajectory": m.memory_trajectory,
             "precision_matrix": m.precision_matrix,
+            "theoretical_memory": m.theoretical_memory,
         }
 
         # Merge kernel data if available
@@ -1092,6 +1757,10 @@ def _serialize_manifest(
             mode_dict["kernels"] = kd.get("kernels", [])
             mode_dict["total_cuda_us"] = kd.get("total_cuda_us", 0)
             mode_dict["wall_clock_ms"] = kd.get("wall_clock_ms", 0)
+            if kd.get("total_cuda_us"):
+                mode_dict["wall_to_cuda_ratio"] = round(
+                    kd.get("wall_clock_ms", 0) * 1000 / kd["total_cuda_us"], 4
+                )
 
         manifest["modes"][m.mode] = mode_dict
 
@@ -1099,11 +1768,25 @@ def _serialize_manifest(
     if kernel_data and "bf16" in kernel_data and "fp8" in kernel_data:
         bf16_cuda = kernel_data["bf16"].get("total_cuda_us", 0)
         fp8_cuda = kernel_data["fp8"].get("total_cuda_us", 0)
+        bf16_wall = kernel_data["bf16"].get("wall_clock_ms", 0)
+        fp8_wall = kernel_data["fp8"].get("wall_clock_ms", 0)
         if fp8_cuda > 0:
             manifest["gpu_projection_speedup"] = round(bf16_cuda / fp8_cuda, 4)
+        if fp8_wall > 0:
+            manifest["wall_clock_speedup"] = round(bf16_wall / fp8_wall, 4)
+        if bf16_cuda > 0 and fp8_cuda > 0 and bf16_wall > 0 and fp8_wall > 0:
+            manifest["kernel_efficiency"] = {
+                "bf16_wall_to_cuda_ratio": round(bf16_wall * 1000 / bf16_cuda, 4),
+                "fp8_wall_to_cuda_ratio": round(fp8_wall * 1000 / fp8_cuda, 4),
+                "ratio_delta": round(
+                    fp8_wall * 1000 / fp8_cuda - bf16_wall * 1000 / bf16_cuda, 4
+                ),
+            }
 
     if precision_audit:
         manifest["precision_audit"] = precision_audit
+    if benchmark_summary:
+        manifest["benchmark_summary"] = benchmark_summary
 
     return manifest
 
@@ -1112,7 +1795,14 @@ def _serialize_manifest(
 # Orchestrator
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def run(mode: str = "trace") -> dict:
+def run(
+    mode: str = "trace",
+    *,
+    gpu: int = 0,
+    precision_seeds: list[int] | None = None,
+    bench_repeats: int = DEFAULT_BENCH_REPEATS,
+    profile_trials: int = 1,
+) -> dict:
     """Main entry point: run introspection and write manifest.json.
 
     Parameters
@@ -1122,12 +1812,14 @@ def run(mode: str = "trace") -> dict:
     """
     import torch
 
+    precision_seeds = precision_seeds or list(DEFAULT_PRECISION_SEEDS)
+
     print("=" * 60)
     print(f"SonicMoE Introspection Engine  [mode={mode}]")
     print("=" * 60)
 
     # Setup
-    device = torch.device("cuda:0")
+    device = torch.device(f"cuda:{gpu}")
     torch.cuda.set_device(device)
 
     # Metadata
@@ -1136,8 +1828,12 @@ def run(mode: str = "trace") -> dict:
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "shape": SHAPE,
         "device": gpu_name,
+        "gpu_index": gpu,
         "torch_version": torch.__version__,
         "mode": mode,
+        "precision_seeds": precision_seeds if mode == "full" else [],
+        "bench_repeats": bench_repeats if mode == "full" else 0,
+        "profile_trials": profile_trials if mode in ("profile", "full") else 0,
     }
     try:
         import quack
@@ -1149,82 +1845,72 @@ def run(mode: str = "trace") -> dict:
     print(f"  Shape: T={SHAPE['T']}, H={SHAPE['H']}, I={SHAPE['I']}, "
           f"E={SHAPE['E']}, K={SHAPE['K']}")
 
-    # Create model + input
-    from sonicmoe import MoE
-    from sonicmoe.enums import ActivationType
-
-    torch.manual_seed(42)
-    model = MoE(
-        SHAPE["E"], SHAPE["K"], SHAPE["H"], SHAPE["I"],
-        ActivationType.SWIGLU, False, 0.02,
-    ).to(device).to(torch.bfloat16)
-
-    x = 0.02 * torch.randn(
-        SHAPE["T"], SHAPE["H"],
-        dtype=torch.bfloat16, device=device, requires_grad=True,
-    )
-
-    # Warmup
-    print("\n[1/5] Warmup ...", flush=True)
-    from sonicmoe.functional.utils import enable_fp8, enable_quack_gemm
-    for _ in range(3):
-        xw = x.detach().clone().requires_grad_(True)
-        with enable_quack_gemm(True):
-            ow, lw = model(xw)
-        (ow.sum() + lw).backward()
-        model.zero_grad(set_to_none=True)
-        del ow, lw, xw
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    # Install hooks
-    phase_tracker = PhaseTracker()
-    tensor_spy = TensorSpy(phase_tracker)
-    phase_tracker.install()
-    tensor_spy.install(model)
-
     # ── Trace BF16 ──
-    print("\n[2/5] Tracing BF16 ...", flush=True)
-    bf16_manifest = run_trace("bf16", model, x, device, phase_tracker, tensor_spy)
+    print("\n[1/5] Tracing BF16 (subprocess-isolated) ...", flush=True)
+    bf16_manifest = run_trace_isolated("bf16", gpu)
     print(f"       → {len(bf16_manifest.tensors)} tensors tracked, "
-          f"{len(bf16_manifest.phase_memory)} phase snapshots")
-
-    # FP8 warmup (need to prime caches)
-    for _ in range(3):
-        xw = x.detach().clone().requires_grad_(True)
-        with enable_quack_gemm(True), enable_fp8(True):
-            ow, lw = model(xw, use_fp8=True)
-        (ow.sum() + lw).backward()
-        model.zero_grad(set_to_none=True)
-        del ow, lw, xw
-    gc.collect()
-    torch.cuda.empty_cache()
+           f"{len(bf16_manifest.phase_memory)} phase snapshots")
 
     # ── Trace FP8 ──
-    print("\n[3/5] Tracing FP8 ...", flush=True)
-    fp8_manifest = run_trace("fp8", model, x, device, phase_tracker, tensor_spy)
+    print("\n[2/5] Tracing FP8 (subprocess-isolated) ...", flush=True)
+    fp8_manifest = run_trace_isolated("fp8", gpu)
     print(f"       → {len(fp8_manifest.tensors)} tensors tracked, "
-          f"{len(fp8_manifest.phase_memory)} phase snapshots")
+           f"{len(fp8_manifest.phase_memory)} phase snapshots")
 
-    # Uninstall hooks
-    tensor_spy.uninstall()
-    phase_tracker.uninstall()
-
-    # ── Kernel profiling (if requested) ──
     kernel_data = None
-    if mode in ("profile", "full"):
-        print("\n[4/5] Kernel profiling (subprocess) ...", flush=True)
-        kernel_data = run_kernel_profile()
+    benchmark_summary = None
+    benchmark_report = None
+    profiler_runs = None
+    mem_breakdown_payload = None
+    compat_kernel_payload = None
+
+    if mode == "profile":
+        print("\n[3/5] Kernel profiling (subprocess) ...", flush=True)
+        kernel_data = run_kernel_profile(gpu=gpu)
         for m in ("bf16", "fp8"):
             if m in (kernel_data or {}):
                 kd = kernel_data[m]
                 print(f"       [{m}] {kd['total_cuda_us']:.1f} µs CUDA, "
+                       f"{kd['wall_clock_ms']:.2f} ms wall, "
+                       f"{len(kd['kernels'])} kernels")
+    elif mode == "full":
+        print("\n[3/5] Rigorous profiler + benchmark ...", flush=True)
+        profiler_runs = run_rigorous_profiler(gpu=gpu, repeats=profile_trials)
+        kernel_data = _build_manifest_kernel_data(profiler_runs)
+        if kernel_data is None:
+            print("       profiler unavailable, falling back to lightweight kernel profile", flush=True)
+            kernel_data = run_kernel_profile(gpu=gpu)
+        else:
+            for m in ("bf16", "fp8"):
+                kd = kernel_data[m]
+                print(f"       [{m}] {kd['total_cuda_us']:.1f} µs CUDA, "
                       f"{kd['wall_clock_ms']:.2f} ms wall, "
-                      f"{len(kd['kernels'])} kernels")
+                      f"{len(kd['kernels'])} kernels "
+                      f"(trials={kd.get('profile_trials', 1)})")
+
+        benchmark_report = run_rigorous_benchmark(
+            gpu=gpu,
+            seeds=precision_seeds,
+            repeats=bench_repeats,
+        )
+        benchmark_summary = _summarize_benchmark_report(benchmark_report)
+        if benchmark_summary:
+            cmp_stash = benchmark_summary.get("comparisons", {}).get("fp8_stash_vs_bf16", {})
+            fwd_delta = cmp_stash.get("fwd_peak_delta_mib")
+            bwd_delta = cmp_stash.get("bwd_peak_delta_mib")
+            if fwd_delta is not None and bwd_delta is not None:
+                print(f"       [stash] fwd {fwd_delta:+.1f} MiB, bwd {bwd_delta:+.1f} MiB vs BF16", flush=True)
+
+        mem_breakdown_payload = _build_mem_breakdown_json(profiler_runs, benchmark_summary)
+        compat_kernel_payload = _build_compat_kernel_breakdown(kernel_data)
+        _write_json_artifact(BENCHMARK_FINAL_PATH, benchmark_report)
+        _write_json_artifact(MEM_BREAKDOWN_PATH, mem_breakdown_payload)
+        _write_json_artifact(KERNEL_BREAKDOWN_ROOT_PATH, kernel_data)
+        _write_json_artifact(KERNEL_BREAKDOWN_COMPAT_PATH, compat_kernel_payload)
     else:
-        print("\n[4/5] Kernel profiling SKIPPED (use --mode profile)", flush=True)
+        print("\n[3/5] Kernel profiling SKIPPED (use --mode profile/full)", flush=True)
         # Try loading from existing kernel_breakdown.json
-        kern_path = ROOT / "kernel_breakdown.json"
+        kern_path = KERNEL_BREAKDOWN_ROOT_PATH
         if kern_path.exists():
             print(f"       → Loading cached data from {kern_path.name}")
             cached = json.loads(kern_path.read_text())
@@ -1236,20 +1922,21 @@ def run(mode: str = "trace") -> dict:
     # ── Precision audit (if full mode) ──
     precision_audit = None
     if mode == "full":
-        print("\n[5/5] Precision audit ...", flush=True)
-        precision_audit = run_precision_audit(model, x)
+        print("\n[4/5] Precision audit (subprocess-isolated) ...", flush=True)
+        precision_audit = run_precision_audit_isolated(gpu=gpu, seeds=precision_seeds)
         rrmse = precision_audit.get("rrmse_pct", {})
         print(f"       RRMSE: output={rrmse.get('output', '?')}%, "
-              f"dx={rrmse.get('dx', '?')}%, "
-              f"dw1={rrmse.get('dw1', '?')}%, "
-              f"dw2={rrmse.get('dw2', '?')}%")
+               f"dx={rrmse.get('dx', '?')}%, "
+               f"dw1={rrmse.get('dw1', '?')}%, "
+               f"dw2={rrmse.get('dw2', '?')}%")
     else:
-        print("\n[5/5] Precision audit SKIPPED (use --mode full)", flush=True)
+        print("\n[4/5] Precision audit SKIPPED (use --mode full)", flush=True)
 
     # ── Assemble and write manifest ──
-    print("\n[WRITE] Assembling manifest ...", flush=True)
+    print("\n[5/5] Assembling manifest ...", flush=True)
     manifest = _serialize_manifest(
-        bf16_manifest, fp8_manifest, kernel_data, precision_audit, metadata
+        bf16_manifest, fp8_manifest, kernel_data, precision_audit,
+        benchmark_summary=benchmark_summary, metadata=metadata
     )
 
     MANIFEST_PATH.write_text(json.dumps(manifest, indent=2, default=str))
@@ -1261,11 +1948,12 @@ def run(mode: str = "trace") -> dict:
     if scoreboard_path.exists():
         try:
             print("  Generating scoreboard.json ...")
-            import importlib.util
             spec = importlib.util.spec_from_file_location("scoreboard", scoreboard_path)
             sb_mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(sb_mod)
-            sb_mod.main()
+            scoreboard = sb_mod.build_scoreboard(manifest)
+            scoreboard_out = ROOT / "scoreboard.json"
+            scoreboard_out.write_text(json.dumps(scoreboard, indent=2, ensure_ascii=False))
             print("  → scoreboard.json generated")
         except Exception as e:
             print(f"  [warn] scoreboard generation failed: {e}")
@@ -1288,9 +1976,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Modes:
-              trace   — shapes / dtypes / lifecycle / memory (~3 s)
-              profile — trace + kernel timing via torch.profiler (~30 s)
-              full    — trace + profile + precision audit (~60 s)
+              trace   — isolated tensor lifecycle + memory manifest
+              profile — trace + lightweight kernel timing
+              full    — trace + repeated benchmark/profiler + precision audit
 
             Example:
               python tools/introspect.py --mode full
@@ -1304,6 +1992,26 @@ def main():
         "--shape", type=str, default=None,
         help="Override shape as T,H,I,E,K (e.g. '8192,3072,1536,8,8')",
     )
+    parser.add_argument(
+        "--gpu", type=int, default=0,
+        help="CUDA device index to target (default: 0)",
+    )
+    parser.add_argument(
+        "--precision-seeds", type=str, default="42,123,777",
+        help="Comma-separated seeds for full-mode precision / repeated benchmarks",
+    )
+    parser.add_argument(
+        "--bench-repeats", type=int, default=DEFAULT_BENCH_REPEATS,
+        help="Repeated benchmark count in full mode (default: 3)",
+    )
+    parser.add_argument(
+        "--profile-trials", type=int, default=1,
+        help="How many times to repeat the rigorous profiler in full mode (default: 1)",
+    )
+    parser.add_argument("--_worker-trace", choices=["bf16", "fp8"], help=argparse.SUPPRESS)
+    parser.add_argument("--_worker-collect", choices=["bf16", "fp8"], help=argparse.SUPPRESS)
+    parser.add_argument("--_worker-seed", type=int, default=42, help=argparse.SUPPRESS)
+    parser.add_argument("--_worker-output", type=str, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     if args.shape:
@@ -1311,7 +2019,25 @@ def main():
         assert len(parts) == 5, f"Expected T,H,I,E,K but got {len(parts)} values"
         SHAPE["T"], SHAPE["H"], SHAPE["I"], SHAPE["E"], SHAPE["K"] = parts
 
-    run(mode=args.mode)
+    if args._worker_trace:
+        payload = _run_trace_worker(args._worker_trace)
+        print("__TRACE_JSON__" + json.dumps(payload, default=str))
+        return
+
+    if args._worker_collect:
+        if not args._worker_output:
+            raise SystemExit("--_worker-output is required for collect workers")
+        _run_collect_worker(args._worker_collect, args._worker_seed, Path(args._worker_output))
+        return
+
+    precision_seeds = [int(seed.strip()) for seed in args.precision_seeds.split(",") if seed.strip()]
+    run(
+        mode=args.mode,
+        gpu=args.gpu,
+        precision_seeds=precision_seeds,
+        bench_repeats=args.bench_repeats,
+        profile_trials=args.profile_trials,
+    )
 
 
 if __name__ == "__main__":

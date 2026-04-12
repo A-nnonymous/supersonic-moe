@@ -5,6 +5,8 @@
 import os
 from contextlib import contextmanager
 
+from ..config import get_active_config
+
 
 _IS_USING_QUACK_GEMM = os.getenv("USE_QUACK_GEMM", "0") == "1"
 
@@ -22,6 +24,10 @@ def enable_quack_gemm(enable: bool = True):
 
 
 def is_using_quack_gemm() -> bool:
+    # Priority: active SonicMoEConfig > context manager > env var
+    cfg = get_active_config()
+    if cfg is not None and cfg.use_quack_gemm is not None:
+        return cfg.use_quack_gemm
     return _IS_USING_QUACK_GEMM
 
 
@@ -34,6 +40,8 @@ def is_using_quack_gemm() -> bool:
 #
 # The env-var ``SONIC_MOE_FP8_MODE=perf`` is still respected for backward
 # compatibility; ``enable_fp8()`` takes precedence.
+#
+# ``SonicMoEConfig`` (via ``get_active_config()``) takes highest priority.
 # ---------------------------------------------------------------------------
 _IS_FP8_ACTIVE = os.getenv("SONIC_MOE_FP8_MODE", "").strip().lower() in ("perf", "mem")
 
@@ -61,4 +69,8 @@ def enable_fp8(enable: bool = True):
 
 
 def is_fp8_active() -> bool:
+    # Priority: active SonicMoEConfig > context manager > env var
+    cfg = get_active_config()
+    if cfg is not None and cfg.use_fp8 is not None:
+        return cfg.use_fp8
     return _IS_FP8_ACTIVE

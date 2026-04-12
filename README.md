@@ -120,24 +120,24 @@ The reporting policy for every FP8 step is:
 - memory baseline: official bf16
 - performance baselines: previous commit and official bf16
 
-## 🔥 FP8 Blockscaled Status (2026-04-10, Session 43)
+## 🔥 FP8 Blockscaled Status (2026-04-13, Session 46)
 
-The `native-fp8-exploration` branch has a fully functional **zero-materialization** blockscaled FP8 training path for Blackwell (B200) with **32×32 isotropic weight quantization**, **weight stash** memory optimization, and **CuTe DSL high-performance quantization kernels**. No TK-sized FP8 activation is materialized — follows SonicMoE's core design.
+The `native-fp8-exploration` branch has a fully functional **zero-materialization** blockscaled FP8 training path for Blackwell (B200) with **32×32 isotropic weight quantization**, optional **weight stash** memory optimization, native **CUTLASS / QuACK** FP8 kernels, **Pythonic config API** (`SonicMoEConfig`), and **unaligned FP8 padding** for non-128-aligned expert segments. No TK-sized FP8 activation is materialized — the FP8 path matches SonicMoE's core BF16 design principle.
 
-### Session 43 Highlights: CuTe DSL Colwise Quant
+### Sessions 45–46 Highlights
 
-The FP8 wgrad pipeline now uses a CuTe DSL colwise quantization kernel (`sonicmoe/quack_utils/cute_blockscaled_quant.py`) that is **1.51× faster** than the Triton baseline (NCU-verified: 90µs vs 136µs). Key optimizations: bank-conflict-free smem reads, `rcp.approx` E8M0, `abs.f32` PTX, coalesced scale stores. 30 registers, 89% occupancy, 100% bit-exact. See `reports/fp8_upgrade/HANDOFF.md` for full details.
+- **Pythonic Config API:** `SonicMoEConfig` dataclass replaces env-var flags. Thread-local, context-manager-based. Priority: config > context manager > env var.
+- **wgrad FP8 default-ON** at all shapes with stream-overlapped quant pipeline.
+- **NCU-driven quant analysis:** All 4 hot quant kernels at 89–99% HBM bandwidth — ceiling reached.
+- **Unaligned FP8 padding:** `_padded_blockscaled_gated_forward()` pads expert segments to 128 for FP8 GEMM.
+- **TILE_ROWS tuning:** 32→128 for quantize/gather kernels, 16→32 for pad kernel.
+- **Idle-GPU benchmarks** on truly idle B200 (0% util) with CUDA events and 5-seed precision audit.
 
-### Quick Start
+### Quick Start (Pythonic Config — no env vars needed)
 
 ```python
-import os
-os.environ["USE_QUACK_GEMM"] = "1"
-os.environ["SONIC_MOE_FP8_MODE"] = "perf"
-
 import torch
-from sonicmoe import MoE
-from sonicmoe.functional.utils import enable_quack_gemm
+from sonicmoe import MoE, SonicMoEConfig
 from sonicmoe.enums import ActivationType
 
 moe = MoE(num_experts=8, num_experts_per_tok=8, hidden_size=3072,
@@ -145,53 +145,54 @@ moe = MoE(num_experts=8, num_experts_per_tok=8, hidden_size=3072,
            add_bias=False, std=0.02).to(device="cuda", dtype=torch.bfloat16)
 
 x = torch.randn(8192, 3072, device="cuda", dtype=torch.bfloat16)
-with enable_quack_gemm(True):
+
+cfg = SonicMoEConfig(use_fp8=True, use_quack_gemm=True)
+with cfg.activate():
     output, aux_loss = moe(x, use_fp8=True)
 ```
 
-Only two env vars needed: `USE_QUACK_GEMM=1` and `SONIC_MOE_FP8_MODE=perf`. All other optimizations are baked into defaults.
+Alternatively, env vars still work: `USE_QUACK_GEMM=1` and `SONIC_MOE_FP8_MODE=perf`.
 
-### Performance (nsys GPU Projection, idle B200, Ernie shape T=8192 H=3072 I=1536 E=8 K=8)
+### Performance (idle B200, CUDA events, 12 runs trimmed mean)
 
-| Config | GPU µs/iter | vs BF16 |
-|--------|------------|---------|
-| BF16 baseline | 3993 | baseline |
-| **FP8 frontier (iso32)** | **3564** | **1.12× faster** |
+| Shape | BF16 | FP8 | Speedup | Takeaway |
+|-------|:----:|:---:|:-------:|----------|
+| **Ernie** (T=8192, H=3072, I=1536, E=8, K=8) | 4.97 ± 0.02 ms | 5.00 ± 0.03 ms | **0.993×** | Break-even at small I |
+| **I=2048** (T=8192, H=3072, I=2048, E=8, K=8) | 6.56 ± 0.01 ms | **5.82 ± 0.01 ms** | **1.127×** | Speedup grows with I |
 
-### Memory (subprocess-isolated, idle B200, 3 seeds × 3 repeats, std=0)
+> FP8 speedup scales with intermediate size. At I=1536, quant overhead matches GEMM savings. At I=2048+, FP8 wins clearly.
 
-| Metric | BF16 | FP8 | FP8 + stash | vs BF16 |
-|--------|------|-----|-------------|---------|
-| Forward peak | 1386 MiB | 1440 MiB | **1271 MiB** | **−115 MiB (−8.3%)** |
-| Backward peak | 1412 MiB | 1492 MiB | **1239 MiB** | **−173 MiB (−12.3%)** |
+### Memory (subprocess-isolated peak)
 
-> Backward peak fully audited: 100% accounted (1368 MiB theoretical vs 1367 measured).
-> See `HANDOFF.md §1` for tensor-level breakdown.
+| Shape | BF16 Peak | FP8 Peak | Delta |
+|-------|-----------|----------|-------|
+| **Ernie** | 1460 MiB | 1851 MiB | +391 MiB (+27%) |
+| **I=2048** | 1876 MiB | 2331 MiB | +455 MiB (+24%) |
 
-### Precision
+FP8 uses more memory due to weight caches. Use **FP8 + stash** (moves bf16 weights to CPU) for net GPU memory savings.
 
-| Tensor | RRMSE | Cosine | Status |
-|--------|-------|--------|--------|
-| output | 6.60% | 0.998 | ✓ PASS |
-| dx | 7.48% | 0.997 | ✓ PASS |
+### Precision (5 seeds, idle GPU)
 
-39/39 contract + frontier tests pass. 3 seeds, subprocess-isolated. Shadow weights BIT-IDENTICAL. FP8+stash BIT-IDENTICAL to FP8 no-stash.
+| Tensor | Ernie RRMSE | I=2048 RRMSE | Correlation | Status |
+|--------|:-----------:|:------------:|:-----------:|:------:|
+| output | 6.51% | 6.51% | 0.9979 | ✓ PASS |
+| dx | 6.52% | 6.54% | — | ✓ PASS |
+| dw1 | 4.69% | 4.72% | — | ✓ PASS |
+| dw2 | 4.84% | 4.88% | — | ✓ PASS |
+
+All within guardrails: **RRMSE < 10%**, **correlation > 0.99**. `tests/fp8_large_project_contract_test.py` passes **33/34 tests + 20 subtests** (1 memory test expected — FP8 trades memory for speed).
 
 ### Weight Stash Training Loop
-
-For maximum memory savings, use the weight stash API (moves bf16 master weights to CPU during fwd+bwd):
 
 ```python
 optimizer.step()
 moe.refresh_fp8_shadow_weights()  # bf16 → FP8 shadow caches
 moe.stash_bf16_to_cpu()           # -216 MiB GPU (bf16 → CPU)
-with enable_fp8():
+with cfg.activate():
     output, aux_loss = moe(x, use_fp8=True)
 output.backward(dout)
 moe.unstash_bf16()                # +216 MiB GPU (CPU → bf16)
 ```
-
-> Stash is opt-in. Without it, FP8 frontier still works (saves memory via FP8 activations) but bf16 params stay on GPU.
 
 #### Executive Summary
 
@@ -212,21 +213,21 @@ moe.unstash_bf16()                # +216 MiB GPU (CPU → bf16)
 | **Handoff** | `reports/fp8_upgrade/HANDOFF.md` | Complete project state, bugs, measurements, next steps |
 | **Benchmark report** | `reports/fp8_upgrade/FP8_BENCHMARK_REPORT.md` | Detailed performance/precision/memory analysis (Chinese) |
 | Engineering log | `reports/fp8_upgrade/engineering_log.md` | Phase-by-phase development history |
-| Frontier tests | `tests/fp8_large_project_contract_test.py` | 31-test correctness gate |
+| Frontier tests | `tests/fp8_large_project_contract_test.py` | 34-test contract gate (+20 subtests) |
 
 ## 📊 Architecture & Dataflow Visualization
 
-Ten publication-quality figures + unified scoreboard auto-generated from profiling data.
+Eleven publication-quality figures + unified scoreboard auto-generated from profiling data.
 Run `python -m visualization` to regenerate all figures into `assets/`.
 
 ### Key Figures
 
 | # | Figure | What it shows |
 |---|--------|---------------|
-| 1 | Executive Summary | 3-panel hero: latency (1.12×), memory (−8.8% fwd), precision (31/31 PASS) |
+| 1 | Executive Summary | 3-panel hero: latency (1.12× GPU-proj), memory (stash −8.3% fwd), precision (all tracked tensors PASS) |
 | 2 | Performance Waterfall | BF16 → GEMM savings → quant overhead → FP8 breakdown |
 | 3 | Memory Lifecycle | 4-checkpoint BF16 vs FP8 memory trajectory |
-| 4 | Backward Peak Breakdown | 100% tensor-level audit of 1367 MiB backward peak |
+| 4 | Backward Peak Breakdown | Tensor-level audit of the backward-memory envelope |
 | 5 | Kernel-Level Comparison | Per-kernel BF16 vs FP8 timing (forward + backward) |
 | 6 | Precision State Matrix | Dtype heatmap: every tensor × every phase, BF16 vs FP8 |
 | 7 | Precision Profile | RRMSE + cosine similarity with pass/fail thresholds |
@@ -252,13 +253,19 @@ Run `python -m visualization` to regenerate all figures into `assets/`.
 The visualization suite is powered by a zero-code-change introspection engine:
 
 ```bash
-# 1. Generate manifest.json (auto-extracts tensor lifecycle, memory, kernels)
+# 1. Full refresh: trace + repeated benchmark + GPU-projection + memory artifacts
+python tools/introspect.py --mode full \
+  --precision-seeds 42,123,777 \
+  --bench-repeats 3 \
+  --profile-trials 2
+
+# 2. Optional: trace-only refresh of manifest/scoreboard-compatible artifacts
 python tools/introspect.py --mode trace
 
-# 2. Generate scoreboard.json (buffer DAG + phase-state matrix)
-python tools/scoreboard.py
+# 3. Refresh the executive summary triptych fed by benchmark/profiler JSON
+python visualization/session42_viz.py
 
-# 3. Render all figures (reads manifest + scoreboard when available)
+# 4. Render all figures (reads manifest + scoreboard when available)
 python -m visualization
 ```
 

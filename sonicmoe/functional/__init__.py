@@ -143,7 +143,7 @@ def _fused_blockscaled_gated_forward(
         if (TK % _SF_TILE_M == 0 and K % _SF_TILE_K == 0)
         else torch.full((1, per_batch_tk), 127, dtype=torch.uint8, device=x.device)
     )
-    BLOCK_ROWS = 32
+    BLOCK_ROWS = 128
     _gather_isa_packed_scales_kernel[(_div_up(TK, BLOCK_ROWS), k_tiles)](
         x_scales_t.view(torch.uint8), x_gather_idx, x_scales_tk, TK,
         src_k_tiles=k_tiles, dst_k_tiles=k_tiles,
@@ -192,19 +192,125 @@ def _fused_blockscaled_gated_forward(
     return z, y1
 
 
+def _padded_blockscaled_gated_forward(
+    x: torch.Tensor,
+    w1: torch.Tensor,
+    expert_frequency_offset: torch.Tensor,
+    x_gather_idx: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """FP8 up-proj with padding for non-128-aligned expert segments.
+
+    Pads expert segment boundaries to 128, runs the zero-mat FP8 GEMM+SwiGLU,
+    then unpads the results.  Avoids the full BF16 fallback while keeping the
+    same E8M0 quantization as the aligned path.
+
+    Padding overhead is ~5-25% extra GEMM rows (typical for MoE routing).
+    """
+    from ..quack_utils.blockscaled_fp8_gemm import (
+        _get_padding_plan,
+        _gather_isa_packed_scales_kernel,
+        _div_up, _SF_TILE_K, _SF_TILE_M, _SF_TILE_STORAGE, _SF_VEC_SIZE,
+        _storage_per_batch,
+        quantize_and_pack_activation,
+        precompute_weight_fp8_for_fused_gated,
+    )
+    from ..quack_utils import gemm_gated
+
+    TK = x_gather_idx.shape[0]
+    needs_pad, padded_cu, padded_total, dst_idx = _get_padding_plan(
+        expert_frequency_offset, TK
+    )
+    if not needs_pad:
+        return _fused_blockscaled_gated_forward(
+            x, w1, expert_frequency_offset, x_gather_idx
+        )
+
+    # Step 1: Quantize at T-size (same as aligned path — no padding here)
+    x_fp8, x_scales_t = quantize_and_pack_activation(x)
+
+    # Step 2: Pad gather indices (padding rows → row 0, safe arbitrary data)
+    padded_gather_idx = torch.zeros(
+        padded_total, dtype=x_gather_idx.dtype, device=x_gather_idx.device
+    )
+    padded_gather_idx[dst_idx] = x_gather_idx
+
+    # Step 3: Gather ISA-packed scales T→TK_padded
+    K = x.shape[1]
+    k_tiles = _div_up(K, _SF_TILE_K)
+    per_batch_tk = _storage_per_batch(padded_total, K)
+    # padded_total is 128-aligned by construction → torch.empty is safe
+    x_scales_tk = torch.empty(
+        (1, per_batch_tk), dtype=torch.uint8, device=x.device
+    )
+    BLOCK_ROWS = 128
+    _gather_isa_packed_scales_kernel[
+        (_div_up(padded_total, BLOCK_ROWS), k_tiles)
+    ](
+        x_scales_t.view(torch.uint8),
+        padded_gather_idx,
+        x_scales_tk,
+        padded_total,
+        src_k_tiles=k_tiles,
+        dst_k_tiles=k_tiles,
+        SF_TILE_M=_SF_TILE_M,
+        SF_TILE_STORAGE=_SF_TILE_STORAGE,
+        BLOCK_ROWS=BLOCK_ROWS,
+        GROUPS_PER_K_TILE=_SF_TILE_K // _SF_VEC_SIZE,
+    )
+    x_scales_tk_e8m0 = x_scales_tk.view(torch.float8_e8m0fnu)
+    del x_scales_t
+
+    # Step 4: Weight FP8 (cached — same as aligned path)
+    w1_fp8, w1_scales = (
+        _STASHED_FP8_WEIGHTS.get("w1_fused", None)
+        or precompute_weight_fp8_for_fused_gated(w1)
+    )
+
+    # Step 5: Zero-mat GEMM+SwiGLU with padded 128-aligned boundaries
+    z_padded, y1_padded = gemm_gated(
+        x_fp8,
+        w1_fp8,
+        activation="swiglu",
+        out_dtype=torch.bfloat16,
+        postact_dtype=torch.bfloat16,
+        cu_seqlens_m=padded_cu,
+        A_idx=padded_gather_idx,
+        a_scales=x_scales_tk_e8m0,
+        b_scales=w1_scales,
+        dynamic_scheduler=False,
+        tuned=False,
+    )
+    del x_fp8, x_scales_tk_e8m0, padded_gather_idx
+
+    # Step 6: Unpad results — discard padding rows
+    z = z_padded[dst_idx]
+    y1 = y1_padded[dst_idx]
+    del z_padded, y1_padded
+
+    return z, y1
+
+
 def _use_epilogue_quant() -> bool:
-    """Check if epilogue blockscaled quant of z is enabled (default: enabled).
+    """Check if epilogue blockscaled quant of z is enabled (default: disabled).
 
     When enabled, the GemmGated epilogue computes blockscaled FP8 quantization
     of z in registers (integer+carry E8M0, matching Triton/Paddle reference).
     This eliminates the standalone quantize_activation_blockscaled_fast kernel
-    for z (−122 µs) and allows earlier z_bf16 freeing (−384 MiB transient).
+    for z (-122 us) and allows earlier z_bf16 freeing (-384 MiB transient).
     """
+    from ..config import get_active_config
+    cfg = get_active_config()
+    if cfg is not None and cfg.epilogue_quant is not None:
+        return cfg.epilogue_quant
     return os.getenv("SONIC_MOE_FP8_EPILOGUE_QUANT", "0").lower() in {"1", "true", "yes", "on"}
 
 
 def _use_fused_swiglu_quant() -> bool:
     """Check if fused SwiGLU+quantize kernels are enabled (default: enabled)."""
+    from ..config import get_active_config
+    cfg = get_active_config()
+    if cfg is not None and cfg.fused_swiglu_quant is not None:
+        return cfg.fused_swiglu_quant
     return os.getenv("SONIC_MOE_FP8_FUSED_SWIGLU_QUANT", "1").lower() in {"1", "true", "yes", "on"}
 
 
@@ -212,26 +318,34 @@ def _use_fused_zy1_quant() -> bool:
     """Check if fused z+y1 quantization is enabled (default: disabled).
 
     When enabled, z (flat scales) and y1 (ISA-packed scales) are quantized
-    in a single fused Triton kernel launch, saving ~3µs launch overhead.
+    in a single fused Triton kernel launch, saving ~3us launch overhead.
     Cost: +96 MiB forward peak (z_fp8 + y1_fp8 coexist during kernel).
-    Enable with SONIC_MOE_FP8_FUSED_ZY1_QUANT=1.
     """
+    from ..config import get_active_config
+    cfg = get_active_config()
+    if cfg is not None and cfg.fused_zy1_quant is not None:
+        return cfg.fused_zy1_quant
     return os.getenv("SONIC_MOE_FP8_FUSED_ZY1_QUANT", "").lower() in {"1", "true", "yes", "on"}
 
 
 def _use_fp8_wgrad() -> bool:
-    """Check if FP8 weight gradients are enabled.
+    """Check if FP8 weight gradients are enabled (default: enabled).
 
-    Auto-enabled at I≥2048 where GEMM compute savings exceed colwise quant cost.
-    At I=1536 (Ernie), colwise quant overhead (977µs) exceeds bf16 GEMM savings.
-    Override with SONIC_MOE_FP8_WGRAD=0/1.
+    FP8 wgrad provides ~384 MiB memory savings from early dz_bf16 freeing.
+    At I=1536 (Ernie), ~10% slower than BF16 GEMM due to colwise quant cost,
+    but the memory savings enable larger batch sizes.
+    Override with SONIC_MOE_FP8_WGRAD=0 or SonicMoEConfig(fp8_wgrad=False).
     """
+    from ..config import get_active_config
+    cfg = get_active_config()
+    if cfg is not None and cfg.fp8_wgrad is not None:
+        return cfg.fp8_wgrad
     val = os.getenv("SONIC_MOE_FP8_WGRAD", "").lower()
     if val in {"1", "true", "yes", "on"}:
         return True
     if val in {"0", "false", "no", "off"}:
         return False
-    return False  # default OFF; auto-detect happens at _FP8Config init
+    return True  # default ON: memory savings justify compute cost
 
 
 def _save_z_fp8() -> bool:
@@ -240,6 +354,10 @@ def _save_z_fp8() -> bool:
     When enabled, z(TK, 2I) is quantized to blockscaled FP8 at end of forward
     and dequantized at start of backward, saving ~50% of z's memory footprint.
     """
+    from ..config import get_active_config
+    cfg = get_active_config()
+    if cfg is not None and cfg.save_z_fp8 is not None:
+        return cfg.save_z_fp8
     return os.getenv("SONIC_MOE_FP8_SAVE_Z_FP8", "1").lower() in {"1", "true", "yes", "on"}
 
 
@@ -251,6 +369,10 @@ def _use_fused_blockscaled_gated() -> bool:
     separate blockscaled_fp8_gemm_varlen + standalone SwiGLU.  This is the
     best-performing FP8 up-proj path on Blackwell and is enabled by default.
     """
+    from ..config import get_active_config
+    cfg = get_active_config()
+    if cfg is not None and cfg.fused_gated is not None:
+        return cfg.fused_gated
     return os.getenv("SONIC_MOE_FP8_FUSED_GATED", "1").lower() in {"1", "true", "yes", "on"}
 
 
@@ -329,19 +451,28 @@ _ALIGNMENT_ASSUMED: bool = (
 _ALIGNMENT_STREAK_THRESHOLD: int = 3
 
 
+def _is_alignment_assumed() -> bool:
+    """Check if alignment is assumed via config, env var, or streak."""
+    from ..config import get_active_config
+    cfg = get_active_config()
+    if cfg is not None and cfg.assume_aligned is not None:
+        return cfg.assume_aligned
+    return _ALIGNMENT_ASSUMED
+
+
 def _all_segments_128_aligned(cu_seqlens: torch.Tensor) -> bool:
     """Return True if all expert segments are 128-aligned (no GEMM padding needed).
 
     Pre-quantized activation input to blockscaled_fp8_gemm_varlen is only
     beneficial when no padding is required, because the padding fallback must
-    dequantize → pad → re-quantize which is very expensive.
+    dequantize -> pad -> re-quantize which is very expensive.
 
     After ``_ALIGNMENT_STREAK_THRESHOLD`` consecutive aligned iterations, the
-    check is skipped entirely (zero D2H sync).  The env var
-    ``SONIC_MOE_FP8_ASSUME_ALIGNED=1`` forces immediate zero-sync mode.
+    check is skipped entirely (zero D2H sync).  ``SonicMoEConfig(assume_aligned=True)``
+    or env var ``SONIC_MOE_FP8_ASSUME_ALIGNED=1`` forces immediate zero-sync mode.
     """
     global _ALIGNMENT_STREAK, _ALIGNMENT_ASSUMED
-    if _ALIGNMENT_ASSUMED:
+    if _is_alignment_assumed():
         return True
     if torch.cuda.is_current_stream_capturing():
         return False
@@ -424,8 +555,7 @@ def _use_mixed_dtype_downproj_dw2() -> bool:
 def _fp8_mode() -> str:
     """Return FP8 mode: 'off', 'perf' (cache+speed), or 'mem' (no-cache+savings).
 
-    Checks the programmatic ``enable_fp8()`` flag first, then falls back to
-    the ``SONIC_MOE_FP8_MODE`` environment variable.
+    Priority: SonicMoEConfig > enable_fp8() context > SONIC_MOE_FP8_MODE env var.
     """
     if is_fp8_active():
         return "perf"
@@ -445,8 +575,8 @@ def _fp8_enabled() -> bool:
 class _FP8Config:
     """Snapshot of all FP8 flags, resolved once at forward entry.
 
-    Eliminates repeated os.getenv() calls in the hot path.  Instances are
-    cheap (no tensors), picklable, and stored on autograd ctx for backward.
+    Resolves from SonicMoEConfig (if active), then env vars, then defaults.
+    Instances are cheap (no tensors), picklable, stored on autograd ctx.
     """
     __slots__ = (
         "enabled", "fused_gated", "save_z_fp8", "fused_swiglu_quant",
@@ -463,10 +593,10 @@ class _FP8Config:
         self.alignment_assumed: bool = False
 
     def resolve_wgrad(self, I: int) -> None:
-        """Auto-enable FP8 wgrad at I≥2048 if not explicitly set."""
-        if os.getenv("SONIC_MOE_FP8_WGRAD", ""):
-            return  # explicit override
-        self.fp8_wgrad = I >= 2048
+        """Resolve FP8 wgrad — now default ON at all shapes for memory savings."""
+        # No-op: wgrad is resolved by _use_fp8_wgrad() at init.
+        # Kept for API compat and potential future per-shape tuning.
+        pass
 
     @staticmethod
     def disabled() -> "_FP8Config":
@@ -625,6 +755,10 @@ def _validate_runtime_precision_switches(fp8_protocol: FP8Protocol | None) -> No
 
 
 def _stage_memory_debug_enabled() -> bool:
+    from ..config import get_active_config
+    cfg = get_active_config()
+    if cfg is not None and cfg.stagewise_memory is not None:
+        return cfg.stagewise_memory
     return os.getenv("SONIC_MOE_STAGEWISE_MEMORY", "").lower() in {"1", "true", "yes", "on"}
 
 
@@ -821,17 +955,11 @@ class _UpProjection(torch.autograd.Function):
                     else:
                         y1 = _swiglu_forward_interleaved(z)
                 else:
-                    # Non-aligned: fall back to BF16 fused path (gemm_gated).
-                    # FP8-with-padding is 2-8x slower than BF16 fused due to
-                    # per-expert padding overhead (128 copy+pad+GEMM+unpad ops).
-                    z, y1 = gemm_gated(
-                        x,
-                        w1.permute(2, 1, 0),
-                        activation="swiglu",
-                        cu_seqlens_m=expert_frequency_offset,
-                        A_idx=x_gather_idx,
-                        postact_dtype=(torch.float8_e4m3fn if use_low_precision_postact_buffer else None),
-                        dynamic_scheduler=False,
+                    # Non-aligned: pad expert segments to 128, use FP8 zero-mat
+                    # path.  Overhead is only the extra padded GEMM rows (~5-25%
+                    # depending on routing), much cheaper than full BF16 fallback.
+                    z, y1 = _padded_blockscaled_gated_forward(
+                        x, w1, expert_frequency_offset, x_gather_idx
                     )
             else:
                 z, y1 = gemm_gated(
@@ -1003,24 +1131,34 @@ class _UpProjection(torch.autograd.Function):
                         colwise_quantize_cute,
                     )
                     bwd_col = _PREQUANTIZED_SCALES.pop("bwd_col", None)
+
+                    # Stream-overlapped quant pipeline:
+                    # S0 (main): dz_col (if not pre-computed) → free dz_bf16 → wait S1 → GEMM
+                    # S1 (side): x_col (Triton, handles gather)
+                    _side_stream = _get_dequant_stream()
+                    _side_stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(_side_stream):
+                        x_col_fp8, x_col_scales = colwise_quantize_and_pack(
+                            x, logical_rows=H, logical_cols=TK,
+                            gather_idx=x_gather_idx,
+                        )
+
                     if bwd_col is not None:
                         # Use pre-computed col-fp8 from dual quant (zero extra HBM read)
                         dz_col_fp8, dz_col_scales = bwd_col
                     else:
-                        # Fallback: compute col-fp8 now (CuTe DSL: 1.5× faster than Triton)
+                        # Fallback: compute col-fp8 now (CuTe DSL: 1.5x faster than Triton)
                         dz_col_fp8, dz_col_scales = colwise_quantize_cute(
                             dz_bf16, logical_rows=w1_shape[0], logical_cols=TK,
                             isa_pack=True,
                         )
-                    # FREE dz_bf16 NOW (−384 MiB before wgrad GEMM!)
+                    # FREE dz_bf16 NOW (-384 MiB before wgrad GEMM!)
                     dz.untyped_storage().resize_(0)
                     del dz_bf16
-                    # Colwise-quant x (Triton handles gather efficiently;
-                    # CuTe DSL gather is ~4× slower due to indirect loads)
-                    x_col_fp8, x_col_scales = colwise_quantize_and_pack(
-                        x, logical_rows=H, logical_cols=TK,
-                        gather_idx=x_gather_idx,
-                    )
+
+                    # Sync: GEMM needs both quant outputs
+                    torch.cuda.current_stream().wait_stream(_side_stream)
+
                     # CUTLASS wgrad GEMM
                     dw1_base = _run_cutlass_blockscaled_gemm_varlen_k(
                         dz_col_fp8, dz_col_scales,
@@ -1222,6 +1360,21 @@ class _DownProjection(torch.autograd.Function):
                         )
                 # Keep w2 varlen cache — iso32 re-quant is expensive (~87µs/iter).
                 # Cache auto-invalidates via w._version at optimizer step.
+                router_perm = s_reverse_scatter_idx
+                y2_for_router = y2
+            elif cfg.enabled:
+                # FP8 enabled but not aligned: use blockscaled_fp8_gemm_varlen
+                # with assume_aligned=False — it pads internally.
+                w2_fp8, w2_scales = (
+                    _STASHED_FP8_WEIGHTS.get("w2_varlen", None)
+                    or precompute_weight_fp8(w2)
+                )
+                y2 = blockscaled_fp8_gemm_varlen(
+                    y1, w2, expert_frequency_offset,
+                    w_fp8=w2_fp8, w_scales=w2_scales,
+                    out_dtype=torch.bfloat16,
+                    assume_aligned=False,
+                )
                 router_perm = s_reverse_scatter_idx
                 y2_for_router = y2
             else:
@@ -1451,11 +1604,11 @@ class _DownProjection(torch.autograd.Function):
                         if (TK_bwd % _SF_TILE_M == 0 and K_bwd % _SF_TILE_K == 0)
                         else torch.full((1, per_batch_bwd), 127, dtype=torch.uint8, device=dout.device)
                     )
-                    _gather_isa_packed_scales_kernel[(_div_up(TK_bwd, 32), k_tiles_bwd)](
+                    _gather_isa_packed_scales_kernel[(_div_up(TK_bwd, 128), k_tiles_bwd)](
                         dout_scales_t.view(torch.uint8), x_gather_idx, dout_scales_tk, TK_bwd,
                         src_k_tiles=k_tiles_bwd, dst_k_tiles=k_tiles_bwd,
                         SF_TILE_M=_SF_TILE_M, SF_TILE_STORAGE=_SF_TILE_STORAGE,
-                        BLOCK_ROWS=32, GROUPS_PER_K_TILE=_SF_TILE_K // _SF_VEC_SIZE,
+                        BLOCK_ROWS=128, GROUPS_PER_K_TILE=_SF_TILE_K // _SF_VEC_SIZE,
                     )
                     dout_scales = dout_scales_tk.view(torch.float8_e8m0fnu)
                     del dout_scales_t, dout_scales_tk
@@ -2014,10 +2167,10 @@ def moe_TC_softmax_topk_layer(
                     output_dtype=z.dtype,
                 )
         elif is_using_quack_gemm():
-            # Unaligned QuACK path: gemm_gated outputs z in interleaved layout
-            # [g0,v0,g1,v1,…] which is incompatible with cutify's stacked
-            # SwiGLU+quant.  The down-projection also falls back to BF16 for
-            # unaligned segments, so FP8 quantization adds no benefit.  Skip.
+            # Unaligned QuACK path: up-proj used padded FP8 zero-mat, producing
+            # z/y1 in interleaved layout.  Down-proj will use
+            # blockscaled_fp8_gemm_varlen(assume_aligned=False) which handles
+            # padding internally from bf16 y1.  No adapter quant needed.
             pass
         else:
             y1, _ = apply_activation_fp8_protocol(
@@ -2034,7 +2187,7 @@ def moe_TC_softmax_topk_layer(
     # via untyped_storage().resize_(0).  Clear w1 FUSED cache (~74 MiB)
     # which is forward-only.  Keep VARLEN cache — entries auto-invalidate
     # via w._version at optimizer step, and hit in no-optimizer benchmarks.
-    if _get_fp8_config().enabled and _get_fp8_config().alignment_assumed:
+    if _get_fp8_config().enabled:
         from ..quack_utils.blockscaled_fp8_gemm import clear_fused_weight_cache
         clear_fused_weight_cache()
 
