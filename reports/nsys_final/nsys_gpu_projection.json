@@ -1,759 +1,548 @@
 {
   "shapes": {
-    "I1536": {
+    "T8192_I1536_E128K8": {
       "shape": {
         "T": 8192,
         "H": 3072,
         "I": 1536,
-        "E": 8,
+        "E": 128,
         "K": 8
       },
       "bf16": {
-        "gpu_projection_us": 29808.5,
-        "per_iter_us": 3726.1,
-        "num_iters": 8,
-        "num_kernels": 504,
+        "gpu_projection_us": 158130.9,
+        "per_iter_us": 7906.5,
+        "num_iters": 20,
+        "num_kernels": 740,
         "kernel_breakdown": [
+          {
+            "name": "void at::native::elementwise_kernel<(int)128, (int)4, void at::native::gpu_kernel_impl_nocast<at::native::direct_copy_ke",
+            "category": "Elementwise Ops",
+            "total_us": 56779.8,
+            "count": 40,
+            "per_iter_us": 2839.0,
+            "per_call_us": 1419.5
+          },
           {
             "name": "kernel_cutlass_kernel_quackgemm_default_epiGemmDefaultSm100_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____",
             "category": "Wgrad GEMM",
-            "total_us": 16474.9,
-            "count": 32,
-            "per_iter_us": 2059.4,
-            "per_call_us": 514.8
+            "total_us": 49854.6,
+            "count": 60,
+            "per_iter_us": 2492.7,
+            "per_call_us": 830.9
           },
           {
-            "name": "kernel_cutlass_kernel_sonicmoequack_utilsgemm_gatedGemmGatedSm100_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationM",
+            "name": "kernel_cutlass_kernel_sonicmoequack_utilsgemm_gatedGemmGatedSm100_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationM",
             "category": "GemmGated (fwd)",
-            "total_us": 5544.1,
-            "count": 8,
-            "per_iter_us": 693.0,
-            "per_call_us": 693.0
+            "total_us": 21117.8,
+            "count": 20,
+            "per_iter_us": 1055.9,
+            "per_call_us": 1055.9
           },
           {
-            "name": "kernel_cutlass_kernel_sonicmoequack_utilsgemm_dgatedGemmDGatedSm100_object_at__TiledMMA_ThrLayoutVMNK21111000_Permutatio",
+            "name": "kernel_cutlass_kernel_sonicmoequack_utilsgemm_dgatedGemmDGatedSm100_object_at__TiledMMA_ThrLayoutVMNK11110000_Permutatio",
             "category": "GemmDGated (bwd)",
-            "total_us": 3487.3,
-            "count": 8,
-            "per_iter_us": 435.9,
-            "per_call_us": 435.9
+            "total_us": 13933.6,
+            "count": 20,
+            "per_iter_us": 696.7,
+            "per_call_us": 696.7
           },
           {
-            "name": "void at::native::elementwise_kernel<(int)128, (int)4, void at::native::gpu_kernel_impl_nocast<at::native::direct_copy_ke",
-            "category": "Other",
-            "total_us": 1437.7,
-            "count": 16,
-            "per_iter_us": 179.7,
-            "per_call_us": 89.9
+            "name": "kernel_cutlass_kernel_quackgemm_default_epiGemmDefaultSm100_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____",
+            "category": "Wgrad GEMM",
+            "total_us": 10270.2,
+            "count": 20,
+            "per_iter_us": 513.5,
+            "per_call_us": 513.5
           },
           {
             "name": "token_gather_sum_kernel",
             "category": "Token Gather",
-            "total_us": 1114.9,
-            "count": 16,
-            "per_iter_us": 139.4,
-            "per_call_us": 69.7
-          },
-          {
-            "name": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char *, (u",
-            "category": "Other",
-            "total_us": 177.8,
-            "count": 16,
-            "per_iter_us": 22.2,
-            "per_call_us": 11.1
-          },
-          {
-            "name": "void at::native::index_elementwise_kernel<(int)128, (int)4, void at::native::gpu_index_kernel<void at::native::index_ker",
-            "category": "Other",
-            "total_us": 121.2,
-            "count": 16,
-            "per_iter_us": 15.2,
-            "per_call_us": 7.6
-          },
-          {
-            "name": "void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<c10::BFloat16, at::native::func_wrapper_t<c10::BFl",
-            "category": "Other",
-            "total_us": 116.5,
-            "count": 8,
-            "per_iter_us": 14.6,
-            "per_call_us": 14.6
-          },
-          {
-            "name": "void at::native::reduce_kernel<(int)128, (int)4, at::native::ReduceOp<float, at::native::func_wrapper_t<float, at::nativ",
-            "category": "Other",
-            "total_us": 115.3,
-            "count": 8,
-            "per_iter_us": 14.4,
-            "per_call_us": 14.4
-          },
-          {
-            "name": "nvjet_sm103_tst_8x64_64x16_1x4_h_bz_TNN",
-            "category": "Other",
-            "total_us": 106.3,
-            "count": 8,
-            "per_iter_us": 13.3,
-            "per_call_us": 13.3
-          },
-          {
-            "name": "nvjet_sm103_tst_64x32_64x16_2x1_2cta_v_bz_splitK_NTT",
-            "category": "Other",
-            "total_us": 105.7,
-            "count": 8,
-            "per_iter_us": 13.2,
-            "per_call_us": 13.2
-          },
-          {
-            "name": "_compute_col_partial_sum_kernel",
-            "category": "Other",
-            "total_us": 103.8,
-            "count": 8,
-            "per_iter_us": 13.0,
-            "per_call_us": 13.0
-          },
-          {
-            "name": "nvjet_sm103_tst_128x192_64x7_2x1_2cta_v_bz_NNT",
-            "category": "Other",
-            "total_us": 98.9,
-            "count": 8,
-            "per_iter_us": 12.4,
-            "per_call_us": 12.4
-          },
-          {
-            "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (i",
-            "category": "Other",
-            "total_us": 73.4,
-            "count": 16,
-            "per_iter_us": 9.2,
-            "per_call_us": 4.6
-          },
-          {
-            "name": "void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<",
-            "category": "Other",
-            "total_us": 72.1,
+            "total_us": 3303.0,
             "count": 40,
-            "per_iter_us": 9.0,
-            "per_call_us": 1.8
+            "per_iter_us": 165.2,
+            "per_call_us": 82.6
           },
           {
-            "name": "void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<float, at::native::func_wrapper_t<float, at::nativ",
+            "name": "void at_cuda_detail::cub::detail::radix_sort::DeviceRadixSortOnesweepKernel<at_cuda_detail::cub::detail::radix::policy_h",
             "category": "Other",
-            "total_us": 69.7,
-            "count": 24,
-            "per_iter_us": 8.7,
-            "per_call_us": 2.9
+            "total_us": 677.6,
+            "count": 80,
+            "per_iter_us": 33.9,
+            "per_call_us": 8.5
           },
           {
-            "name": "_bitmatrix_metadata_compute_stage2",
+            "name": "void count_cumsum_cuda_kernel<int, (bool)1>(const T1 *, int *, int *, long, unsigned int)",
             "category": "Other",
-            "total_us": 64.7,
-            "count": 8,
-            "per_iter_us": 8.1,
-            "per_call_us": 8.1
+            "total_us": 379.0,
+            "count": 40,
+            "per_iter_us": 19.0,
+            "per_call_us": 9.5
           },
           {
             "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (i",
-            "category": "Other",
-            "total_us": 54.5,
-            "count": 16,
-            "per_iter_us": 6.8,
-            "per_call_us": 3.4
-          },
-          {
-            "name": "_softmax_bwd_scatter_small_kernel",
-            "category": "Softmax",
-            "total_us": 49.0,
-            "count": 8,
-            "per_iter_us": 6.1,
-            "per_call_us": 6.1
-          },
-          {
-            "name": "void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<",
-            "category": "Other",
-            "total_us": 47.5,
-            "count": 24,
-            "per_iter_us": 5.9,
-            "per_call_us": 2.0
-          },
-          {
-            "name": "void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<float, at::native::NormOneOps<float, float, float>",
-            "category": "Other",
-            "total_us": 36.3,
-            "count": 16,
-            "per_iter_us": 4.5,
-            "per_call_us": 2.3
-          },
-          {
-            "name": "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, __nv_bfloat16, float, __nv_bfloat16, (bool)0, float, __",
-            "category": "Other",
-            "total_us": 31.7,
-            "count": 8,
-            "per_iter_us": 4.0,
+            "category": "Elementwise Ops",
+            "total_us": 323.8,
+            "count": 80,
+            "per_iter_us": 16.2,
             "per_call_us": 4.0
           },
           {
-            "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::<unnamed>::launch_clamp_scalar(at::TensorIteratorBase",
-            "category": "Other",
-            "total_us": 31.3,
-            "count": 16,
-            "per_iter_us": 3.9,
-            "per_call_us": 2.0
+            "name": "void at::native::index_elementwise_kernel<(int)128, (int)4, void at::native::gpu_index_kernel<void at::native::index_ker",
+            "category": "Elementwise Ops",
+            "total_us": 314.1,
+            "count": 40,
+            "per_iter_us": 15.7,
+            "per_call_us": 7.9
           },
           {
-            "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::AUnaryFunctor<float, float, float, at::native::binary",
+            "name": "void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<c10::BFloat16, at::native::func_wrapper_t<c10::BFl",
+            "category": "Reduce",
+            "total_us": 309.8,
+            "count": 20,
+            "per_iter_us": 15.5,
+            "per_call_us": 15.5
+          },
+          {
+            "name": "void at::native::index_elementwise_kernel<(int)128, (int)4, void at::native::gpu_index_kernel<void at::native::index_ker",
+            "category": "Elementwise Ops",
+            "total_us": 157.4,
+            "count": 20,
+            "per_iter_us": 7.9,
+            "per_call_us": 7.9
+          },
+          {
+            "name": "void at::native::index_elementwise_kernel<(int)128, (int)4, void at::native::gpu_index_kernel<void at::native::index_put",
+            "category": "Elementwise Ops",
+            "total_us": 154.2,
+            "count": 20,
+            "per_iter_us": 7.7,
+            "per_call_us": 7.7
+          },
+          {
+            "name": "void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<float, at::native::func_wrapper_t<float, at::nativ",
+            "category": "Reduce",
+            "total_us": 83.9,
+            "count": 20,
+            "per_iter_us": 4.2,
+            "per_call_us": 4.2
+          },
+          {
+            "name": "void at_cuda_detail::cub::detail::radix_sort::DeviceRadixSortHistogramKernel<at_cuda_detail::cub::detail::radix::policy_",
             "category": "Other",
-            "total_us": 28.5,
-            "count": 16,
-            "per_iter_us": 3.6,
+            "total_us": 74.2,
+            "count": 20,
+            "per_iter_us": 3.7,
+            "per_call_us": 3.7
+          },
+          {
+            "name": "void at::native::<unnamed>::CatArrayBatchedCopy_alignedK_contig<at::native::<unnamed>::OpaqueType<(unsigned int)4>, unsi",
+            "category": "Other",
+            "total_us": 73.6,
+            "count": 40,
+            "per_iter_us": 3.7,
             "per_call_us": 1.8
           },
           {
-            "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::BinaryFunctor<float, float, float, at::native::binary",
-            "category": "Other",
-            "total_us": 27.2,
-            "count": 16,
-            "per_iter_us": 3.4,
-            "per_call_us": 1.7
+            "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (i",
+            "category": "Elementwise Ops",
+            "total_us": 72.4,
+            "count": 20,
+            "per_iter_us": 3.6,
+            "per_call_us": 3.6
           },
           {
-            "name": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase &)::",
-            "category": "Other",
-            "total_us": 26.2,
-            "count": 16,
-            "per_iter_us": 3.3,
-            "per_call_us": 1.6
+            "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (i",
+            "category": "Elementwise Ops",
+            "total_us": 55.2,
+            "count": 20,
+            "per_iter_us": 2.8,
+            "per_call_us": 2.8
           },
           {
-            "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<float>, std::array<char *, (unsigned long",
-            "category": "Other",
-            "total_us": 22.8,
-            "count": 16,
-            "per_iter_us": 2.9,
-            "per_call_us": 1.4
-          },
-          {
-            "name": "void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<int, at::native::func_wrapper_t<int, at::native::s",
-            "category": "Other",
-            "total_us": 21.3,
-            "count": 8,
+            "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<int>, std::array<char *, (unsigned long)1",
+            "category": "Elementwise Ops",
+            "total_us": 53.4,
+            "count": 40,
             "per_iter_us": 2.7,
-            "per_call_us": 2.7
+            "per_call_us": 1.3
           },
           {
-            "name": "kernel_cutlass_kernel_sonicmoefunctionaltopk_softmaxTopK_Softmax_object_at__tensorptrbf16gmemalign16o881_tensorptrf32gme",
-            "category": "TopK Router",
-            "total_us": 19.8,
-            "count": 8,
-            "per_iter_us": 2.5,
-            "per_call_us": 2.5
-          },
-          {
-            "name": "void at::native::unrolled_elementwise_kernel<at::native::CUDAFunctor_add<float>, std::array<char *, (unsigned long)3>, (",
+            "name": "at::native::<unnamed>::fill_reverse_indices_kernel(long *, int, at::cuda::detail::IntDivider<unsigned int>)",
             "category": "Other",
-            "total_us": 17.7,
-            "count": 8,
-            "per_iter_us": 2.2,
-            "per_call_us": 2.2
-          },
-          {
-            "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::<unnamed>::where_kernel_impl(at::TensorIterator &)::[",
-            "category": "Other",
-            "total_us": 17.1,
-            "count": 8,
-            "per_iter_us": 2.1,
-            "per_call_us": 2.1
-          },
-          {
-            "name": "void <unnamed>::softmax_warp_forward<float, float, float, (int)3, (bool)0, (bool)0>(T2 *, const T1 *, int, int, int, con",
-            "category": "Softmax",
-            "total_us": 15.6,
-            "count": 8,
+            "total_us": 39.6,
+            "count": 20,
             "per_iter_us": 2.0,
             "per_call_us": 2.0
           },
           {
-            "name": "_bitmatrix_metadata_compute_stage1",
+            "name": "void at_cuda_detail::cub::detail::radix_sort::DeviceRadixSortExclusiveSumKernel<at_cuda_detail::cub::detail::radix::poli",
             "category": "Other",
-            "total_us": 14.4,
-            "count": 8,
-            "per_iter_us": 1.8,
-            "per_call_us": 1.8
+            "total_us": 38.1,
+            "count": 20,
+            "per_iter_us": 1.9,
+            "per_call_us": 1.9
           },
           {
-            "name": "void at::native::vectorized_elementwise_kernel<(int)4, void at::native::compare_scalar_kernel<float>(at::TensorIteratorB",
-            "category": "Other",
-            "total_us": 14.0,
-            "count": 8,
-            "per_iter_us": 1.7,
-            "per_call_us": 1.7
-          },
-          {
-            "name": "void <unnamed>::softmax_warp_backward<float, float, float, (int)3, (bool)0, (bool)0>(T2 *, const T1 *, const T1 *, int, ",
-            "category": "Softmax",
-            "total_us": 13.7,
-            "count": 8,
-            "per_iter_us": 1.7,
-            "per_call_us": 1.7
-          },
-          {
-            "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::neg_kernel_cuda(at::TensorIteratorBase &)::[lambda() ",
-            "category": "Other",
-            "total_us": 13.7,
-            "count": 8,
-            "per_iter_us": 1.7,
-            "per_call_us": 1.7
-          },
-          {
-            "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<int>, std::array<char *, (unsigned long)1",
-            "category": "Other",
-            "total_us": 13.5,
-            "count": 8,
-            "per_iter_us": 1.7,
-            "per_call_us": 1.7
-          },
-          {
-            "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::CUDAFunctor_add<float>, std::array<char *, (unsigned ",
-            "category": "Other",
-            "total_us": 13.2,
-            "count": 8,
-            "per_iter_us": 1.7,
-            "per_call_us": 1.7
-          },
-          {
-            "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::sign_kernel_cuda(at::TensorIteratorBase &)::[lambda()",
-            "category": "Other",
-            "total_us": 13.2,
-            "count": 8,
-            "per_iter_us": 1.6,
-            "per_call_us": 1.6
+            "name": "void <unnamed>::elementwise_kernel_with_index<int, at::native::arange_cuda_out(const c10::Scalar &, const c10::Scalar &,",
+            "category": "Elementwise Ops",
+            "total_us": 37.4,
+            "count": 20,
+            "per_iter_us": 1.9,
+            "per_call_us": 1.9
           },
           {
             "name": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::FillFunctor<c10::BFloat16>, std::array<char *, (unsig",
-            "category": "Other",
-            "total_us": 11.7,
-            "count": 8,
-            "per_iter_us": 1.5,
-            "per_call_us": 1.5
+            "category": "Elementwise Ops",
+            "total_us": 27.9,
+            "count": 20,
+            "per_iter_us": 1.4,
+            "per_call_us": 1.4
           }
         ],
         "category_summary": {
-          "Wgrad GEMM": 2059.4,
-          "GemmGated (fwd)": 693.0,
-          "GemmDGated (bwd)": 435.9,
-          "Other": 389.9999999999999,
-          "Token Gather": 139.4,
-          "Softmax": 9.799999999999999,
-          "TopK Router": 2.5
+          "Wgrad GEMM": 3006.2,
+          "Elementwise Ops": 2898.8999999999996,
+          "GemmGated (fwd)": 1055.9,
+          "GemmDGated (bwd)": 696.7,
+          "Token Gather": 165.2,
+          "Other": 64.2,
+          "Reduce": 19.7
         },
         "mode": "bf16",
         "shape": {
           "T": 8192,
           "H": 3072,
           "I": 1536,
-          "E": 8,
+          "E": 128,
           "K": 8
-        }
+        },
+        "nsys_rep": "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/output/nsys/bf16_T8192_I1536_E128K8_211016.nsys-rep"
       },
       "fp8": {
-        "gpu_projection_us": 31271.0,
-        "per_iter_us": 3908.9,
-        "num_iters": 8,
-        "num_kernels": 656,
+        "gpu_projection_us": 83840.4,
+        "per_iter_us": 4192.0,
+        "num_iters": 20,
+        "num_kernels": 900,
         "kernel_breakdown": [
           {
             "name": "kernel_cutlass_kernel_quackgemm_default_epiGemmDefaultSm100_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____",
             "category": "Wgrad GEMM",
-            "total_us": 9023.1,
-            "count": 32,
-            "per_iter_us": 1127.9,
-            "per_call_us": 282.0
-          },
-          {
-            "name": "_colwise_quantize_and_pack_kernel",
-            "category": "Blockscaled Quant",
-            "total_us": 4053.4,
-            "count": 16,
-            "per_iter_us": 506.7,
-            "per_call_us": 253.3
-          },
-          {
-            "name": "void at::native::elementwise_kernel<(int)128, (int)4, void at::native::gpu_kernel_impl_nocast<at::native::direct_copy_ke",
-            "category": "Other",
-            "total_us": 3835.1,
-            "count": 24,
-            "per_iter_us": 479.4,
-            "per_call_us": 159.8
+            "total_us": 40582.0,
+            "count": 80,
+            "per_iter_us": 2029.1,
+            "per_call_us": 507.3
           },
           {
             "name": "kernel_cutlass_kernel_sonicmoequack_utilsgemm_sm100_fp8_zeromatGemmGatedSm100ZeroMatBlockscaledQuant_object_at__TiledMMA",
             "category": "GemmGated ZeroMat (fwd)",
-            "total_us": 3588.4,
-            "count": 8,
-            "per_iter_us": 448.6,
-            "per_call_us": 448.6
+            "total_us": 14467.5,
+            "count": 20,
+            "per_iter_us": 723.4,
+            "per_call_us": 723.4
           },
           {
             "name": "kernel_cutlass_kernel_sonicmoequack_utilsgemm_sm100_fp8_zeromatGemmDGatedFP8CLoadSm100ZeroMat_object_at__TiledMMA_ThrLay",
             "category": "GemmDGated ZeroMat (bwd)",
-            "total_us": 3143.3,
-            "count": 8,
-            "per_iter_us": 392.9,
-            "per_call_us": 392.9
+            "total_us": 11270.8,
+            "count": 20,
+            "per_iter_us": 563.5,
+            "per_call_us": 563.5
           },
           {
-            "name": "kernel_cutlass_kernel_sonicmoequack_utilscute_blockscaled_quantColwiseQuantOp_object_at__tensorptrbf16gmemalign16oi64div",
+            "name": "_colwise_quantize_and_pack_kernel",
             "category": "Blockscaled Quant",
-            "total_us": 1969.4,
-            "count": 16,
-            "per_iter_us": 246.2,
-            "per_call_us": 123.1
+            "total_us": 5231.7,
+            "count": 60,
+            "per_iter_us": 261.6,
+            "per_call_us": 87.2
           },
           {
-            "name": "_quantize_and_pack_kernel",
-            "category": "Row Quant",
-            "total_us": 1474.9,
-            "count": 32,
-            "per_iter_us": 184.4,
-            "per_call_us": 46.1
+            "name": "_dual_varlen_quantize_kernel",
+            "category": "Dual Quant",
+            "total_us": 3577.3,
+            "count": 20,
+            "per_iter_us": 178.9,
+            "per_call_us": 178.9
           },
           {
             "name": "token_gather_sum_kernel",
             "category": "Token Gather",
-            "total_us": 1166.2,
-            "count": 16,
-            "per_iter_us": 145.8,
-            "per_call_us": 72.9
+            "total_us": 3302.6,
+            "count": 40,
+            "per_iter_us": 165.1,
+            "per_call_us": 82.6
           },
           {
-            "name": "_quantize_and_pack_iso32_kernel",
+            "name": "_quantize_and_pack_kernel",
             "category": "Row Quant",
-            "total_us": 1038.8,
-            "count": 32,
-            "per_iter_us": 129.8,
-            "per_call_us": 32.5
+            "total_us": 1716.5,
+            "count": 60,
+            "per_iter_us": 85.8,
+            "per_call_us": 28.6
           },
           {
-            "name": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char *, (u",
+            "name": "void at_cuda_detail::cub::detail::radix_sort::DeviceRadixSortOnesweepKernel<at_cuda_detail::cub::detail::radix::policy_h",
             "category": "Other",
-            "total_us": 179.2,
-            "count": 16,
-            "per_iter_us": 22.4,
-            "per_call_us": 11.2
+            "total_us": 632.9,
+            "count": 80,
+            "per_iter_us": 31.6,
+            "per_call_us": 7.9
           },
           {
-            "name": "void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<c10::BFloat16, at::native::func_wrapper_t<c10::BFl",
-            "category": "Other",
-            "total_us": 137.3,
-            "count": 8,
-            "per_iter_us": 17.2,
-            "per_call_us": 17.2
+            "name": "void at::native::elementwise_kernel<(int)128, (int)4, void at::native::gpu_kernel_impl_nocast<at::native::direct_copy_ke",
+            "category": "Elementwise Ops",
+            "total_us": 581.8,
+            "count": 20,
+            "per_iter_us": 29.1,
+            "per_call_us": 29.1
           },
           {
             "name": "_gather_isa_packed_scales_kernel",
             "category": "ISA Scale Gather",
-            "total_us": 130.6,
-            "count": 16,
-            "per_iter_us": 16.3,
-            "per_call_us": 8.2
+            "total_us": 388.3,
+            "count": 40,
+            "per_iter_us": 19.4,
+            "per_call_us": 9.7
+          },
+          {
+            "name": "void count_cumsum_cuda_kernel<int, (bool)1>(const T1 *, int *, int *, long, unsigned int)",
+            "category": "Other",
+            "total_us": 361.6,
+            "count": 40,
+            "per_iter_us": 18.1,
+            "per_call_us": 9.0
+          },
+          {
+            "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (i",
+            "category": "Elementwise Ops",
+            "total_us": 308.5,
+            "count": 80,
+            "per_iter_us": 15.4,
+            "per_call_us": 3.9
           },
           {
             "name": "void at::native::index_elementwise_kernel<(int)128, (int)4, void at::native::gpu_index_kernel<void at::native::index_ker",
-            "category": "Other",
-            "total_us": 119.4,
-            "count": 16,
+            "category": "Elementwise Ops",
+            "total_us": 298.9,
+            "count": 40,
             "per_iter_us": 14.9,
             "per_call_us": 7.5
           },
           {
-            "name": "void at::native::reduce_kernel<(int)128, (int)4, at::native::ReduceOp<float, at::native::func_wrapper_t<float, at::nativ",
-            "category": "Other",
-            "total_us": 111.4,
-            "count": 8,
-            "per_iter_us": 13.9,
-            "per_call_us": 13.9
+            "name": "void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<c10::BFloat16, at::native::func_wrapper_t<c10::BFl",
+            "category": "Reduce",
+            "total_us": 298.1,
+            "count": 20,
+            "per_iter_us": 14.9,
+            "per_call_us": 14.9
           },
           {
-            "name": "nvjet_sm103_tst_8x64_64x16_1x4_h_bz_TNN",
-            "category": "Other",
-            "total_us": 107.5,
-            "count": 8,
-            "per_iter_us": 13.4,
-            "per_call_us": 13.4
+            "name": "void at::native::index_elementwise_kernel<(int)128, (int)4, void at::native::gpu_index_kernel<void at::native::index_ker",
+            "category": "Elementwise Ops",
+            "total_us": 151.0,
+            "count": 20,
+            "per_iter_us": 7.5,
+            "per_call_us": 7.5
           },
           {
-            "name": "_compute_col_partial_sum_kernel",
-            "category": "Other",
-            "total_us": 105.4,
-            "count": 8,
-            "per_iter_us": 13.2,
-            "per_call_us": 13.2
-          },
-          {
-            "name": "nvjet_sm103_tst_64x32_64x16_2x1_2cta_v_bz_splitK_NTT",
-            "category": "Other",
-            "total_us": 104.1,
-            "count": 8,
-            "per_iter_us": 13.0,
-            "per_call_us": 13.0
-          },
-          {
-            "name": "nvjet_sm103_tst_128x192_64x7_2x1_2cta_v_bz_NNT",
-            "category": "Other",
-            "total_us": 97.3,
-            "count": 8,
-            "per_iter_us": 12.2,
-            "per_call_us": 12.2
-          },
-          {
-            "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (i",
-            "category": "Other",
-            "total_us": 74.4,
-            "count": 16,
-            "per_iter_us": 9.3,
-            "per_call_us": 4.6
-          },
-          {
-            "name": "void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<",
-            "category": "Other",
-            "total_us": 72.0,
-            "count": 40,
-            "per_iter_us": 9.0,
-            "per_call_us": 1.8
+            "name": "void at::native::index_elementwise_kernel<(int)128, (int)4, void at::native::gpu_index_kernel<void at::native::index_put",
+            "category": "Elementwise Ops",
+            "total_us": 147.4,
+            "count": 20,
+            "per_iter_us": 7.4,
+            "per_call_us": 7.4
           },
           {
             "name": "void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<float, at::native::func_wrapper_t<float, at::nativ",
-            "category": "Other",
-            "total_us": 70.0,
-            "count": 24,
-            "per_iter_us": 8.8,
-            "per_call_us": 2.9
+            "category": "Reduce",
+            "total_us": 79.4,
+            "count": 20,
+            "per_iter_us": 4.0,
+            "per_call_us": 4.0
           },
           {
-            "name": "_bitmatrix_metadata_compute_stage2",
+            "name": "void at_cuda_detail::cub::detail::radix_sort::DeviceRadixSortHistogramKernel<at_cuda_detail::cub::detail::radix::policy_",
             "category": "Other",
-            "total_us": 64.4,
-            "count": 8,
-            "per_iter_us": 8.1,
-            "per_call_us": 8.1
-          },
-          {
-            "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (i",
-            "category": "Other",
-            "total_us": 53.2,
-            "count": 16,
-            "per_iter_us": 6.6,
-            "per_call_us": 3.3
-          },
-          {
-            "name": "void at::native::elementwise_kernel<(int)128, (int)2, void at::native::gpu_kernel_impl_nocast<at::native::BinaryFunctor<",
-            "category": "Other",
-            "total_us": 48.5,
-            "count": 24,
-            "per_iter_us": 6.1,
-            "per_call_us": 2.0
-          },
-          {
-            "name": "_softmax_bwd_scatter_small_kernel",
-            "category": "Softmax",
-            "total_us": 48.4,
-            "count": 8,
-            "per_iter_us": 6.0,
-            "per_call_us": 6.0
-          },
-          {
-            "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<unsigned char>, std::array<char *, (unsig",
-            "category": "Other",
-            "total_us": 47.3,
-            "count": 16,
-            "per_iter_us": 5.9,
-            "per_call_us": 3.0
-          },
-          {
-            "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<int>, std::array<char *, (unsigned long)1",
-            "category": "Other",
-            "total_us": 38.6,
-            "count": 24,
-            "per_iter_us": 4.8,
-            "per_call_us": 1.6
-          },
-          {
-            "name": "void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<float, at::native::NormOneOps<float, float, float>",
-            "category": "Other",
-            "total_us": 37.6,
-            "count": 16,
-            "per_iter_us": 4.7,
-            "per_call_us": 2.3
-          },
-          {
-            "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::<unnamed>::launch_clamp_scalar(at::TensorIteratorBase",
-            "category": "Other",
-            "total_us": 31.4,
-            "count": 16,
-            "per_iter_us": 3.9,
-            "per_call_us": 2.0
-          },
-          {
-            "name": "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, __nv_bfloat16, float, __nv_bfloat16, (bool)0, float, __",
-            "category": "Other",
-            "total_us": 31.0,
-            "count": 8,
-            "per_iter_us": 3.9,
-            "per_call_us": 3.9
-          },
-          {
-            "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::AUnaryFunctor<float, float, float, at::native::binary",
-            "category": "Other",
-            "total_us": 28.6,
-            "count": 16,
-            "per_iter_us": 3.6,
-            "per_call_us": 1.8
-          },
-          {
-            "name": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::bfloat16_copy_kernel_cuda(at::TensorIteratorBase &)::",
-            "category": "Other",
-            "total_us": 28.1,
-            "count": 16,
+            "total_us": 69.8,
+            "count": 20,
             "per_iter_us": 3.5,
-            "per_call_us": 1.8
+            "per_call_us": 3.5
           },
           {
-            "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::BinaryFunctor<float, float, float, at::native::binary",
+            "name": "void at::native::<unnamed>::CatArrayBatchedCopy_alignedK_contig<at::native::<unnamed>::OpaqueType<(unsigned int)4>, unsi",
             "category": "Other",
-            "total_us": 27.6,
-            "count": 16,
-            "per_iter_us": 3.4,
+            "total_us": 69.1,
+            "count": 40,
+            "per_iter_us": 3.5,
             "per_call_us": 1.7
           },
           {
-            "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<float>, std::array<char *, (unsigned long",
+            "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (i",
+            "category": "Elementwise Ops",
+            "total_us": 67.7,
+            "count": 20,
+            "per_iter_us": 3.4,
+            "per_call_us": 3.4
+          },
+          {
+            "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (i",
+            "category": "Elementwise Ops",
+            "total_us": 51.8,
+            "count": 20,
+            "per_iter_us": 2.6,
+            "per_call_us": 2.6
+          },
+          {
+            "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<int>, std::array<char *, (unsigned long)1",
+            "category": "Elementwise Ops",
+            "total_us": 49.9,
+            "count": 40,
+            "per_iter_us": 2.5,
+            "per_call_us": 1.2
+          },
+          {
+            "name": "at::native::<unnamed>::fill_reverse_indices_kernel(long *, int, at::cuda::detail::IntDivider<unsigned int>)",
             "category": "Other",
-            "total_us": 26.3,
-            "count": 16,
-            "per_iter_us": 3.3,
-            "per_call_us": 1.6
-          },
-          {
-            "name": "void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<int, at::native::func_wrapper_t<int, at::native::s",
-            "category": "Other",
-            "total_us": 22.1,
-            "count": 8,
-            "per_iter_us": 2.8,
-            "per_call_us": 2.8
-          },
-          {
-            "name": "kernel_cutlass_kernel_sonicmoefunctionaltopk_softmaxTopK_Softmax_object_at__tensorptrbf16gmemalign16o881_tensorptrf32gme",
-            "category": "TopK Router",
-            "total_us": 19.3,
-            "count": 8,
-            "per_iter_us": 2.4,
-            "per_call_us": 2.4
-          },
-          {
-            "name": "void at::native::unrolled_elementwise_kernel<at::native::CUDAFunctor_add<float>, std::array<char *, (unsigned long)3>, (",
-            "category": "Other",
-            "total_us": 16.2,
-            "count": 8,
-            "per_iter_us": 2.0,
-            "per_call_us": 2.0
-          },
-          {
-            "name": "void <unnamed>::softmax_warp_forward<float, float, float, (int)3, (bool)0, (bool)0>(T2 *, const T1 *, int, int, int, con",
-            "category": "Softmax",
-            "total_us": 16.1,
-            "count": 8,
-            "per_iter_us": 2.0,
-            "per_call_us": 2.0
-          },
-          {
-            "name": "_bitmatrix_metadata_compute_stage1",
-            "category": "Other",
-            "total_us": 15.8,
-            "count": 8,
-            "per_iter_us": 2.0,
-            "per_call_us": 2.0
-          },
-          {
-            "name": "void at::native::vectorized_elementwise_kernel<(int)4, void at::native::compare_scalar_kernel<float>(at::TensorIteratorB",
-            "category": "Other",
-            "total_us": 15.6,
-            "count": 8,
-            "per_iter_us": 2.0,
-            "per_call_us": 2.0
-          },
-          {
-            "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::<unnamed>::where_kernel_impl(at::TensorIterator &)::[",
-            "category": "Other",
-            "total_us": 15.5,
-            "count": 8,
+            "total_us": 38.0,
+            "count": 20,
             "per_iter_us": 1.9,
             "per_call_us": 1.9
           },
           {
-            "name": "void <unnamed>::softmax_warp_backward<float, float, float, (int)3, (bool)0, (bool)0>(T2 *, const T1 *, const T1 *, int, ",
-            "category": "Softmax",
-            "total_us": 14.8,
-            "count": 8,
+            "name": "void at_cuda_detail::cub::detail::radix_sort::DeviceRadixSortExclusiveSumKernel<at_cuda_detail::cub::detail::radix::poli",
+            "category": "Other",
+            "total_us": 36.2,
+            "count": 20,
+            "per_iter_us": 1.8,
+            "per_call_us": 1.8
+          },
+          {
+            "name": "void <unnamed>::elementwise_kernel_with_index<int, at::native::arange_cuda_out(const c10::Scalar &, const c10::Scalar &,",
+            "category": "Elementwise Ops",
+            "total_us": 35.9,
+            "count": 20,
             "per_iter_us": 1.8,
             "per_call_us": 1.8
           },
           {
             "name": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::FillFunctor<c10::BFloat16>, std::array<char *, (unsig",
-            "category": "Other",
-            "total_us": 12.8,
-            "count": 8,
-            "per_iter_us": 1.6,
-            "per_call_us": 1.6
-          },
-          {
-            "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::neg_kernel_cuda(at::TensorIteratorBase &)::[lambda() ",
-            "category": "Other",
-            "total_us": 12.2,
-            "count": 8,
-            "per_iter_us": 1.5,
-            "per_call_us": 1.5
-          },
-          {
-            "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::CUDAFunctor_add<float>, std::array<char *, (unsigned ",
-            "category": "Other",
-            "total_us": 12.1,
-            "count": 8,
-            "per_iter_us": 1.5,
-            "per_call_us": 1.5
-          },
-          {
-            "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::sign_kernel_cuda(at::TensorIteratorBase &)::[lambda()",
-            "category": "Other",
-            "total_us": 11.9,
-            "count": 8,
-            "per_iter_us": 1.5,
-            "per_call_us": 1.5
+            "category": "Elementwise Ops",
+            "total_us": 25.6,
+            "count": 20,
+            "per_iter_us": 1.3,
+            "per_call_us": 1.3
           }
         ],
         "category_summary": {
-          "Wgrad GEMM": 1127.9,
-          "Blockscaled Quant": 752.9,
-          "Other": 701.2999999999998,
-          "GemmGated ZeroMat (fwd)": 448.6,
-          "GemmDGated ZeroMat (bwd)": 392.9,
-          "Row Quant": 314.20000000000005,
-          "Token Gather": 145.8,
-          "ISA Scale Gather": 16.3,
-          "Softmax": 9.8,
-          "TopK Router": 2.4
+          "Wgrad GEMM": 2029.1,
+          "GemmGated ZeroMat (fwd)": 723.4,
+          "GemmDGated ZeroMat (bwd)": 563.5,
+          "Blockscaled Quant": 261.6,
+          "Dual Quant": 178.9,
+          "Token Gather": 165.1,
+          "Elementwise Ops": 85.9,
+          "Row Quant": 85.8,
+          "Other": 60.4,
+          "ISA Scale Gather": 19.4,
+          "Reduce": 18.9
         },
         "mode": "fp8",
         "shape": {
           "T": 8192,
           "H": 3072,
           "I": 1536,
-          "E": 8,
+          "E": 128,
           "K": 8
+        },
+        "nsys_rep": "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/output/nsys/fp8_T8192_I1536_E128K8_211145.nsys-rep"
+      },
+      "speedup": 1.8861,
+      "memory_bf16": {
+        "mode": "bf16",
+        "base_mib": 3525.5,
+        "peak_fwd_mib": 4696.8,
+        "peak_bwd_mib": 7986.1
+      },
+      "memory_fp8": {
+        "mode": "fp8",
+        "base_mib": 7089.5,
+        "peak_fwd_mib": 7948.9,
+        "peak_bwd_mib": 11562.5
+      },
+      "budget_breakdown": {
+        "Blockscaled Quant": {
+          "bf16_us": 0.0,
+          "fp8_us": 261.6,
+          "delta_us": 261.6
+        },
+        "Dual Quant": {
+          "bf16_us": 0.0,
+          "fp8_us": 178.9,
+          "delta_us": 178.9
+        },
+        "Elementwise Ops": {
+          "bf16_us": 2898.9,
+          "fp8_us": 85.9,
+          "delta_us": -2813.0
+        },
+        "GemmDGated (bwd)": {
+          "bf16_us": 696.7,
+          "fp8_us": 0.0,
+          "delta_us": -696.7
+        },
+        "GemmDGated ZeroMat (bwd)": {
+          "bf16_us": 0.0,
+          "fp8_us": 563.5,
+          "delta_us": 563.5
+        },
+        "GemmGated (fwd)": {
+          "bf16_us": 1055.9,
+          "fp8_us": 0.0,
+          "delta_us": -1055.9
+        },
+        "GemmGated ZeroMat (fwd)": {
+          "bf16_us": 0.0,
+          "fp8_us": 723.4,
+          "delta_us": 723.4
+        },
+        "ISA Scale Gather": {
+          "bf16_us": 0.0,
+          "fp8_us": 19.4,
+          "delta_us": 19.4
+        },
+        "Other": {
+          "bf16_us": 64.2,
+          "fp8_us": 60.4,
+          "delta_us": -3.8
+        },
+        "Reduce": {
+          "bf16_us": 19.7,
+          "fp8_us": 18.9,
+          "delta_us": -0.8
+        },
+        "Row Quant": {
+          "bf16_us": 0.0,
+          "fp8_us": 85.8,
+          "delta_us": 85.8
+        },
+        "Token Gather": {
+          "bf16_us": 165.2,
+          "fp8_us": 165.1,
+          "delta_us": -0.1
+        },
+        "Wgrad GEMM": {
+          "bf16_us": 3006.2,
+          "fp8_us": 2029.1,
+          "delta_us": -977.1
         }
       },
-      "speedup": 0.9532
+      "budget_savings_us": -5547.4,
+      "budget_overhead_us": 1832.6,
+      "budget_net_us": -3714.8
     }
   },
   "metadata": {
-    "timestamp": "2026-04-13T11:22:13",
+    "timestamp": "2026-04-13T21:10:12",
     "shape": {
       "T": 8192,
       "H": 3072,

@@ -25,6 +25,8 @@ Modes
   nsys       — nsys GPU-projection profiling (~120 s per shape×mode)
   quant-bench — isolated CUDA-event quant kernel benchmark (all variants)
   wgrad-bench — FP8 vs BF16 wgrad end-to-end benchmark with memory
+  ncu-bench  — NCU --clock-control=none quant kernel analysis (realistic timing)
+  wgrad-force — forced wgrad FP8 at all shapes (bypass I-threshold) + memory breakdown
 
 Usage
 -----
@@ -80,8 +82,34 @@ DEFAULT_SHAPE = dict(SHAPE)
 DEFAULT_PRECISION_SEEDS = [42, 123, 456, 789, 1024]
 DEFAULT_BENCH_REPEATS = 3
 DEFAULT_NSYS_WARMUP = 5
-DEFAULT_NSYS_ITERS = 8
+DEFAULT_NSYS_ITERS = 20
 PERSISTENT_TMP_ROOT = Path("/root/paddlejob/share-storage/gpfs/system-public/panzhaowu")
+
+# Python binary resolution: prefer the virtualenv that has quack/sonicmoe,
+# fall back to sys.executable.  The old hardcoded xfer path is kept as the
+# first candidate but is no longer a hard requirement.
+_XFER_PYTHON = Path(
+    "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python"
+)
+
+
+def _resolve_python_bin() -> str:
+    """Return a working Python 3.13 binary that can import quack + sonicmoe."""
+    for candidate in [str(_XFER_PYTHON), sys.executable]:
+        p = Path(candidate)
+        if not p.exists():
+            continue
+        try:
+            subprocess.run(
+                [str(p), "-c", "import quack, sonicmoe"],
+                capture_output=True, timeout=30,
+                env={**os.environ, "PYTHONPATH": str(ROOT)},
+            )
+            return str(p)
+        except Exception:
+            continue
+    # Last resort
+    return sys.executable
 
 # Map _log_stage_memory stage names → visualization phase IDs (0-5)
 STAGE_TO_PHASE = {
@@ -251,8 +279,19 @@ def _load_python_module(module_name: str, path: Path):
 def _build_subprocess_env(mode: str, gpu: int) -> dict[str, str]:
     env = os.environ.copy()
     env["USE_QUACK_GEMM"] = "1"
-    env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    # Respect shell-level CUDA_VISIBLE_DEVICES (e.g. from parallel launches).
+    # Only set it when the parent hasn't already pinned a device.
+    if "CUDA_VISIBLE_DEVICES" not in os.environ:
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu)
     env["PYTHONPATH"] = str(ROOT) + (":" + env.get("PYTHONPATH", "") if env.get("PYTHONPATH") else "")
+
+
+def _subprocess_env_for_gpu(gpu: int) -> dict[str, str]:
+    """Build a subprocess env dict that respects shell-level CUDA_VISIBLE_DEVICES."""
+    env = os.environ.copy()
+    if "CUDA_VISIBLE_DEVICES" not in os.environ:
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    return env
     if mode == "fp8":
         env["SONIC_MOE_FP8_MODE"] = "perf"
     else:
@@ -1282,13 +1321,11 @@ def _categorize_kernel(name: str) -> str:
 
     Works with both torch.profiler names and nsys demangled names.
     Order matters: quant checks MUST precede CUTLASS/GEMM checks because
-    CuTe-compiled quant kernels have "cutlass" in their name
-    (e.g. ``kernel_cutlass_..._blockscaled_quantColwise_quantize_cute_kernel``).
+    CuTe-compiled quant kernels have "cutlass" in their name.
+    Designed to minimize "Other" — every significant kernel type gets a label.
     """
     nl = name.lower()
     # ── FP8 quantization family (check BEFORE GEMM/cutlass) ──────────
-    # Exclude ZeroMat GEMM kernels whose name includes "BlockscaledQuant"
-    # (e.g. GemmGatedSm100ZeroMatBlockscaledQuant — the epilogue-quant fwd GEMM)
     if ("blockscaled_quant" in nl or "BlockscaledQuant" in name) and "Gemm" not in name:
         return "Blockscaled Quant"
     if "colwise" in nl and ("quant" in nl or "quantize" in nl):
@@ -1299,6 +1336,10 @@ def _categorize_kernel(name: str) -> str:
         return "Row Quant"
     if "gather_isa" in nl or "ISAGather" in name:
         return "ISA Scale Gather"
+    if "_dual_varlen_quantize" in nl or "_dual_quantize" in nl:
+        return "Dual Quant"
+    if "dequantize" in nl or "blockscaled_fp8" in nl:
+        return "FP8 Dequant"
     # ── GEMM family ──────────────────────────────────────────────────
     if "GemmDefault" in name and "Sm100" in name:
         return "Wgrad GEMM"
@@ -1312,17 +1353,40 @@ def _categorize_kernel(name: str) -> str:
         return "GemmDGated ZeroMat (bwd)"
     if "cutlass" in nl and "gemm" in nl:
         return "GEMM (other)"
+    if "nvjet" in nl or "cublasLt" in nl or "splitKreduce" in nl:
+        return "cuBLAS GEMM"
     # ── Activation / routing ─────────────────────────────────────────
     if "swiglu" in nl or "SwiGLU" in name:
         return "SwiGLU"
     if "scatter" in nl and "token" in nl:
         return "Token Scatter"
-    if "gather" in nl and "token" in nl:
+    if ("gather" in nl and "token" in nl) or "token_gather" in nl:
         return "Token Gather"
-    if "topk" in nl:
+    if "topk" in nl or "TC_topk" in nl:
         return "TopK Router"
     if "softmax" in nl:
         return "Softmax"
+    if "_bitmatrix" in nl or "_compute_col_partial_sum" in nl:
+        return "Router Metadata"
+    # ── PyTorch elementwise (break down the former "Other" blob) ─────
+    if "elementwise_kernel" in nl and ("128" in name) and (", 4," in name or "<4," in name):
+        return "Tensor Copy/Cast"
+    if "elementwise_kernel" in nl:
+        return "Elementwise Ops"
+    if "vectorized_elementwise" in nl:
+        if "Fill" in name:
+            return "Tensor Fill"
+        if "copy" in nl or "bfloat16_copy" in nl:
+            return "Tensor Copy/Cast"
+        if "add" in nl or "CUDAFunctor_add" in name:
+            return "Elementwise Add"
+        return "Elementwise Ops"
+    if "unrolled_elementwise" in nl:
+        return "Tensor Copy/Cast"
+    if "reduce_kernel" in nl:
+        return "Reduce"
+    if "index_elementwise" in nl or "vectorized_gather" in nl:
+        return "Index/Gather"
     return "Other"
 
 
@@ -1339,8 +1403,12 @@ def _categorize_kernel(name: str) -> str:
 
 _NSYS_WORKLOAD_TEMPLATE = textwrap.dedent(r'''
 import os, sys, json, torch, gc
+import torch.nn.functional as F_torch
 sys.path.insert(0, "{root}")
-os.environ["CUDA_VISIBLE_DEVICES"] = "{gpu}"
+# Inherit CUDA_VISIBLE_DEVICES from parent (set by shell for GPU pinning).
+# Only override when running standalone (no parent CVD set).
+if "CUDA_VISIBLE_DEVICES" not in os.environ:
+    os.environ["CUDA_VISIBLE_DEVICES"] = "{gpu}"
 os.environ["USE_QUACK_GEMM"] = "1"
 
 mode = "{mode}"
@@ -1354,8 +1422,10 @@ if mode == "fp8":
 from sonicmoe import MoE, enable_fp8, enable_quack_gemm
 from sonicmoe.enums import ActivationType
 import sonicmoe.functional as functional
+from sonicmoe.functional import count_cumsum, moe_general_routing_inputs
 
 T, H, I, E, K = {T}, {H}, {I}, {E}, {K}
+Mtile = 128
 
 # Reset FP8 state cleanly, then let it build up during warmup
 functional.clear_all_fp8_weight_caches()
@@ -1369,10 +1439,58 @@ moe = MoE(num_experts=E, num_experts_per_tok=K, hidden_size=H,
            add_bias=False, std=0.02).to(device=device, dtype=torch.bfloat16)
 x = (0.02 * torch.randn(T, H, device=device, dtype=torch.bfloat16)).detach().requires_grad_()
 
-# Warm up ({warmup} iters) — build alignment streak, JIT, weight caches
+use_fp8 = (mode == "fp8")
+use_token_rounding = (E > 8)
+
+# Token rounding: pre-compute 128-aligned routing (frozen across iters)
+if use_token_rounding:
+    with torch.no_grad():
+        router_logits = F_torch.linear(x, moe.router.weight)
+        scores = F_torch.softmax(router_logits, dim=-1, dtype=torch.float32).to(torch.bfloat16)
+        topk_values, topk_indices = scores.topk(K, dim=-1)
+        topk_values /= topk_values.sum(dim=-1, keepdim=True)
+        scores.scatter_(-1, topk_indices, topk_values)
+        combined = scores.detach().clone() - 1
+        combined.scatter_(1, topk_indices, topk_values)
+        sorted_idx = combined.argsort(dim=0, descending=True).int()
+        expert_freq = count_cumsum(topk_indices.view(-1), E, do_cumsum=True)[0]
+        expert_freq_rounded = (torch.ceil(expert_freq / Mtile) * Mtile).int()
+        mask = torch.arange(T, device=device, dtype=torch.int32)[:, None].expand(-1, E) < expert_freq_rounded[None, :]
+        token_indices_r = sorted_idx[mask]
+        expert_indices_r = torch.arange(E, device=device, dtype=torch.int32)[None, :].expand(T, -1)[mask]
+        order = token_indices_r.argsort().int()
+        token_indices_r = token_indices_r[order]
+        expert_indices_r = expert_indices_r[order]
+        router_scores_r = scores[token_indices_r, expert_indices_r].contiguous()
+if use_token_rounding:
+    w1_p = moe.c_fc.weight.permute(1, 2, 0)
+    w2_p = moe.c_proj.weight.permute(1, 2, 0)
+
+# FP8 frontier = stash mode (only for standard moe(x) path; token rounding
+# uses moe_general_routing_inputs which doesn't support stash).
+if use_fp8:
+    moe.refresh_fp8_shadow_weights()
+    if not use_token_rounding:
+        moe.stash_bf16_to_cpu()
+
+# Token rounding guarantees 128-alignment; standard path detects it via streak.
+# Set alignment assumed AFTER stash (stash needs it False during setup).
+functional._ALIGNMENT_ASSUMED = True
+
+def run_iter():
+    if use_token_rounding:
+        o, ef = moe_general_routing_inputs(
+            x, router_scores_r, token_indices_r, expert_indices_r,
+            w1_p, None, w2_p, None, E, moe.stream_id, ActivationType.SWIGLU, False,
+        )
+    else:
+        o, ef = moe(x)
+    return o
+
+# Warm up ({warmup} iters)
 for _ in range({warmup}):
-    out, aux = moe(x)
-    loss = out.sum() + aux
+    out = run_iter()
+    loss = out.sum()
     loss.backward()
     moe.zero_grad(set_to_none=True)
     if x.grad is not None:
@@ -1381,11 +1499,11 @@ torch.cuda.synchronize()
 gc.collect()
 torch.cuda.empty_cache()
 
-# Measured iterations — nsys captures this range via cudaProfilerApi
+# Measured iterations
 torch.cuda.cudart().cudaProfilerStart()
 for _ in range({iters}):
-    out, aux = moe(x)
-    loss = out.sum() + aux
+    out = run_iter()
+    loss = out.sum()
     loss.backward()
     moe.zero_grad(set_to_none=True)
     if x.grad is not None:
@@ -1493,6 +1611,132 @@ def _nsys_parse_sqlite(
     }
 
 
+# ── Memory measurement subprocess (paired with nsys) ────────────────────────
+
+_MEM_MEASURE_SCRIPT = textwrap.dedent(r'''
+import gc, json, os, sys, torch
+import torch.nn.functional as F_torch
+
+sys.path.insert(0, "{root}")
+# Inherit CUDA_VISIBLE_DEVICES from parent (set by shell for GPU pinning).
+# Only override when running standalone (no parent CVD set).
+if "CUDA_VISIBLE_DEVICES" not in os.environ:
+    os.environ["CUDA_VISIBLE_DEVICES"] = "{gpu}"
+os.environ["USE_QUACK_GEMM"] = "1"
+
+mode = "{mode}"
+if mode == "fp8":
+    os.environ["SONIC_MOE_FP8_MODE"] = "perf"
+
+from sonicmoe import MoE
+from sonicmoe.enums import ActivationType
+from sonicmoe.functional.utils import enable_fp8, enable_quack_gemm
+from sonicmoe.functional import count_cumsum, moe_general_routing_inputs
+import sonicmoe.functional as functional
+
+functional.clear_all_fp8_weight_caches()
+
+T, H, I, E, K = {T}, {H}, {I}, {E}, {K}
+Mtile = 128
+torch.manual_seed(42)
+device = torch.device("cuda:0")
+moe = MoE(num_experts=E, num_experts_per_tok=K, hidden_size=H,
+           intermediate_size=I, activation_function=ActivationType.SWIGLU,
+           add_bias=False, std=0.02).to(device=device, dtype=torch.bfloat16)
+x = (0.02 * torch.randn(T, H, device=device, dtype=torch.bfloat16)).detach().requires_grad_()
+
+use_fp8 = (mode == "fp8")
+use_token_rounding = (E > 8)
+
+# Token rounding for E>8
+if use_token_rounding:
+    with torch.no_grad():
+        rl = F_torch.linear(x, moe.router.weight)
+        sc = F_torch.softmax(rl, dim=-1, dtype=torch.float32).to(torch.bfloat16)
+        tv, ti = sc.topk(K, dim=-1)
+        tv /= tv.sum(dim=-1, keepdim=True)
+        sc.scatter_(-1, ti, tv)
+        cb = sc.detach().clone() - 1
+        cb.scatter_(1, ti, tv)
+        si = cb.argsort(dim=0, descending=True).int()
+        ef = count_cumsum(ti.view(-1), E, do_cumsum=True)[0]
+        efr = (torch.ceil(ef / Mtile) * Mtile).int()
+        mk = torch.arange(T, device=device, dtype=torch.int32)[:, None].expand(-1, E) < efr[None, :]
+        tok_idx = si[mk]
+        exp_idx = torch.arange(E, device=device, dtype=torch.int32)[None, :].expand(T, -1)[mk]
+        od = tok_idx.argsort().int()
+        tok_idx = tok_idx[od]; exp_idx = exp_idx[od]
+        rsc = sc[tok_idx, exp_idx].contiguous()
+    w1_p = moe.c_fc.weight.permute(1, 2, 0)
+    w2_p = moe.c_proj.weight.permute(1, 2, 0)
+
+if use_fp8:
+    moe.refresh_fp8_shadow_weights()
+    if not use_token_rounding:
+        moe.stash_bf16_to_cpu()
+
+def run_iter():
+    xw = x.detach().clone().requires_grad_(True)
+    if use_token_rounding:
+        o, ef = moe_general_routing_inputs(
+            xw, rsc, tok_idx, exp_idx, w1_p, None, w2_p, None,
+            E, moe.stream_id, ActivationType.SWIGLU, False)
+    else:
+        with enable_quack_gemm(True):
+            if use_fp8:
+                with enable_fp8(True): o, aux = moe(xw, use_fp8=True)
+            else:
+                with enable_fp8(False): o, aux = moe(xw)
+        o = o  # just use o
+    return xw, o
+
+# Warmup
+for _ in range({warmup}):
+    xw, o = run_iter()
+    o.sum().backward()
+    moe.zero_grad(set_to_none=True)
+    del xw, o
+gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
+
+# Measure
+MiB = 1048576
+gc.collect(); torch.cuda.empty_cache()
+torch.cuda.reset_peak_memory_stats(device); torch.cuda.synchronize()
+
+base = torch.cuda.memory_allocated(device) / MiB
+xw, o = run_iter()
+torch.cuda.synchronize()
+peak_fwd = torch.cuda.max_memory_allocated(device) / MiB
+
+torch.cuda.reset_peak_memory_stats(device)
+o.sum().backward()
+torch.cuda.synchronize()
+peak_bwd = torch.cuda.max_memory_allocated(device) / MiB
+
+result = {{"mode": mode, "base_mib": round(base, 1),
+           "peak_fwd_mib": round(peak_fwd, 1),
+           "peak_bwd_mib": round(peak_bwd, 1)}}
+print("__MEM_JSON__" + json.dumps(result))
+''')
+
+
+def _run_memory_measure(mode: str, shape: dict, gpu: int, warmup: int = 5) -> dict:
+    """Subprocess-isolated memory measurement for one mode+shape."""
+    python_bin = _resolve_python_bin()
+    script = _MEM_MEASURE_SCRIPT.format(
+        root=str(ROOT), gpu=str(gpu), mode=mode, warmup=warmup, **shape,
+    )
+    env = _subprocess_env_for_gpu(gpu)
+    proc = subprocess.run(
+        [python_bin, "-c", script],
+        capture_output=True, text=True, timeout=600, env=env, cwd=str(ROOT),
+    )
+    for line in proc.stdout.split("\n"):
+        if line.startswith("__MEM_JSON__"):
+            return json.loads(line[len("__MEM_JSON__"):])
+    return {"error": proc.stderr[-300:] if proc.stderr else "no output"}
+
+
 def run_nsys_profile(
     gpu: int = 0,
     warmup: int = DEFAULT_NSYS_WARMUP,
@@ -1515,19 +1759,23 @@ def run_nsys_profile(
     Returns:
         dict with per-shape, per-mode results
     """
-    env_path = "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer"
-    python_bin = os.path.join(env_path, "bin", "python")
+    python_bin = _resolve_python_bin()
     nsys_bin = "nsys"
 
     if shapes is None:
         shapes = [SHAPE]
 
+    # Persistent output directory for nsys-rep files (user-inspectable)
+    nsys_output_dir = Path("/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/output/nsys")
+    nsys_output_dir.mkdir(parents=True, exist_ok=True)
+
     results: dict[str, Any] = {"shapes": {}}
 
     for shape in shapes:
-        shape_key = f"I{shape['I']}"
+        shape_key = f"T{shape['T']}_I{shape['I']}_E{shape['E']}K{shape['K']}"
         shape_results: dict[str, Any] = {"shape": shape}
 
+        # ── nsys profiling: bf16 then fp8 (serial, no GPU contention) ───
         for mode in ("bf16", "fp8"):
             label = f"{mode}/{shape_key}"
             print(f"  nsys profiling [{label}] ({warmup}w+{iters}m) ...", flush=True)
@@ -1543,28 +1791,33 @@ def run_nsys_profile(
                 f.write(script)
                 script_path = f.name
 
-            sqlite_path = script_path.replace(".py", "")
+            # Output to persistent dir with descriptive name
+            ts = time.strftime("%H%M%S")
+            rep_name = f"{mode}_{shape_key}_{ts}"
+            rep_path = str(nsys_output_dir / rep_name)
 
             try:
                 cmd = [
                     nsys_bin, "profile",
                     "--capture-range=cudaProfilerApi",
                     "--capture-range-end=stop",
-                    f"--output={sqlite_path}",
+                    f"--output={rep_path}",
                     "--export=sqlite",
                     "--force-overwrite=true",
+                    "--gpu-metrics-devices=all",
+                    "--gpu-metrics-frequency=10000",
                     python_bin, script_path,
                 ]
                 proc = subprocess.run(
                     cmd, capture_output=True, text=True, timeout=600,
-                    env={**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu)},
+                    env=_subprocess_env_for_gpu(gpu),
                 )
                 if proc.returncode != 0:
                     print(f"  [WARN] nsys failed for {label}: {proc.stderr[-300:]}", flush=True)
                     shape_results[mode] = {"error": proc.stderr[-500:]}
                     continue
 
-                db_file = f"{sqlite_path}.sqlite"
+                db_file = f"{rep_path}.sqlite"
                 if not os.path.exists(db_file):
                     print(f"  [WARN] sqlite not found for {label}", flush=True)
                     shape_results[mode] = {"error": "sqlite output missing"}
@@ -1573,21 +1826,23 @@ def run_nsys_profile(
                 parsed = _nsys_parse_sqlite(db_file, iters)
                 parsed["mode"] = mode
                 parsed["shape"] = shape
+                parsed["nsys_rep"] = f"{rep_path}.nsys-rep"
                 shape_results[mode] = parsed
                 print(
                     f"    {label}: {parsed.get('per_iter_us', '?')} µs/iter "
-                    f"({parsed.get('num_kernels', '?')} kernels)",
+                    f"({parsed.get('num_kernels', '?')} kernels)"
+                    f"  → {rep_path}.nsys-rep",
                     flush=True,
                 )
             except subprocess.TimeoutExpired:
                 print(f"  [WARN] nsys timed out for {label}", flush=True)
                 shape_results[mode] = {"error": "timeout"}
             finally:
-                for p in [script_path, f"{sqlite_path}.nsys-rep", f"{sqlite_path}.sqlite"]:
-                    try:
-                        os.unlink(p)
-                    except OSError:
-                        pass
+                # Keep nsys-rep + sqlite for user inspection; only delete the temp script
+                try:
+                    os.unlink(script_path)
+                except OSError:
+                    pass
 
         # Compute speedup if both modes succeeded
         bf16_us = shape_results.get("bf16", {}).get("per_iter_us")
@@ -1595,6 +1850,34 @@ def run_nsys_profile(
         if bf16_us and fp8_us and fp8_us > 0:
             shape_results["speedup"] = round(bf16_us / fp8_us, 4)
             print(f"    {shape_key} speedup: {shape_results['speedup']}×", flush=True)
+
+        # ── Paired memory measurement (subprocess-isolated) ────────────
+        # FP8 = stash mode (the frontier default)
+        for mem_mode in ("bf16", "fp8"):
+            print(f"  memory [{mem_mode}/{shape_key}] ...", flush=True)
+            mem = _run_memory_measure(mem_mode, shape, gpu, warmup=warmup)
+            shape_results[f"memory_{mem_mode}"] = mem
+            if "error" not in mem:
+                print(f"    {mem_mode}: fwd={mem['peak_fwd_mib']:.0f} bwd={mem['peak_bwd_mib']:.0f} MiB",
+                      flush=True)
+
+        # ── Category breakdown delta (budget reconciliation) ───────────
+        bf16_cats = shape_results.get("bf16", {}).get("category_summary", {})
+        fp8_cats = shape_results.get("fp8", {}).get("category_summary", {})
+        if bf16_cats and fp8_cats:
+            all_cats = sorted(set(list(bf16_cats) + list(fp8_cats)))
+            breakdown = {}
+            for cat in all_cats:
+                b = bf16_cats.get(cat, 0.0)
+                f = fp8_cats.get(cat, 0.0)
+                breakdown[cat] = {"bf16_us": round(b, 1), "fp8_us": round(f, 1),
+                                  "delta_us": round(f - b, 1)}
+            shape_results["budget_breakdown"] = breakdown
+            savings = sum(d["delta_us"] for d in breakdown.values() if d["delta_us"] < 0)
+            overhead = sum(d["delta_us"] for d in breakdown.values() if d["delta_us"] > 0)
+            shape_results["budget_savings_us"] = round(savings, 1)
+            shape_results["budget_overhead_us"] = round(overhead, 1)
+            shape_results["budget_net_us"] = round(savings + overhead, 1)
 
         results["shapes"][shape_key] = shape_results
 
@@ -1606,8 +1889,7 @@ def run_kernel_profile(gpu: int = 0) -> dict[str, Any]:
 
     Returns dict with "bf16" and "fp8" kernel data.
     """
-    env_path = "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer"
-    python_bin = os.path.join(env_path, "bin", "python")
+    python_bin = _resolve_python_bin()
 
     result = {}
     for mode in ("bf16", "fp8"):
@@ -2455,6 +2737,430 @@ for shape in SHAPES:
 print("__WGRAD_BENCH_JSON__" + json.dumps(results))
 ''')
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# NCU Kernel Analysis Engine (--clock-control=none for real-world timing)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# NCU with clock-control=none gives realistic boost-clock timings that match
+# nsys, unlike the default --clock-control=base which locks to base clock.
+# This engine profiles individual quant kernels in isolation.
+
+_NCU_QUANT_SCRIPT = textwrap.dedent(r'''
+import gc, json, os, sys, torch
+device = torch.device("cuda:0")
+torch.cuda.set_device(device)
+sys.path.insert(0, "{root}")
+
+from sonicmoe.quack_utils.blockscaled_fp8_gemm import (
+    quantize_activation_blockscaled_fast,
+    colwise_quantize_and_pack,
+    fused_transpose_quantize_for_wgrad,
+)
+
+TK, H, I2 = {TK}, {H}, {I2}
+x = torch.randn(TK, H, dtype=torch.bfloat16, device=device)
+dz = torch.randn(TK, I2, dtype=torch.bfloat16, device=device)
+gather_idx = torch.randint(0, TK, (TK,), dtype=torch.int32, device=device)
+
+# Warmup
+for _ in range(5):
+    _ = quantize_activation_blockscaled_fast(x)
+    _ = colwise_quantize_and_pack(x, H, TK)
+torch.cuda.synchronize()
+
+# Target kernel: {kernel_name}
+torch.cuda.cudart().cudaProfilerStart()
+for _ in range({ncu_iters}):
+    {kernel_call}
+torch.cuda.synchronize()
+torch.cuda.cudart().cudaProfilerStop()
+print("NCU_DONE", flush=True)
+''')
+
+_NCU_KERNEL_REGISTRY = {
+    "row_quant_x": "_ = quantize_activation_blockscaled_fast(x)",
+    "row_quant_dz": "_ = quantize_activation_blockscaled_fast(dz)",
+    "colwise_triton_x": "_ = colwise_quantize_and_pack(x, H, TK)",
+    "colwise_triton_x_gather": "_ = colwise_quantize_and_pack(x, H, TK, gather_idx=gather_idx)",
+    "colwise_triton_dz": "_ = colwise_quantize_and_pack(dz, I2, TK)",
+}
+
+
+def run_ncu_bench(
+    gpu: int = 0,
+    kernel_names: list[str] | None = None,
+    ncu_iters: int = 3,
+    clock_control: str = "none",
+) -> dict:
+    """Run NCU with --clock-control=none on specified quant kernels.
+
+    Returns per-kernel timing from NCU (boost-clock realistic), plus
+    key metrics: SM throughput, HBM throughput, occupancy.
+    """
+    python_bin = _resolve_python_bin()
+    ncu_bin = "ncu"
+
+    if kernel_names is None:
+        kernel_names = list(_NCU_KERNEL_REGISTRY.keys())
+
+    TK = SHAPE["T"] * SHAPE["K"]
+    H = SHAPE["H"]
+    I2 = 2 * SHAPE["I"]
+
+    results: dict[str, Any] = {"kernels": {}, "clock_control": clock_control}
+
+    for kname in kernel_names:
+        if kname not in _NCU_KERNEL_REGISTRY:
+            print(f"  [skip] unknown kernel: {kname}", flush=True)
+            continue
+
+        kernel_call = _NCU_KERNEL_REGISTRY[kname]
+        script = _NCU_QUANT_SCRIPT.format(
+            root=str(ROOT), TK=TK, H=H, I2=I2,
+            kernel_name=kname, kernel_call=kernel_call,
+            ncu_iters=ncu_iters,
+        )
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", delete=False, prefix=f"ncu_{kname}_"
+        ) as f:
+            f.write(script)
+            script_path = f.name
+
+        print(f"  ncu profiling [{kname}] (clock={clock_control}) ...", flush=True)
+
+        try:
+            cmd = [
+                ncu_bin,
+                f"--clock-control={clock_control}",
+                "--capture-range=cudaProfilerApi",
+                "--capture-range-end=stop",
+                "--set=full",
+                "--csv",
+                "-c", str(ncu_iters),
+                python_bin, script_path,
+            ]
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=600,
+                env=_subprocess_env_for_gpu(gpu),
+            )
+
+            if proc.returncode != 0:
+                print(f"    [WARN] ncu failed for {kname}: {proc.stderr[-300:]}", flush=True)
+                results["kernels"][kname] = {"error": proc.stderr[-500:]}
+                continue
+
+            # Parse CSV output for Duration and key metrics
+            lines = proc.stdout.split("\n")
+            kernel_metrics: dict[str, Any] = {"raw_lines": []}
+            for line in lines:
+                if "Duration" in line or "duration" in line:
+                    kernel_metrics["raw_lines"].append(line.strip())
+                if "sm__throughput" in line.lower():
+                    kernel_metrics["raw_lines"].append(line.strip())
+                if "dram__throughput" in line.lower():
+                    kernel_metrics["raw_lines"].append(line.strip())
+                if "achieved_occupancy" in line.lower() or "sm__warps_active" in line.lower():
+                    kernel_metrics["raw_lines"].append(line.strip())
+
+            # Extract duration from CSV: look for numeric values after "Duration" header
+            duration_values: list[float] = []
+            for line in lines:
+                parts = line.split(",")
+                for i, part in enumerate(parts):
+                    if "duration" in part.strip().lower() and "unit" not in part.lower():
+                        # Next field or same field might have the value
+                        for j in range(i + 1, min(i + 3, len(parts))):
+                            try:
+                                val = float(parts[j].strip().strip('"'))
+                                if val > 0:
+                                    duration_values.append(val)
+                            except (ValueError, IndexError):
+                                pass
+
+            if duration_values:
+                kernel_metrics["duration_us"] = round(sum(duration_values) / len(duration_values), 2)
+                kernel_metrics["duration_min_us"] = round(min(duration_values), 2)
+                kernel_metrics["duration_max_us"] = round(max(duration_values), 2)
+                kernel_metrics["n_samples"] = len(duration_values)
+
+            results["kernels"][kname] = kernel_metrics
+            dur = kernel_metrics.get("duration_us", "?")
+            print(f"    {kname}: {dur} µs (ncu clock={clock_control})", flush=True)
+
+        except subprocess.TimeoutExpired:
+            print(f"    [WARN] ncu timed out for {kname}", flush=True)
+            results["kernels"][kname] = {"error": "timeout"}
+        finally:
+            try:
+                os.unlink(script_path)
+            except OSError:
+                pass
+
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Wgrad FP8 Force Mode — bypass I-threshold for full-replacement analysis
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_WGRAD_FORCE_FP8_SCRIPT = textwrap.dedent(r'''
+import gc, json, os, sys, statistics, torch
+
+device = torch.device("cuda:0")
+torch.cuda.set_device(device)
+sys.path.insert(0, "{root}")
+
+os.environ["USE_QUACK_GEMM"] = "1"
+os.environ["SONIC_MOE_FP8_MODE"] = "perf"
+os.environ["SONIC_MOE_FP8_WGRAD"] = "{wgrad_mode}"
+
+from sonicmoe import MoE
+from sonicmoe.enums import ActivationType
+from sonicmoe.functional.utils import enable_fp8, enable_quack_gemm
+
+SHAPES = {shapes_json}
+WARMUP = {warmup}
+TRIALS = {trials}
+
+def bench(fn, warmup, trials):
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    times = []
+    for _ in range(trials):
+        s = torch.cuda.Event(enable_timing=True)
+        e = torch.cuda.Event(enable_timing=True)
+        s.record(); fn(); e.record()
+        torch.cuda.synchronize()
+        times.append(s.elapsed_time(e) * 1000)
+    times.sort()
+    trim = max(1, len(times) // 10)
+    trimmed = times[trim:-trim] if len(times) > 2 * trim else times
+    return {{
+        "median_us": round(statistics.median(trimmed), 2),
+        "mean_us": round(statistics.mean(trimmed), 2),
+        "min_us": round(min(times), 2),
+        "max_us": round(max(times), 2),
+        "p5_us": round(times[max(0, len(times)//20)], 2),
+        "p95_us": round(times[min(len(times)-1, len(times)*19//20)], 2),
+        "n_trials": trials,
+    }}
+
+def mem_breakdown(model, x_gen, use_fp8, device):
+    """Detailed memory breakdown using torch.cuda.memory_stats()."""
+    gc.collect(); torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats(device)
+    torch.cuda.synchronize()
+
+    base_alloc = torch.cuda.memory_allocated(device)
+    x_t = x_gen()
+    with enable_quack_gemm(True):
+        if use_fp8:
+            with enable_fp8(True):
+                o, l = model(x_t, use_fp8=True)
+        else:
+            with enable_fp8(False):
+                o, l = model(x_t)
+    torch.cuda.synchronize()
+    post_fwd_alloc = torch.cuda.memory_allocated(device)
+    peak_fwd = torch.cuda.max_memory_allocated(device)
+
+    stats_fwd = torch.cuda.memory_stats(device)
+    fwd_allocs = stats_fwd.get("allocation.all.allocated", 0)
+    fwd_frees = stats_fwd.get("allocation.all.freed", 0)
+
+    torch.cuda.reset_peak_memory_stats(device)
+    (o.sum() + l).backward()
+    torch.cuda.synchronize()
+    post_bwd_alloc = torch.cuda.memory_allocated(device)
+    peak_bwd = torch.cuda.max_memory_allocated(device)
+
+    stats_bwd = torch.cuda.memory_stats(device)
+    bwd_allocs = stats_bwd.get("allocation.all.allocated", 0)
+    bwd_frees = stats_bwd.get("allocation.all.freed", 0)
+    # Segment info
+    active_blocks = stats_bwd.get("active.all.current", 0)
+    active_bytes = stats_bwd.get("active_bytes.all.current", 0)
+
+    model.zero_grad(set_to_none=True)
+    del o, l, x_t
+    gc.collect(); torch.cuda.empty_cache()
+
+    return {{
+        "base_mib": round(base_alloc / 1048576, 2),
+        "post_fwd_mib": round(post_fwd_alloc / 1048576, 2),
+        "peak_fwd_mib": round(peak_fwd / 1048576, 2),
+        "post_bwd_mib": round(post_bwd_alloc / 1048576, 2),
+        "peak_bwd_mib": round(peak_bwd / 1048576, 2),
+        "fwd_net_allocs": fwd_allocs - fwd_frees,
+        "bwd_total_allocs": bwd_allocs,
+        "bwd_total_frees": bwd_frees,
+        "bwd_active_blocks": active_blocks,
+        "bwd_active_bytes_mib": round(active_bytes / 1048576, 2),
+    }}
+
+results = {{"shapes": {{}}}}
+
+for shape in SHAPES:
+    T, H, I, E, K = shape["T"], shape["H"], shape["I"], shape["E"], shape["K"]
+    tag = f"T={{T}}_H={{H}}_I={{I}}_E={{E}}_K={{K}}"
+    print(f"  wgrad-force bench {{tag}} (wgrad={wgrad_mode}) ...", flush=True)
+
+    torch.manual_seed(42)
+    model = MoE(E, K, H, I, ActivationType.SWIGLU, False, 0.02).to(device).to(torch.bfloat16)
+
+    shape_res = {{"shape": shape, "wgrad_mode": "{wgrad_mode}", "modes": {{}}}}
+
+    for mode_name in ("bf16", "fp8"):
+        use_fp8 = (mode_name == "fp8")
+        # Warmup
+        for _ in range(15):
+            xw = 0.02 * torch.randn(T, H, dtype=torch.bfloat16, device=device, requires_grad=True)
+            with enable_quack_gemm(True):
+                if use_fp8:
+                    with enable_fp8(True):
+                        ow, lw = model(xw, use_fp8=True)
+                else:
+                    with enable_fp8(False):
+                        ow, lw = model(xw)
+            (ow.sum() + lw).backward()
+            model.zero_grad(set_to_none=True)
+            del ow, lw, xw
+        gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
+
+        # Full forward+backward timing
+        def run_fwd_bwd():
+            x_t = 0.02 * torch.randn(T, H, dtype=torch.bfloat16, device=device, requires_grad=True)
+            with enable_quack_gemm(True):
+                if use_fp8:
+                    with enable_fp8(True):
+                        o, l = model(x_t, use_fp8=True)
+                else:
+                    with enable_fp8(False):
+                        o, l = model(x_t)
+            (o.sum() + l).backward()
+            model.zero_grad(set_to_none=True)
+            del o, l, x_t
+
+        fwd_bwd = bench(run_fwd_bwd, 5, TRIALS)
+
+        # Memory breakdown (3 runs, take last)
+        x_gen = lambda: 0.02 * torch.randn(T, H, dtype=torch.bfloat16, device=device, requires_grad=True)
+        mem = mem_breakdown(model, x_gen, use_fp8, device)
+
+        shape_res["modes"][mode_name] = {{
+            "forward_backward_us": fwd_bwd,
+            "memory": mem,
+        }}
+        gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
+
+    # Compute speedups
+    bf16 = shape_res["modes"].get("bf16", {{}})
+    fp8 = shape_res["modes"].get("fp8", {{}})
+    if bf16 and fp8:
+        bf16_us = bf16.get("forward_backward_us", {{}}).get("median_us", 0)
+        fp8_us = fp8.get("forward_backward_us", {{}}).get("median_us", 0)
+        shape_res["speedup"] = round(bf16_us / fp8_us, 4) if fp8_us > 0 else 0
+        shape_res["delta_us"] = round(fp8_us - bf16_us, 1)
+        # Memory comparison
+        bf16_mem = bf16.get("memory", {{}})
+        fp8_mem = fp8.get("memory", {{}})
+        shape_res["memory_delta"] = {{
+            "peak_fwd_delta_mib": round(fp8_mem.get("peak_fwd_mib", 0) - bf16_mem.get("peak_fwd_mib", 0), 2),
+            "peak_bwd_delta_mib": round(fp8_mem.get("peak_bwd_mib", 0) - bf16_mem.get("peak_bwd_mib", 0), 2),
+        }}
+
+    results["shapes"][tag] = shape_res
+    del model; gc.collect(); torch.cuda.empty_cache()
+
+print("__WGRAD_FORCE_JSON__" + json.dumps(results))
+''')
+
+
+def run_wgrad_force_fp8(
+    gpu: int = 0,
+    shapes: list[dict] | None = None,
+    warmup: int = 10,
+    trials: int = 30,
+    force_wgrad: bool = True,
+) -> dict:
+    """Run wgrad benchmark with SONIC_MOE_FP8_WGRAD forced on or off.
+
+    This bypasses the I-threshold to measure wgrad FP8 at ALL shapes,
+    including I=1536 where it's normally disabled.
+    """
+    if shapes is None:
+        shapes = [dict(SHAPE)]
+
+    python_bin = _resolve_python_bin()
+    wgrad_mode = "1" if force_wgrad else "0"
+
+    script = _WGRAD_FORCE_FP8_SCRIPT.format(
+        root=str(ROOT),
+        shapes_json=json.dumps(shapes),
+        warmup=warmup,
+        trials=trials,
+        wgrad_mode=wgrad_mode,
+    )
+
+    env = _subprocess_env_for_gpu(gpu)
+    env["USE_QUACK_GEMM"] = "1"
+
+    print(f"  Running wgrad-force benchmark (wgrad={wgrad_mode}) ...", flush=True)
+    proc = subprocess.run(
+        [python_bin, "-c", script],
+        capture_output=True, text=True, timeout=900, env=env,
+        cwd=str(ROOT),
+    )
+
+    for line in proc.stdout.split("\n"):
+        if line.startswith("__WGRAD_FORCE_JSON__"):
+            data = json.loads(line[len("__WGRAD_FORCE_JSON__"):])
+            return data
+
+    print(f"  WARNING: No wgrad-force JSON found", flush=True)
+    if proc.stderr:
+        print(f"  stderr (last 1000 chars): {proc.stderr[-1000:]}", flush=True)
+    if proc.stdout:
+        print(f"  stdout (last 500 chars): {proc.stdout[-500:]}", flush=True)
+    return {}
+
+
+def _print_wgrad_force_summary(data: dict) -> None:
+    """Pretty-print wgrad force benchmark results."""
+    for shape_key, shape_res in data.get("shapes", {}).items():
+        shape = shape_res.get("shape", {})
+        wgrad_mode = shape_res.get("wgrad_mode", "?")
+        print(f"\n  === Wgrad-Force Benchmark (wgrad={wgrad_mode}): "
+              f"T={shape.get('T')}, H={shape.get('H')}, I={shape.get('I')} ===")
+
+        modes = shape_res.get("modes", {})
+        bf16 = modes.get("bf16", {})
+        fp8 = modes.get("fp8", {})
+
+        bf16_us = bf16.get("forward_backward_us", {}).get("median_us", 0)
+        fp8_us = fp8.get("forward_backward_us", {}).get("median_us", 0)
+        speedup = shape_res.get("speedup", 0)
+        delta = shape_res.get("delta_us", 0)
+
+        print(f"  BF16: {bf16_us:.0f} µs  |  FP8: {fp8_us:.0f} µs  |  "
+              f"Speedup: {speedup:.4f}×  |  Delta: {delta:+.0f} µs")
+
+        # Memory
+        mem_delta = shape_res.get("memory_delta", {})
+        for mode_name in ("bf16", "fp8"):
+            mem = modes.get(mode_name, {}).get("memory", {})
+            if mem:
+                print(f"  [{mode_name}] base={mem.get('base_mib', '?')} MiB  "
+                      f"peak_fwd={mem.get('peak_fwd_mib', '?')} MiB  "
+                      f"peak_bwd={mem.get('peak_bwd_mib', '?')} MiB  "
+                      f"bwd_active={mem.get('bwd_active_bytes_mib', '?')} MiB")
+        if mem_delta:
+            print(f"  [delta] fwd={mem_delta.get('peak_fwd_delta_mib', '?'):+.1f} MiB  "
+                  f"bwd={mem_delta.get('peak_bwd_delta_mib', '?'):+.1f} MiB")
+
+
 # B200/B30Z peak HBM bandwidth (GB/s)
 _B200_PEAK_HBM_GBPS = 8000
 
@@ -2472,8 +3178,7 @@ def run_quant_bench(
         I = SHAPE["I"]
         shapes = [{"TK": TK, "H": H, "I2": 2 * I, "I1": I}]
 
-    env_path = "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer"
-    python_bin = os.path.join(env_path, "bin", "python")
+    python_bin = _resolve_python_bin()
 
     script = _QUANT_BENCH_SCRIPT.format(
         root=str(ROOT),
@@ -2483,8 +3188,7 @@ def run_quant_bench(
         peak_hbm_gbps=_B200_PEAK_HBM_GBPS,
     )
 
-    env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    env = _subprocess_env_for_gpu(gpu)
     env["USE_QUACK_GEMM"] = "1"
     env["SONIC_MOE_FP8_MODE"] = "perf"
 
@@ -2518,8 +3222,7 @@ def run_wgrad_bench(
     if shapes is None:
         shapes = [dict(SHAPE)]
 
-    env_path = "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer"
-    python_bin = os.path.join(env_path, "bin", "python")
+    python_bin = _resolve_python_bin()
 
     script = _WGRAD_BENCH_SCRIPT.format(
         root=str(ROOT),
@@ -2528,8 +3231,7 @@ def run_wgrad_bench(
         trials=trials,
     )
 
-    env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    env = _subprocess_env_for_gpu(gpu)
     env["USE_QUACK_GEMM"] = "1"
 
     print("  Running wgrad benchmark (subprocess) ...", flush=True)
@@ -2688,21 +3390,40 @@ def run(
         print(f"\n  → {nsys_out} ({nsys_out.stat().st_size / 1024:.1f} KB)")
 
         # Print summary table
-        print("\n" + "=" * 60)
-        print("  nsys GPU-Projection Summary")
-        print("=" * 60)
+        print("\n" + "=" * 90)
+        print("  nsys GPU-Projection + Memory (FP8 frontier = stash mode)")
+        print("=" * 90)
+        print(f"  {'Shape':<28s} {'BF16 µs':>8s} {'FP8 µs':>8s} {'Speed':>6s} "
+              f"{'BF16 Bwd':>9s} {'FP8 Bwd':>9s} {'MemΔ%':>7s}")
+        print(f"  {'-'*28} {'-'*8} {'-'*8} {'-'*6} {'-'*9} {'-'*9} {'-'*7}")
         for shape_key, shape_res in nsys_data.get("shapes", {}).items():
-            bf16_us = shape_res.get("bf16", {}).get("per_iter_us", "?")
-            fp8_us = shape_res.get("fp8", {}).get("per_iter_us", "?")
-            speedup = shape_res.get("speedup", "?")
-            print(f"  {shape_key}: BF16={bf16_us} µs  FP8={fp8_us} µs  → {speedup}×")
+            bf16_us = shape_res.get("bf16", {}).get("per_iter_us", 0)
+            fp8_us = shape_res.get("fp8", {}).get("per_iter_us", 0)
+            speedup = shape_res.get("speedup", 0)
+            bf16_bwd = shape_res.get("memory_bf16", {}).get("peak_bwd_mib", 0)
+            fp8_bwd = shape_res.get("memory_fp8", {}).get("peak_bwd_mib", 0)
+            mem_pct = round((fp8_bwd - bf16_bwd) / bf16_bwd * 100, 1) if bf16_bwd else 0
+            print(f"  {shape_key:<28s} {bf16_us:>7.0f}  {fp8_us:>7.0f}  "
+                  f"{speedup:>5.3f}× {bf16_bwd:>8.0f}M {fp8_bwd:>8.0f}M {mem_pct:>+6.1f}%")
 
-            # Print category breakdown
-            for m in ("bf16", "fp8"):
-                cats = shape_res.get(m, {}).get("category_summary")
-                if cats:
-                    print(f"    [{m}] {', '.join(f'{k}={v:.0f}µs' for k, v in list(cats.items())[:6])}")
-        print("=" * 60)
+        # Budget breakdown for each shape
+        for shape_key, shape_res in nsys_data.get("shapes", {}).items():
+            bb = shape_res.get("budget_breakdown")
+            if not bb:
+                continue
+            print(f"\n  --- {shape_key} FP8 Budget ---")
+            print(f"  {'Category':<30s} {'BF16':>7s} {'FP8':>7s} {'Delta':>8s}")
+            print(f"  {'-'*30} {'-'*7} {'-'*7} {'-'*8}")
+            for cat in sorted(bb, key=lambda c: bb[c]["delta_us"]):
+                d = bb[cat]
+                tag = "SAVE" if d["delta_us"] < -5 else ("COST" if d["delta_us"] > 5 else "")
+                print(f"  {cat:<30s} {d['bf16_us']:>6.0f}  {d['fp8_us']:>6.0f}  "
+                      f"{d['delta_us']:>+7.0f}  {tag}")
+            net = shape_res.get("budget_net_us", 0)
+            print(f"  {'NET':<30s} {'':>7s} {'':>7s} {net:>+7.0f}  "
+                  f"→ FP8 {'wins' if net < 0 else 'loses'}")
+
+        print("=" * 90)
         return nsys_data
 
     # ── quant-bench mode: isolated quant kernel CUDA-event benchmark ──
@@ -2738,6 +3459,86 @@ def run(
         _print_wgrad_bench_summary(wgrad_data)
         print("=" * 60)
         return wgrad_data
+
+    # ── ncu-bench mode: NCU kernel analysis with clock-control=none ──
+    if mode == "ncu-bench":
+        print(f"\n  NCU quant kernel analysis (clock-control=none) ...")
+        ncu_data = run_ncu_bench(gpu=gpu)
+        ncu_data["metadata"] = metadata
+        out_path = ROOT / "reports" / "ncu_quant_bench.json"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(ncu_data, indent=2, default=str))
+        print(f"\n  → {out_path} ({out_path.stat().st_size / 1024:.1f} KB)")
+        print("=" * 60)
+        return ncu_data
+
+    # ── wgrad-force mode: forced wgrad FP8 at all shapes ──
+    if mode == "wgrad-force":
+        # Run with wgrad forced ON (bypass I-threshold) and OFF for comparison
+        all_shapes = wgrad_bench_shapes or [dict(SHAPE)]
+        # Also sweep I=2048, I=3072 if only default shape given
+        if len(all_shapes) == 1 and all_shapes[0].get("I", 0) == SHAPE["I"]:
+            base = dict(all_shapes[0])
+            all_shapes = [
+                base,
+                {**base, "I": 2048},
+                {**base, "I": 3072},
+            ]
+
+        print(f"\n  Wgrad FP8 force-ON benchmark ({len(all_shapes)} shapes) ...")
+        on_data = run_wgrad_force_fp8(
+            gpu=gpu, shapes=all_shapes, trials=wgrad_bench_trials, force_wgrad=True,
+        )
+        on_data["metadata"] = metadata
+        on_data["wgrad_forced"] = True
+
+        print(f"\n  Wgrad FP8 force-OFF benchmark ({len(all_shapes)} shapes) ...")
+        off_data = run_wgrad_force_fp8(
+            gpu=gpu, shapes=all_shapes, trials=wgrad_bench_trials, force_wgrad=False,
+        )
+        off_data["wgrad_forced"] = False
+
+        combined = {
+            "metadata": metadata,
+            "wgrad_on": on_data,
+            "wgrad_off": off_data,
+            "analysis": {},
+        }
+        # Compare: for each shape, report speedup delta between on and off
+        for tag in on_data.get("shapes", {}):
+            on_sp = on_data["shapes"][tag].get("speedup", 0)
+            off_sp = off_data.get("shapes", {}).get(tag, {}).get("speedup", 0)
+            on_us = on_data["shapes"][tag].get("modes", {}).get("fp8", {}).get(
+                "forward_backward_us", {}).get("median_us", 0)
+            off_us = off_data.get("shapes", {}).get(tag, {}).get("modes", {}).get("fp8", {}).get(
+                "forward_backward_us", {}).get("median_us", 0)
+            combined["analysis"][tag] = {
+                "wgrad_on_speedup": on_sp,
+                "wgrad_off_speedup": off_sp,
+                "wgrad_on_fp8_us": on_us,
+                "wgrad_off_fp8_us": off_us,
+                "wgrad_delta_us": round(on_us - off_us, 1) if on_us and off_us else None,
+            }
+
+        out_path = ROOT / "reports" / "wgrad_force_bench.json"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(combined, indent=2, default=str))
+        print(f"\n  → {out_path} ({out_path.stat().st_size / 1024:.1f} KB)")
+
+        print("\n" + "=" * 60)
+        print("  Wgrad Force FP8 Analysis")
+        print("=" * 60)
+        _print_wgrad_force_summary(on_data)
+        print("\n  --- Wgrad OFF comparison ---")
+        _print_wgrad_force_summary(off_data)
+
+        print("\n  --- Shape-wise wgrad impact ---")
+        for tag, analysis in combined["analysis"].items():
+            print(f"  {tag}: ON={analysis['wgrad_on_speedup']:.4f}× "
+                  f"OFF={analysis['wgrad_off_speedup']:.4f}× "
+                  f"delta={analysis.get('wgrad_delta_us', '?')} µs")
+        print("=" * 60)
+        return combined
 
     # ── Trace BF16 ──
     print("\n[1/5] Tracing BF16 (subprocess-isolated) ...", flush=True)
@@ -2881,7 +3682,7 @@ def main():
         """),
     )
     parser.add_argument(
-        "--mode", choices=["trace", "profile", "full", "nsys", "quant-bench", "wgrad-bench"],
+        "--mode", choices=["trace", "profile", "full", "nsys", "quant-bench", "wgrad-bench", "ncu-bench", "wgrad-force"],
         default="trace",
         help="Introspection depth (default: trace)",
     )

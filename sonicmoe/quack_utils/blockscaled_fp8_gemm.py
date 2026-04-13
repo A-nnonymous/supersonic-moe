@@ -1765,7 +1765,12 @@ def colwise_quantize_and_pack(
 
     fp8_out = torch.empty(TK, H, dtype=torch.float8_e4m3fn, device=src.device)
     per_batch_storage = _storage_per_batch(H, TK)
-    packed_scales = torch.full((1, per_batch_storage), 127, dtype=torch.uint8, device=src.device)
+    # When both dims are tile-aligned, every scale byte is written by the kernel.
+    # Skip expensive torch.full fill kernel (~5µs launch) — use torch.empty instead.
+    if H % _SF_TILE_M == 0 and TK % _SF_TILE_K == 0:
+        packed_scales = torch.empty((1, per_batch_storage), dtype=torch.uint8, device=src.device)
+    else:
+        packed_scales = torch.full((1, per_batch_storage), 127, dtype=torch.uint8, device=src.device)
 
     num_groups = _div_up(TK, GROUP_SIZE)
     k_tiles = _div_up(TK, _SF_TILE_K)

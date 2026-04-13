@@ -618,15 +618,18 @@ class _FP8Config:
         self.alignment_assumed: bool = False
 
     # Threshold below which FP8 wgrad quant overhead exceeds GEMM savings.
-    # Benchmarked on B30Z: I=1536 → 0.913×, I=2048 → 1.057×, I=3072 → 1.182×.
-    _WGRAD_FP8_I_THRESHOLD = 2048
+    # Session 53 re-benchmarked after cache fix + stash:
+    #   I=1536: 1.300× (aligned), I=2048: 1.35×, I=3072: 1.50×.
+    # Wgrad ON is profitable at all I values when aligned.
+    # For non-aligned shapes, wgrad is disabled (padding overhead + CUTLASS
+    # compat issues make it unprofitable).
+    _WGRAD_FP8_I_THRESHOLD = 0
 
     def resolve_wgrad(self, I: int) -> None:
         """Resolve FP8 wgrad based on explicit setting or shape-based heuristic.
 
-        When ``_use_fp8_wgrad()`` returns None (auto), applies the threshold:
-        - I >= 2048: enable FP8 wgrad (GEMM savings > quant overhead)
-        - I < 2048: disable FP8 wgrad (quant overhead dominates)
+        After the Session 53 VARLEN cache fix, FP8 wgrad is profitable at all
+        tested I values (1536, 2048, 3072). Threshold is effectively 0.
         """
         if self._fp8_wgrad_setting is not None:
             self.fp8_wgrad = self._fp8_wgrad_setting
@@ -1258,18 +1261,19 @@ class _UpProjection(torch.autograd.Function):
                         "Ensure _DownProjection backward creates bwd prequant."
                     )
             else:
+                # Non-FP8 BF16 fallback (FP8 non-aligned is unreachable — DownProj
+                # backward raises before reaching here). Keep original fast path.
                 dw1_base = torch.empty((E, w1_shape[0], w1_shape[1]), dtype=w1_dtype, device=w1_device)
                 dw1 = dw1_base.permute(1, 2, 0)
                 gemm(
-                    x.T,
-                    dz,
-                    out=dw1_base.permute(0, 2, 1),
-                    cu_seqlens_k=expert_frequency_offset,
-                    A_idx=x_gather_idx,
-                    batch_idx_permute=None,
-                    dynamic_scheduler=False,
+                    x.T, dz, out=dw1_base.permute(0, 2, 1),
+                    cu_seqlens_k=expert_frequency_offset, A_idx=x_gather_idx,
+                    batch_idx_permute=None, dynamic_scheduler=False,
                 )
-                dx_expanded = gemm(dz, w1.permute(2, 0, 1), cu_seqlens_m=expert_frequency_offset, dynamic_scheduler=False)
+                dx_expanded = gemm(
+                    dz, w1.permute(2, 0, 1),
+                    cu_seqlens_m=expert_frequency_offset, dynamic_scheduler=False,
+                )
         else:
             raise RuntimeError(
                 "Non-QuACK GEMM path is removed. Set USE_QUACK_GEMM=1."
@@ -1614,17 +1618,18 @@ class _DownProjection(torch.autograd.Function):
                 # Backward-needed caches survive via ctx references:
                 #   w2_dgated  → ctx._w2_dgated_fp8 (DownProj dgated)
                 #   w1T_varlen → UpProj ctx._w1T_fp8 (actgrad)
+                #
+                # NOTE: keep _VARLEN_WEIGHT_CACHE alive — it is keyed by
+                # (data_ptr, _version) so stale entries auto-invalidate at
+                # optimizer step, and keeping it avoids ~300µs/iter weight
+                # re-quantize overhead on the next forward pass.
                 from ..quack_utils.blockscaled_fp8_gemm import (
                     _FUSED_WEIGHT_CACHE, _VARLEN_WEIGHT_CACHE,
                 )
-                _FUSED_WEIGHT_CACHE.clear()
-                _VARLEN_WEIGHT_CACHE.clear()
-                for _evict_name in ("w1_fused", "w2_varlen"):
-                    _evict_entry = _STASHED_FP8_WEIGHTS.pop(_evict_name, None)
-                    if _evict_entry is not None:
-                        for _t in _evict_entry:
-                            if isinstance(_t, torch.Tensor) and _t.untyped_storage().size() > 0:
-                                _t.untyped_storage().resize_(0)
+                # Keep ALL weight caches and stashed entries alive. They are
+                # version-keyed and auto-invalidate at optimizer step. Freeing
+                # them corrupts the cache (shared tensor objects) and costs
+                # ~980µs/iter re-quantization at large E.
 
                 # All segments aligned: use blockscaled FP8 path.
                 if ctx._use_fused_blockscaled_gated_flag:
@@ -1728,14 +1733,12 @@ class _DownProjection(torch.autograd.Function):
                     # ── Eager release of w2_dgated (consumed by dgated GEMM above) ──
                     # w1_fused and w2_varlen were already freed at backward entry
                     # (early eviction). Only w2_dgated remains to clean up here.
-                    if ctx._w2_decoupled:
-                        ctx._w2_dgated_fp8.untyped_storage().resize_(0)
-                        ctx._w2_dgated_scales.untyped_storage().resize_(0)
+                    # NOTE: do NOT free ctx._w2_dgated_fp8 storage — it's shared
+                    # with _FUSED_WEIGHT_CACHE. Freeing it corrupts the cache and
+                    # causes "storage of size 0" errors on the next forward.
+                    # The cache is version-keyed and auto-invalidates at optimizer step.
                     _w2d_stash = _STASHED_FP8_WEIGHTS.pop("w2_dgated", None)
-                    if _w2d_stash is not None:
-                        for _t in _w2d_stash:
-                            if isinstance(_t, torch.Tensor) and _t.untyped_storage().size() > 0:
-                                _t.untyped_storage().resize_(0)
+                    # Don't free stash entries either — they may alias cache tensors.
 
                     # Weight-grad: dw2 = dout.T @ y1s (per expert).
                     _log_stage_memory("backward:down-proj-dgated")
@@ -1815,7 +1818,7 @@ class _DownProjection(torch.autograd.Function):
                         a_scales=dout_scales,
                         w_fp8=w2_fp8, w_scales=w2_scales,
                         out_dtype=torch.bfloat16,
-                        assume_aligned=True,
+                        assume_aligned=ctx._alignment_assumed_flag,
                     )
                     del dout_fp8, dout_scales
                     # Eagerly release w2 FP8 cache (~37 MiB) — actgrad GEMM done.
@@ -1869,15 +1872,19 @@ class _DownProjection(torch.autograd.Function):
                     del y1s_wgrad
                     _log_stage_memory("backward:down-proj-weight")
                     ds = ds[s_reverse_scatter_idx]
+            elif ctx._fp8_enabled_flag and not ctx._alignment_assumed_flag:
+                # FP8 enabled but non-aligned: unreachable in production
+                # (callers must use token rounding for 128-alignment).
+                raise RuntimeError(
+                    f"FP8 blockscaled backward requires 128-aligned expert segments. "
+                    f"Got non-aligned cu_seqlens. Use token rounding in the router "
+                    f"to ensure each expert receives a multiple of 128 tokens."
+                )
             else:
-                # BF16 path: needs bf16 z for gemm_dgated
+                # BF16 path (fp8 disabled): standard gemm_dgated, no alignment req.
                 if z is None:
                     z = dequantize_blockscaled_fp8(z_fp8, z_raw_scales_u8)
                     del z_fp8, z_raw_scales_u8
-                # BF16 path: cast colvec_scale to fp32 to avoid QuACK varlen
-                # alignment bug (domain_offset on bf16 ptr reduces to 16-bit
-                # alignment, but async copy requires 32-bit; fp32 is always
-                # 32-bit aligned after any integer offset)
                 dz = torch.empty_like(z)
                 _, y1s, ds = gemm_dgated(
                     dout,
@@ -2228,12 +2235,11 @@ def moe_TC_softmax_topk_layer(
 
     # ── Memory optimization: eagerly release forward transients ──────────
     # z bf16 and y1 bf16 storage was already freed inside _UpProjection
-    # via untyped_storage().resize_(0).  Clear w1 FUSED cache (~74 MiB)
-    # which is forward-only.  Keep VARLEN cache — entries auto-invalidate
-    # via w._version at optimizer step, and hit in no-optimizer benchmarks.
-    if _get_fp8_config().enabled:
-        from ..quack_utils.blockscaled_fp8_gemm import clear_fused_weight_cache
-        clear_fused_weight_cache()
+    # via untyped_storage().resize_(0).  Keep ALL weight caches (version-keyed,
+    # auto-invalidate at optimizer step).  Session 53 analysis: clearing FUSED
+    # cache saved ~74 MiB but cost ~980µs/iter at E=128 from weight re-quant.
+    # if _get_fp8_config().enabled:
+    #     clear_fused_weight_cache()
 
     _reset_stage_memory_probe()
     o = _DownProjection.apply(
@@ -2319,10 +2325,12 @@ def moe_general_routing_inputs(
     )
 
     # ── Eagerly release forward transients (same as moe_TC_softmax_topk_layer) ──
-    # z/y1 bf16 storage freed inside _UpProjection; clear w1 FUSED cache only.
-    if _fp8_enabled() and _ALIGNMENT_ASSUMED:
-        from ..quack_utils.blockscaled_fp8_gemm import clear_fused_weight_cache
-        clear_fused_weight_cache()
+    # z/y1 bf16 storage freed inside _UpProjection.
+    # NOTE: keep FUSED weight cache alive (version-keyed, auto-invalidates at
+    # optimizer step). Clearing it saved ~74 MiB but cost ~980µs/iter at E=128
+    # from weight re-quantization.
+    # if _fp8_enabled() and _ALIGNMENT_ASSUMED:
+    #     clear_fused_weight_cache()
 
     o = _DownProjection.apply(
         y1,
