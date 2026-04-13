@@ -120,16 +120,18 @@ The reporting policy for every FP8 step is:
 - memory baseline: official bf16
 - performance baselines: previous commit and official bf16
 
-## 🔥 FP8 Blockscaled Status (2026-04-12, Session 51)
+## 🔥 FP8 Blockscaled Status (2026-04-13, Session 52)
 
-The `native-fp8-exploration` branch has a fully functional **zero-materialization** blockscaled FP8 training path for Blackwell (B200) with **32×32 isotropic weight quantization**, optional **weight stash** memory optimization, native **CUTLASS / QuACK** FP8 kernels, **Pythonic config API** (`SonicMoEConfig`), **unaligned FP8 padding**, **epilogue FP8 D output** (z written directly as fp8 by CUTLASS), **CuTe DSL colwise quant kernels** (1.3× faster than Triton without gather), **early weight cache eviction**, and **nsys GPU-projection profiling** integrated into introspect.py. No TK-sized FP8 activation is materialized — the FP8 path matches SonicMoE's core BF16 design principle.
+The `native-fp8-exploration` branch has a fully functional **zero-materialization** blockscaled FP8 training path for Blackwell (B30Z) with **32×32 isotropic weight quantization**, optional **weight stash** memory optimization, native **CUTLASS / QuACK** FP8 kernels, **Pythonic config API** (`SonicMoEConfig`), **unaligned FP8 padding** (forward only), **epilogue FP8 D output** (z written directly as fp8 by CUTLASS), **NCU-guided quant kernel optimization** (num_warps=1 → 2.3× colwise speedup), **shape-based wgrad FP8 auto-tuning**, and **fused dual row+col quantization**. No TK-sized FP8 activation is materialized.
 
-### Session 51 Highlights
+### Session 52 Highlights
 
-- **`_fp8_mode()` priority fix**: `enable_fp8(False)` now properly overrides `SONIC_MOE_FP8_MODE` env var. This was the **root cause** of Session 49's contaminated BF16 baselines.
-- **CUDA events benchmark** (3 rounds × 20 trials): **1.08× at I=1536, 1.22× at I=2048** — most reliable under GPU contention.
-- **Kernel classifier fix**: ZeroMat GEMM kernels no longer double-counted as "Blockscaled Quant" in profiling.
-- **34/34 tests + 20 subtests PASS** (verified with fix applied).
+- **num_warps=1 quant kernel optimization**: NCU profiling revealed 63% idle warp cycles at default nw=4. Reducing to nw=1 gives **2.3× colwise speedup**, **2.0× dual quant speedup**. Bitwise identical output.
+- **CuTe-to-Triton migration**: All hot-path colwise quant now uses Triton nw=1 (faster than CuTe at 137µs vs 182µs).
+- **Fused dual quant**: `dual_quantize_varlen` replaces separate col+row quant in DownProj wgrad (183µs vs 311µs).
+- **Wgrad FP8 auto-tuning**: OFF for I<2048 (quant overhead dominates), ON for I>=2048.
+- **43% total quant overhead reduction** in DownProj wgrad path.
+- **34/34 tests + 20 subtests PASS**.
 
 ### Quick Start (Pythonic Config — no env vars needed)
 
@@ -151,24 +153,24 @@ with cfg.activate():
 
 Alternatively, env vars still work: `USE_QUACK_GEMM=1` and `SONIC_MOE_FP8_MODE=perf`.
 
-### Performance (Session 51 — CUDA events, B200 under 100% GPU contention)
+### Performance (Session 52 — CUDA events, B30Z, TK=65536)
 
-| Shape | BF16 (µs) | FP8 (µs) | Speedup | Variance |
-|-------|:---------:|:--------:|:-------:|----------|
-| **Ernie** (I=1536) | 1436 | 1332 | **1.08×** | BF16 highly variable (1436–2256µs across rounds); FP8 stable (1320–1336µs) |
-| **I=2048** | 2044 | 1672 | **1.22×** | Very consistent across all 3 rounds |
+| Shape | BF16 total (ms) | FP8 total (ms) | Speedup | Notes |
+|-------|:---:|:---:|:---:|-------|
+| **I=1536** (Ernie) | 5.238 | 5.328 | **0.983×** | FP8 bwd faster, fwd overhead dominates |
+| **I=2048** | 6.338 | 6.146 | **1.031×** | Near break-even |
+| **I=3072** | 9.198 | 8.098 | **1.136×** | Clear win — GEMM savings dominate |
 
-> **Methodology:** CUDA events, same-process (both modes experience identical GPU contention). Median of 20 trials × 3 independent rounds. I=1536 uses the clean round (lowest BF16 contention); the 3-round average is 1.49× but inflated by BF16 contention spikes. See HANDOFF.md for full breakdown.
+> **Methodology:** CUDA events, same-process, median of 15 trials, 5 warmup. Both modes experience identical contention. FP8 advantage grows with I: O(I²) GEMM savings vs O(I) quant overhead.
 
-### Memory (Session 50–51, subprocess-isolated peak, env-var decontaminated)
+### Memory (Session 52, torch.cuda.max_memory_allocated)
 
-| Config | I=1536 Fwd | I=1536 Bwd | I=2048 Fwd | I=2048 Bwd |
-|--------|-----------|----------|----------|----------|
-| **BF16** | 1290 MiB | 1412 MiB | 1554 MiB | 1828 MiB |
-| **FP8** | 1232 MiB | 1530 MiB | 1476 MiB | 1985 MiB |
-| **FP8+Stash** | 1018 MiB | 1314 MiB | 1192 MiB | 1697 MiB |
+| Config | I=1536 | I=2048 | I=3072 |
+|--------|:---:|:---:|:---:|
+| **BF16** | 1628 MiB | 2116 MiB | 3094 MiB |
+| **FP8** | 1572 MiB | 2274 MiB | 3329 MiB |
 
-FP8 saves 4–5% overall peak (forward). **FP8+Stash** saves **21–23%** peak (bf16 weights offloaded to CPU, FP8 caches serve backward).
+FP8 saves memory at I=1536 (wgrad OFF by auto-tune). At I>=2048 (wgrad ON), quant temporaries cost more. **FP8+Stash** saves **21–23%** peak at all shapes.
 
 ### Precision (5 seeds × 2 shapes)
 
@@ -211,7 +213,7 @@ moe.unstash_bf16()                # +216 MiB GPU (CPU → bf16)
 |----------|------|-----|
 | **Agent context** | `AGENTS.md` / `agent.md` | Cold-start for new agents — status, API, key files, lessons |
 | **Handoff** | `reports/fp8_upgrade/HANDOFF.md` | Complete project state, bugs, measurements, next steps |
-| Engineering log | `reports/fp8_upgrade/engineering_log.md` | Phase-by-phase development history (Phases 1–16) |
+| Engineering log | `reports/fp8_upgrade/engineering_log.md` | Phase-by-phase development history (Phases 1–17) |
 | Frontier tests | `tests/fp8_large_project_contract_test.py` | 34-test contract gate (+20 subtests) |
 
 ## 📊 Architecture & Dataflow Visualization

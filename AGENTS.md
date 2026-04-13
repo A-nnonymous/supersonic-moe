@@ -3,15 +3,18 @@
 Cold-start context for agents working on SonicMoE FP8 blockscaled optimization.
 **Read `reports/fp8_upgrade/HANDOFF.md` first** — it is the single source of truth.
 
-## Current Status (2026-04-12, Session 51)
+## Current Status (2026-04-13, Session 52)
 
 - **FP8 forward+backward fully functional** — zero-materialization CUTLASS kernels, no TK-sized FP8 activation materialized
 - **34/34 precision tests + 20 subtests PASS** (RRMSE <10%, correlation >0.99)
-- **Performance** (CUDA events, same-process, B200 under contention):
-  - I=1536 (Ernie): **1.08×** speedup (conservative clean-round; BF16 high-variance under contention)
-  - I=2048: **1.22×** speedup (very consistent)
-- **Memory**: FP8 saves 4–5% peak; **FP8+Stash saves 21–23% peak**
+- **Performance** (CUDA events, same-process, B30Z, TK=65536):
+  - I=1536 (Ernie): **0.983×** (FP8 slightly slower — fwd quant overhead dominates)
+  - I=2048: **1.031×** (near break-even)
+  - I=3072: **1.136×** (clear win — GEMM savings dominate)
+- **Memory**: FP8 saves 3.4% at I=1536 (wgrad OFF); costs 7.5% at I>=2048 (wgrad ON). **FP8+Stash saves 21–23% peak**
 - **Config**: Pythonic `SonicMoEConfig` API (env vars still work as fallback)
+- **Quant kernels**: num_warps=1 optimization (2.3× colwise speedup), fused dual quant, CuTe replaced by Triton in hot path
+- **Wgrad auto-tuning**: OFF for I<2048, ON for I>=2048
 
 ## Best training path (Pythonic Config)
 
@@ -57,7 +60,7 @@ Auto-selected in `gemm_gated.py`/`gemm_dgated.py` when `gather_A + blockscaled`.
 | `sonicmoe/functional/__init__.py` | Forward/backward orchestration, FP8 config, cache management |
 | `sonicmoe/moe.py` | MoE class, stash/unstash, refresh_fp8_shadow_weights |
 | `sonicmoe/quack_utils/gemm_sm100_fp8_zeromat.py` | Zero-mat CUTLASS kernel classes |
-| `sonicmoe/quack_utils/cute_blockscaled_quant.py` | CuTe DSL colwise quant (1.3× faster than Triton w/o gather) |
+| `sonicmoe/quack_utils/cute_blockscaled_quant.py` | CuTe DSL colwise quant (no longer in hot path; Triton nw=1 is faster) |
 | `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` | Triton quant kernels, weight caches |
 | `sonicmoe/quack_utils/gemm_gated.py` | GemmGated wrapper (auto ZeroMat selection) |
 | `sonicmoe/quack_utils/gemm_dgated.py` | GemmDGated wrapper (auto ZeroMat selection) |
@@ -85,17 +88,19 @@ CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
 
 1. **`_fp8_mode()` priority**: Context manager (`enable_fp8(False)`) now correctly overrides env var. Fixed in Session 51. Before this fix, BF16 baselines with env var set were secretly running FP8.
 2. **Measurement on busy cluster**: CUDA events same-process is the most reliable method. nsys GPU-projection requires idle GPU for reliable cross-mode comparison.
-3. **Quant overhead is 25–42% of FP8 time** — the #1 optimization target. row_quant already at HBM ceiling (97% occ, 4613 GB/s). CuTe colwise beats Triton 1.3× without gather; Triton wins with gather.
-4. **FP8 backward peak +118 MiB over BF16** due to wgrad quant temporaries. Weight stash (-216 MiB) is the proven solution.
-5. **QuACK JIT cache is source-fingerprint-based** — editing CuTe kernels does NOT invalidate cache. Must manually `rm /tmp/root/quack_cache/<hash>/*.o` AND `_compile_colwise_quant.cache_clear()`.
+3. **num_warps=1 is dramatically better for Triton quant kernels**: NCU showed 63% idle warp cycles at nw=4. Reducing to nw=1 gives 2.3× colwise speedup. Does NOT help row_quant (already at HBM ceiling).
+4. **Quant overhead after Session 52 optimization**: 43% reduced in DownProj wgrad path. Forward quant overhead (~19% slower fwd) is now the dominant bottleneck.
+5. **FP8 backward peak +118 MiB over BF16** due to wgrad quant temporaries. Weight stash (-216 MiB) is the proven solution.
+6. **QuACK JIT cache is source-fingerprint-based** — editing CuTe kernels does NOT invalidate cache. Must manually `rm /tmp/root/quack_cache/<hash>/*.o` AND `_compile_colwise_quant.cache_clear()`.
 
 ## What NOT to waste time on
 
-See HANDOFF.md §7 "Dead Ends" for the complete list with evidence. Key items:
-- FP8 wgrad colwise quant at I=1536 (SM contention → 0.887× net negative)
+See HANDOFF.md §6 "Dead Ends" for the complete list with evidence. Key items:
+- FP8 wgrad at I=1536 (0.913× net negative — auto-tuned OFF)
+- num_warps=1 on row_quant (nw=1/2/4 all give 108-109µs)
+- CuTe colwise for hot-path nogather (Triton nw=1 at 137µs beats CuTe at 182µs)
 - torch.as_strided for fake TK shape (PyTorch storage bounds check)
 - Save x as fp8 between fwd/bwd (dequant creates +24.8 MiB transient spike)
-- Pre-gather + CuTe colwise (53µs > Triton fused 39µs)
 - Micro-optimizing row_quant (already at 97% occupancy, 56% DRAM)
 - Early weight cache eviction at I=1536 (peak is at wgrad, not dgated)
 

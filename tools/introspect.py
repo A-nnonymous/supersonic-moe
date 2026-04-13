@@ -19,10 +19,12 @@ Session 46 improvements:
 
 Modes
 -----
-  trace   — shapes / dtypes / lifecycle / memory (~3 s)
-  profile — trace + kernel timing via torch.profiler (~30 s)
-  full    — trace + profile + precision audit (~60 s)
-  nsys    — nsys GPU-projection profiling (~120 s per shape×mode)
+  trace      — shapes / dtypes / lifecycle / memory (~3 s)
+  profile    — trace + kernel timing via torch.profiler (~30 s)
+  full       — trace + profile + precision audit (~60 s)
+  nsys       — nsys GPU-projection profiling (~120 s per shape×mode)
+  quant-bench — isolated CUDA-event quant kernel benchmark (all variants)
+  wgrad-bench — FP8 vs BF16 wgrad end-to-end benchmark with memory
 
 Usage
 -----
@@ -31,6 +33,9 @@ Usage
     python tools/introspect.py --mode full            # everything
     python tools/introspect.py --mode nsys            # gold-standard GPU timing
     python tools/introspect.py --mode nsys --nsys-shapes 8192,3072,1536,8,8 8192,3072,2048,8,8
+    python tools/introspect.py --mode quant-bench     # quant kernel micro-benchmark
+    python tools/introspect.py --mode quant-bench --quant-bench-shapes 65536,3072,3072,1536
+    python tools/introspect.py --mode wgrad-bench     # FP8 vs BF16 wgrad timing + memory
 
 Output: ``manifest.json`` at repo root.
 """
@@ -1338,12 +1343,19 @@ sys.path.insert(0, "{root}")
 os.environ["CUDA_VISIBLE_DEVICES"] = "{gpu}"
 os.environ["USE_QUACK_GEMM"] = "1"
 
+mode = "{mode}"
+
+# CRITICAL: set FP8 env vars BEFORE importing sonicmoe, because
+# sonicmoe.functional.utils._IS_FP8_ACTIVE is evaluated at module load time
+# from SONIC_MOE_FP8_MODE.  Setting after import has no effect on the global.
+if mode == "fp8":
+    os.environ["SONIC_MOE_FP8_MODE"] = "perf"
+
 from sonicmoe import MoE, enable_fp8, enable_quack_gemm
 from sonicmoe.enums import ActivationType
 import sonicmoe.functional as functional
 
 T, H, I, E, K = {T}, {H}, {I}, {E}, {K}
-mode = "{mode}"
 
 # Reset FP8 state cleanly, then let it build up during warmup
 functional.clear_all_fp8_weight_caches()
@@ -1356,11 +1368,6 @@ moe = MoE(num_experts=E, num_experts_per_tok=K, hidden_size=H,
            intermediate_size=I, activation_function=ActivationType.SWIGLU,
            add_bias=False, std=0.02).to(device=device, dtype=torch.bfloat16)
 x = (0.02 * torch.randn(T, H, device=device, dtype=torch.bfloat16)).detach().requires_grad_()
-
-if mode == "fp8":
-    os.environ["SONIC_MOE_FP8_MODE"] = "perf"
-    enable_fp8(True)
-enable_quack_gemm(True)
 
 # Warm up ({warmup} iters) — build alignment streak, JIT, weight caches
 for _ in range({warmup}):
@@ -2092,6 +2099,519 @@ def _serialize_manifest(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Quant Kernel Benchmark Engine (CUDA-event, isolated)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Isolated CUDA-event benchmark of every quant kernel variant at arbitrary shapes.
+# Reports median, p5, p95, min, max, stddev. Calculates theoretical HBM BW floor.
+# Used for NCU-driven optimization feedback loop.
+
+_QUANT_BENCH_SCRIPT = textwrap.dedent(r'''
+import gc, json, os, sys, statistics, torch
+
+device = torch.device("cuda:0")
+torch.cuda.set_device(device)
+sys.path.insert(0, "{root}")
+
+from sonicmoe.quack_utils.blockscaled_fp8_gemm import (
+    quantize_activation_blockscaled_fast,
+    colwise_quantize_and_pack,
+)
+try:
+    from sonicmoe.quack_utils.cute_blockscaled_quant import colwise_quantize_cute
+    HAS_CUTE = True
+except ImportError:
+    HAS_CUTE = False
+
+SHAPES = {shapes_json}
+WARMUP = {warmup}
+TRIALS = {trials}
+PEAK_HBM_GBps = {peak_hbm_gbps}
+
+def bench(fn, warmup, trials):
+    """CUDA-event benchmark with trimmed statistics."""
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    times = []
+    for _ in range(trials):
+        s = torch.cuda.Event(enable_timing=True)
+        e = torch.cuda.Event(enable_timing=True)
+        s.record(); fn(); e.record()
+        torch.cuda.synchronize()
+        times.append(s.elapsed_time(e) * 1000)  # µs
+    times.sort()
+    trim = max(1, len(times) // 10)
+    trimmed = times[trim:-trim] if len(times) > 2 * trim else times
+    return {{
+        "median_us": round(statistics.median(trimmed), 2),
+        "mean_us": round(statistics.mean(trimmed), 2),
+        "min_us": round(min(times), 2),
+        "max_us": round(max(times), 2),
+        "p5_us": round(times[max(0, len(times)//20)], 2),
+        "p95_us": round(times[min(len(times)-1, len(times)*19//20)], 2),
+        "stddev_us": round(statistics.stdev(times), 2) if len(times) > 1 else 0,
+        "n_trials": trials,
+    }}
+
+def bw_floor_us(total_bytes):
+    """Theoretical minimum time at peak HBM bandwidth."""
+    return total_bytes / (PEAK_HBM_GBps * 1e3)
+
+results = {{"shapes": {{}}}}
+
+for shape in SHAPES:
+    TK = shape["TK"]
+    H = shape["H"]
+    I2 = shape.get("I2", H)
+    I1 = shape.get("I1", I2 // 2)
+    tag = f"TK={{TK}}_H={{H}}_I2={{I2}}"
+    print(f"  benchmarking {{tag}} ...", flush=True)
+
+    shape_res = {{"TK": TK, "H": H, "I2": I2, "I1": I1, "kernels": {{}}}}
+
+    x = torch.randn(TK, H, dtype=torch.bfloat16, device=device)
+    dz = torch.randn(TK, I2, dtype=torch.bfloat16, device=device)
+    y1s = torch.randn(TK, I1, dtype=torch.bfloat16, device=device)
+    gather_idx = torch.randint(0, TK, (TK,), dtype=torch.int32, device=device)
+
+    # Warmup all paths
+    for _ in range(3):
+        _ = quantize_activation_blockscaled_fast(x)
+        _ = colwise_quantize_and_pack(x, H, TK)
+    torch.cuda.synchronize()
+
+    # --- row quant family ---
+    x_bytes = TK * H * 2
+    dz_bytes = TK * I2 * 2
+    y1s_bytes = TK * I1 * 2
+
+    r = bench(lambda: quantize_activation_blockscaled_fast(x), WARMUP, TRIALS)
+    r["io_bytes"] = x_bytes + TK * H  # read bf16, write fp8 + scales
+    r["bw_floor_us"] = round(bw_floor_us(r["io_bytes"]), 2)
+    r["bw_util_pct"] = round(r["bw_floor_us"] / r["median_us"] * 100, 1) if r["median_us"] > 0 else 0
+    shape_res["kernels"]["row_quant_x"] = r
+
+    r = bench(lambda: quantize_activation_blockscaled_fast(dz), WARMUP, TRIALS)
+    r["io_bytes"] = dz_bytes + TK * I2
+    r["bw_floor_us"] = round(bw_floor_us(r["io_bytes"]), 2)
+    r["bw_util_pct"] = round(r["bw_floor_us"] / r["median_us"] * 100, 1) if r["median_us"] > 0 else 0
+    shape_res["kernels"]["row_quant_dz"] = r
+
+    # --- colwise Triton family ---
+    r = bench(lambda: colwise_quantize_and_pack(x, H, TK), WARMUP, TRIALS)
+    r["io_bytes"] = x_bytes + TK * H
+    r["bw_floor_us"] = round(bw_floor_us(r["io_bytes"]), 2)
+    r["bw_util_pct"] = round(r["bw_floor_us"] / r["median_us"] * 100, 1) if r["median_us"] > 0 else 0
+    shape_res["kernels"]["colwise_triton_x"] = r
+
+    r = bench(lambda: colwise_quantize_and_pack(x, H, TK, gather_idx=gather_idx), WARMUP, TRIALS)
+    r["io_bytes"] = x_bytes + TK * H  # + gather index read
+    r["bw_floor_us"] = round(bw_floor_us(r["io_bytes"]), 2)
+    r["bw_util_pct"] = round(r["bw_floor_us"] / r["median_us"] * 100, 1) if r["median_us"] > 0 else 0
+    shape_res["kernels"]["colwise_triton_x_gather"] = r
+
+    r = bench(lambda: colwise_quantize_and_pack(dz, I2, TK), WARMUP, TRIALS)
+    r["io_bytes"] = dz_bytes + TK * I2
+    r["bw_floor_us"] = round(bw_floor_us(r["io_bytes"]), 2)
+    r["bw_util_pct"] = round(r["bw_floor_us"] / r["median_us"] * 100, 1) if r["median_us"] > 0 else 0
+    shape_res["kernels"]["colwise_triton_dz"] = r
+
+    r = bench(lambda: colwise_quantize_and_pack(y1s, I1, TK), WARMUP, TRIALS)
+    r["io_bytes"] = y1s_bytes + TK * I1
+    r["bw_floor_us"] = round(bw_floor_us(r["io_bytes"]), 2)
+    r["bw_util_pct"] = round(r["bw_floor_us"] / r["median_us"] * 100, 1) if r["median_us"] > 0 else 0
+    shape_res["kernels"]["colwise_triton_y1s"] = r
+
+    # --- colwise CuTe family ---
+    if HAS_CUTE:
+        for _ in range(3):
+            _ = colwise_quantize_cute(x, H, TK, isa_pack=True)
+        torch.cuda.synchronize()
+
+        r = bench(lambda: colwise_quantize_cute(x, H, TK, isa_pack=True), WARMUP, TRIALS)
+        r["io_bytes"] = x_bytes + TK * H
+        r["bw_floor_us"] = round(bw_floor_us(r["io_bytes"]), 2)
+        r["bw_util_pct"] = round(r["bw_floor_us"] / r["median_us"] * 100, 1) if r["median_us"] > 0 else 0
+        shape_res["kernels"]["colwise_cute_x_isa"] = r
+
+        r = bench(lambda: colwise_quantize_cute(dz, I2, TK, isa_pack=True), WARMUP, TRIALS)
+        r["io_bytes"] = dz_bytes + TK * I2
+        r["bw_floor_us"] = round(bw_floor_us(r["io_bytes"]), 2)
+        r["bw_util_pct"] = round(r["bw_floor_us"] / r["median_us"] * 100, 1) if r["median_us"] > 0 else 0
+        shape_res["kernels"]["colwise_cute_dz_isa"] = r
+
+        r = bench(lambda: colwise_quantize_cute(y1s, I1, TK, isa_pack=True), WARMUP, TRIALS)
+        r["io_bytes"] = y1s_bytes + TK * I1
+        r["bw_floor_us"] = round(bw_floor_us(r["io_bytes"]), 2)
+        r["bw_util_pct"] = round(r["bw_floor_us"] / r["median_us"] * 100, 1) if r["median_us"] > 0 else 0
+        shape_res["kernels"]["colwise_cute_y1s_isa"] = r
+
+        r = bench(lambda: colwise_quantize_cute(x, H, TK, gather_idx=gather_idx, isa_pack=True), WARMUP, TRIALS)
+        r["io_bytes"] = x_bytes + TK * H
+        r["bw_floor_us"] = round(bw_floor_us(r["io_bytes"]), 2)
+        r["bw_util_pct"] = round(r["bw_floor_us"] / r["median_us"] * 100, 1) if r["median_us"] > 0 else 0
+        shape_res["kernels"]["colwise_cute_x_gather_isa"] = r
+
+        r = bench(lambda: colwise_quantize_cute(x, H, TK, isa_pack=False), WARMUP, TRIALS)
+        r["io_bytes"] = x_bytes + TK * H
+        r["bw_floor_us"] = round(bw_floor_us(r["io_bytes"]), 2)
+        r["bw_util_pct"] = round(r["bw_floor_us"] / r["median_us"] * 100, 1) if r["median_us"] > 0 else 0
+        shape_res["kernels"]["colwise_cute_x_raw"] = r
+
+    # --- Summary: best per-task ---
+    kernels = shape_res["kernels"]
+    summary = {{}}
+    # Best colwise for x (no gather)
+    x_cands = {{k: v["median_us"] for k, v in kernels.items() if "colwise" in k and "_x" in k and "gather" not in k}}
+    if x_cands:
+        best = min(x_cands, key=x_cands.get)
+        summary["best_colwise_x_nogather"] = {{"kernel": best, "us": x_cands[best]}}
+    # Best colwise for x (with gather)
+    x_gather = {{k: v["median_us"] for k, v in kernels.items() if "colwise" in k and "_x" in k and "gather" in k}}
+    if x_gather:
+        best = min(x_gather, key=x_gather.get)
+        summary["best_colwise_x_gather"] = {{"kernel": best, "us": x_gather[best]}}
+    # Speedup ratios
+    if "colwise_triton_x" in kernels and "colwise_cute_x_isa" in kernels:
+        t, c = kernels["colwise_triton_x"]["median_us"], kernels["colwise_cute_x_isa"]["median_us"]
+        summary["cute_vs_triton_nogather"] = round(t / c, 3) if c > 0 else 0
+    if "colwise_triton_x_gather" in kernels and "colwise_cute_x_gather_isa" in kernels:
+        t, c = kernels["colwise_triton_x_gather"]["median_us"], kernels["colwise_cute_x_gather_isa"]["median_us"]
+        summary["cute_vs_triton_gather"] = round(t / c, 3) if c > 0 else 0
+
+    shape_res["summary"] = summary
+
+    results["shapes"][tag] = shape_res
+    del x, dz, y1s, gather_idx
+    gc.collect(); torch.cuda.empty_cache()
+
+print("__QUANT_BENCH_JSON__" + json.dumps(results))
+''')
+
+
+_WGRAD_BENCH_SCRIPT = textwrap.dedent(r'''
+import gc, json, os, sys, statistics, torch
+
+device = torch.device("cuda:0")
+torch.cuda.set_device(device)
+sys.path.insert(0, "{root}")
+
+from sonicmoe import MoE
+from sonicmoe.enums import ActivationType
+from sonicmoe.functional.utils import enable_fp8, enable_quack_gemm
+
+SHAPES = {shapes_json}
+WARMUP = {warmup}
+TRIALS = {trials}
+
+def bench(fn, warmup, trials):
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    times = []
+    for _ in range(trials):
+        s = torch.cuda.Event(enable_timing=True)
+        e = torch.cuda.Event(enable_timing=True)
+        s.record(); fn(); e.record()
+        torch.cuda.synchronize()
+        times.append(s.elapsed_time(e) * 1000)
+    times.sort()
+    trim = max(1, len(times) // 10)
+    trimmed = times[trim:-trim] if len(times) > 2 * trim else times
+    return {{
+        "median_us": round(statistics.median(trimmed), 2),
+        "mean_us": round(statistics.mean(trimmed), 2),
+        "min_us": round(min(times), 2),
+        "max_us": round(max(times), 2),
+        "p5_us": round(times[max(0, len(times)//20)], 2),
+        "p95_us": round(times[min(len(times)-1, len(times)*19//20)], 2),
+        "n_trials": trials,
+    }}
+
+results = {{"shapes": {{}}}}
+
+for shape in SHAPES:
+    T, H, I, E, K = shape["T"], shape["H"], shape["I"], shape["E"], shape["K"]
+    tag = f"T={{T}}_H={{H}}_I={{I}}_E={{E}}_K={{K}}"
+    print(f"  wgrad bench {{tag}} ...", flush=True)
+
+    torch.manual_seed(42)
+    model = MoE(E, K, H, I, ActivationType.SWIGLU, False, 0.02).to(device).to(torch.bfloat16)
+
+    shape_res = {{"shape": shape, "modes": {{}}}}
+
+    for mode_name in ("bf16", "fp8"):
+        use_fp8 = (mode_name == "fp8")
+        # Warmup
+        for _ in range(15):
+            xw = 0.02 * torch.randn(T, H, dtype=torch.bfloat16, device=device, requires_grad=True)
+            with enable_quack_gemm(True):
+                if use_fp8:
+                    with enable_fp8(True):
+                        ow, lw = model(xw, use_fp8=True)
+                else:
+                    with enable_fp8(False):
+                        ow, lw = model(xw)
+            (ow.sum() + lw).backward()
+            model.zero_grad(set_to_none=True)
+            del ow, lw, xw
+        gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
+
+        # Forward-only timing
+        def run_fwd():
+            x_t = 0.02 * torch.randn(T, H, dtype=torch.bfloat16, device=device, requires_grad=True)
+            with torch.no_grad():
+                with enable_quack_gemm(True):
+                    if use_fp8:
+                        with enable_fp8(True):
+                            o, l = model(x_t, use_fp8=True)
+                    else:
+                        with enable_fp8(False):
+                            o, l = model(x_t)
+            del o, l, x_t
+
+        fwd = bench(run_fwd, 5, TRIALS)
+
+        # Full forward+backward timing
+        def run_fwd_bwd():
+            x_t = 0.02 * torch.randn(T, H, dtype=torch.bfloat16, device=device, requires_grad=True)
+            with enable_quack_gemm(True):
+                if use_fp8:
+                    with enable_fp8(True):
+                        o, l = model(x_t, use_fp8=True)
+                else:
+                    with enable_fp8(False):
+                        o, l = model(x_t)
+            (o.sum() + l).backward()
+            model.zero_grad(set_to_none=True)
+            del o, l, x_t
+
+        fwd_bwd = bench(run_fwd_bwd, 5, TRIALS)
+
+        # Backward = fwd_bwd - fwd
+        bwd_median = fwd_bwd["median_us"] - fwd["median_us"]
+
+        shape_res["modes"][mode_name] = {{
+            "forward_us": fwd,
+            "forward_backward_us": fwd_bwd,
+            "backward_est_us": round(bwd_median, 2),
+        }}
+
+        gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
+
+    # Compute speedups
+    bf16 = shape_res["modes"].get("bf16", {{}})
+    fp8 = shape_res["modes"].get("fp8", {{}})
+    if bf16 and fp8:
+        bf16_fwdbwd = bf16.get("forward_backward_us", {{}}).get("median_us", 0)
+        fp8_fwdbwd = fp8.get("forward_backward_us", {{}}).get("median_us", 0)
+        bf16_fwd = bf16.get("forward_us", {{}}).get("median_us", 0)
+        fp8_fwd = fp8.get("forward_us", {{}}).get("median_us", 0)
+        bf16_bwd = bf16.get("backward_est_us", 0)
+        fp8_bwd = fp8.get("backward_est_us", 0)
+        shape_res["speedup"] = {{
+            "fwd_bwd": round(bf16_fwdbwd / fp8_fwdbwd, 4) if fp8_fwdbwd > 0 else 0,
+            "fwd": round(bf16_fwd / fp8_fwd, 4) if fp8_fwd > 0 else 0,
+            "bwd": round(bf16_bwd / fp8_bwd, 4) if fp8_bwd > 0 else 0,
+        }}
+
+    del model
+    gc.collect(); torch.cuda.empty_cache()
+    results["shapes"][tag] = shape_res
+
+    # Memory measurement (separate clean run)
+    torch.cuda.reset_peak_memory_stats(device)
+    torch.manual_seed(42)
+    model = MoE(E, K, H, I, ActivationType.SWIGLU, False, 0.02).to(device).to(torch.bfloat16)
+    for mode_name in ("bf16", "fp8"):
+        use_fp8 = (mode_name == "fp8")
+        torch.cuda.reset_peak_memory_stats(device)
+        gc.collect(); torch.cuda.empty_cache()
+        base = torch.cuda.memory_allocated(device)
+        x_t = 0.02 * torch.randn(T, H, dtype=torch.bfloat16, device=device, requires_grad=True)
+        with enable_quack_gemm(True):
+            if use_fp8:
+                with enable_fp8(True):
+                    o, l = model(x_t, use_fp8=True)
+            else:
+                with enable_fp8(False):
+                    o, l = model(x_t)
+        fwd_peak = torch.cuda.max_memory_allocated(device)
+        (o.sum() + l).backward()
+        bwd_peak = torch.cuda.max_memory_allocated(device)
+        model.zero_grad(set_to_none=True)
+        del o, l, x_t
+
+        results["shapes"][tag]["modes"][mode_name]["memory_mib"] = {{
+            "base": round(base / 1048576, 2),
+            "fwd_peak": round(fwd_peak / 1048576, 2),
+            "bwd_peak": round(bwd_peak / 1048576, 2),
+        }}
+        gc.collect(); torch.cuda.empty_cache()
+    del model
+    gc.collect(); torch.cuda.empty_cache()
+
+print("__WGRAD_BENCH_JSON__" + json.dumps(results))
+''')
+
+# B200/B30Z peak HBM bandwidth (GB/s)
+_B200_PEAK_HBM_GBPS = 8000
+
+
+def run_quant_bench(
+    gpu: int = 0,
+    shapes: list[dict] | None = None,
+    warmup: int = 10,
+    trials: int = 50,
+) -> dict:
+    """Run isolated quant kernel benchmark via CUDA events in subprocess."""
+    if shapes is None:
+        TK = SHAPE["T"] * SHAPE["K"]
+        H = SHAPE["H"]
+        I = SHAPE["I"]
+        shapes = [{"TK": TK, "H": H, "I2": 2 * I, "I1": I}]
+
+    env_path = "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer"
+    python_bin = os.path.join(env_path, "bin", "python")
+
+    script = _QUANT_BENCH_SCRIPT.format(
+        root=str(ROOT),
+        shapes_json=json.dumps(shapes),
+        warmup=warmup,
+        trials=trials,
+        peak_hbm_gbps=_B200_PEAK_HBM_GBPS,
+    )
+
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    env["USE_QUACK_GEMM"] = "1"
+    env["SONIC_MOE_FP8_MODE"] = "perf"
+
+    print("  Running quant kernel benchmark (subprocess) ...", flush=True)
+    proc = subprocess.run(
+        [python_bin, "-c", script],
+        capture_output=True, text=True, timeout=600, env=env,
+        cwd=str(ROOT),
+    )
+
+    for line in proc.stdout.split("\n"):
+        if line.startswith("__QUANT_BENCH_JSON__"):
+            data = json.loads(line[len("__QUANT_BENCH_JSON__"):])
+            return data
+
+    print(f"  WARNING: No quant bench JSON found", flush=True)
+    if proc.stderr:
+        print(f"  stderr (last 1000 chars): {proc.stderr[-1000:]}", flush=True)
+    if proc.stdout:
+        print(f"  stdout (last 500 chars): {proc.stdout[-500:]}", flush=True)
+    return {}
+
+
+def run_wgrad_bench(
+    gpu: int = 0,
+    shapes: list[dict] | None = None,
+    warmup: int = 10,
+    trials: int = 30,
+) -> dict:
+    """Run wgrad FP8 vs BF16 end-to-end benchmark."""
+    if shapes is None:
+        shapes = [dict(SHAPE)]
+
+    env_path = "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer"
+    python_bin = os.path.join(env_path, "bin", "python")
+
+    script = _WGRAD_BENCH_SCRIPT.format(
+        root=str(ROOT),
+        shapes_json=json.dumps(shapes),
+        warmup=warmup,
+        trials=trials,
+    )
+
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu)
+    env["USE_QUACK_GEMM"] = "1"
+
+    print("  Running wgrad benchmark (subprocess) ...", flush=True)
+    proc = subprocess.run(
+        [python_bin, "-c", script],
+        capture_output=True, text=True, timeout=900, env=env,
+        cwd=str(ROOT),
+    )
+
+    for line in proc.stdout.split("\n"):
+        if line.startswith("__WGRAD_BENCH_JSON__"):
+            data = json.loads(line[len("__WGRAD_BENCH_JSON__"):])
+            return data
+
+    print(f"  WARNING: No wgrad bench JSON found", flush=True)
+    if proc.stderr:
+        print(f"  stderr (last 1000 chars): {proc.stderr[-1000:]}", flush=True)
+    if proc.stdout:
+        print(f"  stdout (last 500 chars): {proc.stdout[-500:]}", flush=True)
+    return {}
+
+
+def _print_quant_bench_summary(data: dict) -> None:
+    """Pretty-print quant bench results to terminal."""
+    for shape_key, shape_res in data.get("shapes", {}).items():
+        TK = shape_res.get("TK", "?")
+        H = shape_res.get("H", "?")
+        I2 = shape_res.get("I2", "?")
+        print(f"\n  === Quant Kernel Benchmark: TK={TK}, H={H}, I2={I2} ===")
+        print(f"  {'Kernel':<45s} {'Median':>8s} {'Min':>8s} {'P95':>8s} {'BW%':>5s}")
+        print(f"  {'-'*45} {'-'*8} {'-'*8} {'-'*8} {'-'*5}")
+        for kname, kdata in shape_res.get("kernels", {}).items():
+            med = kdata.get("median_us", 0)
+            mn = kdata.get("min_us", 0)
+            p95 = kdata.get("p95_us", 0)
+            bw = kdata.get("bw_util_pct", 0)
+            print(f"  {kname:<45s} {med:>7.1f}µ {mn:>7.1f}µ {p95:>7.1f}µ {bw:>4.0f}%")
+
+        summary = shape_res.get("summary", {})
+        if summary:
+            print(f"\n  Summary:")
+            for k, v in summary.items():
+                if isinstance(v, dict):
+                    print(f"    {k}: {v.get('kernel', '?')} = {v.get('us', '?')}µs")
+                else:
+                    print(f"    {k}: {v}×")
+
+
+def _print_wgrad_bench_summary(data: dict) -> None:
+    """Pretty-print wgrad bench results to terminal."""
+    for shape_key, shape_res in data.get("shapes", {}).items():
+        shape = shape_res.get("shape", {})
+        print(f"\n  === Wgrad Benchmark: T={shape.get('T')}, H={shape.get('H')}, "
+              f"I={shape.get('I')}, E={shape.get('E')}, K={shape.get('K')} ===")
+        print(f"  {'':20s} {'BF16':>12s} {'FP8':>12s} {'Speedup':>9s}")
+        print(f"  {'-'*20} {'-'*12} {'-'*12} {'-'*9}")
+
+        modes = shape_res.get("modes", {})
+        bf16 = modes.get("bf16", {})
+        fp8 = modes.get("fp8", {})
+        speedup = shape_res.get("speedup", {})
+
+        for phase, phase_key in [("Fwd+Bwd", "forward_backward_us"), ("Forward", "forward_us")]:
+            bf16_v = bf16.get(phase_key, {}).get("median_us", 0)
+            fp8_v = fp8.get(phase_key, {}).get("median_us", 0)
+            sp = bf16_v / fp8_v if fp8_v > 0 else 0
+            print(f"  {phase:<20s} {bf16_v:>10.0f}µs {fp8_v:>10.0f}µs {sp:>8.3f}×")
+
+        bf16_bwd = bf16.get("backward_est_us", 0)
+        fp8_bwd = fp8.get("backward_est_us", 0)
+        sp_bwd = bf16_bwd / fp8_bwd if fp8_bwd > 0 else 0
+        print(f"  {'Backward (est)':20s} {bf16_bwd:>10.0f}µs {fp8_bwd:>10.0f}µs {sp_bwd:>8.3f}×")
+
+        # Memory
+        for mode_name in ("bf16", "fp8"):
+            mem = modes.get(mode_name, {}).get("memory_mib", {})
+            if mem:
+                print(f"  [{mode_name}] peak fwd={mem.get('fwd_peak', '?')} MiB, "
+                      f"bwd={mem.get('bwd_peak', '?')} MiB")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Orchestrator
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -2105,13 +2625,17 @@ def run(
     nsys_warmup: int = DEFAULT_NSYS_WARMUP,
     nsys_iters: int = DEFAULT_NSYS_ITERS,
     nsys_shapes: list[dict[str, int]] | None = None,
+    quant_bench_shapes: list[dict] | None = None,
+    quant_bench_trials: int = 50,
+    wgrad_bench_shapes: list[dict] | None = None,
+    wgrad_bench_trials: int = 30,
 ) -> dict:
     """Main entry point: run introspection and write manifest.json.
 
     Parameters
     ----------
     mode : str
-        "trace" | "profile" | "full" | "nsys"
+        "trace" | "profile" | "full" | "nsys" | "quant-bench" | "wgrad-bench"
     """
     import torch
 
@@ -2180,6 +2704,40 @@ def run(
                     print(f"    [{m}] {', '.join(f'{k}={v:.0f}µs' for k, v in list(cats.items())[:6])}")
         print("=" * 60)
         return nsys_data
+
+    # ── quant-bench mode: isolated quant kernel CUDA-event benchmark ──
+    if mode == "quant-bench":
+        print(f"\n  Quant kernel CUDA-event benchmark ...")
+        quant_data = run_quant_bench(
+            gpu=gpu,
+            shapes=quant_bench_shapes,
+            trials=quant_bench_trials,
+        )
+        quant_data["metadata"] = metadata
+        out_path = ROOT / "reports" / "quant_bench.json"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(quant_data, indent=2, default=str))
+        print(f"\n  → {out_path} ({out_path.stat().st_size / 1024:.1f} KB)")
+        _print_quant_bench_summary(quant_data)
+        print("=" * 60)
+        return quant_data
+
+    # ── wgrad-bench mode: FP8 vs BF16 wgrad end-to-end benchmark ──
+    if mode == "wgrad-bench":
+        print(f"\n  Wgrad FP8 vs BF16 benchmark ...")
+        wgrad_data = run_wgrad_bench(
+            gpu=gpu,
+            shapes=wgrad_bench_shapes,
+            trials=wgrad_bench_trials,
+        )
+        wgrad_data["metadata"] = metadata
+        out_path = ROOT / "reports" / "wgrad_bench.json"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(wgrad_data, indent=2, default=str))
+        print(f"\n  → {out_path} ({out_path.stat().st_size / 1024:.1f} KB)")
+        _print_wgrad_bench_summary(wgrad_data)
+        print("=" * 60)
+        return wgrad_data
 
     # ── Trace BF16 ──
     print("\n[1/5] Tracing BF16 (subprocess-isolated) ...", flush=True)
@@ -2323,7 +2881,8 @@ def main():
         """),
     )
     parser.add_argument(
-        "--mode", choices=["trace", "profile", "full", "nsys"], default="trace",
+        "--mode", choices=["trace", "profile", "full", "nsys", "quant-bench", "wgrad-bench"],
+        default="trace",
         help="Introspection depth (default: trace)",
     )
     parser.add_argument(
@@ -2358,6 +2917,22 @@ def main():
         "--nsys-shapes", nargs="+", type=str, default=None,
         help="nsys mode: shapes as T,H,I,E,K (space-separated, e.g. '8192,3072,1536,8,8 8192,3072,2048,8,8')",
     )
+    parser.add_argument(
+        "--quant-bench-shapes", nargs="+", type=str, default=None,
+        help="quant-bench mode: shapes as TK,H,I2,I1 (space-separated)",
+    )
+    parser.add_argument(
+        "--quant-bench-trials", type=int, default=50,
+        help="quant-bench mode: CUDA-event trials per kernel (default: 50)",
+    )
+    parser.add_argument(
+        "--wgrad-bench-shapes", nargs="+", type=str, default=None,
+        help="wgrad-bench mode: shapes as T,H,I,E,K (space-separated)",
+    )
+    parser.add_argument(
+        "--wgrad-bench-trials", type=int, default=30,
+        help="wgrad-bench mode: timing trials per mode (default: 30)",
+    )
     parser.add_argument("--_worker-trace", choices=["bf16", "fp8"], help=argparse.SUPPRESS)
     parser.add_argument("--_worker-collect", choices=["bf16", "fp8"], help=argparse.SUPPRESS)
     parser.add_argument("--_worker-seed", type=int, default=42, help=argparse.SUPPRESS)
@@ -2391,6 +2966,24 @@ def main():
             assert len(parts) == 5, f"Expected T,H,I,E,K but got {len(parts)} values in '{s}'"
             nsys_shapes.append(dict(zip(("T", "H", "I", "E", "K"), parts)))
 
+    # Parse quant-bench shapes
+    quant_bench_shapes = None
+    if args.quant_bench_shapes:
+        quant_bench_shapes = []
+        for s in args.quant_bench_shapes:
+            parts = [int(x) for x in s.split(",")]
+            assert len(parts) == 4, f"Expected TK,H,I2,I1 but got {len(parts)} values in '{s}'"
+            quant_bench_shapes.append(dict(zip(("TK", "H", "I2", "I1"), parts)))
+
+    # Parse wgrad-bench shapes
+    wgrad_bench_shapes = None
+    if args.wgrad_bench_shapes:
+        wgrad_bench_shapes = []
+        for s in args.wgrad_bench_shapes:
+            parts = [int(x) for x in s.split(",")]
+            assert len(parts) == 5, f"Expected T,H,I,E,K but got {len(parts)} values in '{s}'"
+            wgrad_bench_shapes.append(dict(zip(("T", "H", "I", "E", "K"), parts)))
+
     run(
         mode=args.mode,
         gpu=args.gpu,
@@ -2400,6 +2993,10 @@ def main():
         nsys_warmup=args.nsys_warmup,
         nsys_iters=args.nsys_iters,
         nsys_shapes=nsys_shapes,
+        quant_bench_shapes=quant_bench_shapes,
+        quant_bench_trials=args.quant_bench_trials,
+        wgrad_bench_shapes=wgrad_bench_shapes,
+        wgrad_bench_trials=args.wgrad_bench_trials,
     )
 
 

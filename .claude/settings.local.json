@@ -172,7 +172,25 @@
       "Bash(PROJ=\"/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe\"\nPYBIN=\"/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python\"\n\nssh -o StrictHostKeyChecking=no 10.51.200.142 \\\\\n  \"CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf PYTHONPATH=${PROJ} \\\\\n   ${PYBIN} -m pytest ${PROJ}/tests/fp8_large_project_contract_test.py ${PROJ}/tests/fp8_frontier_strict_test.py \\\\\n   --tb=short -q 2>&1\" | tail -5)",
       "Bash(PROJ=\"/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe\"\nPYBIN=\"/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python\"\n\nssh -o StrictHostKeyChecking=no 10.51.200.142 \\\\\n  \"CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf PYTHONPATH=${PROJ} \\\\\n   ${PYBIN} -m pytest ${PROJ}/tests/fp8_large_project_contract_test.py::FP8AlignedContractTest::test_fp8_memory_less_than_bf16 \\\\\n   -v --tb=short 2>&1\" | tail -8)",
       "Bash(PROJ=\"/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe\"\nPYBIN=\"/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python\"\n\nssh -o StrictHostKeyChecking=no 10.51.200.142 \\\\\n  \"CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf PYTHONPATH=${PROJ} \\\\\n   ${PYBIN} -m pytest ${PROJ}/tests/fp8_large_project_contract_test.py ${PROJ}/tests/fp8_frontier_strict_test.py \\\\\n   --tb=short -q 2>&1\" | tail -3)",
-      "Bash(PROJ=\"/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe\"\nPYBIN=\"/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python\"\n\nssh -o StrictHostKeyChecking=no 10.51.200.142 \\\\\n  \"CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf PYTHONPATH=${PROJ} \\\\\n   ${PYBIN} -m pytest ${PROJ}/tests/fp8_large_project_contract_test.py::FP8AlignedContractTest::test_triton_weight_quant_matches_eager \\\\\n   -v --tb=short 2>&1\" | tail -5)"
+      "Bash(PROJ=\"/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe\"\nPYBIN=\"/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python\"\n\nssh -o StrictHostKeyChecking=no 10.51.200.142 \\\\\n  \"CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf PYTHONPATH=${PROJ} \\\\\n   ${PYBIN} -m pytest ${PROJ}/tests/fp8_large_project_contract_test.py::FP8AlignedContractTest::test_triton_weight_quant_matches_eager \\\\\n   -v --tb=short 2>&1\" | tail -5)",
+      "Bash(/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python -c \"import quack; print\\('quack', quack.__version__\\)\" 2>&1 && /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python -c \"import torch; print\\('torch', torch.__version__\\); print\\('cuda', torch.version.cuda\\)\" 2>&1)",
+      "Bash(XFER_PY=/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python && $XFER_PY -c \"import quack; print\\('quack', quack.__version__\\); import torch; print\\('torch', torch.__version__, 'cuda', torch.version.cuda\\)\")",
+      "Read(//usr/bin/**)",
+      "Bash(/usr/bin/python3.13 -c \"import quack; print\\(''quack'', quack.__version__\\)\")",
+      "Read(//usr/local/bin/**)",
+      "Bash(/usr/local/bin/python3.13 -c \"print\\(''ok''\\)\")",
+      "Bash(pip list:*)",
+      "Bash(apt list:*)",
+      "Bash(apt-get update:*)",
+      "Bash(which:*)",
+      "Bash(/usr/bin/python3.13 --version 2>/dev/null || /bin/python3.13 --version 2>/dev/null)",
+      "Bash(XFER=/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer && $XFER/bin/python --version && $XFER/bin/python -c \"import sys; print\\(sys.prefix\\)\")",
+      "Bash(XFER=/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer && $XFER/bin/python -m pip install quack==0.3.7 2>&1 | tail -20)",
+      "Bash(XFER=/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer && $XFER/bin/python -m pip install quack==0.3.7 -i https://pypi.org/simple/ 2>&1 | tail -20)",
+      "Bash(CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 python3 tools/introspect.py --mode nsys --gpu 0 2>&1 | tail -40)",
+      "Bash(apt-get install:*)",
+      "Bash(CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 python3 tools/introspect.py --mode nsys --gpu 0 2>&1 | tail -50)",
+      "Bash(CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 python3 tools/introspect.py --mode nsys --gpu 0 2>&1 | tail -30)"
     ]
   }
 }

@@ -143,7 +143,7 @@
 24. **Runtime loops beat full unroll when occupancy matters** — 30 regs (89% occ) > 64 regs (44% occ) for this workload. The extra warps hide ALU latency better than ILP from unrolling.
 25. **CuTe DSL `cute.make_tensor` creates register overhead** — each tensor object stores pointer + layout metadata in registers. Avoid creating temporary tensors in hot loops.
 26. **NCU `--clock-control=none` is essential on contested nodes** — fixed clocks produce inconsistent results when GPU boost is affected by thermal throttling from other workloads.
-27. **Split dual quant > fused dual quant** — CuTe col (84µs) + Triton row (62µs) = 146µs beats both Triton fused (168µs) and CuTe fused (300µs). L2 cache keeps 2nd read hot. Specialized kernels > one-kernel-does-all.
+27. **Split dual quant > fused dual quant [OUTDATED — reversed by nw=1 fix in Session 52]** — At nw=4: CuTe col (84µs) + Triton row (62µs) = 146µs beat Triton fused (168µs). But at nw=1: dual_quantize_varlen=183µs < separate col(137µs)+row(130µs)=267µs. The nw=1 fix reduces per-block overhead enough that fusion's single-HBM-read advantage dominates.
 28. **Fused dual quant instruction bloat 3.6×** — per-TK-row warp butterfly shuffle (5 stages × fmax) + per-row E8M0 (10 ALU ops) + per-element rmem fp8 cast (4-element alloc+cast) = 288M instructions vs 80M for separate. The fp8 vector cast requiring 4-element rmem round-trip is the core overhead.
 29. **[32][33] smem padding works for bank conflicts but breaks cp.async tiled_copy** — stride 33 is not multiple of 8, so 128-bit vector loads can't align. Element-wise load (no vectorization) is 10× slower.
 30. **nsys GPU busy time ≠ wall-clock** — on busy nodes, GPU busy/iter = 5691µs but wall = 8144µs (30% gaps from CPU launch delay). Use nsys `cuda_gpu_trace` → merge intervals → compute actual GPU busy time.
@@ -208,4 +208,23 @@
 40. **FP8 is more contention-resilient** — under 100% GPU util, BF16 showed 57% timing variance while FP8 showed 1.2% at I=1536. Compute-bound FP8 GEMMs are less affected by memory bandwidth contention.
 41. **Weight stash is the dominant memory optimization** — 21–23% peak savings vs 4–5% from FP8 alone. The stash strategy works because FP8 caches serve backward, making bf16 master weights redundant during forward+backward.
 42. **FP8 backward peak > BF16 backward peak without stash** — wgrad quant creates ~118 MiB temporaries. This is fundamental to blockscaled FP8 wgrad and cannot be eliminated without fusing quant into the GEMM epilogue.
+
+## Phase 17: NCU-Guided Quant Optimization + Wgrad Auto-Tune (Session 52)
+
+- **num_warps=1 discovery** (key insight): NCU showed Triton colwise at nw=4 spends 63% of cycles with no eligible warp (stall_barrier dominated). Reducing to nw=1 (32 threads/block) allows more blocks in-flight per SM → 2.3x speedup on colwise, 2.0x on dual_quantize_varlen. Bitwise identical output.
+- **CuTe-to-Triton migration**: All hot-path nogather colwise calls now use Triton nw=1 (137us) instead of CuTe (182us). UpProj fallback also switched.
+- **Fused dual quant in DownProj wgrad**: `dual_quantize_varlen(dz)` replaces separate `colwise_quantize_cute(dz)` + `quantize_and_pack_activation(dz)`. Saves one HBM read: 183us vs 311us.
+- **Wgrad FP8 shape auto-tuning**: `_FP8Config.resolve_wgrad(I)` — ON for I>=2048, OFF for I<2048. Based on measured crossover: I=1536 wgrad is 0.913x (net negative).
+- **Total quant overhead reduction in DownProj wgrad**: ~676us -> ~388us = 43% savings.
+- **introspect.py: quant-bench + wgrad-bench modes** — isolated CUDA-event kernel benchmarks with statistics, JSON output.
+- **End-to-end results** (CUDA events, TK=65536, B30Z): I=1536: 0.983x, I=2048: 1.031x, I=3072: 1.136x. FP8 forward consistently ~19% slower (quant overhead), FP8 backward consistently faster (9.6-23.2%).
+- 34/34 tests + 20 subtests PASS.
+
+### Lessons (Session 52)
+
+43. **num_warps=1 dramatically better for bandwidth-bound Triton kernels** — counter-intuitive; fewer warps/block -> more blocks in-flight per SM -> better utilization. Key NCU diagnostic: "% cycles with no eligible warp". Does NOT help row_quant (nw=1/2/4 all 108us — already well-balanced).
+44. **Fused dual quant viability depends on per-block overhead** — at nw=4, dual kernel's 288M instructions caused 3.6x bloat. At nw=1, overhead per block drops enough that single-HBM-read advantage makes dual competitive (183us vs 267us).
+45. **CuTe nogather is no longer faster than Triton** — the nw=1 fix inverted the CuTe advantage: Triton nw=1 at 137us beats CuTe at 182us for nogather colwise at dim=3072. CuTe DSL retains its advantage only in theory (93% occ, 48% DRAM) but cannot match Triton's nw=1 block-level parallelism.
+46. **FP8 forward overhead is the dominant bottleneck** — at I=1536, FP8 forward is 19% slower (2.457 vs 2.062ms). This single factor prevents FP8 from winning at small I. The forward quant overhead (quantize_and_pack_activation ~130us + GEMM dispatch overhead) cannot be hidden because it's on the critical path.
+47. **FP8 wgrad auto-tuning is essential** — shape-dependent ROI: I=1536 wgrad is net negative (0.913x), I=2048 is break-even (1.057x), I=3072 is positive (1.182x). Without auto-tuning, small-I workloads pay an unnecessary penalty.
 

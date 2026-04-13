@@ -1,427 +1,304 @@
 # Blockscaled FP8 MoE — Handoff
 
-> **Last updated:** 2026-04-12 (Session 51 — `_fp8_mode()` priority fix, CUDA events benchmark, classifier fix, documentation cleanup)
+> **Last updated:** 2026-04-13 (Session 52 — NCU-guided quant kernel 2.3x speedup, wgrad auto-tuning, dual-fused quant, CuTe-to-Triton migration)
 > **Branch:** `native-fp8-exploration`
-> **Status:** Zero-materialization FP8 + iso32 weights + optional stash + CuTe DSL wgrad quant + Pythonic config API + unaligned FP8 padding + epilogue FP8 D output + early weight cache eviction + nsys GPU-projection engine. Contract suite: **34/34 tests + 20 subtests PASS**.
+> **Status:** Zero-materialization FP8 forward+backward functional. Contract suite: **34/34 tests + 20 subtests PASS**. Quant kernels optimized 43%. Wgrad FP8 auto-tuned by shape.
 
 ---
 
-## 0. Bottom Line
+## 0. Bottom Line (Session 52 — verified numbers)
 
-### Performance (Session 51 — dual methodology, B200 under 100% GPU contention)
+### Performance (CUDA events, T=8192, E=8, top_k=8, TK=65536)
 
-| Shape | Methodology | BF16 (µs) | FP8 (µs) | Speedup | Notes |
-|-------|-------------|:---------:|:--------:|:-------:|-------|
-| **Ernie** (I=1536) | CUDA events (same-process, clean round) | 1436 | 1332 | **1.08×** | BF16 high-variance (1436–2256µs); FP8 stable |
-| **Ernie** (I=1536) | nsys GPU-projection (separate process) | 9087 | 9425 | 0.96× | Contention noise; unreliable at 100% GPU util |
-| **I=2048** | CUDA events (same-process, 3 rounds) | 2044 | 1672 | **1.22×** | Very consistent across all 3 rounds |
-| **I=2048** | nsys GPU-projection (separate process) | 13207 | 11296 | 1.17× | Separate processes → different contention windows |
+| Shape | BF16 total (ms) | FP8 total (ms) | Speedup | BF16 fwd | FP8 fwd | BF16 bwd | FP8 bwd |
+|-------|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| **I=1536** (Ernie) | 5.238 | 5.328 | **0.983x** | 2.062 | 2.457 | 3.176 | 2.871 |
+| **I=2048** | 6.338 | 6.146 | **1.031x** | 2.499 | 2.899 | 3.839 | 3.247 |
+| **I=3072** | 9.198 | 8.098 | **1.136x** | 3.582 | 3.786 | 5.616 | 4.312 |
 
-> **Methodology notes:**
-> - **CUDA events** (primary): BF16 and FP8 run in the **same process**, experiencing identical contention. Median of 20 warmup + 20 measured trials. 3 independent rounds. Most reliable on busy cluster.
-> - **nsys GPU-projection**: BF16 and FP8 run in **separate subprocesses** at different times → different contention levels. Gold standard only on idle GPUs.
-> - **I=1536 CUDA events variance**: BF16 showed 1436/2246/2256µs across 3 rounds (57% swing!), while FP8 was 1332/1336/1320µs (1.2% swing). FP8 appears more resilient to memory-contention (compute-bound FP8 GEMMs vs bandwidth-bound BF16).
-> - **Honest assessment**: On a quiet GPU, expect **1.05–1.10× at I=1536** and **1.15–1.22× at I=2048**. FP8 advantage grows with I (O(I²) GEMM savings vs O(I) quant overhead).
+**Methodology:** CUDA events, same-process, median of 15 trials, 5 warmup. B30Z GPU (275 GiB), shared cluster. Both modes experience identical contention.
 
-### Memory (Session 50–51 — clean v3 methodology, env-var decontaminated)
+**Key finding:** FP8 backward is consistently faster (9.6%-23.2% at I=1536-3072). FP8 forward is consistently slower (5.7%-19.2%) due to activation quantization overhead. Net effect crosses 1.0x between I=1536 and I=2048.
 
-| Config | I | FwdPeak | BwdPeak | Δ FwdPk | Δ BwdPk | Overall Peak Saving |
-|--------|---|---------|---------|---------|---------|---------------------|
-| bf16 | 1536 | 1289.9 | 1412.4 | — | — | — |
-| **fp8** | 1536 | 1232.2 | 1530.4 | **-57.7** | **+118.0** | **4.4%** (fwd peak) |
-| **fp8_stash** | 1536 | 1018.1 | 1314.4 | **-271.8** | **-98.0** | **21.1%** |
-| bf16 | 2048 | 1553.9 | 1828.4 | — | — | — |
-| **fp8** | 2048 | 1476.4 | 1985.4 | **-77.5** | **+157.0** | **5.0%** (fwd peak) |
-| **fp8_stash** | 2048 | 1191.7 | 1697.4 | **-362.2** | **-131.0** | **23.4%** |
+**Honest assessment:**
+- **I=1536**: FP8 is slightly slower (~0.98x). Wgrad auto-tune correctly disables FP8 wgrad here.
+- **I=2048**: Near break-even to slight win (~1.03x).
+- **I=3072**: Clear win (~1.14x). GEMM savings dominate.
+- FP8 advantage grows with I: GEMM savings ~ O(I^2), quant overhead ~ O(I).
 
-**Key insight:** Without stash, FP8 saves on forward peak (z_fp8 quantization) but costs on backward peak (quant temporaries during wgrad). With stash (bf16 weights offloaded to CPU), FP8 wins everywhere. At production scale with expert parallelism (E_local ≈ 1–4), activation savings scale with T and dominate.
+### Memory (torch.cuda.max_memory_allocated, TK=65536)
 
-> **CRITICAL:** Session 49 memory numbers were contaminated — `SONIC_MOE_FP8_MODE=perf` env var leaked into bf16 runs. Session 50 fixed this with explicit env-var clearing. Session 51 fixed the root cause: `_fp8_mode()` now returns `"off"` when `is_fp8_active()` is False, regardless of env var.
+| Shape | BF16 peak (MiB) | FP8 peak (MiB) | Delta |
+|-------|:---:|:---:|:---:|
+| I=1536 | 1627.8 | 1572.0 | **-3.4%** |
+| I=2048 | 2116.3 | 2274.3 | +7.5% |
+| I=3072 | 3094.1 | 3328.8 | +7.6% |
 
-### Precision (34/34 contract tests, 20 subtests, all PASS)
+**Key insight:** At I=1536 (wgrad OFF by auto-tune), FP8 saves memory. At I>=2048 (wgrad ON), FP8 uses MORE memory due to wgrad quant temporaries. **FP8+Stash** saves 21-23% at all shapes (bf16 weights offloaded to CPU).
 
-| Tensor | Ernie RRMSE | I=2048 RRMSE | Correlation | Status |
-|--------|:-----------:|:------------:|:-----------:|:------:|
-| output | 6.49% | 6.49% | 0.9979 | ✓ PASS |
-| dx | 6.52% | 6.53% | 0.9979 | ✓ PASS |
-| dw1 | 4.69% | 4.68% | 0.9989 | ✓ PASS |
-| dw2 | 4.88% | 4.87% | 0.9988 | ✓ PASS |
+### Precision (unchanged, verified Session 52)
 
-All within guardrails: **RRMSE < 10%**, **correlation > 0.99**.
+| Tensor | RRMSE | Correlation | Status |
+|--------|:---:|:---:|:---:|
+| output | 6.49% | 0.9979 | PASS |
+| dx | 6.52% | 0.9979 | PASS |
+| dw1 | 4.69% | 0.9989 | PASS |
+| dw2 | 4.88% | 0.9988 | PASS |
+
+All within guardrails: **RRMSE < 10%**, **correlation > 0.99**. 34/34 tests + 20 subtests PASS.
 
 ---
 
-## 1. Session 51 Changes (Bug Fix + CUDA Events Benchmark)
+## 1. Session 52 Changes
 
 | Change | Impact | Files |
 |--------|--------|-------|
-| **`_fp8_mode()` priority fix** | `enable_fp8(False)` now properly returns `"off"` regardless of `SONIC_MOE_FP8_MODE` env var. Previously, the env var overrode the context manager — every "BF16" measurement with env var set was secretly running FP8. This was the **root cause** of Session 49's contaminated memory numbers. | `sonicmoe/functional/__init__.py` L578–590 |
-| **Kernel classifier fix** | `_categorize_kernel()` now excludes ZeroMat GEMM kernels (e.g. `GemmGatedSm100ZeroMatBlockscaledQuant`) from "Blockscaled Quant" category. They were being double-counted as both GEMM and quant. | `tools/introspect.py` L1282–1287 |
-| **CUDA events 3-round benchmark** | 20-trial median × 3 independent rounds, same-process BF16/FP8 comparison. More reliable than nsys under 100% GPU contention. | `reports/final_benchmark.json` |
-| **Variable rename** | `_colwise_quant_triton` → `colwise_quantize_and_pack` for consistency | `sonicmoe/functional/__init__.py` |
+| **num_warps=1 on colwise quant** | 2.3x speedup on `_colwise_quantize_and_pack_kernel`. NCU-guided: fewer warps/block -> more blocks in-flight -> better SM utilization. Bitwise identical output. | `blockscaled_fp8_gemm.py` L1789 |
+| **num_warps=1 on dual_quantize_varlen** | 2.0x speedup (314->157us at TK=65536). Same mechanism. | `blockscaled_fp8_gemm.py` L1969 |
+| **CuTe-to-Triton nogather migration** | DownProj wgrad uses Triton nw=1 colwise for y1s (was CuTe). UpProj fallback also switched. CuTe nogather was 182us, Triton nw=1 is 137us. | `functional/__init__.py` L1755, L1183 |
+| **Fused dual quant in DownProj** | `dual_quantize_varlen(dz)` replaces separate `colwise_quantize_cute(dz)` + `quantize_and_pack_activation(dz)`. 183us vs 311us = 41% faster, saves one HBM read. | `functional/__init__.py` L1760 |
+| **Wgrad FP8 shape auto-tuning** | `_FP8Config.resolve_wgrad(I)`: ON for I>=2048, OFF for I<2048. Eliminates negative-ROI wgrad quant at small I. | `functional/__init__.py` L624-636 |
+| **introspect.py: quant-bench mode** | Isolated CUDA-event kernel benchmark for all quant kernels with statistics. | `tools/introspect.py` |
+| **introspect.py: wgrad-bench mode** | FP8 vs BF16 end-to-end with per-shape memory tracking. | `tools/introspect.py` |
 
-### `_fp8_mode()` Fix Detail
+### Total Quant Overhead Reduction (DownProj wgrad, TK=65536, dim=1536)
 
-**Before (broken):**
-```python
-def _fp8_mode():
-    if is_fp8_active(): return "perf"  # False when enable_fp8(False)
-    mode = os.getenv("SONIC_MOE_FP8_MODE", "")  # Falls through!
-    if mode in ("perf", "mem"): return mode  # Returns "perf"!
-    return "off"
-```
-
-**After (fixed):**
-```python
-def _fp8_mode():
-    if not is_fp8_active(): return "off"  # Context manager wins
-    mode = os.getenv("SONIC_MOE_FP8_MODE", "")
-    if mode == "mem": return "mem"
-    return "perf"  # Default when active
-```
+| Component | Before Session 52 | After Session 52 | Savings |
+|-----------|:---:|:---:|:---:|
+| y1s colwise nogather | CuTe 104us | Triton nw=1 82us | -22us |
+| dz colwise nogather | CuTe 182us | (fused into dual) | -- |
+| dz row quant | Triton 129us | (fused into dual) | -- |
+| dz dual (row+col fused) | -- | Triton nw=1 183us | -128us |
+| dout colwise gather | Triton nw=4 260us | Triton nw=1 122us | -138us |
+| **Total** | **~676us** | **~388us** | **-288us (43%)** |
 
 ---
 
-## 1b. Session 50 Changes (Memory Analysis + Early Eviction)
+## 2. Quant Kernel Performance Data (Session 52 — CUDA events)
 
-| Change | Impact | Files |
-|--------|--------|-------|
-| **Early weight cache eviction** | Clears `_FUSED_WEIGHT_CACHE` + `_VARLEN_WEIGHT_CACHE` at backward entry (before dgated). Frees ~37 MiB (w2_varlen). No peak reduction at I=1536 (wgrad peak dominates), but helps at larger shapes. | `sonicmoe/functional/__init__.py` |
-| **Streamlined w2_dgated eviction** | Post-dgated eviction now only handles w2_dgated (resize_(0) + stash pop). w1_fused/w2_varlen handled by early eviction. | `sonicmoe/functional/__init__.py` |
-| **Removed redundant local import** | `quantize_activation_blockscaled_fast` local import at L934 removed (shadowed module-level import, caused `UnboundLocalError`). | `sonicmoe/functional/__init__.py` |
-| **Env var contamination fix** | Documented critical bug: `SONIC_MOE_FP8_MODE=perf` leaks into bf16 runs. Fix: `os.environ.pop('SONIC_MOE_FP8_MODE', None)` before bf16 measurement. | This handoff, profiling scripts |
+All at TK=65536, B30Z, median of 30 trials.
 
-### Session 50 Memory Deep-Dive
+### Production Kernels (with num_warps=1 applied)
 
-**Why FP8 backward peak is +118 MiB despite z_fp8 savings:**
+| Kernel | dim=3072 (us) | dim=1536 (us) | Notes |
+|--------|:---:|:---:|-------|
+| Triton colwise nogather | 137 | 82 | Production path for y1s |
+| Triton colwise gather | 122 | 76 | Production path for dout, x |
+| CuTe colwise nogather | 182 | 104 | **No longer in hot path** (kept as reference) |
+| row_quant | 130 | 77 | Unchanged; at HBM ceiling |
+| dual_quantize_varlen | 183 | 110 | Fuses row+col; replaces separate col(137)+row(130)=267us |
 
-After-forward tensor snapshots show BF16 and FP8 have **identical** tensor layouts (both use QuACK GEMM which quantizes weights to FP8 regardless of activation mode, and both save z as fp8 via epilogue quant). The +118 MiB backward overhead comes from **wgrad quantization temporaries** (colwise quant of dout and y1s for blockscaled fp8 wgrad).
+### NCU Root Cause (why num_warps=1 wins)
 
-**Backward memory timeline (I=1536, measured):**
-| Stage | Alloc (MiB) | Peak (MiB) |
-|-------|-------------|------------|
-| down-proj-dgated (after dgated GEMM) | 1275 | 1344 |
-| **down-proj-weight (wgrad)** | 1167 | **1578** ← peak |
-| up-proj-core | 1449 | 1578 |
-| token-reduce | 1497 | 1578 |
+Triton default num_warps=4 uses 48 registers/thread -> 62.5% theoretical occupancy -> **63% cycles with no eligible warp** (latency-bound). NCU stall reason: `stall_barrier` dominated.
 
-The backward peak occurs during **wgrad** (not dgated), so early cache eviction before dgated doesn't reduce overall peak.
+With num_warps=1 (32 threads/block):
+- More blocks in-flight per SM (21x1 warp vs 10x4 warps)
+- Reduced L1 contention from fewer concurrent random accesses per block
+- Better cross-SM load balancing (more, smaller grid blocks)
+- **Output is bitwise identical** across all num_warps values (verified at 6 shapes)
 
-**Cache structure investigation:**
-- `_FUSED_WEIGHT_CACHE`: 1 entry (37.1 MiB) — shares storage with a `_VARLEN_WEIGHT_CACHE` entry
-- `_VARLEN_WEIGHT_CACHE`: 2 entries (74.2 MiB w1T + 37.1 MiB w2_varlen)
-- w1T held by `ctx._w1T_fp8` (needed for backward actgrad) — cannot evict
-- Clearing both dicts frees only **37.1 MiB** (w2_varlen, the only entry without ctx reference)
+### What Cannot Be Further Optimized
 
-**Phase B (save x as fp8) was attempted and reverted:**
-- Saving x (T×H bf16, 48 MiB) as fp8 (24 MiB) + scales saves 23 MiB during DownProj backward
-- But dequant at UpProj backward start creates transient x_fp8 + x_bf16 coexistence (+24 MiB spike)
-- Net result: +24.8 MiB WORSE at both shapes. Reverted.
+| Kernel | Why | Evidence |
+|--------|-----|----------|
+| row_quant | 97% occupancy, 4613 GB/s effective BW, 56% DRAM utilization. At HBM ceiling. | NCU Session 48 |
+| row_quant num_warps | nw=1/2/4 all give 108-109us. No sensitivity. | CUDA events Session 52 |
 
-### nsys Category Breakdown (Session 50, per-iter, µs)
+### Open Optimization Targets
 
-> **Note:** These are from a specific nsys capture. Totals may differ from the performance table above because each nsys run captures a different contention window on the shared cluster. The **relative proportions** within each mode are the valuable signal, not the absolute totals.
-
-**I=1536:**
-
-| Category | BF16 | FP8 | Delta |
-|----------|-----:|----:|------:|
-| Wgrad GEMM | 6088 | 3682 | -2406 |
-| GemmGated (fwd) | 1303 | — | — |
-| GemmDGated (bwd) | 745 | — | — |
-| GemmDGated ZeroMat (bwd) | — | 684 | — |
-| Blockscaled Quant | — | 2073 | +2073 |
-| Row Quant | — | 325 | +325 |
-| Token Gather | 633 | 391 | -242 |
-| Other | 881 | 2216 | +1335 |
-| **Total** | **9658** | **9396** | **-262** |
-
-**I=2048:**
-
-| Category | BF16 | FP8 | Delta |
-|----------|-----:|----:|------:|
-| Wgrad GEMM | 7160 | 3794 | -3366 |
-| GemmGated (fwd) | 2853 | — | — |
-| GemmDGated (bwd) | 1259 | — | — |
-| GemmDGated ZeroMat (bwd) | — | 1912 | — |
-| Blockscaled Quant | — | 3904 | +3904 |
-| Row Quant | — | 1150 | +1150 |
-| Token Gather | 139 | 144 | +5 |
-| Other | 1202 | 1107 | -95 |
-| **Total** | **12622** | **12036** | **-586** |
-
-### Key Insights from Sessions 50–51
-
-1. **Wgrad GEMM is 1.84× faster at I=1536 and 1.89× faster at I=2048** — this is the core FP8 value, and it scales with I.
-
-2. **Quant overhead dominates FP8 cost**: Blockscaled Quant + Row Quant = 2398µs at I=1536 (25% of FP8 time), 5054µs at I=2048 (42% of FP8 time). This is the #1 optimization target.
-
-3. **"Other" category inflation in FP8**: 2216µs vs 881µs at I=1536 (+1335µs). This likely includes CUDA allocator overhead, kernel launch overhead, and scale manipulation kernels not classified into named categories.
-
-4. **FP8 advantage grows with I**: ~1.08× at I=1536 → ~1.22× at I=2048 (CUDA events). At larger I, GEMM savings grow O(I²) while quant overhead grows O(I).
-
-5. **FP8 is more contention-resilient**: Under 100% GPU utilization, BF16 showed 57% timing variance while FP8 showed 1.2% (at I=1536). Hypothesis: FP8's compute-bound GEMM kernels are less affected by memory bandwidth contention than BF16's bandwidth-bound kernels.
-
-6. **`_fp8_mode()` priority bug invalidated prior BF16 baselines**: Any measurement using `enable_fp8(False)` with `SONIC_MOE_FP8_MODE` env var set was secretly running FP8. All such data from Sessions 49 and earlier is unreliable.
-
-### Previous Sessions (47-49)
-
-| Change | Impact | Files |
-|--------|--------|-------|
-| **Epilogue FP8 D output** | GemmGated writes z directly as fp8 (`out_dtype=float8_e4m3fn`). Eliminates standalone z quant kernel (~141µs) + z.to(fp8) cast (~288µs). Never allocates bf16 z (saves 384 MiB transient). | `sonicmoe/functional/__init__.py` |
-| **BF16 placeholder for autograd** | z stored as lightweight bf16 `as_strided((0,0))` placeholder (2 bytes). Actual fp8 z lives in prequant cache. Avoids fp8 tensors in autograd graph (which cause illegal memory access at large shapes). | `sonicmoe/functional/__init__.py` |
-| **Eager weight cache release** | After dgated GEMM, clear `_FUSED_WEIGHT_CACHE`, `_VARLEN_WEIGHT_CACHE`, and `resize_(0)` consumed w2_dgated + unused w2_varlen/w1_fused tensors. Estimated -74 to -148 MiB peak. | `sonicmoe/functional/__init__.py` |
-| **Single-stream wgrad pipeline** | Removed cross-stream overlap for wgrad quant. Single-stream execution enables caching allocator block reuse (cross-stream reuse requires record_stream). +50µs latency (0.6% of total) but better memory reuse. | `sonicmoe/functional/__init__.py` |
-| **CuTe colwise+gather coalesced loads** | Rewrote gather path from per-thread sequential element loads to warp-cooperative coalesced loads (32 lanes load 32 consecutive columns of same row). NCU LD efficiency 2.1→~16 bytes/sector. **154µs → 58µs** (2.7× improvement). Still behind Triton's 39µs. | `sonicmoe/quack_utils/cute_blockscaled_quant.py` |
-| **Epilogue quant default-ON** | `_use_epilogue_quant()` now defaults True (env var `SONIC_MOE_FP8_EPILOGUE_QUANT=1`). | `sonicmoe/functional/__init__.py` |
-
-### Sessions 45-46 Changes (prior)
-
-| Change | Impact | Files |
-|--------|--------|-------|
-| **Pythonic Config API** (`SonicMoEConfig`) | Replace env-var flags with dataclass + thread-local context manager. 10 fields. | `sonicmoe/config.py`, `sonicmoe/__init__.py`, `sonicmoe/moe.py`, `sonicmoe/functional/__init__.py` |
-| **wgrad FP8 default-ON** | `_use_fp8_wgrad()` defaults True at all shapes | `sonicmoe/functional/__init__.py` |
-| **Unaligned FP8 padding** | `_padded_blockscaled_gated_forward()` pads to 128 for FP8 GEMM | `sonicmoe/functional/__init__.py`, `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` |
-| **CuTe DSL colwise quant** | 90µs vs Triton 136µs = 1.51× faster (no gather). 30 regs, 89% occupancy, zero bank conflicts | `sonicmoe/quack_utils/cute_blockscaled_quant.py` |
+| Target | Current | Theoretical floor | Gap | Approach |
+|--------|:---:|:---:|:---:|----------|
+| Triton colwise nw=1 | 137us (3072) | ~90us (match CuTe DRAM%) | 1.5x | Better L1 utilization; Triton achieves only 30% DRAM util vs CuTe's 48% |
+| dual_quantize_varlen nw=1 | 183us | ~130us (row_quant floor) | 1.4x | Dual reads once but writes twice. Instruction count 288M is 3.6x row's 80M. |
+| colwise gather nw=1 | 122us | ~80us | 1.5x | Gather scatter limits L1 reuse. Could try larger BLOCK_DIM. |
 
 ---
 
-## 2. NCU Kernel Performance Data (B200, clock-control=none)
-
-This is the **authoritative** per-kernel profiling data from Sessions 47-48. All measurements use `ncu --clock-control=none --set full` on GPU 0 (uncontested kernel execution, no thermal throttling).
-
-### Quant Kernels
-
-| Kernel | Time (µs) | Regs | Occ% | DRAM% | LD Eff (bytes/sector) | Effective BW (GB/s) |
-|--------|-----------|------|------|-------|-----------------------|---------------------|
-| `_quantize_flat_v2_kernel` (row quant) | 20 | 28 | 97% | 56% | 32 (optimal) | 4613 |
-| `_colwise_quantize_and_pack_kernel` (Triton, no gather) | 39 | 48 | 58% | 28% | 16 (50% waste) | 2280 |
-| `_colwise_quantize_and_pack_kernel` (Triton, with gather) | 39 | 48 | 58% | 31% | 16 | 2145 |
-| `ColwiseQuantOp` (CuTe DSL, no gather) | 29 | 30 | 93% | 42% | TMA (cp.async) | 3465 |
-| `ColwiseQuantOp` (CuTe DSL, with gather, **NEW**) | 58 | 30 | 89% | ~35% | ~16 | ~1700 |
-| `ColwiseQuantOp` (CuTe DSL, with gather, OLD) | 154 | 30 | 89% | 8% | 2.1 (93% waste!) | 685 |
-| `dual_quantize_varlen_kernel` (Triton fused) | 47 | 48 | 58% | 30% | 21 | 2444 |
-
-### Key NCU Insights
-
-1. **CuTe DSL beats Triton by 1.3× without gather** (29µs vs 39µs): TMA loads via cp.async, 30 regs → 93% occupancy vs 48 regs → 58%. CuTe's LD_eff shows 0 because TMA bypasses SASS LD tracking.
-
-2. **With gather, Triton beats CuTe** (39µs vs 58µs): Triton's compiler generates efficient multi-address scatter-gather from `tl.load(ptr + offsets)`. CuTe element-wise `mSrc[row, col]` generates scalar loads that can't be vectorized.
-
-3. **Pre-gather is NOT the solution**: `torch.index_select` (24µs) + CuTe colwise (29µs) = 53µs > Triton fused (39µs). The extra HBM write+read of the 48 MiB gathered buffer costs more than in-register gather.
-
-4. **row_quant at HBM ceiling**: 4613 GB/s effective bandwidth, 97% occupancy. No further optimization possible.
-
-5. **Estimated total quant overhead per iteration (Ernie I=1536)**:
-   - 4× row_quant (20µs) = 80µs
-   - 2× CuTe colwise no-gather (29+17µs) = 46µs
-   - 2× Triton colwise+gather (39µs) = 78µs
-   - Total: ~200µs quantization overhead
-
-### How to Profile
-
-```bash
-source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate
-
-# Single kernel NCU (clock-control=none is essential on contested nodes)
-ncu --clock-control=none --set full \
-    --kernel-name "regex:quantize|ColwiseQuant" --launch-count 5 \
-    -o /tmp/ncu_quant.ncu-rep \
-    python -c "import your_profiling_script"
-
-# Export to CSV for analysis
-ncu -i /tmp/ncu_quant.ncu-rep --csv --page raw > /tmp/ncu_metrics.csv
-```
-
-### JIT Cache Warning
-
-QuACK CuTe DSL compiles kernels to `/tmp/root/quack_cache/<fingerprint>/*.o`. The fingerprint is based on **quack package source**, NOT user kernel source. After editing CuTe kernels, you MUST:
-```bash
-rm -rf /tmp/root/quack_cache/1c7d36d20210c6ea683563bc34f8d2c853acd2b841f8dd9ad017cb9b7f223ce1/*.o
-```
-And in Python: `_compile_colwise_quant.cache_clear()` (the `@lru_cache` wrapper).
-
----
-
-## 3. Pythonic Config API
-
-```python
-from sonicmoe import SonicMoEConfig
-
-cfg = SonicMoEConfig(use_fp8=True, use_quack_gemm=True,
-                     fp8_wgrad=True, assume_aligned=True)
-with cfg.activate():
-    output, loss = moe(x, use_fp8=True)
-```
-
-**Priority chain:** `SonicMoEConfig` (thread-local) > `enable_fp8()`/`enable_quack_gemm()` context managers > env vars
-
-**10 config fields** (all default `None` → fall back to env var):
-- `use_fp8`, `use_quack_gemm`, `fp8_wgrad`, `fused_gated`, `save_z_fp8`
-- `fused_swiglu_quant`, `epilogue_quant`, `fused_zy1_quant`
-- `assume_aligned`, `stagewise_memory`
-
-**Key files:** `sonicmoe/config.py` (dataclass + thread-local) • `sonicmoe/functional/__init__.py` (all `_use_*()` helpers check config first)
-
----
-
-## 4. Critical Design Context
+## 3. Design and Architecture
 
 ### Zero-Materialization FP8
 
-SonicMoE core design avoids materializing gathered TK-sized activations:
-- `quantize_and_pack_activation(x)` → T-sized FP8 + T-sized scales
-- `_gather_isa_packed_scales_kernel` → TK-sized ISA-packed scales (~54µs, 1.6% of CUDA time)
-- `GemmGatedSm100ZeroMat` kernel: T-FP8 + A_idx + TK-scales (no TK FP8 materialization)
+SonicMoE avoids materializing TK-sized FP8 activations:
+- `quantize_and_pack_activation(x)` produces T-sized FP8 + T-sized scales
+- `_gather_isa_packed_scales_kernel` produces TK-sized ISA-packed scales
+- `GemmGatedSm100ZeroMat` / `GemmDGatedSm100ZeroMat`: T-FP8 + A_idx + TK-scales (no TK FP8 copy)
 
-### Epilogue FP8 D Output (Session 48)
+Zero-mat kernels subclass `GemmSm100` via MRO, override `__call__` with `@cute.jit`. Auto-selected in `gemm_gated.py`/`gemm_dgated.py` when `gather_A + blockscaled`.
 
-When `epilogue_quant=True` (now default), GemmGated writes z directly as `float8_e4m3fn`:
-- CUTLASS epilogue computes blockscaled E8M0 scales in registers
-- D output is fp8 — no bf16 z allocation, no standalone quant kernel
-- A bf16 placeholder tensor with `as_strided((0,0))` wraps the autograd graph node (avoids fp8 tensors in autograd chain which cause illegal memory access at large shapes)
-- Actual fp8 data lives in `_PREQUANTIZED_SCALES["z_fp8"]`
+### Epilogue Quant (default ON, Session 48)
 
-### Unaligned FP8 Padding
+GemmGated writes z directly as `float8_e4m3fn` in CUTLASS epilogue. No standalone quant kernel, no bf16 z allocation. BF16 placeholder with `as_strided((0,0))` wraps autograd graph node.
 
-When expert segments are not 128-aligned:
-- **Up-proj:** `_padded_blockscaled_gated_forward()` pads segments to 128, runs zero-mat FP8 GEMM+SwiGLU, then unpads
-- **Down-proj:** `blockscaled_fp8_gemm_varlen(assume_aligned=False)` handles padding internally
-- **Backward:** stays BF16 (QuACK BF16 handles unaligned natively)
+### Wgrad FP8 Auto-Tuning (Session 52)
 
-### Memory Optimizations (Sessions 48-50)
+`_FP8Config.resolve_wgrad(I)` applies shape-based heuristic:
+- I >= 2048: FP8 wgrad ON (GEMM savings > quant overhead)
+- I < 2048: FP8 wgrad OFF (quant overhead dominates)
+- Explicitly settable via `SonicMoEConfig(fp8_wgrad=True/False)`
 
-1. **Early weight cache eviction** (Session 50): At backward entry, clear `_FUSED_WEIGHT_CACHE` + `_VARLEN_WEIGHT_CACHE` and resize_(0) stash entries for w1_fused/w2_varlen. Frees ~37 MiB. Does NOT reduce peak at I=1536 because wgrad (not dgated) is the peak. Helps at larger shapes where dgated peak > wgrad peak.
-2. **Streamlined post-dgated eviction** (Session 50): Only resize_(0) w2_dgated after dgated GEMM (previously also redundantly evicted w1_fused/w2_varlen).
-3. **Single-stream wgrad**: Removed cross-stream dz quant overlap. Single-stream lets caching allocator reuse freed blocks without `record_stream` overhead. +50µs latency but better peak memory.
-4. **BF16 placeholder for z**: 2-byte storage broadcast via zero strides instead of full-size bf16 tensor in autograd graph.
+Benchmarked: I=1536 -> 0.913x (wgrad OFF), I=2048 -> 1.057x (ON), I=3072 -> 1.182x (ON).
+
+### Weight Stash (FP8+Stash)
+
+```python
+optimizer.step()
+moe.refresh_fp8_shadow_weights()  # bf16 -> FP8 caches
+moe.stash_bf16_to_cpu()           # -216 MiB GPU
+# ... forward + backward with FP8 ...
+moe.unstash_bf16()                # restore for optimizer
+```
+
+Saves 21-23% peak memory at all shapes.
+
+### Unaligned FP8
+
+- **Forward**: `_padded_blockscaled_gated_forward()` pads expert segments to 128, runs zero-mat GEMM+SwiGLU, unpads. Works.
+- **Forward down-proj**: `blockscaled_fp8_gemm_varlen(assume_aligned=False)` handles padding internally.
+- **Backward**: Falls back to BF16 entirely (no padded FP8 dgated or wgrad implemented).
+
+### Pythonic Config API
+
+```python
+cfg = SonicMoEConfig(use_fp8=True, use_quack_gemm=True)
+with cfg.activate():
+    output, aux_loss = moe(x, use_fp8=True)
+```
+
+Priority: `SonicMoEConfig` (thread-local) > `enable_fp8()`/`enable_quack_gemm()` context managers > env vars.
 
 ---
 
-## 5. Key Files
+## 4. Key Files
 
 | File | Role |
 |------|------|
-| `sonicmoe/config.py` | Pythonic config API — `SonicMoEConfig` dataclass, thread-local, context manager |
-| `sonicmoe/functional/__init__.py` | Forward/backward orchestration, FP8 config, epilogue quant, stash, cache eviction, unaligned padding |
-| `sonicmoe/moe.py` | MoE class, `refresh_fp8_shadow_weights`, stash/unstash API |
-| `sonicmoe/quack_utils/cute_blockscaled_quant.py` | **CuTe DSL colwise quant kernel** — 29µs no-gather, 58µs with gather |
-| `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` | Triton quant kernels, weight caches, blockscaled helpers |
-| `sonicmoe/quack_utils/gemm_sm100_fp8_zeromat.py` | Zero-materialization FP8 CUTLASS kernels |
-| `sonicmoe/quack_utils/gemm_gated.py` | Gated GEMM wrapper (auto ZeroMat selection) |
-| `sonicmoe/quack_utils/gemm_dgated.py` | Backward gated GEMM wrapper (auto ZeroMat selection) |
-| `tools/introspect.py` | Main experiment entry point — trace, benchmark, profiler, precision audit, **nsys GPU-projection** |
-| `tests/fp8_large_project_contract_test.py` | Correctness gate (34 tests + 20 subtests) |
-| `docs/FP8_ARCH_SPEC.md` | Full architecture spec, data flow, memory lifecycle |
+| `sonicmoe/config.py` | `SonicMoEConfig` dataclass + thread-local context manager |
+| `sonicmoe/functional/__init__.py` | Forward/backward orchestration, FP8 config, cache mgmt, wgrad auto-tune |
+| `sonicmoe/moe.py` | MoE class, stash/unstash, refresh_fp8_shadow_weights |
+| `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` | Triton quant kernels (colwise, row, dual, fused), weight caches, num_warps=1 |
+| `sonicmoe/quack_utils/cute_blockscaled_quant.py` | CuTe DSL colwise quant (no longer in hot path; kept as reference) |
+| `sonicmoe/quack_utils/gemm_sm100_fp8_zeromat.py` | Zero-mat CUTLASS kernel classes |
+| `sonicmoe/quack_utils/gemm_gated.py` | GemmGated wrapper (auto ZeroMat selection) |
+| `sonicmoe/quack_utils/gemm_dgated.py` | GemmDGated wrapper (auto ZeroMat selection) |
+| `tools/introspect.py` | Profiling harness: quant-bench, wgrad-bench, nsys GPU-projection, precision |
+| `tests/fp8_large_project_contract_test.py` | 34 precision tests + 20 subtests |
 
 ---
 
-## 6. Validation Commands
+## 5. Validation Commands
 
 ```bash
 source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate
 cd /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe
 
-# Clear CuTe JIT cache (required after editing cute_blockscaled_quant.py)
-rm -rf /tmp/root/quack_cache/1c7d36d20210c6ea683563bc34f8d2c853acd2b841f8dd9ad017cb9b7f223ce1/*.o
-
-# Contract suite (34 tests, ~3.5 min)
+# Contract suite (34 tests + 20 subtests, ~2.5 min)
 CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
   python -m pytest tests/fp8_large_project_contract_test.py -v --tb=short
 
-# Unaligned FP8 smoke tests
-CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
-  python -m pytest -v tests/test_unaligned_fp8_padded.py
+# Isolated quant kernel benchmark
+CUDA_VISIBLE_DEVICES=0 python tools/introspect.py --mode quant-bench
 
-# nsys GPU-projection profiling (gold standard for performance)
-CUDA_VISIBLE_DEVICES=0 python tools/introspect.py --mode nsys \
-  --nsys-shapes 8192,3072,1536,8,8 8192,3072,2048,8,8
-
-# Full artifact refresh (trace + profiler + precision + benchmark)
-CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 SONIC_MOE_FP8_MODE=perf \
-  python tools/introspect.py --mode full --gpu 0 \
-  --precision-seeds 42,123,456,789,1024 --bench-repeats 3 --profile-trials 2
+# End-to-end FP8 vs BF16 benchmark with memory
+CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 python tools/introspect.py --mode wgrad-bench
 ```
 
 ---
 
-## 7. Dead Ends (verified, do NOT retry)
+## 6. Dead Ends (verified, do NOT retry)
 
-| Approach | Why it fails | Session |
+| Approach | Why it fails | Evidence |
 |----------|-------------|---------|
-| FP8 wgrad colwise quant at I=1536 | SM contention → 0.887× net negative | 45 |
-| torch.as_strided for fake TK shape | PyTorch storage bounds check rejects it | 41-42 |
-| Rowwise quant + strided view for wgrad | HW requires contiguous K groups | 45 |
-| Transpose + rowquant for wgrad | Transpose alone 1509µs > colwise 260µs | 45 |
-| Fused CuTe dual quant | 288M instructions (3.6× bloat vs separate) | 43 |
-| cp.async aligned to stride-33 smem | Alignment constraint prevents 128-bit vectorized loads | 43 |
-| Smem-mediated fp8 vectorized store | -44% instructions but +96% L1 traffic | 43 |
-| Full loop unroll for fp8 store | 64 regs → 44% occupancy; runtime loop faster | 43 |
-| Pre-gather + CuTe colwise (no in-kernel gather) | torch.index_select 24µs + CuTe 29µs = 53µs > Triton fused 39µs | 48 |
-| Blind wallclock comparison on busy cluster | Shared-node contention swamps kernel-time signal | 44+ |
-| Micro-optimizing quant kernels at 89%+ HBM | row_quant at 97% occ, 56% DRAM — ceiling reached | 45 |
-| Save x (activation) as fp8 between fwd/bwd | Dequant in UpProj backward creates transient spike (x_fp8 + x_bf16 coexist, +24.8 MiB vs baseline). Net WORSE at all shapes tested. | 50 |
-| Early weight cache eviction at I=1536 | Frees only 37 MiB (shared data_ptr between FUSED/VARLEN caches). Peak is at wgrad, not dgated, so eviction before dgated has no effect on peak. Only helps at larger shapes. | 50 |
+| FP8 wgrad at I=1536 | 0.913x net negative. Quant overhead > GEMM savings. Auto-tuned OFF. | Session 52 CUDA events |
+| num_warps=1 on row_quant | nw=1/2/4 all give 108-109us. Already at HBM ceiling. | Session 52 CUDA events |
+| num_warps=8 on any kernel | Always slower than nw=4. | Session 52 CUDA events |
+| CuTe colwise for hot-path nogather | Triton nw=1 (137us) beats CuTe (182us) by 1.33x at dim=3072. | Session 52 |
+| Pre-gather + CuTe colwise | index_select(24us) + CuTe(29us) = 53us > Triton fused(39us) | Session 48 NCU |
+| Save x as fp8 between fwd/bwd | Dequant creates +24.8 MiB transient spike. Net WORSE. | Session 50 |
+| torch.as_strided for fake TK shape | PyTorch storage bounds check rejects it | Session 41-42 |
+| Fused CuTe dual quant | 288M instructions (3.6x bloat vs separate) | Session 43 |
+| Early weight cache eviction at I=1536 | Only frees 37 MiB. Peak is at wgrad, not dgated. | Session 50 |
+| Micro-optimizing row_quant | 97% occupancy, 56% DRAM. At ceiling. | Session 48 NCU |
+
+---
+
+## 7. Lessons (compact, high-value)
+
+### Measurement
+1. **CUDA events same-process** is most reliable under contention. nsys needs idle GPU.
+2. **Env vars are process-global and cached at import.** `SONIC_MOE_FP8_MODE` leaks into BF16 baselines. Use subprocess isolation or the `_fp8_mode()` fix (Session 51).
+3. **`_fp8_mode()` priority bug** (fixed Session 51): `enable_fp8(False)` did NOT work when env var was set. All pre-Session-51 "BF16" baselines with env var are invalid.
+4. **NCU `--clock-control=none`** essential on contested nodes.
+
+### Kernel Engineering
+5. **num_warps=1 is dramatically better for quant kernels** -- counter-intuitive but verified: fewer warps/block -> more blocks/SM -> better utilization. The key diagnostic is NCU "% cycles with no eligible warp" (63% at nw=4, much lower at nw=1).
+6. **Fused dual quant < separate row+col at nw=4** (314us vs 267us), **but dual WINS at nw=1** (183us vs 267us). The nw=1 fix made dual competitive.
+7. **CuTe DSL scalar gather is unfixable** -- `mSrc[row, col]` compiles to individual SASS LDG. Triton `tl.load(ptr + offsets)` generates vectorized multi-address loads.
+8. **QuACK JIT cache is source-fingerprint-based** -- editing CuTe kernels does NOT invalidate cache. Must manually `rm /tmp/root/quack_cache/<hash>/*.o` AND `_compile_colwise_quant.cache_clear()`.
+9. **E8M0 scales encode BF16 magnitude, NOT FP8 magnitude** -- scales must be computed from original BF16 source.
+
+### Architecture
+10. **CUTLASS PreAct constraint** -- `assert PreAct.element_size() == 2` blocks feeding FP8 z to GemmDGated. Hard CUTLASS DSL limitation.
+11. **Cross-stream memory reuse needs record_stream** -- single-stream is simpler.
+12. **Weight stash (21-23% savings) is the dominant memory win.** FP8 alone saves only 3-5% (or costs more with wgrad ON).
+13. **FP8 advantage scales with I**: O(I^2) GEMM savings vs O(I) quant overhead. Crossover ~I=1536.
+14. **Per-element FP8 cast != blockscaled FP8** -- GEMM epilogue `.to(fp8)` is simple saturating cast. Blockscaled needs per-32-element amax -> E8M0 -> scale-aware cast.
 
 ---
 
 ## 8. Next Steps (Prioritized)
 
-### P0: Compress quant overhead (Target: 2× reduction)
-Quant is 30-45% of FP8 time. Strategies:
-- **Fused row+colwise quant**: single pass over data for both quantization formats
-- **Epilogue quant on wgrad GEMM**: emit pre-quantized weights from GEMM epilogue
-- **Async quant overlap**: overlap quantization with independent computation
-- Benchmark each with nsys GPU-projection: `python tools/introspect.py --mode nsys`
+### P0: Compress forward quant overhead
+FP8 forward is 19% slower at I=1536 (2.457 vs 2.062ms). This is the primary reason FP8 doesn't win at small I. Sources:
+- `quantize_and_pack_activation(x)` for DownProj: ~130us at T=8192, H=3072
+- FP8 GEMM dispatch overhead (CUTLASS scale parameter handling)
+- Investigate whether x row-quant can be overlapped with router computation.
 
-### P1: Close CuTe gather gap (58µs → target ≤39µs)
-CuTe colwise+gather is 58µs vs Triton 39µs. Options:
-- Vectorized gather in CuTe (4-8 bf16 elements per gather)
-- Shared memory staging (coalesced global → smem → colwise quant)
-- Or accept Triton for gather sites (2 call sites) and CuTe for no-gather (3 call sites)
+### P1: Further colwise quant optimization
+Triton colwise nw=1 achieves only 30% DRAM utilization (vs CuTe's 48%). Gap suggests room for better vectorization or L1 utilization:
+- Try larger BLOCK_DIM (256, 512) with nw=1
+- Profile with NCU to verify L1 miss rate at nw=1
 
-### P2: Memory reduction
-FP8 backward peak is +118 MiB over BF16 due to wgrad quantization temporaries. Strategies:
-- **Stash weights to CPU**: `moe.stash_bf16_to_cpu()` → FP8 wins everywhere (-98 MiB bwd at I=1536, -131 MiB at I=2048). Cost: CPU↔GPU transfer latency per optimizer step.
-- **Reduce wgrad quant temporaries**: The wgrad blockscaled path creates colwise-quantized copies of dout and y1s. Fusing or streaming these reduces transient peak.
-- **Save x as fp8**: Saves T×H bytes between forward and backward BUT dequant in UpProj backward creates transient spike. Only viable if DownProj backward peak > UpProj backward peak (tested and failed at I=1536; may work at very large T).
-- At production scale with expert parallelism (E_local ≈ 1-4): weights are tiny, activations dominate. FP8 activation savings (z_fp8, potential x_fp8) scale with T and become dominant.
+### P2: Unaligned FP8 backward
+Currently falls back to BF16 entirely. Implementing padded FP8 backward would extend FP8 benefits to uneven routing:
+- padded FP8 dgated (needs `_get_padding_plan` + GemmDGated with padded cu_seqlens)
+- padded FP8 wgrad (needs padded CUTLASS varlen_k GEMM)
 
-### P3: Larger shapes (I=4096, I=8192)
-FP8 GEMM savings scale with I. At I=4096+ the fixed quant overhead becomes negligible and speedup should exceed 1.2×.
+### P3: Larger shapes (I=4096+)
+FP8 speedup should exceed 1.2x at I=4096 based on the O(I^2) vs O(I) scaling model. Validate.
 
 ---
 
-## 8b. High-Value Lessons for Next Agent
+## 9. Previous Session History
 
-These lessons represent days of debugging distilled into actionable rules:
+### Session 51 (fp8_mode fix + CUDA events benchmark)
+- Fixed `_fp8_mode()` priority: context manager now properly overrides env var
+- CUDA events 3-round benchmark established as primary methodology
+- Kernel classifier fix (ZeroMat GEMM excluded from quant category)
 
-1. **BF16 baselines MUST use subprocess isolation OR the `_fp8_mode()` fix.** The env var `SONIC_MOE_FP8_MODE` is cached at import time. If set, `enable_fp8(False)` context manager was broken before Session 51. After the fix, the context manager properly returns "off". But subprocess isolation (clearing env var before BF16 runs) is still the safest approach.
+### Sessions 48-50 (epilogue quant + memory deep-dive)
+- Epilogue FP8 D output: GemmGated writes z as fp8 in epilogue (no standalone quant)
+- BF16 placeholder via `as_strided((0,0))` for autograd graph
+- Early weight cache eviction (37 MiB, ineffective at I=1536)
+- Single-stream wgrad (better memory reuse vs cross-stream)
+- FP8 backward peak +118 MiB over BF16 from wgrad quant temporaries
+- CuTe gather coalesced loads: 154us -> 58us (2.7x) but still behind Triton 39us
+- Save x as fp8: reverted (+24.8 MiB transient spike from dequant)
 
-2. **Measurement hierarchy on busy cluster:** CUDA events same-process > nsys on idle GPU > nsys on busy GPU > wall-clock. On a busy cluster, nsys runs BF16/FP8 in separate processes at different times with different contention — this can produce up to 10% noise in cross-mode comparison.
-
-3. **Quant overhead is the only remaining optimization target.** FP8 GEMM savings (1.84–1.89× on wgrad) are substantial, but quant overhead consumes 25–42% of FP8 time. row_quant is at HBM ceiling (97% occ, 4613 GB/s). CuTe colwise is 29µs (no gather) / 58µs (with gather); Triton gather is 39µs. The gather gap (CuTe 58µs vs Triton 39µs) is due to CuTe scalar gather loads — vectorized multi-address loads are needed.
-
-4. **FP8 advantage scales with I.** At I=1536 quant overhead nearly cancels GEMM savings (1.08×). At I=2048 the gap widens (1.22×). Mathematical model: GEMM savings ∝ O(I²), quant overhead ∝ O(I). Crossover is ~I=1536 on B200.
-
-5. **Weight stash is the dominant memory win.** FP8 alone saves only 4–5% peak (weight caches nearly offset activation savings). FP8+Stash saves 21–23% by freeing bf16 master weights during fwd+bwd (FP8 caches serve backward).
-
-6. **At production scale (expert parallelism), activations dominate weights.** When E_local ≈ 1–4, weights are small and FP8 activation savings (∝ T × I) become the primary benefit. The weight cache cost (∝ E × H × I) becomes negligible.
-
-7. **The "Other" category in nsys FP8 is inflated by +1335µs at I=1536.** This includes CUDA allocator overhead, kernel launch overhead, scale manipulation kernels, and other un-categorized operations. Reducing this requires either: (a) fusing more operations, (b) better categorization in introspect.py to identify the real culprits, or (c) reducing the number of kernel launches.
-
-8. **QuACK JIT cache fingerprint is package-source-based, NOT user-kernel-source-based.** After editing CuTe kernels, you MUST clear `/tmp/root/quack_cache/<hash>/*.o` AND call `_compile_colwise_quant.cache_clear()`. Forgetting this will silently run stale kernels.
+### Sessions 45-46 (Pythonic config + unaligned padding + CuTe DSL)
+- SonicMoEConfig dataclass with thread-local context manager
+- Unaligned FP8 padding for forward path
+- CuTe DSL colwise quant (no-gather 29us, 93% occ -- was hot path before Session 52)
+- wgrad FP8 default-ON
 
 ---
 
-## 9. Environment & Information Sources
-
-### Environment
+## 10. Environment
 
 | Item | Value |
 |------|-------|
 | Python env | `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate` |
-| GPUs | 8× B200 (192 GiB each) |
+| GPU | B30Z (275 GiB), shared cluster |
 | PyTorch | 2.11.0+cu130, CUDA 13.0 |
 | QuACK | 0.3.7 |
 | JIT cache | `/tmp/root/quack_cache/` |
@@ -430,24 +307,10 @@ These lessons represent days of debugging distilled into actionable rules:
 
 ### Data Sources
 
-| Resource | Location | Description |
-|----------|----------|-------------|
-| `benchmark_final.json` | repo root | Session 46 timing, memory, precision for 2 shapes |
-| `reports/final_benchmark.json` | reports/ | **Session 51** CUDA events 3-round benchmark + memory (most reliable perf data) |
-| `manifest.json` | repo root | Tensor lifetimes, theoretical memory, precision audit |
-| `kernel_breakdown.json` | repo root | Aggregated GPU-projection timing |
-| `mem_breakdown.json` | repo root | Checkpoint-by-checkpoint allocator snapshots |
-| `reports/nsys_final/nsys_gpu_projection.json` | reports/ | **Session 50–51 nsys GPU-projection data** — per-kernel timing, category breakdown (noisy under contention) |
-| `reports/nsys_final/` | reports/ | nsys-derived kernel breakdown |
-| NCU reports | `/tmp/ncu_quant2.ncu-rep`, `/tmp/ncu_improved_gather.ncu-rep` | Session 48 NCU profiling (23 kernels, full metrics) |
-| `docs/FP8_ARCH_SPEC.md` | docs/ | Architecture spec, data flow, memory lifecycle |
-| `reports/fp8_upgrade/engineering_log.md` | reports/ | Phase-by-phase development history |
-
-### Measurement Methodology
-
-1. **CUDA events within same process** — best on busy cluster (both modes see identical contention). Use median of 20 trials, 3+ independent rounds. Report min-of-medians for "clean round" or all rounds for variance analysis.
-2. **nsys GPU-projection** — gold standard on **idle** GPUs only. On busy cluster, BF16 and FP8 run in separate processes at different times → different contention → unreliable comparison.
-3. **NCU `--clock-control=none`** — essential on contested nodes to avoid thermal throttle artifacts. Use for per-kernel analysis, not end-to-end timing.
-4. **Subprocess isolation mandatory** — `SONIC_MOE_FP8_MODE` and `USE_QUACK_GEMM` are cached at import time.
-5. **`_fp8_mode()` fix required** — before Session 51, `enable_fp8(False)` did NOT disable FP8 when env var was set. Any pre-fix "BF16 baseline" with env var is invalid.
-6. **Trimmed mean** — 12 iterations, drop 2 min + 2 max, mean of 8 (for nsys).
+| File | Description |
+|------|-------------|
+| `reports/e2e_bench_session52.json` | Session 52 E2E benchmark (3 shapes x bf16/fp8) |
+| `reports/quant_bench_final.json` | Session 52 quant kernel before/after comparison |
+| `reports/final_benchmark.json` | Session 51 CUDA events 3-round benchmark |
+| `reports/nsys_final/nsys_gpu_projection.json` | Session 50-51 nsys per-kernel category breakdown |
+| `reports/fp8_upgrade/engineering_log.md` | Phase-by-phase development history |

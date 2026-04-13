@@ -1,0 +1,62 @@
+[
+  {
+    "shape": "I=1536 (Ernie)",
+    "mode": "bf16",
+    "fwd_ms": 2.062,
+    "bwd_ms": 3.176,
+    "total_ms": 5.238,
+    "fwd_min": 2.015,
+    "bwd_min": 3.137,
+    "peak_MiB": 1627.8
+  },
+  {
+    "shape": "I=1536 (Ernie)",
+    "mode": "fp8",
+    "fwd_ms": 2.457,
+    "bwd_ms": 2.871,
+    "total_ms": 5.328,
+    "fwd_min": 2.44,
+    "bwd_min": 2.843,
+    "peak_MiB": 1572.0
+  },
+  {
+    "shape": "I=2048",
+    "mode": "bf16",
+    "fwd_ms": 2.499,
+    "bwd_ms": 3.839,
+    "total_ms": 6.338,
+    "fwd_min": 2.432,
+    "bwd_min": 3.798,
+    "peak_MiB": 2116.3
+  },
+  {
+    "shape": "I=2048",
+    "mode": "fp8",
+    "fwd_ms": 2.899,
+    "bwd_ms": 3.247,
+    "total_ms": 6.146,
+    "fwd_min": 2.836,
+    "bwd_min": 3.201,
+    "peak_MiB": 2274.3
+  },
+  {
+    "shape": "I=3072",
+    "mode": "bf16",
+    "fwd_ms": 3.582,
+    "bwd_ms": 5.616,
+    "total_ms": 9.198,
+    "fwd_min": 3.458,
+    "bwd_min": 5.271,
+    "peak_MiB": 3094.1
+  },
+  {
+    "shape": "I=3072",
+    "mode": "fp8",
+    "fwd_ms": 3.786,
+    "bwd_ms": 4.312,
+    "total_ms": 8.098,
+    "fwd_min": 3.701,
+    "bwd_min": 4.267,
+    "peak_MiB": 3328.8
+  }
+]

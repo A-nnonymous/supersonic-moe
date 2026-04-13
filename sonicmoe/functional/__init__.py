@@ -351,13 +351,12 @@ def _use_fused_zy1_quant() -> bool:
     return os.getenv("SONIC_MOE_FP8_FUSED_ZY1_QUANT", "").lower() in {"1", "true", "yes", "on"}
 
 
-def _use_fp8_wgrad() -> bool:
-    """Check if FP8 weight gradients are enabled (default: enabled).
+def _use_fp8_wgrad() -> bool | None:
+    """Check if FP8 weight gradients are enabled.
 
-    FP8 wgrad provides ~384 MiB memory savings from early dz_bf16 freeing.
-    At I=1536 (Ernie), ~10% slower than BF16 GEMM due to colwise quant cost,
-    but the memory savings enable larger batch sizes.
-    Override with SONIC_MOE_FP8_WGRAD=0 or SonicMoEConfig(fp8_wgrad=False).
+    Returns True/False if explicitly set (config or env var), None for auto-detect.
+    When None (auto), ``_FP8Config.resolve_wgrad(I)`` applies the shape-based
+    heuristic: ON for I >= 2048, OFF for I < 2048.
     """
     from ..config import get_active_config
     cfg = get_active_config()
@@ -368,7 +367,7 @@ def _use_fp8_wgrad() -> bool:
         return True
     if val in {"0", "false", "no", "off"}:
         return False
-    return True  # default ON: memory savings justify compute cost
+    return None  # auto-detect based on I
 
 
 def _save_z_fp8() -> bool:
@@ -605,7 +604,7 @@ class _FP8Config:
     """
     __slots__ = (
         "enabled", "fused_gated", "save_z_fp8", "fused_swiglu_quant",
-        "epilogue_quant", "fp8_wgrad", "alignment_assumed",
+        "epilogue_quant", "fp8_wgrad", "_fp8_wgrad_setting", "alignment_assumed",
     )
 
     def __init__(self) -> None:
@@ -614,14 +613,25 @@ class _FP8Config:
         self.save_z_fp8: bool = _save_z_fp8()
         self.fused_swiglu_quant: bool = _use_fused_swiglu_quant()
         self.epilogue_quant: bool = _use_epilogue_quant()
-        self.fp8_wgrad: bool = _use_fp8_wgrad()
+        self._fp8_wgrad_setting = _use_fp8_wgrad()  # True/False/None
+        self.fp8_wgrad: bool = self._fp8_wgrad_setting or False  # resolved in resolve_wgrad
         self.alignment_assumed: bool = False
 
+    # Threshold below which FP8 wgrad quant overhead exceeds GEMM savings.
+    # Benchmarked on B30Z: I=1536 → 0.913×, I=2048 → 1.057×, I=3072 → 1.182×.
+    _WGRAD_FP8_I_THRESHOLD = 2048
+
     def resolve_wgrad(self, I: int) -> None:
-        """Resolve FP8 wgrad — now default ON at all shapes for memory savings."""
-        # No-op: wgrad is resolved by _use_fp8_wgrad() at init.
-        # Kept for API compat and potential future per-shape tuning.
-        pass
+        """Resolve FP8 wgrad based on explicit setting or shape-based heuristic.
+
+        When ``_use_fp8_wgrad()`` returns None (auto), applies the threshold:
+        - I >= 2048: enable FP8 wgrad (GEMM savings > quant overhead)
+        - I < 2048: disable FP8 wgrad (quant overhead dominates)
+        """
+        if self._fp8_wgrad_setting is not None:
+            self.fp8_wgrad = self._fp8_wgrad_setting
+        else:
+            self.fp8_wgrad = I >= self._WGRAD_FP8_I_THRESHOLD
 
     @staticmethod
     def disabled() -> "_FP8Config":
@@ -633,6 +643,7 @@ class _FP8Config:
         cfg.fused_swiglu_quant = False
         cfg.epilogue_quant = False
         cfg.fp8_wgrad = False
+        cfg._fp8_wgrad_setting = False
         cfg.alignment_assumed = False
         return cfg
 
@@ -1149,14 +1160,11 @@ class _UpProjection(torch.autograd.Function):
                         colwise_quantize_and_pack,
                         _run_cutlass_blockscaled_gemm_varlen_k,
                     )
-                    from ..quack_utils.cute_blockscaled_quant import (
-                        colwise_quantize_cute,
-                    )
                     bwd_col = _PREQUANTIZED_SCALES.pop("bwd_col", None)
 
                     # Stream-overlapped quant pipeline:
                     # S0 (main): dz_col (if not pre-computed) → free dz_bf16 → wait S1 → GEMM
-                    # S1 (side): x_col (Triton, handles gather — 1.5× faster than CuTe gather)
+                    # S1 (side): x_col (Triton nw=1, handles gather)
                     _side_stream = _get_dequant_stream()
                     _side_stream.wait_stream(torch.cuda.current_stream())
                     with torch.cuda.stream(_side_stream):
@@ -1169,10 +1177,9 @@ class _UpProjection(torch.autograd.Function):
                         # Use pre-computed col-fp8 from dual quant (zero extra HBM read)
                         dz_col_fp8, dz_col_scales = bwd_col
                     else:
-                        # Fallback: compute col-fp8 now (CuTe DSL: 1.5x faster than Triton)
-                        dz_col_fp8, dz_col_scales = colwise_quantize_cute(
+                        # Fallback: compute col-fp8 now (Triton nw=1)
+                        dz_col_fp8, dz_col_scales = colwise_quantize_and_pack(
                             dz_bf16, logical_rows=w1_shape[0], logical_cols=TK,
-                            isa_pack=True,
                         )
                     # FREE dz_bf16 NOW (-384 MiB before wgrad GEMM!)
                     dz.untyped_storage().resize_(0)
@@ -1736,31 +1743,22 @@ class _DownProjection(torch.autograd.Function):
                     if ctx._fp8_cfg.fp8_wgrad:
                         from ..quack_utils.blockscaled_fp8_gemm import (
                             colwise_quantize_and_pack,
+                            dual_quantize_varlen,
                             _run_cutlass_blockscaled_gemm_varlen_k,
-                        )
-                        from ..quack_utils.cute_blockscaled_quant import (
-                            colwise_quantize_cute,
                         )
                         TK_wgrad = x_gather_idx.shape[0]
 
                         # Memory-optimized wgrad pipeline (all main stream):
-                        # Single-stream execution lets the caching allocator reuse
-                        # freed blocks (cross-stream reuse requires record_stream).
-                        # Order: y1s_col → free y1s(-192M) → dz_col(reuses 192M) →
-                        #         dz_row → free dz(-384M) → dout_col(reuses 384M) → GEMM
-                        # Peak: background + dz(384) + y1s_col(96) + dz_col/dz_row(192)
-
-                        y1s_col_fp8, y1s_col_sc = colwise_quantize_cute(
+                        # Triton nw=1 colwise is 2.3× faster than default nw=4.
+                        # dual_quantize_varlen fuses row+col quant in one HBM read
+                        # (157µs vs separate 274µs = 43% faster).
+                        y1s_col_fp8, y1s_col_sc = colwise_quantize_and_pack(
                             y1s, logical_rows=y1s.shape[1], logical_cols=TK_wgrad,
-                            isa_pack=True,
                         )
                         del y1s
 
-                        dz_col_fp8, dz_col_scales = colwise_quantize_cute(
-                            dz, logical_rows=dz.shape[1], logical_cols=dz.shape[0],
-                            isa_pack=True,
-                        )
-                        dz_fp8, dz_packed_scales = quantize_and_pack_activation(dz)
+                        dz_fp8, dz_packed_scales, dz_col_fp8, dz_col_scales = \
+                            dual_quantize_varlen(dz, dz.shape[0], dz.shape[1])
                         _PREQUANTIZED_SCALES["bwd"] = (dz, dz_fp8, dz_packed_scales)
                         _PREQUANTIZED_SCALES["bwd_col"] = (dz_col_fp8, dz_col_scales)
                         dz.untyped_storage().resize_(0)

@@ -1774,6 +1774,9 @@ def colwise_quantize_and_pack(
     has_gather = gather_idx is not None
     gather_ptr = gather_idx if has_gather else src
 
+    # NCU-guided: num_warps=1 reduces register pressure per block, allowing
+    # more blocks in-flight on each SM → 2.3× speedup at TK=65536 (verified
+    # bitwise identical to num_warps=4 across all shapes).
     _colwise_quantize_and_pack_kernel[grid](
         src, gather_ptr, fp8_out, packed_scales,
         TK, H,
@@ -1786,6 +1789,7 @@ def colwise_quantize_and_pack(
         SF_TILE_M=_SF_TILE_M,
         SF_TILE_K=_SF_TILE_K,
         SF_TILE_STORAGE=_SF_TILE_STORAGE,
+        num_warps=1,
     )
     return fp8_out, packed_scales.view(torch.float8_e8m0fnu)
 
@@ -1953,6 +1957,7 @@ def dual_quantize_varlen(
     col_k_tiles = _div_up(TK, _SF_TILE_K)
 
     grid = (_div_up(TK, GROUP_SIZE), _div_up(dim, BLOCK_DIM))
+    # NCU-guided: num_warps=1 gives 2× speedup (157µs vs 314µs at TK=65536).
     _dual_varlen_quantize_kernel[grid](
         src,
         row_fp8, row_scales,
@@ -1964,6 +1969,7 @@ def dual_quantize_varlen(
         GROUP_SIZE=GROUP_SIZE, BLOCK_DIM=BLOCK_DIM,
         SF_TILE_M=_SF_TILE_M, SF_TILE_K=_SF_TILE_K,
         SF_TILE_STORAGE=_SF_TILE_STORAGE,
+        num_warps=1,
     )
     return (
         row_fp8, row_scales.view(torch.float8_e8m0fnu),
