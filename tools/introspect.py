@@ -1509,21 +1509,16 @@ if use_token_rounding:
         token_indices_r = token_indices_r[order]
         expert_indices_r = expert_indices_r[order]
         router_scores_r = scores[token_indices_r, expert_indices_r].contiguous()
-if use_token_rounding:
-    w1_p = moe.c_fc.weight.permute(1, 2, 0)
-    w2_p = moe.c_proj.weight.permute(1, 2, 0)
 
-# Pre-compute weight views for direct moe_TC_softmax_topk_layer calls
+# FP8 frontier: CPU optimizer (master weights + Adam on CPU, only FP8 on GPU).
+# setup_cpu_optimizer calls refresh + stash internally.
+if use_fp8:
+    moe.setup_cpu_optimizer(torch.optim.Adam, lr=1e-3)
+
+# Create weight views AFTER setup_cpu_optimizer (avoids keeping bf16 storage
+# alive via Python refcount when stash replaces param.data).
 w1_p = moe.c_fc.weight.permute(1, 2, 0)
 w2_p = moe.c_proj.weight.permute(1, 2, 0)
-
-# FP8 frontier = stash mode for ALL E values.
-# Token rounding path supports stash because:
-# - _STASHED_FP8_WEIGHTS bypasses cache lookup (no data_ptr dependency)
-# - Weight decoupling (ctx._w1_decoupled) avoids saving bf16 in autograd
-if use_fp8:
-    moe.refresh_fp8_shadow_weights()
-    moe.stash_bf16_to_cpu()
 
 # Token rounding guarantees 128-alignment; standard path detects it via streak.
 # Set alignment assumed AFTER stash (stash needs it False during setup).
@@ -1726,12 +1721,16 @@ if use_token_rounding:
         od = tok_idx.argsort().int()
         tok_idx = tok_idx[od]; exp_idx = exp_idx[od]
         rsc = sc[tok_idx, exp_idx].contiguous()
+if use_fp8:
+    # Use CPU optimizer: master weights + Adam states on CPU, only FP8 on GPU
+    moe.setup_cpu_optimizer(torch.optim.Adam, lr=1e-3)
+    # setup_cpu_optimizer calls refresh + stash internally
+
+# Create weight views AFTER setup (so they reference stashed/expanded data,
+# not the original bf16 storage — which would keep bf16 alive via refcount).
+if use_token_rounding:
     w1_p = moe.c_fc.weight.permute(1, 2, 0)
     w2_p = moe.c_proj.weight.permute(1, 2, 0)
-
-if use_fp8:
-    moe.refresh_fp8_shadow_weights()
-    moe.stash_bf16_to_cpu()
 
 def run_iter():
     xw = x.detach().clone().requires_grad_(True)
@@ -1745,14 +1744,17 @@ def run_iter():
                 with enable_fp8(True): o, aux = moe(xw, use_fp8=True)
             else:
                 with enable_fp8(False): o, aux = moe(xw)
-        o = o  # just use o
+        o = o
     return xw, o
 
 # Warmup
 for _ in range({warmup}):
     xw, o = run_iter()
     o.sum().backward()
-    moe.zero_grad(set_to_none=True)
+    if use_fp8:
+        moe.cpu_optimizer_step()
+    else:
+        moe.zero_grad(set_to_none=True)
     del xw, o
 gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
 
