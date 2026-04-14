@@ -138,25 +138,37 @@ The `native-fp8-exploration` branch has a fully functional **zero-materializatio
 
 | T | I | E | BF16 (µs) | FP8 (µs) | Speedup | FP8 Bwd (MiB) | MemΔ |
 |---|---|---|:---:|:---:|:---:|:---:|:---:|
-| **8192** | **1536** | **8** | **3556** | **2791** | **1.27×** | **1547** | +6.0% |
-| 8192 | 1536 | 32 | 3735 | 3013 | **1.24×** | 3624 | +33.9% |
-| 8192 | 1536 | 128 | 5079 | 4047 | **1.26×** | 11562 | +46.5% |
-| 32768 | 1536 | 8 | 15940 | 11501 | **1.39×** | 5359 | +8.9% |
-| 32768 | 1536 | 32 | 16776 | 11659 | **1.44×** | 6891 | +19.1% |
-| 32768 | 1536 | 128 | 18406 | 12556 | **1.47×** | 14532 | +34.9% |
+| **8192** | **1536** | **8** | **3600** | **2698** | **1.33×** | **1547** | +6.0% |
+| 8192 | 1536 | 32 | 3735 | 2917 | **1.28×** | 2909 | +7.5% |
+| 8192 | 1536 | 128 | 5056 | 3909 | **1.29×** | 8700 | +10.3% |
+| 32768 | 1536 | 8 | 15811 | 10518 | **1.50×** | 5359 | +8.9% |
+| 32768 | 1536 | 32 | 16718 | 10530 | **1.59×** | 6176 | +6.7% |
+| 32768 | 1536 | 128 | 18382 | 11798 | **1.56×** | 11669 | +8.3% |
 
-Precision (5 seeds, FP8 vs BF16 on identical routing — RRMSE %):
+Precision (3 seeds, FP8 vs BF16 on identical routing — RRMSE %):
 
 | T | E | output | dx | dw1 | dw2 | Status |
 |---|---|:---:|:---:|:---:|:---:|:---:|
-| 8192 | 8 | 6.52 | 6.53 | 4.71 | 4.92 | PASS |
+| 8192 | 8 | 6.52 | 6.53 | 4.71 | 4.90 | PASS |
 | 8192 | 32 | 6.52 | 6.51 | 5.47 | 5.88 | PASS |
 | 8192 | 128 | 6.52 | 6.52 | 6.01 | 6.50 | PASS |
-| 32768 | 8 | 6.55 | 6.56 | 4.12 | 4.19 | PASS |
-| 32768 | 32 | 6.55 | 6.54 | 4.60 | 4.83 | PASS |
+| 32768 | 8 | 6.55 | 6.55 | 4.12 | 4.20 | PASS |
+| 32768 | 32 | 6.55 | 6.54 | 4.60 | 4.84 | PASS |
 | 32768 | 128 | 6.55 | 6.55 | 5.40 | 5.81 | PASS |
 
-All within guardrails: RRMSE < 10%. Precision tested on same code path as performance (E≤8: `moe_TC_softmax_topk_layer`, E>8: token rounding + `moe_general_routing_inputs`).
+All RRMSE < 10%. Precision tested on same code path as performance.
+
+### Memory Optimization (optional, for memory-constrained scenarios)
+
+```python
+# CPU optimizer offload: master weights + Adam on CPU, only FP8 on GPU
+# Saves ~3.4 GB at E=128 base, costs ~500µs/iter from CPU↔GPU transfers
+moe.setup_cpu_optimizer(torch.optim.Adam, lr=1e-3)
+for batch in dataloader:
+    out, aux = moe(x, use_fp8=True)
+    loss.backward()
+    moe.cpu_optimizer_step()
+```
 
 > **Methodology:** nsys GPU-projection, 12-20 iters after 5 warmup. Each shape×mode in isolated subprocess (`CUDA_VISIBLE_DEVICES` per GPU). BF16 baseline verified within <1% of official SonicMoE. E>8 FP8 uses official token rounding (Mtile=128). nsys-rep files: `panzhaowu/output/nsys/`.
 

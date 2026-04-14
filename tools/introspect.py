@@ -1117,8 +1117,7 @@ def _run_collect_worker(mode: str, seed: int, out_path: Path) -> None:
 
     if mode == "fp8":
         model.refresh_fp8_shadow_weights()
-        if not use_token_rounding:
-            model.stash_bf16_to_cpu()
+        model.stash_bf16_to_cpu()
 
     torch.manual_seed(seed)
     x = (0.02 * torch.randn(T, H, dtype=torch.bfloat16, device=device)).detach().requires_grad_(True)
@@ -1159,12 +1158,14 @@ def _run_collect_worker(mode: str, seed: int, out_path: Path) -> None:
     out.sum().backward()
     torch.cuda.synchronize()
 
+    # Capture grads BEFORE saving
     payload = {
         "output": out.detach().cpu(),
         "dx": x.grad.detach().cpu() if x.grad is not None else None,
         "dw1": model.c_fc.weight.grad.detach().cpu() if model.c_fc.weight.grad is not None else None,
         "dw2": model.c_proj.weight.grad.detach().cpu() if model.c_proj.weight.grad is not None else None,
     }
+    torch.save(payload, out_path)
     torch.save(payload, out_path)
 
 
@@ -1510,10 +1511,11 @@ if use_token_rounding:
         expert_indices_r = expert_indices_r[order]
         router_scores_r = scores[token_indices_r, expert_indices_r].contiguous()
 
-# FP8 frontier: CPU optimizer (master weights + Adam on CPU, only FP8 on GPU).
-# setup_cpu_optimizer calls refresh + stash internally.
+# FP8 frontier: refresh + stash (highest performance, all caches retained).
+# For memory-constrained: use setup_cpu_optimizer() instead (see docs/HANDOFF.md).
 if use_fp8:
-    moe.setup_cpu_optimizer(torch.optim.Adam, lr=1e-3)
+    moe.refresh_fp8_shadow_weights()
+    moe.stash_bf16_to_cpu()
 
 # Create weight views AFTER setup_cpu_optimizer (avoids keeping bf16 storage
 # alive via Python refcount when stash replaces param.data).
@@ -1722,12 +1724,10 @@ if use_token_rounding:
         tok_idx = tok_idx[od]; exp_idx = exp_idx[od]
         rsc = sc[tok_idx, exp_idx].contiguous()
 if use_fp8:
-    # Use CPU optimizer: master weights + Adam states on CPU, only FP8 on GPU
-    moe.setup_cpu_optimizer(torch.optim.Adam, lr=1e-3)
-    # setup_cpu_optimizer calls refresh + stash internally
+    moe.refresh_fp8_shadow_weights()
+    moe.stash_bf16_to_cpu()
 
-# Create weight views AFTER setup (so they reference stashed/expanded data,
-# not the original bf16 storage — which would keep bf16 alive via refcount).
+# Create weight views AFTER stash
 if use_token_rounding:
     w1_p = moe.c_fc.weight.permute(1, 2, 0)
     w2_p = moe.c_proj.weight.permute(1, 2, 0)
@@ -1751,10 +1751,7 @@ def run_iter():
 for _ in range({warmup}):
     xw, o = run_iter()
     o.sum().backward()
-    if use_fp8:
-        moe.cpu_optimizer_step()
-    else:
-        moe.zero_grad(set_to_none=True)
+    moe.zero_grad(set_to_none=True)
     del xw, o
 gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
 
