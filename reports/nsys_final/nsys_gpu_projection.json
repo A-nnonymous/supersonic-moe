@@ -1,548 +1,1122 @@
 {
   "shapes": {
-    "T8192_I1536_E128K8": {
+    "T8192_I1536_E8K8": {
       "shape": {
         "T": 8192,
         "H": 3072,
         "I": 1536,
-        "E": 128,
+        "E": 8,
         "K": 8
       },
       "bf16": {
-        "gpu_projection_us": 158130.9,
-        "per_iter_us": 7906.5,
-        "num_iters": 20,
-        "num_kernels": 740,
+        "gpu_projection_us": 14092.4,
+        "per_iter_us": 3523.1,
+        "num_iters": 4,
+        "num_kernels": 116,
         "kernel_breakdown": [
-          {
-            "name": "void at::native::elementwise_kernel<(int)128, (int)4, void at::native::gpu_kernel_impl_nocast<at::native::direct_copy_ke",
-            "category": "Elementwise Ops",
-            "total_us": 56779.8,
-            "count": 40,
-            "per_iter_us": 2839.0,
-            "per_call_us": 1419.5
-          },
           {
             "name": "kernel_cutlass_kernel_quackgemm_default_epiGemmDefaultSm100_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____",
             "category": "Wgrad GEMM",
-            "total_us": 49854.6,
-            "count": 60,
-            "per_iter_us": 2492.7,
-            "per_call_us": 830.9
+            "total_us": 8334.6,
+            "count": 16,
+            "per_iter_us": 2083.6,
+            "per_call_us": 520.9
           },
           {
-            "name": "kernel_cutlass_kernel_sonicmoequack_utilsgemm_gatedGemmGatedSm100_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationM",
+            "name": "kernel_cutlass_kernel_sonicmoequack_utilsgemm_gatedGemmGatedSm100_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationM",
             "category": "GemmGated (fwd)",
-            "total_us": 21117.8,
-            "count": 20,
-            "per_iter_us": 1055.9,
-            "per_call_us": 1055.9
+            "total_us": 2772.6,
+            "count": 4,
+            "per_iter_us": 693.2,
+            "per_call_us": 693.2
           },
           {
-            "name": "kernel_cutlass_kernel_sonicmoequack_utilsgemm_dgatedGemmDGatedSm100_object_at__TiledMMA_ThrLayoutVMNK11110000_Permutatio",
+            "name": "kernel_cutlass_kernel_sonicmoequack_utilsgemm_dgatedGemmDGatedSm100_object_at__TiledMMA_ThrLayoutVMNK21111000_Permutatio",
             "category": "GemmDGated (bwd)",
-            "total_us": 13933.6,
-            "count": 20,
-            "per_iter_us": 696.7,
-            "per_call_us": 696.7
-          },
-          {
-            "name": "kernel_cutlass_kernel_quackgemm_default_epiGemmDefaultSm100_object_at__TiledMMA_ThrLayoutVMNK11110000_PermutationMNK____",
-            "category": "Wgrad GEMM",
-            "total_us": 10270.2,
-            "count": 20,
-            "per_iter_us": 513.5,
-            "per_call_us": 513.5
+            "total_us": 1756.1,
+            "count": 4,
+            "per_iter_us": 439.0,
+            "per_call_us": 439.0
           },
           {
             "name": "token_gather_sum_kernel",
             "category": "Token Gather",
-            "total_us": 3303.0,
-            "count": 40,
-            "per_iter_us": 165.2,
-            "per_call_us": 82.6
+            "total_us": 559.0,
+            "count": 8,
+            "per_iter_us": 139.8,
+            "per_call_us": 69.9
           },
           {
-            "name": "void at_cuda_detail::cub::detail::radix_sort::DeviceRadixSortOnesweepKernel<at_cuda_detail::cub::detail::radix::policy_h",
-            "category": "Other",
-            "total_us": 677.6,
-            "count": 80,
-            "per_iter_us": 33.9,
-            "per_call_us": 8.5
-          },
-          {
-            "name": "void count_cumsum_cuda_kernel<int, (bool)1>(const T1 *, int *, int *, long, unsigned int)",
-            "category": "Other",
-            "total_us": 379.0,
-            "count": 40,
-            "per_iter_us": 19.0,
-            "per_call_us": 9.5
-          },
-          {
-            "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (i",
+            "name": "void at::native::elementwise_kernel<(int)128, (int)4, void at::native::gpu_kernel_impl_nocast<at::native::direct_copy_ke",
             "category": "Elementwise Ops",
-            "total_us": 323.8,
-            "count": 80,
-            "per_iter_us": 16.2,
-            "per_call_us": 4.0
+            "total_us": 110.1,
+            "count": 4,
+            "per_iter_us": 27.5,
+            "per_call_us": 27.5
+          },
+          {
+            "name": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char *, (u",
+            "category": "Elementwise Ops",
+            "total_us": 81.8,
+            "count": 4,
+            "per_iter_us": 20.5,
+            "per_call_us": 20.5
           },
           {
             "name": "void at::native::index_elementwise_kernel<(int)128, (int)4, void at::native::gpu_index_kernel<void at::native::index_ker",
             "category": "Elementwise Ops",
-            "total_us": 314.1,
-            "count": 40,
-            "per_iter_us": 15.7,
-            "per_call_us": 7.9
+            "total_us": 61.2,
+            "count": 8,
+            "per_iter_us": 15.3,
+            "per_call_us": 7.6
           },
           {
             "name": "void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<c10::BFloat16, at::native::func_wrapper_t<c10::BFl",
             "category": "Reduce",
-            "total_us": 309.8,
-            "count": 20,
-            "per_iter_us": 15.5,
-            "per_call_us": 15.5
+            "total_us": 58.6,
+            "count": 4,
+            "per_iter_us": 14.6,
+            "per_call_us": 14.6
           },
           {
-            "name": "void at::native::index_elementwise_kernel<(int)128, (int)4, void at::native::gpu_index_kernel<void at::native::index_ker",
+            "name": "nvjet_sm103_tst_8x64_64x16_1x4_h_bz_TNN",
+            "category": "cuBLAS GEMM",
+            "total_us": 53.0,
+            "count": 4,
+            "per_iter_us": 13.2,
+            "per_call_us": 13.2
+          },
+          {
+            "name": "_compute_col_partial_sum_kernel",
+            "category": "Router Metadata",
+            "total_us": 52.8,
+            "count": 4,
+            "per_iter_us": 13.2,
+            "per_call_us": 13.2
+          },
+          {
+            "name": "nvjet_sm103_tst_64x32_64x16_2x1_2cta_v_bz_splitK_NTT",
+            "category": "cuBLAS GEMM",
+            "total_us": 51.1,
+            "count": 4,
+            "per_iter_us": 12.8,
+            "per_call_us": 12.8
+          },
+          {
+            "name": "nvjet_sm103_tst_128x192_64x7_2x1_2cta_v_bz_NNT",
+            "category": "cuBLAS GEMM",
+            "total_us": 48.8,
+            "count": 4,
+            "per_iter_us": 12.2,
+            "per_call_us": 12.2
+          },
+          {
+            "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (i",
             "category": "Elementwise Ops",
-            "total_us": 157.4,
-            "count": 20,
+            "total_us": 36.6,
+            "count": 8,
+            "per_iter_us": 9.1,
+            "per_call_us": 4.6
+          },
+          {
+            "name": "_bitmatrix_metadata_compute_stage2",
+            "category": "Router Metadata",
+            "total_us": 31.6,
+            "count": 4,
             "per_iter_us": 7.9,
             "per_call_us": 7.9
           },
           {
-            "name": "void at::native::index_elementwise_kernel<(int)128, (int)4, void at::native::gpu_index_kernel<void at::native::index_put",
-            "category": "Elementwise Ops",
-            "total_us": 154.2,
-            "count": 20,
-            "per_iter_us": 7.7,
-            "per_call_us": 7.7
+            "name": "_softmax_bwd_scatter_small_kernel",
+            "category": "Softmax",
+            "total_us": 24.2,
+            "count": 4,
+            "per_iter_us": 6.1,
+            "per_call_us": 6.1
           },
           {
             "name": "void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<float, at::native::func_wrapper_t<float, at::nativ",
             "category": "Reduce",
-            "total_us": 83.9,
-            "count": 20,
-            "per_iter_us": 4.2,
-            "per_call_us": 4.2
-          },
-          {
-            "name": "void at_cuda_detail::cub::detail::radix_sort::DeviceRadixSortHistogramKernel<at_cuda_detail::cub::detail::radix::policy_",
-            "category": "Other",
-            "total_us": 74.2,
-            "count": 20,
-            "per_iter_us": 3.7,
-            "per_call_us": 3.7
-          },
-          {
-            "name": "void at::native::<unnamed>::CatArrayBatchedCopy_alignedK_contig<at::native::<unnamed>::OpaqueType<(unsigned int)4>, unsi",
-            "category": "Other",
-            "total_us": 73.6,
-            "count": 40,
-            "per_iter_us": 3.7,
-            "per_call_us": 1.8
-          },
-          {
-            "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (i",
-            "category": "Elementwise Ops",
-            "total_us": 72.4,
-            "count": 20,
+            "total_us": 14.5,
+            "count": 4,
             "per_iter_us": 3.6,
             "per_call_us": 3.6
           },
           {
-            "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (i",
-            "category": "Elementwise Ops",
-            "total_us": 55.2,
-            "count": 20,
-            "per_iter_us": 2.8,
-            "per_call_us": 2.8
-          },
-          {
-            "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<int>, std::array<char *, (unsigned long)1",
-            "category": "Elementwise Ops",
-            "total_us": 53.4,
-            "count": 40,
-            "per_iter_us": 2.7,
-            "per_call_us": 1.3
-          },
-          {
-            "name": "at::native::<unnamed>::fill_reverse_indices_kernel(long *, int, at::cuda::detail::IntDivider<unsigned int>)",
-            "category": "Other",
-            "total_us": 39.6,
-            "count": 20,
-            "per_iter_us": 2.0,
-            "per_call_us": 2.0
-          },
-          {
-            "name": "void at_cuda_detail::cub::detail::radix_sort::DeviceRadixSortExclusiveSumKernel<at_cuda_detail::cub::detail::radix::poli",
-            "category": "Other",
-            "total_us": 38.1,
-            "count": 20,
-            "per_iter_us": 1.9,
-            "per_call_us": 1.9
-          },
-          {
-            "name": "void <unnamed>::elementwise_kernel_with_index<int, at::native::arange_cuda_out(const c10::Scalar &, const c10::Scalar &,",
-            "category": "Elementwise Ops",
-            "total_us": 37.4,
-            "count": 20,
-            "per_iter_us": 1.9,
-            "per_call_us": 1.9
+            "name": "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, __nv_bfloat16, float, __nv_bfloat16, (bool)0, float, __",
+            "category": "Reduce",
+            "total_us": 14.3,
+            "count": 4,
+            "per_iter_us": 3.6,
+            "per_call_us": 3.6
           },
           {
             "name": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::FillFunctor<c10::BFloat16>, std::array<char *, (unsig",
             "category": "Elementwise Ops",
-            "total_us": 27.9,
-            "count": 20,
-            "per_iter_us": 1.4,
+            "total_us": 10.9,
+            "count": 8,
+            "per_iter_us": 2.7,
             "per_call_us": 1.4
+          },
+          {
+            "name": "void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<int, at::native::func_wrapper_t<int, at::native::s",
+            "category": "Reduce",
+            "total_us": 10.5,
+            "count": 4,
+            "per_iter_us": 2.6,
+            "per_call_us": 2.6
+          },
+          {
+            "name": "kernel_cutlass_kernel_sonicmoefunctionaltopk_softmaxTopK_Softmax_object_at__tensorptrbf16gmemalign16o881_tensorptrf32gme",
+            "category": "TopK Router",
+            "total_us": 9.6,
+            "count": 4,
+            "per_iter_us": 2.4,
+            "per_call_us": 2.4
+          },
+          {
+            "name": "_bitmatrix_metadata_compute_stage1",
+            "category": "Router Metadata",
+            "total_us": 7.3,
+            "count": 4,
+            "per_iter_us": 1.8,
+            "per_call_us": 1.8
+          },
+          {
+            "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<int>, std::array<char *, (unsigned long)1",
+            "category": "Elementwise Ops",
+            "total_us": 7.1,
+            "count": 4,
+            "per_iter_us": 1.8,
+            "per_call_us": 1.8
           }
         ],
         "category_summary": {
-          "Wgrad GEMM": 3006.2,
-          "Elementwise Ops": 2898.8999999999996,
-          "GemmGated (fwd)": 1055.9,
-          "GemmDGated (bwd)": 696.7,
-          "Token Gather": 165.2,
-          "Other": 64.2,
-          "Reduce": 19.7
+          "Wgrad GEMM": 2083.6,
+          "GemmGated (fwd)": 693.2,
+          "GemmDGated (bwd)": 439.0,
+          "Token Gather": 139.8,
+          "Elementwise Ops": 76.89999999999999,
+          "cuBLAS GEMM": 38.2,
+          "Reduce": 24.400000000000002,
+          "Router Metadata": 22.900000000000002,
+          "Softmax": 6.1,
+          "TopK Router": 2.4
         },
         "mode": "bf16",
         "shape": {
           "T": 8192,
           "H": 3072,
           "I": 1536,
-          "E": 128,
+          "E": 8,
           "K": 8
         },
-        "nsys_rep": "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/output/nsys/bf16_T8192_I1536_E128K8_211016.nsys-rep"
+        "nsys_rep": "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/output/nsys/bf16_T8192_I1536_E8K8_195431.nsys-rep"
       },
       "fp8": {
-        "gpu_projection_us": 83840.4,
-        "per_iter_us": 4192.0,
-        "num_iters": 20,
-        "num_kernels": 900,
+        "gpu_projection_us": 10784.9,
+        "per_iter_us": 2696.2,
+        "num_iters": 4,
+        "num_kernels": 152,
         "kernel_breakdown": [
           {
             "name": "kernel_cutlass_kernel_quackgemm_default_epiGemmDefaultSm100_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____",
             "category": "Wgrad GEMM",
-            "total_us": 40582.0,
-            "count": 80,
-            "per_iter_us": 2029.1,
-            "per_call_us": 507.3
+            "total_us": 4265.1,
+            "count": 16,
+            "per_iter_us": 1066.3,
+            "per_call_us": 266.6
           },
           {
             "name": "kernel_cutlass_kernel_sonicmoequack_utilsgemm_sm100_fp8_zeromatGemmGatedSm100ZeroMatBlockscaledQuant_object_at__TiledMMA",
             "category": "GemmGated ZeroMat (fwd)",
-            "total_us": 14467.5,
-            "count": 20,
-            "per_iter_us": 723.4,
-            "per_call_us": 723.4
+            "total_us": 1801.6,
+            "count": 4,
+            "per_iter_us": 450.4,
+            "per_call_us": 450.4
           },
           {
             "name": "kernel_cutlass_kernel_sonicmoequack_utilsgemm_sm100_fp8_zeromatGemmDGatedFP8CLoadSm100ZeroMat_object_at__TiledMMA_ThrLay",
             "category": "GemmDGated ZeroMat (bwd)",
-            "total_us": 11270.8,
-            "count": 20,
-            "per_iter_us": 563.5,
-            "per_call_us": 563.5
+            "total_us": 1533.9,
+            "count": 4,
+            "per_iter_us": 383.5,
+            "per_call_us": 383.5
           },
           {
             "name": "_colwise_quantize_and_pack_kernel",
             "category": "Blockscaled Quant",
-            "total_us": 5231.7,
-            "count": 60,
-            "per_iter_us": 261.6,
-            "per_call_us": 87.2
+            "total_us": 940.7,
+            "count": 12,
+            "per_iter_us": 235.2,
+            "per_call_us": 78.4
           },
           {
             "name": "_dual_varlen_quantize_kernel",
             "category": "Dual Quant",
-            "total_us": 3577.3,
-            "count": 20,
-            "per_iter_us": 178.9,
-            "per_call_us": 178.9
+            "total_us": 609.0,
+            "count": 4,
+            "per_iter_us": 152.3,
+            "per_call_us": 152.3
           },
           {
             "name": "token_gather_sum_kernel",
             "category": "Token Gather",
-            "total_us": 3302.6,
-            "count": 40,
-            "per_iter_us": 165.1,
-            "per_call_us": 82.6
+            "total_us": 586.1,
+            "count": 8,
+            "per_iter_us": 146.5,
+            "per_call_us": 73.3
           },
           {
             "name": "_quantize_and_pack_kernel",
             "category": "Row Quant",
-            "total_us": 1716.5,
-            "count": 60,
-            "per_iter_us": 85.8,
-            "per_call_us": 28.6
-          },
-          {
-            "name": "void at_cuda_detail::cub::detail::radix_sort::DeviceRadixSortOnesweepKernel<at_cuda_detail::cub::detail::radix::policy_h",
-            "category": "Other",
-            "total_us": 632.9,
-            "count": 80,
-            "per_iter_us": 31.6,
-            "per_call_us": 7.9
+            "total_us": 306.6,
+            "count": 12,
+            "per_iter_us": 76.6,
+            "per_call_us": 25.5
           },
           {
             "name": "void at::native::elementwise_kernel<(int)128, (int)4, void at::native::gpu_kernel_impl_nocast<at::native::direct_copy_ke",
             "category": "Elementwise Ops",
-            "total_us": 581.8,
-            "count": 20,
-            "per_iter_us": 29.1,
-            "per_call_us": 29.1
+            "total_us": 111.2,
+            "count": 4,
+            "per_iter_us": 27.8,
+            "per_call_us": 27.8
+          },
+          {
+            "name": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char *, (u",
+            "category": "Elementwise Ops",
+            "total_us": 80.8,
+            "count": 4,
+            "per_iter_us": 20.2,
+            "per_call_us": 20.2
           },
           {
             "name": "_gather_isa_packed_scales_kernel",
             "category": "ISA Scale Gather",
-            "total_us": 388.3,
-            "count": 40,
-            "per_iter_us": 19.4,
-            "per_call_us": 9.7
-          },
-          {
-            "name": "void count_cumsum_cuda_kernel<int, (bool)1>(const T1 *, int *, int *, long, unsigned int)",
-            "category": "Other",
-            "total_us": 361.6,
-            "count": 40,
-            "per_iter_us": 18.1,
-            "per_call_us": 9.0
-          },
-          {
-            "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (i",
-            "category": "Elementwise Ops",
-            "total_us": 308.5,
-            "count": 80,
-            "per_iter_us": 15.4,
-            "per_call_us": 3.9
+            "total_us": 65.1,
+            "count": 8,
+            "per_iter_us": 16.3,
+            "per_call_us": 8.1
           },
           {
             "name": "void at::native::index_elementwise_kernel<(int)128, (int)4, void at::native::gpu_index_kernel<void at::native::index_ker",
             "category": "Elementwise Ops",
-            "total_us": 298.9,
-            "count": 40,
+            "total_us": 59.4,
+            "count": 8,
+            "per_iter_us": 14.9,
+            "per_call_us": 7.4
+          },
+          {
+            "name": "void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<c10::BFloat16, at::native::func_wrapper_t<c10::BFl",
+            "category": "Reduce",
+            "total_us": 58.0,
+            "count": 4,
+            "per_iter_us": 14.5,
+            "per_call_us": 14.5
+          },
+          {
+            "name": "nvjet_sm103_tst_8x64_64x16_1x4_h_bz_TNN",
+            "category": "cuBLAS GEMM",
+            "total_us": 54.6,
+            "count": 4,
+            "per_iter_us": 13.7,
+            "per_call_us": 13.7
+          },
+          {
+            "name": "_compute_col_partial_sum_kernel",
+            "category": "Router Metadata",
+            "total_us": 52.7,
+            "count": 4,
+            "per_iter_us": 13.2,
+            "per_call_us": 13.2
+          },
+          {
+            "name": "nvjet_sm103_tst_64x32_64x16_2x1_2cta_v_bz_splitK_NTT",
+            "category": "cuBLAS GEMM",
+            "total_us": 50.2,
+            "count": 4,
+            "per_iter_us": 12.6,
+            "per_call_us": 12.6
+          },
+          {
+            "name": "nvjet_sm103_tst_128x192_64x7_2x1_2cta_v_bz_NNT",
+            "category": "cuBLAS GEMM",
+            "total_us": 45.3,
+            "count": 4,
+            "per_iter_us": 11.3,
+            "per_call_us": 11.3
+          },
+          {
+            "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (i",
+            "category": "Elementwise Ops",
+            "total_us": 37.6,
+            "count": 8,
+            "per_iter_us": 9.4,
+            "per_call_us": 4.7
+          },
+          {
+            "name": "_bitmatrix_metadata_compute_stage2",
+            "category": "Router Metadata",
+            "total_us": 32.0,
+            "count": 4,
+            "per_iter_us": 8.0,
+            "per_call_us": 8.0
+          },
+          {
+            "name": "_softmax_bwd_scatter_small_kernel",
+            "category": "Softmax",
+            "total_us": 24.3,
+            "count": 4,
+            "per_iter_us": 6.1,
+            "per_call_us": 6.1
+          },
+          {
+            "name": "void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<float, at::native::func_wrapper_t<float, at::nativ",
+            "category": "Reduce",
+            "total_us": 14.2,
+            "count": 4,
+            "per_iter_us": 3.6,
+            "per_call_us": 3.6
+          },
+          {
+            "name": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::FillFunctor<c10::BFloat16>, std::array<char *, (unsig",
+            "category": "Elementwise Ops",
+            "total_us": 11.6,
+            "count": 8,
+            "per_iter_us": 2.9,
+            "per_call_us": 1.4
+          },
+          {
+            "name": "void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<int, at::native::func_wrapper_t<int, at::native::s",
+            "category": "Reduce",
+            "total_us": 10.6,
+            "count": 4,
+            "per_iter_us": 2.6,
+            "per_call_us": 2.6
+          },
+          {
+            "name": "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, __nv_bfloat16, float, __nv_bfloat16, (bool)0, float, __",
+            "category": "Reduce",
+            "total_us": 10.4,
+            "count": 4,
+            "per_iter_us": 2.6,
+            "per_call_us": 2.6
+          },
+          {
+            "name": "kernel_cutlass_kernel_sonicmoefunctionaltopk_softmaxTopK_Softmax_object_at__tensorptrbf16gmemalign16o881_tensorptrf32gme",
+            "category": "TopK Router",
+            "total_us": 9.0,
+            "count": 4,
+            "per_iter_us": 2.2,
+            "per_call_us": 2.2
+          },
+          {
+            "name": "_bitmatrix_metadata_compute_stage1",
+            "category": "Router Metadata",
+            "total_us": 7.8,
+            "count": 4,
+            "per_iter_us": 1.9,
+            "per_call_us": 1.9
+          },
+          {
+            "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<int>, std::array<char *, (unsigned long)1",
+            "category": "Elementwise Ops",
+            "total_us": 7.2,
+            "count": 4,
+            "per_iter_us": 1.8,
+            "per_call_us": 1.8
+          }
+        ],
+        "category_summary": {
+          "Wgrad GEMM": 1066.3,
+          "GemmGated ZeroMat (fwd)": 450.4,
+          "GemmDGated ZeroMat (bwd)": 383.5,
+          "Blockscaled Quant": 235.2,
+          "Dual Quant": 152.3,
+          "Token Gather": 146.5,
+          "Elementwise Ops": 77.0,
+          "Row Quant": 76.6,
+          "cuBLAS GEMM": 37.599999999999994,
+          "Reduce": 23.300000000000004,
+          "Router Metadata": 23.099999999999998,
+          "ISA Scale Gather": 16.3,
+          "Softmax": 6.1,
+          "TopK Router": 2.2
+        },
+        "mode": "fp8",
+        "shape": {
+          "T": 8192,
+          "H": 3072,
+          "I": 1536,
+          "E": 8,
+          "K": 8
+        },
+        "nsys_rep": "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/output/nsys/fp8_T8192_I1536_E8K8_195521.nsys-rep"
+      },
+      "speedup": 1.3067,
+      "memory_bf16": {
+        "mode": "bf16",
+        "base_mib": 280.3,
+        "peak_fwd_mib": 1337.7,
+        "peak_bwd_mib": 1458.8
+      },
+      "memory_fp8": {
+        "mode": "fp8",
+        "base_mib": 324.2,
+        "peak_fwd_mib": 1102.5,
+        "peak_bwd_mib": 1546.9
+      },
+      "budget_breakdown": {
+        "Blockscaled Quant": {
+          "bf16_us": 0.0,
+          "fp8_us": 235.2,
+          "delta_us": 235.2
+        },
+        "Dual Quant": {
+          "bf16_us": 0.0,
+          "fp8_us": 152.3,
+          "delta_us": 152.3
+        },
+        "Elementwise Ops": {
+          "bf16_us": 76.9,
+          "fp8_us": 77.0,
+          "delta_us": 0.1
+        },
+        "GemmDGated (bwd)": {
+          "bf16_us": 439.0,
+          "fp8_us": 0.0,
+          "delta_us": -439.0
+        },
+        "GemmDGated ZeroMat (bwd)": {
+          "bf16_us": 0.0,
+          "fp8_us": 383.5,
+          "delta_us": 383.5
+        },
+        "GemmGated (fwd)": {
+          "bf16_us": 693.2,
+          "fp8_us": 0.0,
+          "delta_us": -693.2
+        },
+        "GemmGated ZeroMat (fwd)": {
+          "bf16_us": 0.0,
+          "fp8_us": 450.4,
+          "delta_us": 450.4
+        },
+        "ISA Scale Gather": {
+          "bf16_us": 0.0,
+          "fp8_us": 16.3,
+          "delta_us": 16.3
+        },
+        "Reduce": {
+          "bf16_us": 24.4,
+          "fp8_us": 23.3,
+          "delta_us": -1.1
+        },
+        "Router Metadata": {
+          "bf16_us": 22.9,
+          "fp8_us": 23.1,
+          "delta_us": 0.2
+        },
+        "Row Quant": {
+          "bf16_us": 0.0,
+          "fp8_us": 76.6,
+          "delta_us": 76.6
+        },
+        "Softmax": {
+          "bf16_us": 6.1,
+          "fp8_us": 6.1,
+          "delta_us": 0.0
+        },
+        "Token Gather": {
+          "bf16_us": 139.8,
+          "fp8_us": 146.5,
+          "delta_us": 6.7
+        },
+        "TopK Router": {
+          "bf16_us": 2.4,
+          "fp8_us": 2.2,
+          "delta_us": -0.2
+        },
+        "Wgrad GEMM": {
+          "bf16_us": 2083.6,
+          "fp8_us": 1066.3,
+          "delta_us": -1017.3
+        },
+        "cuBLAS GEMM": {
+          "bf16_us": 38.2,
+          "fp8_us": 37.6,
+          "delta_us": -0.6
+        }
+      },
+      "budget_savings_us": -2151.4,
+      "budget_overhead_us": 1321.3,
+      "budget_net_us": -830.1
+    },
+    "T8192_I2048_E8K8": {
+      "shape": {
+        "T": 8192,
+        "H": 3072,
+        "I": 2048,
+        "E": 8,
+        "K": 8
+      },
+      "bf16": {
+        "gpu_projection_us": 19399.8,
+        "per_iter_us": 4850.0,
+        "num_iters": 4,
+        "num_kernels": 116,
+        "kernel_breakdown": [
+          {
+            "name": "kernel_cutlass_kernel_quackgemm_default_epiGemmDefaultSm100_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____",
+            "category": "Wgrad GEMM",
+            "total_us": 9292.0,
+            "count": 12,
+            "per_iter_us": 2323.0,
+            "per_call_us": 774.3
+          },
+          {
+            "name": "kernel_cutlass_kernel_sonicmoequack_utilsgemm_gatedGemmGatedSm100_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationM",
+            "category": "GemmGated (fwd)",
+            "total_us": 4392.1,
+            "count": 4,
+            "per_iter_us": 1098.0,
+            "per_call_us": 1098.0
+          },
+          {
+            "name": "kernel_cutlass_kernel_sonicmoequack_utilsgemm_dgatedGemmDGatedSm100_object_at__TiledMMA_ThrLayoutVMNK21111000_Permutatio",
+            "category": "GemmDGated (bwd)",
+            "total_us": 2309.6,
+            "count": 4,
+            "per_iter_us": 577.4,
+            "per_call_us": 577.4
+          },
+          {
+            "name": "kernel_cutlass_kernel_quackgemm_default_epiGemmDefaultSm100_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____",
+            "category": "Wgrad GEMM",
+            "total_us": 2182.8,
+            "count": 4,
+            "per_iter_us": 545.7,
+            "per_call_us": 545.7
+          },
+          {
+            "name": "token_gather_sum_kernel",
+            "category": "Token Gather",
+            "total_us": 548.5,
+            "count": 8,
+            "per_iter_us": 137.1,
+            "per_call_us": 68.6
+          },
+          {
+            "name": "void at::native::elementwise_kernel<(int)128, (int)4, void at::native::gpu_kernel_impl_nocast<at::native::direct_copy_ke",
+            "category": "Elementwise Ops",
+            "total_us": 109.9,
+            "count": 4,
+            "per_iter_us": 27.5,
+            "per_call_us": 27.5
+          },
+          {
+            "name": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char *, (u",
+            "category": "Elementwise Ops",
+            "total_us": 81.7,
+            "count": 4,
+            "per_iter_us": 20.4,
+            "per_call_us": 20.4
+          },
+          {
+            "name": "void at::native::index_elementwise_kernel<(int)128, (int)4, void at::native::gpu_index_kernel<void at::native::index_ker",
+            "category": "Elementwise Ops",
+            "total_us": 59.7,
+            "count": 8,
             "per_iter_us": 14.9,
             "per_call_us": 7.5
           },
           {
             "name": "void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<c10::BFloat16, at::native::func_wrapper_t<c10::BFl",
             "category": "Reduce",
-            "total_us": 298.1,
-            "count": 20,
-            "per_iter_us": 14.9,
-            "per_call_us": 14.9
+            "total_us": 59.1,
+            "count": 4,
+            "per_iter_us": 14.8,
+            "per_call_us": 14.8
           },
           {
-            "name": "void at::native::index_elementwise_kernel<(int)128, (int)4, void at::native::gpu_index_kernel<void at::native::index_ker",
-            "category": "Elementwise Ops",
-            "total_us": 151.0,
-            "count": 20,
-            "per_iter_us": 7.5,
-            "per_call_us": 7.5
+            "name": "_compute_col_partial_sum_kernel",
+            "category": "Router Metadata",
+            "total_us": 53.9,
+            "count": 4,
+            "per_iter_us": 13.5,
+            "per_call_us": 13.5
           },
           {
-            "name": "void at::native::index_elementwise_kernel<(int)128, (int)4, void at::native::gpu_index_kernel<void at::native::index_put",
+            "name": "nvjet_sm103_tst_8x64_64x16_1x4_h_bz_TNN",
+            "category": "cuBLAS GEMM",
+            "total_us": 52.7,
+            "count": 4,
+            "per_iter_us": 13.2,
+            "per_call_us": 13.2
+          },
+          {
+            "name": "nvjet_sm103_tst_64x32_64x16_2x1_2cta_v_bz_splitK_NTT",
+            "category": "cuBLAS GEMM",
+            "total_us": 49.7,
+            "count": 4,
+            "per_iter_us": 12.4,
+            "per_call_us": 12.4
+          },
+          {
+            "name": "nvjet_sm103_tst_128x192_64x7_2x1_2cta_v_bz_NNT",
+            "category": "cuBLAS GEMM",
+            "total_us": 48.3,
+            "count": 4,
+            "per_iter_us": 12.1,
+            "per_call_us": 12.1
+          },
+          {
+            "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (i",
             "category": "Elementwise Ops",
-            "total_us": 147.4,
-            "count": 20,
-            "per_iter_us": 7.4,
-            "per_call_us": 7.4
+            "total_us": 36.4,
+            "count": 8,
+            "per_iter_us": 9.1,
+            "per_call_us": 4.5
+          },
+          {
+            "name": "_bitmatrix_metadata_compute_stage2",
+            "category": "Router Metadata",
+            "total_us": 31.9,
+            "count": 4,
+            "per_iter_us": 8.0,
+            "per_call_us": 8.0
+          },
+          {
+            "name": "_softmax_bwd_scatter_small_kernel",
+            "category": "Softmax",
+            "total_us": 24.4,
+            "count": 4,
+            "per_iter_us": 6.1,
+            "per_call_us": 6.1
           },
           {
             "name": "void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<float, at::native::func_wrapper_t<float, at::nativ",
             "category": "Reduce",
-            "total_us": 79.4,
-            "count": 20,
-            "per_iter_us": 4.0,
-            "per_call_us": 4.0
+            "total_us": 20.8,
+            "count": 4,
+            "per_iter_us": 5.2,
+            "per_call_us": 5.2
           },
           {
-            "name": "void at_cuda_detail::cub::detail::radix_sort::DeviceRadixSortHistogramKernel<at_cuda_detail::cub::detail::radix::policy_",
-            "category": "Other",
-            "total_us": 69.8,
-            "count": 20,
+            "name": "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, __nv_bfloat16, float, __nv_bfloat16, (bool)0, float, __",
+            "category": "Reduce",
+            "total_us": 14.1,
+            "count": 4,
             "per_iter_us": 3.5,
             "per_call_us": 3.5
           },
           {
-            "name": "void at::native::<unnamed>::CatArrayBatchedCopy_alignedK_contig<at::native::<unnamed>::OpaqueType<(unsigned int)4>, unsi",
-            "category": "Other",
-            "total_us": 69.1,
-            "count": 40,
-            "per_iter_us": 3.5,
-            "per_call_us": 1.7
-          },
-          {
-            "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (i",
+            "name": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::FillFunctor<c10::BFloat16>, std::array<char *, (unsig",
             "category": "Elementwise Ops",
-            "total_us": 67.7,
-            "count": 20,
-            "per_iter_us": 3.4,
-            "per_call_us": 3.4
+            "total_us": 10.9,
+            "count": 8,
+            "per_iter_us": 2.7,
+            "per_call_us": 1.4
           },
           {
-            "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (i",
-            "category": "Elementwise Ops",
-            "total_us": 51.8,
-            "count": 20,
-            "per_iter_us": 2.6,
-            "per_call_us": 2.6
+            "name": "void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<int, at::native::func_wrapper_t<int, at::native::s",
+            "category": "Reduce",
+            "total_us": 10.7,
+            "count": 4,
+            "per_iter_us": 2.7,
+            "per_call_us": 2.7
           },
           {
-            "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<int>, std::array<char *, (unsigned long)1",
-            "category": "Elementwise Ops",
-            "total_us": 49.9,
-            "count": 40,
-            "per_iter_us": 2.5,
-            "per_call_us": 1.2
+            "name": "kernel_cutlass_kernel_sonicmoefunctionaltopk_softmaxTopK_Softmax_object_at__tensorptrbf16gmemalign16o881_tensorptrf32gme",
+            "category": "TopK Router",
+            "total_us": 9.8,
+            "count": 4,
+            "per_iter_us": 2.4,
+            "per_call_us": 2.4
           },
           {
-            "name": "at::native::<unnamed>::fill_reverse_indices_kernel(long *, int, at::cuda::detail::IntDivider<unsigned int>)",
-            "category": "Other",
-            "total_us": 38.0,
-            "count": 20,
+            "name": "_bitmatrix_metadata_compute_stage1",
+            "category": "Router Metadata",
+            "total_us": 7.4,
+            "count": 4,
             "per_iter_us": 1.9,
             "per_call_us": 1.9
           },
           {
-            "name": "void at_cuda_detail::cub::detail::radix_sort::DeviceRadixSortExclusiveSumKernel<at_cuda_detail::cub::detail::radix::poli",
-            "category": "Other",
-            "total_us": 36.2,
-            "count": 20,
+            "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<int>, std::array<char *, (unsigned long)1",
+            "category": "Elementwise Ops",
+            "total_us": 7.4,
+            "count": 4,
             "per_iter_us": 1.8,
             "per_call_us": 1.8
+          }
+        ],
+        "category_summary": {
+          "Wgrad GEMM": 2868.7,
+          "GemmGated (fwd)": 1098.0,
+          "GemmDGated (bwd)": 577.4,
+          "Token Gather": 137.1,
+          "Elementwise Ops": 76.39999999999999,
+          "cuBLAS GEMM": 37.7,
+          "Reduce": 26.2,
+          "Router Metadata": 23.4,
+          "Softmax": 6.1,
+          "TopK Router": 2.4
+        },
+        "mode": "bf16",
+        "shape": {
+          "T": 8192,
+          "H": 3072,
+          "I": 2048,
+          "E": 8,
+          "K": 8
+        },
+        "nsys_rep": "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/output/nsys/bf16_T8192_I2048_E8K8_195712.nsys-rep"
+      },
+      "fp8": {
+        "gpu_projection_us": 13623.7,
+        "per_iter_us": 3405.9,
+        "num_iters": 4,
+        "num_kernels": 152,
+        "kernel_breakdown": [
+          {
+            "name": "kernel_cutlass_kernel_quackgemm_default_epiGemmDefaultSm100_object_at__TiledMMA_ThrLayoutVMNK21111000_PermutationMNK____",
+            "category": "Wgrad GEMM",
+            "total_us": 5535.8,
+            "count": 16,
+            "per_iter_us": 1383.9,
+            "per_call_us": 346.0
           },
           {
-            "name": "void <unnamed>::elementwise_kernel_with_index<int, at::native::arange_cuda_out(const c10::Scalar &, const c10::Scalar &,",
+            "name": "kernel_cutlass_kernel_sonicmoequack_utilsgemm_sm100_fp8_zeromatGemmGatedSm100ZeroMatBlockscaledQuant_object_at__TiledMMA",
+            "category": "GemmGated ZeroMat (fwd)",
+            "total_us": 2499.1,
+            "count": 4,
+            "per_iter_us": 624.8,
+            "per_call_us": 624.8
+          },
+          {
+            "name": "kernel_cutlass_kernel_sonicmoequack_utilsgemm_sm100_fp8_zeromatGemmDGatedFP8CLoadSm100ZeroMat_object_at__TiledMMA_ThrLay",
+            "category": "GemmDGated ZeroMat (bwd)",
+            "total_us": 2110.9,
+            "count": 4,
+            "per_iter_us": 527.7,
+            "per_call_us": 527.7
+          },
+          {
+            "name": "_colwise_quantize_and_pack_kernel",
+            "category": "Blockscaled Quant",
+            "total_us": 1001.8,
+            "count": 12,
+            "per_iter_us": 250.4,
+            "per_call_us": 83.5
+          },
+          {
+            "name": "_dual_varlen_quantize_kernel",
+            "category": "Dual Quant",
+            "total_us": 793.9,
+            "count": 4,
+            "per_iter_us": 198.5,
+            "per_call_us": 198.5
+          },
+          {
+            "name": "token_gather_sum_kernel",
+            "category": "Token Gather",
+            "total_us": 570.5,
+            "count": 8,
+            "per_iter_us": 142.6,
+            "per_call_us": 71.3
+          },
+          {
+            "name": "_quantize_and_pack_kernel",
+            "category": "Row Quant",
+            "total_us": 374.1,
+            "count": 12,
+            "per_iter_us": 93.5,
+            "per_call_us": 31.2
+          },
+          {
+            "name": "void at::native::elementwise_kernel<(int)128, (int)4, void at::native::gpu_kernel_impl_nocast<at::native::direct_copy_ke",
             "category": "Elementwise Ops",
-            "total_us": 35.9,
-            "count": 20,
-            "per_iter_us": 1.8,
-            "per_call_us": 1.8
+            "total_us": 110.5,
+            "count": 4,
+            "per_iter_us": 27.6,
+            "per_call_us": 27.6
+          },
+          {
+            "name": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::CUDAFunctor_add<c10::BFloat16>, std::array<char *, (u",
+            "category": "Elementwise Ops",
+            "total_us": 80.8,
+            "count": 4,
+            "per_iter_us": 20.2,
+            "per_call_us": 20.2
+          },
+          {
+            "name": "_gather_isa_packed_scales_kernel",
+            "category": "ISA Scale Gather",
+            "total_us": 65.2,
+            "count": 8,
+            "per_iter_us": 16.3,
+            "per_call_us": 8.1
+          },
+          {
+            "name": "void at::native::index_elementwise_kernel<(int)128, (int)4, void at::native::gpu_index_kernel<void at::native::index_ker",
+            "category": "Elementwise Ops",
+            "total_us": 59.7,
+            "count": 8,
+            "per_iter_us": 14.9,
+            "per_call_us": 7.5
+          },
+          {
+            "name": "void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<c10::BFloat16, at::native::func_wrapper_t<c10::BFl",
+            "category": "Reduce",
+            "total_us": 59.2,
+            "count": 4,
+            "per_iter_us": 14.8,
+            "per_call_us": 14.8
+          },
+          {
+            "name": "nvjet_sm103_tst_8x64_64x16_1x4_h_bz_TNN",
+            "category": "cuBLAS GEMM",
+            "total_us": 53.9,
+            "count": 4,
+            "per_iter_us": 13.5,
+            "per_call_us": 13.5
+          },
+          {
+            "name": "_compute_col_partial_sum_kernel",
+            "category": "Router Metadata",
+            "total_us": 52.0,
+            "count": 4,
+            "per_iter_us": 13.0,
+            "per_call_us": 13.0
+          },
+          {
+            "name": "nvjet_sm103_tst_64x32_64x16_2x1_2cta_v_bz_splitK_NTT",
+            "category": "cuBLAS GEMM",
+            "total_us": 49.5,
+            "count": 4,
+            "per_iter_us": 12.4,
+            "per_call_us": 12.4
+          },
+          {
+            "name": "nvjet_sm103_tst_128x192_64x7_2x1_2cta_v_bz_NNT",
+            "category": "cuBLAS GEMM",
+            "total_us": 48.5,
+            "count": 4,
+            "per_iter_us": 12.1,
+            "per_call_us": 12.1
+          },
+          {
+            "name": "void at::native::unrolled_elementwise_kernel<at::native::direct_copy_kernel_cuda(at::TensorIteratorBase &)::[lambda() (i",
+            "category": "Elementwise Ops",
+            "total_us": 35.8,
+            "count": 8,
+            "per_iter_us": 9.0,
+            "per_call_us": 4.5
+          },
+          {
+            "name": "_bitmatrix_metadata_compute_stage2",
+            "category": "Router Metadata",
+            "total_us": 31.7,
+            "count": 4,
+            "per_iter_us": 7.9,
+            "per_call_us": 7.9
+          },
+          {
+            "name": "_softmax_bwd_scatter_small_kernel",
+            "category": "Softmax",
+            "total_us": 24.0,
+            "count": 4,
+            "per_iter_us": 6.0,
+            "per_call_us": 6.0
+          },
+          {
+            "name": "void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<float, at::native::func_wrapper_t<float, at::nativ",
+            "category": "Reduce",
+            "total_us": 20.6,
+            "count": 4,
+            "per_iter_us": 5.1,
+            "per_call_us": 5.1
+          },
+          {
+            "name": "void cublasLt::splitKreduce_kernel<(int)32, (int)16, int, float, __nv_bfloat16, float, __nv_bfloat16, (bool)0, float, __",
+            "category": "Reduce",
+            "total_us": 14.2,
+            "count": 4,
+            "per_iter_us": 3.6,
+            "per_call_us": 3.6
           },
           {
             "name": "void at::native::vectorized_elementwise_kernel<(int)8, at::native::FillFunctor<c10::BFloat16>, std::array<char *, (unsig",
             "category": "Elementwise Ops",
-            "total_us": 25.6,
-            "count": 20,
-            "per_iter_us": 1.3,
-            "per_call_us": 1.3
+            "total_us": 10.9,
+            "count": 8,
+            "per_iter_us": 2.7,
+            "per_call_us": 1.4
+          },
+          {
+            "name": "void at::native::reduce_kernel<(int)512, (int)1, at::native::ReduceOp<int, at::native::func_wrapper_t<int, at::native::s",
+            "category": "Reduce",
+            "total_us": 10.8,
+            "count": 4,
+            "per_iter_us": 2.7,
+            "per_call_us": 2.7
+          },
+          {
+            "name": "kernel_cutlass_kernel_sonicmoefunctionaltopk_softmaxTopK_Softmax_object_at__tensorptrbf16gmemalign16o881_tensorptrf32gme",
+            "category": "TopK Router",
+            "total_us": 9.4,
+            "count": 4,
+            "per_iter_us": 2.4,
+            "per_call_us": 2.4
+          },
+          {
+            "name": "_bitmatrix_metadata_compute_stage1",
+            "category": "Router Metadata",
+            "total_us": 7.6,
+            "count": 4,
+            "per_iter_us": 1.9,
+            "per_call_us": 1.9
+          },
+          {
+            "name": "void at::native::vectorized_elementwise_kernel<(int)4, at::native::FillFunctor<int>, std::array<char *, (unsigned long)1",
+            "category": "Elementwise Ops",
+            "total_us": 6.8,
+            "count": 4,
+            "per_iter_us": 1.7,
+            "per_call_us": 1.7
           }
         ],
         "category_summary": {
-          "Wgrad GEMM": 2029.1,
-          "GemmGated ZeroMat (fwd)": 723.4,
-          "GemmDGated ZeroMat (bwd)": 563.5,
-          "Blockscaled Quant": 261.6,
-          "Dual Quant": 178.9,
-          "Token Gather": 165.1,
-          "Elementwise Ops": 85.9,
-          "Row Quant": 85.8,
-          "Other": 60.4,
-          "ISA Scale Gather": 19.4,
-          "Reduce": 18.9
+          "Wgrad GEMM": 1383.9,
+          "GemmGated ZeroMat (fwd)": 624.8,
+          "GemmDGated ZeroMat (bwd)": 527.7,
+          "Blockscaled Quant": 250.4,
+          "Dual Quant": 198.5,
+          "Token Gather": 142.6,
+          "Row Quant": 93.5,
+          "Elementwise Ops": 76.1,
+          "cuBLAS GEMM": 38.0,
+          "Reduce": 26.2,
+          "Router Metadata": 22.799999999999997,
+          "ISA Scale Gather": 16.3,
+          "Softmax": 6.0,
+          "TopK Router": 2.4
         },
         "mode": "fp8",
         "shape": {
           "T": 8192,
           "H": 3072,
-          "I": 1536,
-          "E": 128,
+          "I": 2048,
+          "E": 8,
           "K": 8
         },
-        "nsys_rep": "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/output/nsys/fp8_T8192_I1536_E128K8_211145.nsys-rep"
+        "nsys_rep": "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/output/nsys/fp8_T8192_I2048_E8K8_195802.nsys-rep"
       },
-      "speedup": 1.8861,
+      "speedup": 1.424,
       "memory_bf16": {
         "mode": "bf16",
-        "base_mib": 3525.5,
-        "peak_fwd_mib": 4696.8,
-        "peak_bwd_mib": 7986.1
+        "base_mib": 352.3,
+        "peak_fwd_mib": 1601.7,
+        "peak_bwd_mib": 1874.8
       },
       "memory_fp8": {
         "mode": "fp8",
-        "base_mib": 7089.5,
-        "peak_fwd_mib": 7948.9,
-        "peak_bwd_mib": 11562.5
+        "base_mib": 410.8,
+        "peak_fwd_mib": 1288.2,
+        "peak_bwd_mib": 1992.5
       },
       "budget_breakdown": {
         "Blockscaled Quant": {
           "bf16_us": 0.0,
-          "fp8_us": 261.6,
-          "delta_us": 261.6
+          "fp8_us": 250.4,
+          "delta_us": 250.4
         },
         "Dual Quant": {
           "bf16_us": 0.0,
-          "fp8_us": 178.9,
-          "delta_us": 178.9
+          "fp8_us": 198.5,
+          "delta_us": 198.5
         },
         "Elementwise Ops": {
-          "bf16_us": 2898.9,
-          "fp8_us": 85.9,
-          "delta_us": -2813.0
+          "bf16_us": 76.4,
+          "fp8_us": 76.1,
+          "delta_us": -0.3
         },
         "GemmDGated (bwd)": {
-          "bf16_us": 696.7,
+          "bf16_us": 577.4,
           "fp8_us": 0.0,
-          "delta_us": -696.7
+          "delta_us": -577.4
         },
         "GemmDGated ZeroMat (bwd)": {
           "bf16_us": 0.0,
-          "fp8_us": 563.5,
-          "delta_us": 563.5
+          "fp8_us": 527.7,
+          "delta_us": 527.7
         },
         "GemmGated (fwd)": {
-          "bf16_us": 1055.9,
+          "bf16_us": 1098.0,
           "fp8_us": 0.0,
-          "delta_us": -1055.9
+          "delta_us": -1098.0
         },
         "GemmGated ZeroMat (fwd)": {
           "bf16_us": 0.0,
-          "fp8_us": 723.4,
-          "delta_us": 723.4
+          "fp8_us": 624.8,
+          "delta_us": 624.8
         },
         "ISA Scale Gather": {
           "bf16_us": 0.0,
-          "fp8_us": 19.4,
-          "delta_us": 19.4
-        },
-        "Other": {
-          "bf16_us": 64.2,
-          "fp8_us": 60.4,
-          "delta_us": -3.8
+          "fp8_us": 16.3,
+          "delta_us": 16.3
         },
         "Reduce": {
-          "bf16_us": 19.7,
-          "fp8_us": 18.9,
-          "delta_us": -0.8
+          "bf16_us": 26.2,
+          "fp8_us": 26.2,
+          "delta_us": 0.0
+        },
+        "Router Metadata": {
+          "bf16_us": 23.4,
+          "fp8_us": 22.8,
+          "delta_us": -0.6
         },
         "Row Quant": {
           "bf16_us": 0.0,
-          "fp8_us": 85.8,
-          "delta_us": 85.8
+          "fp8_us": 93.5,
+          "delta_us": 93.5
         },
-        "Token Gather": {
-          "bf16_us": 165.2,
-          "fp8_us": 165.1,
+        "Softmax": {
+          "bf16_us": 6.1,
+          "fp8_us": 6.0,
           "delta_us": -0.1
         },
+        "Token Gather": {
+          "bf16_us": 137.1,
+          "fp8_us": 142.6,
+          "delta_us": 5.5
+        },
+        "TopK Router": {
+          "bf16_us": 2.4,
+          "fp8_us": 2.4,
+          "delta_us": 0.0
+        },
         "Wgrad GEMM": {
-          "bf16_us": 3006.2,
-          "fp8_us": 2029.1,
-          "delta_us": -977.1
+          "bf16_us": 2868.7,
+          "fp8_us": 1383.9,
+          "delta_us": -1484.8
+        },
+        "cuBLAS GEMM": {
+          "bf16_us": 37.7,
+          "fp8_us": 38.0,
+          "delta_us": 0.3
         }
       },
-      "budget_savings_us": -5547.4,
-      "budget_overhead_us": 1832.6,
-      "budget_net_us": -3714.8
+      "budget_savings_us": -3161.2,
+      "budget_overhead_us": 1717.0,
+      "budget_net_us": -1444.2
     }
   },
   "metadata": {
-    "timestamp": "2026-04-13T21:10:12",
+    "timestamp": "2026-04-14T19:54:27",
     "shape": {
       "T": 8192,
       "H": 3072,

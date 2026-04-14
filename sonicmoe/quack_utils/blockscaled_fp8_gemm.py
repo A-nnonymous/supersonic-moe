@@ -618,6 +618,7 @@ def _fused_z_save_y1_quant_kernel(
     SF_TILE_M: tl.constexpr,
     SF_TILE_STORAGE: tl.constexpr,
     Y1_GROUPS_PER_K_TILE: tl.constexpr = 4,
+    SAFE_INT64: tl.constexpr = False,
 ):
     """Fused quantization of z (raw E8M0) and y1 (ISA-packed E8M0).
 
@@ -632,6 +633,8 @@ def _fused_z_save_y1_quant_kernel(
     work_id = tl.program_id(1)
     row_ids = row_base + tl.arange(0, BLOCK_ROWS)
     row_mask_1d = row_ids < rows
+    if SAFE_INT64:
+        row_ids = row_ids.to(tl.int64)
 
     if work_id < z_col_blocks:
         # ---- Z path: quantize Z_GROUPS_PER_BLOCK groups with raw E8M0 scales ----
@@ -793,6 +796,10 @@ def fused_z_save_y1_quant(
     y1_groups_per_k_tile = _SF_TILE_K // group_size  # 4 for default
 
     BLOCK_ROWS = 32
+    # INT32 overflow guard: dispatch to int64 branch when row_id * stride > 2^31
+    _max_stride = max(z.stride(0), z_fp8.stride(0), y1.stride(0), y1_fp8.stride(0))
+    _needs_int64 = int((TK - 1) * _max_stride > 2**31 - 1)
+
     # 2D grid: dim0=row_blocks, dim1=z_col_blocks + y1_k_tiles
     grid = (_div_up(TK, BLOCK_ROWS), z_col_blocks + y1_k_tiles)
     _fused_z_save_y1_quant_kernel[grid](
@@ -827,6 +834,7 @@ def fused_z_save_y1_quant(
         SF_TILE_M=_SF_TILE_M,
         SF_TILE_STORAGE=_SF_TILE_STORAGE,
         Y1_GROUPS_PER_K_TILE=y1_groups_per_k_tile,
+        SAFE_INT64=_needs_int64,
     )
     return (
         z_fp8,
@@ -2454,6 +2462,7 @@ def _quantize_and_pack_kernel(
     SF_TILE_M: tl.constexpr,
     SF_TILE_STORAGE: tl.constexpr,
     GROUPS_PER_K_TILE: tl.constexpr = 4,
+    SAFE_INT64: tl.constexpr = False,
 ):
     """Fused blockscaled quantize + ISA scale pack — 2D grid version.
 
@@ -2465,6 +2474,8 @@ def _quantize_and_pack_kernel(
     k_tile_idx = tl.program_id(1)
     row_ids = row_base + tl.arange(0, BLOCK_ROWS)
     row_mask_1d = row_ids < rows
+    if SAFE_INT64:
+        row_ids = row_ids.to(tl.int64)
 
     # Pre-compute row-dependent ISA layout (invariant across groups)
     row_tiles = row_ids // SF_TILE_M
@@ -2529,6 +2540,7 @@ def _gather_quantize_and_pack_kernel(
     NUM_GROUPS: tl.constexpr,
     SF_TILE_M: tl.constexpr,
     SF_TILE_STORAGE: tl.constexpr,
+    SAFE_INT64: tl.constexpr = False,
 ):
     """Fused gather + blockscaled quantize + ISA scale pack.
 
@@ -2542,6 +2554,9 @@ def _gather_quantize_and_pack_kernel(
 
     # Load gather indices (invariant across groups)
     gather_ids = tl.load(gather_idx_ptr + row_ids, mask=row_mask_1d, other=0)
+    if SAFE_INT64:
+        row_ids = row_ids.to(tl.int64)
+        gather_ids = gather_ids.to(tl.int64)
 
     # Pre-compute row-dependent ISA layout
     row_tiles = row_ids // SF_TILE_M
@@ -2621,6 +2636,10 @@ def gather_quantize_and_pack_activation(
         )
 
     BLOCK_ROWS = 32
+    # INT32 overflow guard: gather_ids index into src (T rows), row_ids index dst (TK rows)
+    _max_offset = max((x.shape[0] - 1) * x.stride(0), (TK - 1) * fp8_out.stride(0))
+    _needs_int64 = int(_max_offset > 2**31 - 1)
+
     grid = (_div_up(TK, BLOCK_ROWS),)
     _gather_quantize_and_pack_kernel[grid](
         x,
@@ -2637,6 +2656,7 @@ def gather_quantize_and_pack_activation(
         NUM_GROUPS=num_groups,
         SF_TILE_M=_SF_TILE_M,
         SF_TILE_STORAGE=_SF_TILE_STORAGE,
+        SAFE_INT64=_needs_int64,
     )
     return fp8_out, packed_scales.view(torch.float8_e8m0fnu)
 
@@ -2681,6 +2701,10 @@ def quantize_and_pack_activation(
 
     BLOCK_ROWS = 32
     groups_per_k_tile = _SF_TILE_K // group_size  # 4 for default SF_TILE_K=128, GROUP_SIZE=32
+    # INT32 overflow guard: dispatch to int64 branch when row_id * stride > 2^31
+    _max_stride = max(x.stride(0), fp8_out.stride(0))
+    _needs_int64 = int((M - 1) * _max_stride > 2**31 - 1)
+
     grid = (_div_up(M, BLOCK_ROWS), k_tiles)
     _quantize_and_pack_kernel[grid](
         x,
@@ -2700,6 +2724,7 @@ def quantize_and_pack_activation(
         SF_TILE_M=_SF_TILE_M,
         SF_TILE_STORAGE=_SF_TILE_STORAGE,
         GROUPS_PER_K_TILE=groups_per_k_tile,
+        SAFE_INT64=_needs_int64,
     )
     return fp8_out, packed_scales.view(torch.float8_e8m0fnu)
 
@@ -3080,11 +3105,17 @@ def _quantize_and_pack_iso32_kernel(
     row_ids = row_base + tl.arange(0, BLOCK_ROWS)
     row_mask = row_ids < rows
 
+    # int64 row offsets to avoid overflow when rows * stride > 2^31
+    row_ids_i64 = row_ids.to(tl.int64)
+
     row_tiles = row_ids // SF_TILE_M
     row_in_tile = row_ids % SF_TILE_M
     row_base_offset = (row_in_tile % 32) * 16 + (row_in_tile // 32) * 4
 
     packed_scale_i32 = tl.zeros([BLOCK_ROWS], dtype=tl.int32)
+
+    src_stride_row_i64 = src_stride_row.to(tl.int64)
+    dst_stride_row_i64 = dst_stride_row.to(tl.int64)
 
     for g in tl.range(0, GROUPS_PER_K_TILE):
         group_id = k_tile_idx * GROUPS_PER_K_TILE + g
@@ -3092,7 +3123,7 @@ def _quantize_and_pack_iso32_kernel(
         col_mask = col_offsets[None, :] < cols
         mask = row_mask[:, None] & col_mask
 
-        src_ptrs = src_ptr + row_ids[:, None] * src_stride_row + col_offsets[None, :] * src_stride_col
+        src_ptrs = src_ptr + row_ids_i64[:, None] * src_stride_row_i64 + col_offsets[None, :].to(tl.int64) * src_stride_col
         values = tl.load(src_ptrs, mask=mask, other=0.0).to(tl.float32)
 
         # 32×32 isotropic amax: reduce over BOTH axes
@@ -3111,15 +3142,15 @@ def _quantize_and_pack_iso32_kernel(
         quant_scale = (quant_exp.to(tl.int32) << 23).to(tl.float32, bitcast=True)
         quantized = (values * quant_scale).to(tl.float8e4nv)
 
-        dst_ptrs = dst_fp8_ptr + row_ids[:, None] * dst_stride_row + col_offsets[None, :] * dst_stride_col
+        dst_ptrs = dst_fp8_ptr + row_ids_i64[:, None] * dst_stride_row_i64 + col_offsets[None, :].to(tl.int64) * dst_stride_col
         tl.store(dst_ptrs, quantized, mask=mask)
 
         # Broadcast: all 32 rows get the SAME scale byte
         e8m0_broadcast = tl.full([BLOCK_ROWS], e8m0_clamped.to(tl.int32), dtype=tl.int32)
         packed_scale_i32 = packed_scale_i32 | ((e8m0_broadcast & 0xFF) << (g * 8))
 
-    tile_base = (row_tiles * k_tiles + k_tile_idx) * SF_TILE_STORAGE
-    packed_offset_i32 = (tile_base + row_base_offset) // 4
+    tile_base = (row_tiles.to(tl.int64) * k_tiles + k_tile_idx) * SF_TILE_STORAGE
+    packed_offset_i32 = (tile_base + row_base_offset.to(tl.int64)) // 4
     scale_ptr_i32 = dst_packed_scale_ptr.to(tl.pointer_type(tl.int32))
     tl.store(scale_ptr_i32 + packed_offset_i32, packed_scale_i32, mask=row_mask)
 

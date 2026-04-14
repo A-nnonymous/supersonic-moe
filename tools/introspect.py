@@ -23,6 +23,7 @@ Modes
   profile    — trace + kernel timing via torch.profiler (~30 s)
   full       — trace + profile + precision audit (~60 s)
   nsys       — nsys GPU-projection profiling (~120 s per shape×mode)
+  grid       — parallel 27-shape (3T×3E×3I) nsys profiling across 8 GPUs
   quant-bench — isolated CUDA-event quant kernel benchmark (all variants)
   wgrad-bench — FP8 vs BF16 wgrad end-to-end benchmark with memory
   ncu-bench  — NCU --clock-control=none quant kernel analysis (realistic timing)
@@ -35,6 +36,7 @@ Usage
     python tools/introspect.py --mode full            # everything
     python tools/introspect.py --mode nsys            # gold-standard GPU timing
     python tools/introspect.py --mode nsys --nsys-shapes 8192,3072,1536,8,8 8192,3072,2048,8,8
+    python tools/introspect.py --mode grid --gpu 8    # 27-shape grid on 8 GPUs
     python tools/introspect.py --mode quant-bench     # quant kernel micro-benchmark
     python tools/introspect.py --mode quant-bench --quant-bench-shapes 65536,3072,3072,1536
     python tools/introspect.py --mode wgrad-bench     # FP8 vs BF16 wgrad timing + memory
@@ -84,6 +86,13 @@ DEFAULT_BENCH_REPEATS = 3
 DEFAULT_NSYS_WARMUP = 5
 DEFAULT_NSYS_ITERS = 20
 PERSISTENT_TMP_ROOT = Path("/root/paddlejob/share-storage/gpfs/system-public/panzhaowu")
+
+# ── Grid benchmark: 3T × 3E × 3I = 27 shapes ──────────────────────────────
+GRID_T = [8192, 16384, 32768]
+GRID_E = [8, 32, 128]
+GRID_I = [1536, 2048, 3072]
+GRID_H = 3072  # fixed hidden dim
+GRID_K = 8     # fixed topK
 
 # Python binary resolution: prefer the virtualenv that has quack/sonicmoe,
 # fall back to sys.executable.  The old hardcoded xfer path is kept as the
@@ -296,12 +305,6 @@ def _subprocess_env_for_gpu(gpu: int) -> dict[str, str]:
     env = os.environ.copy()
     if "CUDA_VISIBLE_DEVICES" not in os.environ:
         env["CUDA_VISIBLE_DEVICES"] = str(gpu)
-    return env
-    if mode == "fp8":
-        env["SONIC_MOE_FP8_MODE"] = "perf"
-    else:
-        env.pop("SONIC_MOE_FP8_MODE", None)
-        env.pop("SONIC_MOE_FP8_DOUBLE_QUANT", None)
     return env
 
 
@@ -1854,6 +1857,7 @@ def run_nsys_profile(
             rep_path = str(nsys_output_dir / rep_name)
 
             try:
+                sub_env = _subprocess_env_for_gpu(gpu)
                 cmd = [
                     nsys_bin, "profile",
                     "--capture-range=cudaProfilerApi",
@@ -1861,13 +1865,11 @@ def run_nsys_profile(
                     f"--output={rep_path}",
                     "--export=sqlite",
                     "--force-overwrite=true",
-                    "--gpu-metrics-devices=all",
-                    "--gpu-metrics-frequency=10000",
                     python_bin, script_path,
                 ]
                 proc = subprocess.run(
                     cmd, capture_output=True, text=True, timeout=600,
-                    env=_subprocess_env_for_gpu(gpu),
+                    env=sub_env,
                 )
                 if proc.returncode != 0:
                     print(f"  [WARN] nsys failed for {label}: {proc.stderr[-300:]}", flush=True)
@@ -3384,6 +3386,7 @@ def run(
     nsys_warmup: int = DEFAULT_NSYS_WARMUP,
     nsys_iters: int = DEFAULT_NSYS_ITERS,
     nsys_shapes: list[dict[str, int]] | None = None,
+    nsys_output: str | None = None,
     quant_bench_shapes: list[dict] | None = None,
     quant_bench_trials: int = 50,
     wgrad_bench_shapes: list[dict] | None = None,
@@ -3394,8 +3397,21 @@ def run(
     Parameters
     ----------
     mode : str
-        "trace" | "profile" | "full" | "nsys" | "quant-bench" | "wgrad-bench"
+        "trace" | "profile" | "full" | "nsys" | "quant-bench" | "wgrad-bench" | "compile-session53"
     """
+    # compile-session53: pure data aggregation, no GPU needed
+    if mode == "compile-session53":
+        return run_compile_session53()
+
+    # grid: parallel multi-GPU nsys profiling
+    if mode == "grid":
+        return run_grid(
+            num_gpus=gpu or 8,  # --gpu doubles as num_gpus for grid mode
+            nsys_warmup=nsys_warmup,
+            nsys_iters=nsys_iters,
+            grid_output=nsys_output,
+        )
+
     import torch
 
     precision_seeds = precision_seeds or list(DEFAULT_PRECISION_SEEDS)
@@ -3467,7 +3483,7 @@ def run(
         nsys_data["metadata"] = metadata
 
         # Write nsys results
-        nsys_out = NSYS_BREAKDOWN_PATH
+        nsys_out = Path(nsys_output) if nsys_output else NSYS_BREAKDOWN_PATH
         nsys_out.parent.mkdir(parents=True, exist_ok=True)
         nsys_out.write_text(json.dumps(nsys_data, indent=2, default=str))
         print(f"\n  → {nsys_out} ({nsys_out.stat().st_size / 1024:.1f} KB)")
@@ -3860,6 +3876,271 @@ def run(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# grid: parallel multi-GPU nsys profiling for the full shape grid
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _grid_generate_shapes() -> list[dict[str, int]]:
+    """Generate the 3T × 3E × 3I = 27 shape grid."""
+    shapes = []
+    for T in GRID_T:
+        for E in GRID_E:
+            for I in GRID_I:
+                shapes.append({"T": T, "H": GRID_H, "I": I, "E": E, "K": GRID_K})
+    return shapes
+
+
+def _grid_estimate_cost(shape: dict) -> float:
+    """Heuristic cost for load-balancing: proportional to FLOPs."""
+    T, E, I = shape["T"], shape["E"], shape["I"]
+    return T * E * I / 1e9
+
+
+def run_grid(
+    num_gpus: int = 8,
+    nsys_warmup: int = DEFAULT_NSYS_WARMUP,
+    nsys_iters: int = DEFAULT_NSYS_ITERS,
+    grid_output: str | None = None,
+) -> dict[str, Any]:
+    """Run the full 27-shape grid benchmark across multiple GPUs in parallel.
+
+    Each GPU runs ``--mode nsys`` on its assigned shapes sequentially.
+    nsys sessions on different GPUs do NOT collide because
+    ``CUDA_VISIBLE_DEVICES`` pins each subprocess to one physical GPU.
+
+    Returns merged dict with all shapes.
+    """
+    python_bin = _resolve_python_bin()
+    shapes = _grid_generate_shapes()
+
+    # ── Load-balanced assignment (greedy LPT algorithm) ──
+    costs = [(s, _grid_estimate_cost(s)) for s in shapes]
+    costs.sort(key=lambda x: x[1], reverse=True)
+    gpu_loads = [0.0] * num_gpus
+    gpu_shapes: list[list[dict]] = [[] for _ in range(num_gpus)]
+    for shape, cost in costs:
+        lightest = min(range(num_gpus), key=lambda g: gpu_loads[g])
+        gpu_shapes[lightest].append(shape)
+        gpu_loads[lightest] += cost
+
+    # ── Output directory ──
+    out_dir = Path(grid_output) if grid_output else (ROOT / "reports" / "grid_session53")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 80)
+    print("  SonicMoE Grid Benchmark — 27-shape parallel nsys profiling")
+    print("=" * 80)
+    for g in range(num_gpus):
+        tags = [f"T{s['T']}_E{s['E']}_I{s['I']}" for s in gpu_shapes[g]]
+        print(f"  GPU {g}: {len(gpu_shapes[g])} shapes (cost={gpu_loads[g]:.1f})  {tags}")
+    print()
+
+    # ── Launch parallel subprocesses ──
+    procs: list[tuple[int, subprocess.Popen, Path, Any]] = []
+    log_dir = out_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    for g in range(num_gpus):
+        if not gpu_shapes[g]:
+            continue
+        # Build --nsys-shapes as a single space-separated arg (nargs="+")
+        shape_strs = [f"{s['T']},{s['H']},{s['I']},{s['E']},{s['K']}" for s in gpu_shapes[g]]
+
+        gpu_json = out_dir / f"gpu{g}.json"
+        cmd = [
+            python_bin, str(ROOT / "tools" / "introspect.py"),
+            "--mode", "nsys",
+            "--gpu", "0",  # always 0: CUDA_VISIBLE_DEVICES pins the physical GPU
+            "--nsys-warmup", str(nsys_warmup),
+            "--nsys-iters", str(nsys_iters),
+            "--nsys-output", str(gpu_json),
+            "--nsys-shapes", *shape_strs,
+        ]
+        env = os.environ.copy()
+        env["CUDA_VISIBLE_DEVICES"] = str(g)
+        env["PYTHONPATH"] = str(ROOT) + (":" + env.get("PYTHONPATH", "") if env.get("PYTHONPATH") else "")
+
+        log_file = open(log_dir / f"gpu{g}.log", "w")
+        print(f"  Launching GPU {g} ({len(gpu_shapes[g])} shapes) → {gpu_json.name}", flush=True)
+        p = subprocess.Popen(
+            cmd, stdout=log_file, stderr=subprocess.STDOUT,
+            env=env, cwd=str(ROOT),
+        )
+        procs.append((g, p, gpu_json, log_file))
+
+    # ── Wait for all ──
+    print(f"\n  Waiting for {len(procs)} GPU workers ...", flush=True)
+    failed = []
+    for g, p, gpu_json, log_file in procs:
+        rc = p.wait()
+        log_file.close()
+        if rc != 0:
+            print(f"  [WARN] GPU {g} exited with code {rc}", flush=True)
+            failed.append(g)
+        else:
+            sz = gpu_json.stat().st_size / 1024 if gpu_json.exists() else 0
+            print(f"  GPU {g} done → {gpu_json.name} ({sz:.1f} KB)", flush=True)
+
+    # ── Merge all per-GPU JSONs ──
+    print(f"\n  Merging results ...", flush=True)
+    merged: dict[str, Any] = {
+        "metadata": {
+            "session": 53,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "num_gpus": num_gpus,
+            "nsys_warmup": nsys_warmup,
+            "nsys_iters": nsys_iters,
+            "grid_T": GRID_T,
+            "grid_E": GRID_E,
+            "grid_I": GRID_I,
+            "failed_gpus": failed,
+        },
+        "shapes": {},
+    }
+    for g in range(num_gpus):
+        gpu_json = out_dir / f"gpu{g}.json"
+        if not gpu_json.exists():
+            continue
+        try:
+            gpu_data = json.loads(gpu_json.read_text())
+            for shape_key, shape_res in gpu_data.get("shapes", {}).items():
+                # Validate: shape must have both bf16 and fp8 nsys data
+                has_bf16 = "per_iter_us" in shape_res.get("bf16", {})
+                has_fp8 = "per_iter_us" in shape_res.get("fp8", {})
+                shape_res["_source_gpu"] = g
+                shape_res["_complete"] = has_bf16 and has_fp8
+                merged["shapes"][shape_key] = shape_res
+        except (json.JSONDecodeError, KeyError) as e:
+            print(f"  [WARN] Failed to parse gpu{g}.json: {e}", flush=True)
+
+    complete = sum(1 for v in merged["shapes"].values() if v.get("_complete"))
+    total = len(merged["shapes"])
+    merged["metadata"]["shapes_complete"] = complete
+    merged["metadata"]["shapes_total"] = total
+
+    # Write merged output
+    merged_path = out_dir / "session53_grid_full.json"
+    merged_path.write_text(json.dumps(merged, indent=2, default=str))
+    print(f"\n  → {merged_path} ({merged_path.stat().st_size / 1024:.1f} KB)")
+
+    # ── Summary table ──
+    print(f"\n{'='*100}")
+    print(f"  Grid Summary: {complete}/{total} shapes complete")
+    print(f"{'='*100}")
+    print(f"  {'Shape':<28s} {'BF16 µs':>8s} {'FP8 µs':>8s} {'Speed':>7s} "
+          f"{'BF16 Bwd':>9s} {'FP8 Bwd':>9s} {'MemΔ%':>7s} {'Src':>4s}")
+    print(f"  {'-'*28} {'-'*8} {'-'*8} {'-'*7} {'-'*9} {'-'*9} {'-'*7} {'-'*4}")
+    for sk in sorted(merged["shapes"]):
+        sr = merged["shapes"][sk]
+        bf16_us = sr.get("bf16", {}).get("per_iter_us", 0)
+        fp8_us = sr.get("fp8", {}).get("per_iter_us", 0)
+        speedup = sr.get("speedup", 0)
+        bf16_bwd = sr.get("memory_bf16", {}).get("peak_bwd_mib", 0)
+        fp8_bwd = sr.get("memory_fp8", {}).get("peak_bwd_mib", 0)
+        mem_pct = round((fp8_bwd - bf16_bwd) / bf16_bwd * 100, 1) if bf16_bwd else 0
+        src = sr.get("_source_gpu", "?")
+        ok = "✓" if sr.get("_complete") else "✗"
+        print(f"  {sk:<28s} {bf16_us:>7.0f}  {fp8_us:>7.0f}  {speedup:>6.3f}× "
+              f"{bf16_bwd:>8.0f}M {fp8_bwd:>8.0f}M {mem_pct:>+6.1f}% GPU{src} {ok}")
+    print(f"{'='*100}")
+
+    if failed:
+        print(f"\n  ⚠ Failed GPUs: {failed}. Check {log_dir}/gpu*.log for details.")
+
+    return merged
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# compile-session53: aggregate benchmark artifacts (no GPU needed)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def run_compile_session53() -> dict:
+    """Aggregate all Session 53 benchmark JSONs into a single summary.
+
+    No GPU required — purely reads existing data files and writes
+    ``reports/session53_summary.json``.
+    """
+    root = Path(__file__).resolve().parent.parent
+    reports = root / "reports"
+
+    summary: dict[str, Any] = {"session": 53, "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")}
+
+    # ── E2E benchmark (authoritative timing + memory) ──
+    e2e_path = reports / "e2e_bench_session52.json"
+    e2e = json.loads(e2e_path.read_text())
+    shapes = {}
+    for row in e2e:
+        label = row["shape"]
+        shapes.setdefault(label, {})
+        shapes[label][row["mode"]] = row
+    # Compute speedups
+    e2e_summary = {}
+    for label, modes in shapes.items():
+        bf = modes["bf16"]
+        fp = modes["fp8"]
+        e2e_summary[label] = {
+            "bf16_total_ms": bf["total_ms"],
+            "fp8_total_ms":  fp["total_ms"],
+            "speedup":       round(bf["total_ms"] / fp["total_ms"], 4),
+            "bf16_peak_MiB": bf["peak_MiB"],
+            "fp8_peak_MiB":  fp["peak_MiB"],
+            "mem_delta_pct":  round((fp["peak_MiB"] - bf["peak_MiB"]) / bf["peak_MiB"] * 100, 2),
+        }
+    summary["e2e"] = e2e_summary
+
+    # ── Quant kernel benchmark ──
+    quant_path = reports / "quant_bench_final.json"
+    quant = json.loads(quant_path.read_text())
+    summary["quant_kernels"] = {
+        f"{q['kernel']}@{q['dim']}": round(q["median"], 1) for q in quant
+    }
+
+    # ── Kernel profiler breakdown (I=1536) ──
+    kb_path = root / "kernel_breakdown.json"
+    kb = json.loads(kb_path.read_text())
+    for mode in ("bf16", "fp8"):
+        total = kb[mode]["total_cuda_us"]
+        top5 = []
+        for k in kb[mode]["kernels"][:5]:
+            short = k["name"][:60]
+            top5.append({"name": short, "us": round(k["avg_cuda_us"], 1)})
+        summary[f"kernel_breakdown_{mode}"] = {"total_cuda_us": total, "top5": top5}
+
+    # ── Memory breakdown (I=1536) ──
+    mem_path = root / "mem_breakdown.json"
+    mem = json.loads(mem_path.read_text())
+    summary["memory_lifecycle"] = {
+        mode: mem[mode]["checkpoints"] for mode in ("bf16", "fp8")
+    }
+    if "fp8_stash" in mem:
+        stash = mem["fp8_stash"]
+        summary["memory_lifecycle"]["fp8_stash"] = {
+            "bwd_peak_mean": stash["summary"]["memory_mib"]["bwd_peak"]["mean"],
+            "timing_speedup": stash["comparison_vs_bf16"]["timing_speedup"],
+            "bwd_peak_delta_pct": stash["comparison_vs_bf16"]["bwd_peak_delta_pct"],
+        }
+
+    # ── Wgrad benchmark ──
+    wgrad_path = reports / "wgrad_bench.json"
+    wgrad = json.loads(wgrad_path.read_text())
+    wgrad_summary = {}
+    for shape_key, shape_data in wgrad.get("shapes", {}).items():
+        modes = shape_data.get("modes", {})
+        speedup = shape_data.get("speedup", {})
+        wgrad_summary[shape_key] = {
+            "bf16_fwd_bwd_us": modes.get("bf16", {}).get("forward_backward_us", {}).get("median_us"),
+            "fp8_fwd_bwd_us": modes.get("fp8", {}).get("forward_backward_us", {}).get("median_us"),
+            "speedup": speedup.get("fwd_bwd"),
+        }
+    summary["wgrad_bench"] = wgrad_summary
+
+    # Write
+    out_path = reports / "session53_summary.json"
+    out_path.write_text(json.dumps(summary, indent=2, default=str))
+    print(f"\n  → {out_path} ({out_path.stat().st_size / 1024:.1f} KB)")
+    return summary
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # CLI
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -3873,14 +4154,16 @@ def main():
               profile — trace + lightweight kernel timing
               full    — trace + repeated benchmark/profiler + precision audit
               nsys    — nsys GPU-projection profiling (gold standard for perf)
+              grid    — parallel 27-shape nsys grid across multiple GPUs
 
             Example:
               python tools/introspect.py --mode full
               python tools/introspect.py --mode nsys --nsys-shapes 8192,3072,1536,8,8 8192,3072,2048,8,8
+              python tools/introspect.py --mode grid --gpu 8
         """),
     )
     parser.add_argument(
-        "--mode", choices=["trace", "profile", "full", "nsys", "report", "precision", "quant-bench", "wgrad-bench", "ncu-bench", "wgrad-force"],
+        "--mode", choices=["trace", "profile", "full", "nsys", "grid", "report", "precision", "quant-bench", "wgrad-bench", "ncu-bench", "wgrad-force", "compile-session53"],
         default="trace",
         help="Introspection depth (default: trace)",
     )
@@ -3915,6 +4198,10 @@ def main():
     parser.add_argument(
         "--nsys-shapes", nargs="+", type=str, default=None,
         help="nsys mode: shapes as T,H,I,E,K (space-separated, e.g. '8192,3072,1536,8,8 8192,3072,2048,8,8')",
+    )
+    parser.add_argument(
+        "--nsys-output", type=str, default=None,
+        help="nsys mode: override output JSON path (avoids race when running parallel GPUs)",
     )
     parser.add_argument(
         "--quant-bench-shapes", nargs="+", type=str, default=None,
@@ -3992,6 +4279,7 @@ def main():
         nsys_warmup=args.nsys_warmup,
         nsys_iters=args.nsys_iters,
         nsys_shapes=nsys_shapes,
+        nsys_output=getattr(args, 'nsys_output', None),
         quant_bench_shapes=quant_bench_shapes,
         quant_bench_trials=args.quant_bench_trials,
         wgrad_bench_shapes=wgrad_bench_shapes,

@@ -58,8 +58,8 @@ def db2_and_ds_kernel(
     h_offsets = Hidx * BLOCK_H + tl.arange(0, BLOCK_H)
     h_mask = h_offsets < H
 
-    E_count_start = tl.load(expert_offset_ptr + Eidx)
-    E_count_end = tl.load(expert_offset_ptr + Eidx + 1)
+    E_count_start = tl.load(expert_offset_ptr + Eidx).to(tl.int64)
+    E_count_end = tl.load(expert_offset_ptr + Eidx + 1).to(tl.int64)
     n_tokens = E_count_end - E_count_start
 
     b2 = tl.load(b2_ptr + Eidx * H + h_offsets, mask=h_mask, other=0.0).to(tl.float32)
@@ -74,10 +74,10 @@ def db2_and_ds_kernel(
         tk_grouped = E_count_start + tk_offsets
 
         # Gather token indices: [BLOCK_TK]
-        token_indices = tl.load(x_gather_idx_ptr + tk_grouped, mask=tk_mask, other=0).to(tl.uint32)
+        token_indices = tl.load(x_gather_idx_ptr + tk_grouped, mask=tk_mask, other=0).to(tl.int64)
 
         # Get scatter indices: [BLOCK_TK]
-        scatter_indices = tl.load(s_scatter_idx_ptr + tk_grouped, mask=tk_mask, other=0).to(tl.uint32)
+        scatter_indices = tl.load(s_scatter_idx_ptr + tk_grouped, mask=tk_mask, other=0).to(tl.int64)
 
         s = tl.load(s_ptr + scatter_indices, mask=tk_mask, other=0.0).to(tl.float32)
 
@@ -157,7 +157,7 @@ def db1_kernel(
             # Token offsets within this block
             tk_offsets = block_start + tl.arange(0, BLOCK_TK)
             tk_mask = tk_offsets < n_tokens
-            tk_grouped = E_count_start + tk_offsets
+            tk_grouped = (E_count_start + tk_offsets).to(tl.int64)
 
             dz_offsets = tk_grouped[:, None] * I + i_offsets[None, :]
             dz_mask = tk_mask[:, None] & i_mask[None, :]

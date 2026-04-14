@@ -1,6 +1,13 @@
 """Package entry-point: ``python -m visualization``."""
-from visualization.sonicmoe_dataflow import generate_all
-generate_all()
+
+# Legacy visualization (requires manifest.json + old data files)
+try:
+    from visualization.sonicmoe_dataflow import generate_all
+    generate_all()
+except FileNotFoundError:
+    print("  [skip] Legacy dataflow: data files not found")
+except Exception as e:
+    print(f"  [skip] Legacy dataflow: {e}")
 
 # Scoreboard visualization (requires scoreboard.json from tools/scoreboard.py)
 try:
@@ -11,3 +18,14 @@ except FileNotFoundError:
     print("\n  [skip] Scoreboard: scoreboard.json not found — run tools/scoreboard.py first")
 except Exception as e:
     print(f"\n  [skip] Scoreboard: {e}")
+
+# Session 53 Frontier visualization (no GPU needed)
+try:
+    from visualization.frontier_viz import generate_frontier
+    generate_frontier()
+except FileNotFoundError as e:
+    print(f"\n  [skip] Frontier: data file not found — {e}")
+except Exception as e:
+    import traceback
+    print(f"\n  [skip] Frontier: {e}")
+    traceback.print_exc()

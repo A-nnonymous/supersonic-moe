@@ -228,3 +228,29 @@
 46. **FP8 forward overhead is the dominant bottleneck** — at I=1536, FP8 forward is 19% slower (2.457 vs 2.062ms). This single factor prevents FP8 from winning at small I. The forward quant overhead (quantize_and_pack_activation ~130us + GEMM dispatch overhead) cannot be hidden because it's on the critical path.
 47. **FP8 wgrad auto-tuning is essential** — shape-dependent ROI: I=1536 wgrad is net negative (0.913x), I=2048 is break-even (1.057x), I=3072 is positive (1.182x). Without auto-tuning, small-I workloads pay an unnecessary penalty.
 
+## Phase 18: Weight Cache Fixes + Official Baseline + 27-Shape Grid (Session 53)
+
+- **VARLEN weight cache fix**: `_VARLEN_WEIGHT_CACHE.clear()` at DownProj backward forced re-quantization every iter (~360µs). Cache is version-keyed, auto-invalidates at optimizer step. This single fix took FP8 from 1.03× to 1.14× speedup.
+- **FUSED weight cache fix**: Same pattern in `_FUSED_WEIGHT_CACHE.clear()` between forward and backward.
+- **Cache corruption fix**: `ctx._w2_dgated_fp8.untyped_storage().resize_(0)` freed tensor aliased in `_FUSED_WEIGHT_CACHE` → E>8 crash. Don't free ctx tensors that alias cache entries.
+- **B.mT.contiguous() removal**: Our `gemm_interface.py` added `.contiguous()` after `B.mT` (~600µs elementwise copy per iter). Official has just `B.mT`. Fix: remove, BF16-only guard.
+- **Official BF16 baseline**: Used `/lab/official/sonic-moe` (env `official_bf16`) as the ONLY valid BF16 baseline. Our branch BF16 had ~9% overhead from FP8 infrastructure.
+- **Wgrad threshold=0**: FP8 wgrad profitable at all I values after cache fixes (threshold was I≥2048 in Session 52).
+- **Token rounding for E>8**: Official `forward_token_choice_rounding(Mtile=128)` for 128-alignment. `moe_general_routing_inputs` for FP8 E>8 workloads.
+- **INT32 pointer overflow** (user-discovered): Triton int32 pointer arithmetic wraps at `row × stride > 2³¹-1`. Dual-path dispatch with `SAFE_INT64`. Full kernel audit in `docs/HANDOFF.md`.
+- **introspect.py grid mode**: 27-shape (3T×3E×3I) parallel nsys profiling on 8 GPUs with LPT load balancing.
+- **GPU isolation fix**: `_subprocess_env_for_gpu()` respects shell-level `CUDA_VISIBLE_DEVICES`.
+- **Final results**: 27-shape grid, **1.29× – 1.70×, mean 1.53×**. Memory +5-10%. Precision all PASS.
+
+### Lessons (Session 53)
+
+48. **Weight cache invalidation must be version-keyed, not eager.** Clearing caches every backward costs 300-980µs/iter. `weight._version` auto-invalidates at optimizer step.
+49. **Never `resize_(0)` tensors aliased in caches.** Context tensors saved by autograd may share storage with cache entries.
+50. **Official baseline is non-negotiable.** Our branch BF16 had 9% overhead from FP8 infrastructure (1280 kernels vs 520). Must use official SonicMoE as the BF16 comparison point.
+51. **CUTLASS JIT cache contamination across shapes.** Different shapes compile incompatible kernels; same-process multi-shape → ILLEGAL_INSTRUCTION. Isolated subprocesses required.
+52. **Weight view refcount prevents stash memory savings.** Python references to weight views keep bf16 storage alive. Create views AFTER stash.
+53. **I scaling dominates FP8 ROI.** GEMM savings ∝ O(I²), quant overhead ∝ O(I). The quadratic-linear gap widens with I.
+
+---
+
+> **Canonical handoff for next agent: `docs/HANDOFF.md`**
