@@ -1,236 +1,106 @@
 # SonicMoE FP8 Optimization — Handoff
 
-> Branch: `native-fp8-exploration`
-> Date: 2026-04-13 (Session 53, final)
+> Branch: `native-fp8-exploration`, commit `e5a28ce`
 > Environment: quack-kernels 0.3.7, torch 2.11.0+cu130, B30Z (Blackwell)
-> Python: 3.13 via `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python`
+> Python: 3.13 via `panzhaowu/envs/xfer/bin/python`
 
 ---
 
-## 1. Project Status
+## 1. Performance (nsys GPU-Projection, default high-perf path)
 
-FP8 blockscaled training is **1.48-1.89× faster** than BF16 across E=8/32/128
-at the Ernie shape (T=8192, H=3072, I=1536, K=8) on B30Z.
+| T | E | BF16 µs | FP8 µs | Speedup | FP8 Bwd MiB | MemΔ |
+|---|---|:---:|:---:|:---:|:---:|:---:|
+| 8192 | 8 | 3600 | 2698 | **1.33×** | 1547 | +6% |
+| 8192 | 32 | 3735 | 2917 | **1.28×** | 2909 | +8% |
+| 8192 | 128 | 5056 | 3909 | **1.29×** | 8700 | +10% |
+| 32768 | 8 | 15811 | 10518 | **1.50×** | 5359 | +9% |
+| 32768 | 32 | 16718 | 10530 | **1.59×** | 6176 | +7% |
+| 32768 | 128 | 18382 | 11798 | **1.56×** | 11669 | +8% |
 
-| E | BF16 (µs) | FP8 (µs) | Speedup | FP8 Bwd Peak | MemΔ vs BF16 |
-|---|:---:|:---:|:---:|:---:|:---:|
-| 8 | 4050 | 2739 | **1.48×** | 1547 MiB | +6.0% |
-| 32 | 4646 | 3008 | **1.54×** | 3624 MiB | +33.2% |
-| 128 | 7906 | 4192 | **1.89×** | 11562 MiB | +44.8% |
-
-vs Official BF16 baseline (3767 µs): **1.38× at E=8**.
-
-Method: nsys GPU-projection (gold standard), 20 measured iters.
-Precision: RRMSE < 7%, cosine > 0.997 for all output/gradient tensors.
+Precision: all RRMSE < 7%, cosine > 0.997. Full data: `reports/session53_breakdown.md`.
 
 ---
 
-## 2. What Was Changed in Session 53
+## 2. Key Code Changes (Session 53)
 
-### Critical Bug Fixes (3 cache-related)
-
-1. **VARLEN weight cache eviction** (`functional/__init__.py` line ~1629):
-   DownProjection backward was clearing `_VARLEN_WEIGHT_CACHE` every iteration.
-   This forced 3 weight re-quantizations per iter (~300µs at E=8, ~980µs at E=128).
-   **Fix**: keep cache alive (version-keyed, auto-invalidates at optimizer step).
-
-2. **FUSED weight cache eviction** (same file, lines ~1629/2249):
-   Both `moe_TC_softmax_topk_layer` and `moe_general_routing_inputs` cleared
-   `_FUSED_WEIGHT_CACHE` between forward and backward. Same re-quant cost.
-   **Fix**: keep cache alive.
-
-3. **Cache corruption via ctx.resize_(0)** (line ~1741):
-   DownProjection backward freed `ctx._w2_dgated_fp8.untyped_storage()` after
-   using it. But this tensor is the SAME Python object as the `_FUSED_WEIGHT_CACHE`
-   entry → cache corrupted → "storage of size 0" crash on next forward.
-   **Fix**: don't free ctx tensors that alias cache entries.
-
-   **Cost of all 3 fixes**: +~148 MiB backward peak (FP8 weight caches retained).
-
-### Other Changes
-
-4. **Wgrad threshold = 0**: FP8 wgrad enabled at all I values (was I≥2048).
-   After cache fixes, FP8 wgrad is profitable even at I=1536.
-
-5. **Non-aligned FP8 = RuntimeError**: Non-128-aligned expert segments raise
-   an explicit error instead of producing silent garbage. Callers must use
-   token rounding (official `forward_token_choice_rounding` with Mtile=128).
-
-6. **introspect.py enhancements**:
-   - `_resolve_python_bin()`: auto-detect working Python binary
-   - `_subprocess_env_for_gpu()`: respect shell-level CUDA_VISIBLE_DEVICES
-     (fixes GPU contention in parallel runs)
-   - nsys-rep files saved to persistent `/panzhaowu/output/nsys/`
-   - `--gpu-metrics-devices=all` for SM utilization
-   - Memory measurement paired with each nsys run
-   - Token rounding for E>8 in nsys/memory workloads
-   - Improved kernel categorization (no more "Other" blob)
-
-7. **colwise_quantize_and_pack**: `torch.empty` instead of `torch.full`
-   for tile-aligned shapes (saves ~5µs/call fill kernel).
+| Change | File | Impact |
+|--------|------|--------|
+| VARLEN weight cache preservation | `functional/__init__.py` | +11pp speedup (1.03→1.14×) |
+| FUSED weight cache preservation | same | Eliminates re-quant at large E |
+| Cache corruption fix (no resize_(0)) | same | Fixes E>8 crash |
+| Wgrad threshold=0 | same | FP8 wgrad at all I values |
+| Non-aligned → RuntimeError | same | Callers must token-round |
+| B.mT without .contiguous() | `gemm_interface.py` | Aligns BF16 with official (<1%) |
+| introspect: GPU isolation | `tools/introspect.py` | Correct parallel measurements |
+| introspect: token rounding | same | E>8 nsys/precision support |
+| introspect: kernel categorization | same | No more "Other" blob |
+| CPU optimizer offload (opt-in) | `moe.py` | -3.4 GB base at E=128 |
 
 ---
 
-## 3. Architecture: How FP8 Works
+## 3. Architecture
 
-### Forward Path (aligned, fused_gated)
+### Default FP8 Path (max performance)
 ```
-x(T,H) bf16
-  → quantize_and_pack_activation → x_fp8(T,H) + ISA scales
-  → _gather_isa_packed_scales T→TK
-  → GemmGatedSm100ZeroMat (CUTLASS, A_idx gather, no TK materialization)
-  → z(TK,2I) bf16, y1(TK,I) bf16
-  → z quantize → z_fp8 (save for backward, -50% z memory)
-  → y1 quantize → y1_fp8 + ISA scales (prequant cache for DownProj)
-  → blockscaled_fp8_gemm_varlen (y1_fp8 @ w2_fp8) → output(TK,H)
-  → token_gather_sum → (T,H)
+Setup: refresh_fp8_shadow_weights() → stash_bf16_to_cpu()
+Each iter: fwd(fp8) → bwd(fp8) → zero_grad
+Optimizer: unstash → Adam.step → refresh → re-stash
 ```
+All 4 FP8 weight caches retained (w1_fused, w2_varlen, w2_dgated, w1T_varlen).
 
-### Backward Path (aligned, wgrad ON)
+### Optional CPU Optimizer (max memory savings)
 ```
-dout(T,H) bf16
-  DownProj backward:
-    → dout quantize + ISA scale gather
-    → GemmDGatedZeroMat (CUTLASS fused: GEMM + dSwiGLU + colvec_reduce)
-      → dy1(TK,I), dz(TK,2I), y1s(TK,I), ds
-    → dual_quantize_varlen(dz) → row_fp8 + col_fp8 (single HBM read)
-    → FP8 wgrad: colwise_quant(y1s) || colwise_quant(dout,gather)
-      → _run_cutlass_blockscaled_gemm_varlen_k → dw2
-    → prequant dz for UpProj
-
-  UpProj backward:
-    → FP8 wgrad: col_fp8(dz) + col_fp8(x,gather) → CUTLASS varlen_k → dw1
-    → Free dz bf16 (-384 MiB)
-    → FP8 actgrad: dz_fp8 @ w1T_fp8 → dx_expanded
-    → token_broadcast_backward → dx(T,H)
+Setup: setup_cpu_optimizer(Adam, lr=1e-3)
+Each iter: fwd(fp8) → bwd(fp8) → cpu_optimizer_step()
 ```
+Bf16 master weights + Adam states on CPU. Saves ~3.4 GB base at E=128.
 
-### Key Design Patterns
-- **Zero-materialization**: TK-sized FP8 activation never stored in HBM
-- **Stash mode**: bf16 params → CPU, compute on FP8 shadow caches
-- **Weight cache**: version-keyed `_FUSED_WEIGHT_CACHE` + `_VARLEN_WEIGHT_CACHE`
-  auto-invalidate at optimizer step. NEVER free cached tensor storage.
-- **Dual quant**: single HBM read → row + col fp8 (saves ~80µs vs separate)
-- **Token rounding**: for E>8, `forward_token_choice_rounding(Mtile=128)` ensures
-  128-aligned expert segments
+### Token Rounding (E>8)
+FP8 requires 128-aligned expert segments. For E>8, use official
+`forward_token_choice_rounding(Mtile=128)`. BF16 handles any routing natively.
 
 ---
 
-## 4. Lessons Learned
+## 4. How to Benchmark
 
-### Performance Measurement
-- **Only nsys GPU-projection is trustworthy**. CUDA events include CPU overhead.
-- **Our branch BF16 ≠ Official BF16**. Our branch has ~5-9% FP8 infra overhead
-  even in BF16 mode. Always use official SonicMoE as baseline.
-- **3+ repeated measurements required**. Single-run data is unreliable.
-- **GPU must be idle** (util=0%). Non-idle measurements can be 2-5× off.
-- **Parallel runs need GPU isolation**: `CUDA_VISIBLE_DEVICES` at shell level,
-  NOT inside subprocess scripts.
+```bash
+# nsys GPU-projection (gold standard)
+CUDA_VISIBLE_DEVICES=0 python tools/introspect.py --mode nsys --gpu 0 \
+  --nsys-iters 12 --nsys-warmup 3 --nsys-shapes 8192,3072,1536,8,8
 
-### Cache/Memory
-- **Never `resize_(0)` on tensors that alias a cache**. This was the single
-  biggest bug — caused "storage of size 0" crashes and silent performance
-  regression (cache miss → re-quant every iter).
-- **Version-keyed caches are self-cleaning**. `w._version` increments at
-  optimizer step → stale entries miss → fresh entries written. No need for
-  manual eviction.
-- **FUSED cache holds ~74 MiB** (w1 fp8). VARLEN holds ~47 MiB (w2 fp8).
-  Total ~121 MiB retained is acceptable for ~1000µs/iter savings.
+# Precision audit
+CUDA_VISIBLE_DEVICES=0 python tools/introspect.py --mode precision --gpu 0 \
+  --nsys-shapes 8192,3072,1536,32,8 --precision-seeds 42,123,777
 
-### FP8 Constraints
-- **128-alignment is hardware (SM100 ISA scale tile layout)**, not software.
-  Cannot be relaxed. Token rounding is the production solution.
-- **E>8 with random routing is always non-aligned**. Must use token rounding.
-- **E=8 with T=8192 is coincidentally aligned** (seed=42 init → uniform routing).
+# Parallel multi-shape
+for g in 0 1 2; do
+  CUDA_VISIBLE_DEVICES=$g python tools/introspect.py --mode nsys --gpu 0 \
+    --nsys-shapes <T,H,I,E,K> 2>&1 > /tmp/gpu${g}.log &
+done; wait
+```
+
+**Rules:** GPU must be idle. Each shape in isolated subprocess. BF16 uses
+`moe_TC_softmax_topk_layer` directly (matches official). FP8 E>8 uses token rounding.
 
 ---
 
 ## 5. File Map
 
-### Modified Production Code
-| File | Changes |
-|------|---------|
-| `sonicmoe/functional/__init__.py` | Cache fixes, wgrad threshold=0, non-aligned error, FUSED/VARLEN preservation |
-| `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` | colwise tile-aligned torch.empty optimization |
-| `tools/introspect.py` | Python resolution, GPU isolation, nsys improvements, token rounding, kernel categorization |
-
-### Reports
-| File | Content |
-|------|---------|
-| `reports/session53_breakdown.md` | **Definitive**: final perf/mem/precision data with budget breakdown |
-| `reports/session52_perf_mem_precision_report.md` | Historical: pre-Session-53 data (superseded) |
-| `reports/nsys_final/nsys_gpu_projection.json` | Machine-readable nsys data |
-
-### BF16 Baseline
-| Path | Purpose |
-|------|---------|
-| `/root/.../lab/official/sonic-moe` | **Official BF16 code** — the ONLY valid baseline |
-| `/root/.../envs/official_bf16` | Its Python environment |
-| `/root/.../envs/xfer` | FP8 frontier Python 3.13 environment |
-| `/root/.../output/nsys/` | Persistent nsys-rep files for GUI inspection |
+| File | Role |
+|------|------|
+| `sonicmoe/functional/__init__.py` | Core FP8 fwd/bwd orchestration |
+| `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` | Triton quant kernels, CUTLASS wrappers |
+| `sonicmoe/quack_utils/gemm_interface.py` | BF16 GEMM wrapper (B.mT fix) |
+| `sonicmoe/moe.py` | MoE module: stash, CPU optimizer, refresh |
+| `tools/introspect.py` | nsys/precision/report profiling tool |
+| `reports/session53_breakdown.md` | Final performance/memory/precision data |
+| `docs/HANDOFF.md` | This file |
 
 ---
 
-## 6. Next Steps (Prioritized)
+## 6. Next Steps
 
-### Tier 1: Production readiness
-1. **Token rounding integration into MoE.forward()**: currently only
-   `moe_general_routing_inputs` supports it. MoE.forward should auto-round
-   for E>8 or expose a `token_rounding=True` flag.
-2. **Stash for token rounding path**: `moe_general_routing_inputs` doesn't
-   support stash (bf16→CPU). Adding this would save ~216 MiB at E=8 and
-   reduce base memory at all E values.
-3. **Precision regression test**: add E=32/128 precision checks to
-   `fp8_large_project_contract_test.py`.
-
-### Tier 2: Further optimization
-4. **Fuse dual quant into dSwiGLU**: currently separate kernel. Fusing saves
-   1 HBM read of dz (~80µs). Prototype exists in Session 52 HANDOFF.
-5. **Stream overlap**: y1s quant || dz quant on separate streams (~50µs).
-6. **Reduce FP8 memory at large E**: lazy weight quantization (quant on first
-   use, not pre-compute all 128 experts at refresh_fp8_shadow_weights).
-
-### Tier 3: Research
-7. **FP8 padding support**: decompose `gemm_dgated` into separate actgrad +
-   SwiGLU backward for non-aligned shapes (eliminates token rounding requirement).
-8. **Per-expert weight layout**: store weights as (E, dim, dim) contiguous
-   to eliminate permute().contiguous() overhead at large E.
-
----
-
-## 7. How to Run
-
-```bash
-# Activate environment
-source /root/.../envs/xfer/bin/activate
-
-# FP8 introspect (nsys GPU-projection, the gold standard)
-CUDA_VISIBLE_DEVICES=0 python tools/introspect.py --mode nsys --gpu 0 \
-  --nsys-iters 20 --nsys-warmup 5 --nsys-shapes 8192,3072,1536,8,8
-
-# Multiple shapes in parallel (one GPU per shape)
-for g in 0 1 2; do
-  CUDA_VISIBLE_DEVICES=$g python tools/introspect.py --mode nsys --gpu 0 \
-    --nsys-shapes <T,H,I,E,K> 2>&1 > /tmp/nsys_gpu${g}.log &
-done; wait
-
-# Official BF16 baseline (separate env)
-CUDA_VISIBLE_DEVICES=0 /root/.../envs/official_bf16/bin/python \
-  /root/.../lab/official/sonic-moe/benchmarks/moe-cute.py \
-  --thiek 8192,3072,1536,8,8 --dtype BFloat16 --activation swiglu --skip_test
-
-# Quick correctness check
-CUDA_VISIBLE_DEVICES=0 python -c "
-import os; os.environ['USE_QUACK_GEMM']='1'; os.environ['SONIC_MOE_FP8_MODE']='perf'
-from sonicmoe import MoE; from sonicmoe.enums import ActivationType
-from sonicmoe.functional.utils import enable_fp8, enable_quack_gemm
-import torch
-m = MoE(8,8,3072,1536,ActivationType.SWIGLU,False,0.02).cuda().bfloat16()
-m.refresh_fp8_shadow_weights(); m.stash_bf16_to_cpu()
-x = torch.randn(8192,3072,dtype=torch.bfloat16,device='cuda',requires_grad=True)
-with enable_quack_gemm(True), enable_fp8(True):
-    o,l = m(x, use_fp8=True)
-(o.sum()+l).backward()
-print(f'OK: output.norm={o.norm():.2f}, dx.norm={x.grad.norm():.2f}')
-"
-```
+1. **FP8 Parameter**: store weights as fp8 directly (saves 50% param memory, eliminates shadow cache duplication)
+2. **8-bit Adam**: bitsandbytes-style optimizer to reduce optimizer state memory
+3. **Fuse dual quant into dSwiGLU**: save 1 HBM read (~80µs)
+4. **Stream overlap**: quant kernels on parallel streams (~50µs)
