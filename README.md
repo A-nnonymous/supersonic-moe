@@ -172,45 +172,105 @@ for batch in dataloader:
 
 > **Methodology:** nsys GPU-projection, 12-20 iters after 5 warmup. Each shape×mode in isolated subprocess (`CUDA_VISIBLE_DEVICES` per GPU). BF16 baseline verified within <1% of official SonicMoE. E>8 FP8 uses official token rounding (Mtile=128). nsys-rep files: `panzhaowu/output/nsys/`.
 
-### How to Benchmark
+### How to Reproduce All Results
+
+All measurements use `tools/introspect.py`. Activate the environment first:
 
 ```bash
-# Single shape (nsys GPU-projection = gold standard)
-CUDA_VISIBLE_DEVICES=0 python tools/introspect.py --mode nsys --gpu 0 \
-  --nsys-iters 20 --nsys-warmup 5 --nsys-shapes 8192,3072,1536,8,8
-
-# Multi-shape parallel (one GPU per shape)
-for pair in "0,8192,3072,1536,8,8" "1,8192,3072,1536,32,8" "2,32768,3072,1536,8,8"; do
-  IFS=',' read g T H I E K <<< "$pair"
-  CUDA_VISIBLE_DEVICES=$g python tools/introspect.py --mode nsys --gpu 0 \
-    --nsys-shapes $T,$H,$I,$E,$K 2>&1 > /tmp/nsys_E${E}_T${T}.log &
-done; wait
-
-# Full report (nsys + memory + precision per shape)
-CUDA_VISIBLE_DEVICES=0 python tools/introspect.py --mode report --gpu 0 \
-  --nsys-shapes 8192,3072,1536,8,8 --precision-seeds 42,123,777,999,2024
-
-# View nsys timeline in Nsight Systems GUI
-nsys-ui /root/.../panzhaowu/output/nsys/<file>.nsys-rep
+source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate
+cd /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe
 ```
 
-**Rules:**
-- GPU must be idle (`nvidia-smi` util=0%) before measurement
-- Each shape runs in its own subprocess (no CUTLASS cache cross-contamination)
-- BF16 uses `moe_TC_softmax_topk_layer` directly (same as official)
-- FP8 E≤8 uses stash mode; E>8 uses token rounding + `moe_general_routing_inputs`
-- Expert segments must be 128-aligned (SM100 ISA scale tile constraint)
+#### 1. Performance (nsys GPU-projection — gold standard)
 
-### Memory (Session 53, torch.cuda peak, paired with nsys, all 4 GPUs identical)
+```bash
+# Single shape: T=8192, H=3072, I=1536, E=8, K=8
+CUDA_VISIBLE_DEVICES=0 python tools/introspect.py \
+  --mode nsys --gpu 0 --nsys-iters 12 --nsys-warmup 3 \
+  --nsys-shapes 8192,3072,1536,8,8
 
-| Shape | BF16 Bwd (MiB) | FP8 Bwd (MiB) | Stash Bwd (MiB) | Stash vs BF16 |
-|-------|:---:|:---:|:---:|:---:|
-| T=4096 I=1536 | 929 | 1060 | **695** | **−25.2%** |
-| **T=8192 I=1536** | **1460** | **1502** | **1138** | **−22.0%** |
-| T=8192 I=2048 | 1876 | 2231 | **1745** | **−7.0%** |
-| T=8192 I=3072 | 2710 | 3242 | **2514** | **−7.2%** |
+# Output includes:
+#   - BF16 and FP8 GPU-projection µs/iter (merged overlapping kernel intervals)
+#   - Paired memory: base, peak_fwd, peak_bwd for both modes
+#   - Per-category budget breakdown (GEMM savings vs FP8 overhead)
+#   - nsys-rep files saved to panzhaowu/output/nsys/ for GUI inspection
+```
 
-FP8+Stash delivers both faster compute AND lower peak memory across all shapes.
+#### 2. Parallel multi-shape sweep (one GPU per shape)
+
+```bash
+# Reproduce the full 6-shape table from Session 53:
+for g in 0 1 2 3 4 5; do
+  shapes=("8192,3072,1536,8,8" "8192,3072,1536,32,8" "8192,3072,1536,128,8" \
+          "32768,3072,1536,8,8" "32768,3072,1536,32,8" "32768,3072,1536,128,8")
+  CUDA_VISIBLE_DEVICES=$g python tools/introspect.py \
+    --mode nsys --gpu 0 --nsys-iters 12 --nsys-warmup 3 \
+    --nsys-shapes ${shapes[$g]} \
+    2>&1 > /tmp/nsys_gpu${g}.log &
+done
+wait
+# Collect results:
+for g in 0 1 2 3 4 5; do
+  grep -A 3 "Shape.*Speed" /tmp/nsys_gpu${g}.log | sed -n '3p'
+done
+```
+
+#### 3. Precision audit (FP8 vs BF16, multi-seed)
+
+```bash
+# Single shape:
+CUDA_VISIBLE_DEVICES=0 python tools/introspect.py \
+  --mode precision --gpu 0 \
+  --nsys-shapes 8192,3072,1536,8,8 \
+  --precision-seeds 42,123,777
+
+# Parallel multi-shape precision:
+for g in 0 1 2 3 4 5; do
+  shapes=("8192,3072,1536,8,8" "8192,3072,1536,32,8" "8192,3072,1536,128,8" \
+          "32768,3072,1536,8,8" "32768,3072,1536,32,8" "32768,3072,1536,128,8")
+  CUDA_VISIBLE_DEVICES=$g python tools/introspect.py \
+    --mode precision --gpu 0 \
+    --nsys-shapes ${shapes[$g]} \
+    --precision-seeds 42,123,777 \
+    2>&1 > /tmp/prec_gpu${g}.log &
+done
+wait
+for g in 0 1 2 3 4 5; do
+  grep "output=" /tmp/prec_gpu${g}.log | tail -1
+done
+```
+
+#### 4. Memory-only measurement
+
+Memory is automatically paired with nsys runs. For standalone memory:
+
+```bash
+# From Python (uses subprocess isolation internally):
+python -c "
+import sys; sys.path.insert(0, '.')
+from tools.introspect import _run_memory_measure
+for mode in ('bf16', 'fp8'):
+    r = _run_memory_measure(mode, {'T':8192,'H':3072,'I':1536,'E':8,'K':8}, 0)
+    print(f'{mode}: base={r[\"base_mib\"]:.0f}  fwd={r[\"peak_fwd_mib\"]:.0f}  bwd={r[\"peak_bwd_mib\"]:.0f} MiB')
+"
+```
+
+#### 5. View nsys timelines
+
+```bash
+# nsys-rep files are saved to persistent storage:
+ls /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/output/nsys/*.nsys-rep
+# Open in Nsight Systems GUI for SM utilization, kernel timeline, etc.
+```
+
+### Measurement Rules
+
+- **GPU must be idle** (`nvidia-smi` util=0%) before any measurement
+- **Each shape×mode runs in its own subprocess** (avoids CUTLASS JIT cache cross-contamination between different shapes)
+- **BF16 uses `moe_TC_softmax_topk_layer` directly** (same API as official benchmark, verified <1% gap)
+- **FP8 E≤8** uses stash mode (bf16 weights → CPU during fwd/bwd)
+- **FP8 E>8** uses official token rounding (`forward_token_choice_rounding`, Mtile=128) + `moe_general_routing_inputs`
+- **Expert segments must be 128-aligned** (SM100 ISA scale tile hardware constraint; non-aligned raises `RuntimeError`)
 
 ### Quick Start (Pythonic Config — no env vars needed)
 
