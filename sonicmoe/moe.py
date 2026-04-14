@@ -465,6 +465,76 @@ class MoE(nn.Module):
 
         return stats
 
+    @torch.no_grad()
+    def setup_cpu_optimizer(
+        self,
+        optimizer_cls: type = torch.optim.Adam,
+        **optim_kwargs,
+    ) -> None:
+        """Move master weights + optimizer to CPU. Only FP8 shadows remain on GPU.
+
+        GPU memory: only FP8 shadows (~1728 MiB at E=128)
+        CPU memory: bf16 masters + optimizer states (~17 GB at E=128)
+
+        Training loop::
+
+            moe.setup_cpu_optimizer(torch.optim.Adam, lr=1e-3)
+            for batch in dataloader:
+                out, aux = moe(x, use_fp8=True)
+                loss.backward()
+                stats = moe.cpu_optimizer_step()
+        """
+        self.refresh_fp8_shadow_weights()
+
+        # CPU bf16 masters (pinned for fast transfers)
+        self._cpu_masters = {}
+        cpu_params = []
+        for name, param in self.named_parameters():
+            if param.requires_grad:
+                cpu_copy = param.data.float().cpu().pin_memory().requires_grad_(True)
+                self._cpu_masters[name] = cpu_copy
+                cpu_params.append(cpu_copy)
+
+        self._cpu_optimizer = optimizer_cls(cpu_params, **optim_kwargs)
+        self.stash_bf16_to_cpu()
+        self._cpu_optim_active = True
+
+    @torch.no_grad()
+    def cpu_optimizer_step(self, *, verify_precision: bool = False) -> dict | None:
+        """Optimizer step: GPU grad → CPU Adam → GPU FP8 refresh.
+
+        Bf16 weights briefly materialize on GPU only during refresh_fp8_shadow_weights.
+        """
+        assert getattr(self, '_cpu_optim_active', False), "Call setup_cpu_optimizer() first"
+        device = self.c_fc.weight.device
+        stats = {} if verify_precision else None
+
+        # 1. GPU bf16 grad → CPU fp32 master.grad
+        for name, param in self.named_parameters():
+            if param.grad is not None and name in self._cpu_masters:
+                self._cpu_masters[name].grad = param.grad.float().cpu()
+                param.grad = None  # free GPU grad immediately
+
+        # 2. Adam on CPU (zero GPU cost)
+        self._cpu_optimizer.step()
+        self._cpu_optimizer.zero_grad()
+
+        # 3. CPU master → GPU bf16 → refresh FP8 → re-stash
+        self.unstash_bf16()
+        for name, param in self.named_parameters():
+            if name in self._cpu_masters:
+                param.data.copy_(self._cpu_masters[name].data.to(param.dtype).to(device))
+        torch.cuda.synchronize()
+
+        if verify_precision:
+            for wname in ("w1", "w2"):
+                p = self.c_fc.weight if wname == "w1" else self.c_proj.weight
+                stats[f"{wname}_norm"] = round(float(p.data.norm().item()), 4)
+
+        self.refresh_fp8_shadow_weights()
+        self.stash_bf16_to_cpu()
+        return stats
+
     def forward(
         self,
         hidden_states: torch.Tensor,

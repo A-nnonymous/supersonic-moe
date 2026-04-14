@@ -1517,12 +1517,13 @@ if use_token_rounding:
 w1_p = moe.c_fc.weight.permute(1, 2, 0)
 w2_p = moe.c_proj.weight.permute(1, 2, 0)
 
-# FP8 frontier = stash mode (only for standard moe(x) path; token rounding
-# uses moe_general_routing_inputs which doesn't support stash).
+# FP8 frontier = stash mode for ALL E values.
+# Token rounding path supports stash because:
+# - _STASHED_FP8_WEIGHTS bypasses cache lookup (no data_ptr dependency)
+# - Weight decoupling (ctx._w1_decoupled) avoids saving bf16 in autograd
 if use_fp8:
     moe.refresh_fp8_shadow_weights()
-    if not use_token_rounding:
-        moe.stash_bf16_to_cpu()
+    moe.stash_bf16_to_cpu()
 
 # Token rounding guarantees 128-alignment; standard path detects it via streak.
 # Set alignment assumed AFTER stash (stash needs it False during setup).
@@ -1730,8 +1731,7 @@ if use_token_rounding:
 
 if use_fp8:
     moe.refresh_fp8_shadow_weights()
-    if not use_token_rounding:
-        moe.stash_bf16_to_cpu()
+    moe.stash_bf16_to_cpu()
 
 def run_iter():
     xw = x.detach().clone().requires_grad_(True)
