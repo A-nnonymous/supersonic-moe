@@ -284,6 +284,11 @@ def _build_subprocess_env(mode: str, gpu: int) -> dict[str, str]:
     if "CUDA_VISIBLE_DEVICES" not in os.environ:
         env["CUDA_VISIBLE_DEVICES"] = str(gpu)
     env["PYTHONPATH"] = str(ROOT) + (":" + env.get("PYTHONPATH", "") if env.get("PYTHONPATH") else "")
+    if mode == "fp8":
+        env["SONIC_MOE_FP8_MODE"] = "perf"
+    else:
+        env.pop("SONIC_MOE_FP8_MODE", None)
+    return env
 
 
 def _subprocess_env_for_gpu(gpu: int) -> dict[str, str]:
@@ -1088,30 +1093,70 @@ def run_trace_isolated(trace_mode: str, gpu: int) -> ModeManifest:
 
 
 def _run_collect_worker(mode: str, seed: int, out_path: Path) -> None:
-    """Worker entrypoint: materialize outputs and grads for precision audit."""
+    """Worker entrypoint: materialize outputs and grads for precision audit.
+
+    Must use EXACTLY the same code path as the nsys workload:
+    - E≤8: moe_TC_softmax_topk_layer (same as official benchmark)
+    - E>8: token rounding + moe_general_routing_inputs (both bf16 and fp8)
+    """
     import torch
+    import torch.nn.functional as F_torch
+    import sonicmoe.functional as functional
     from sonicmoe.functional.utils import enable_fp8, enable_quack_gemm
+    from sonicmoe.functional import moe_TC_softmax_topk_layer
+    from sonicmoe.enums import ActivationType
 
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
 
     model, _ = _build_model_and_input(device)
-    if mode == "fp8" and hasattr(model, "refresh_fp8_shadow_weights"):
+    E, T, H, K = SHAPE["E"], SHAPE["T"], SHAPE["H"], SHAPE["K"]
+    use_token_rounding = (E > 8)
+
+    functional._ALIGNMENT_ASSUMED = True
+
+    if mode == "fp8":
         model.refresh_fp8_shadow_weights()
+        if not use_token_rounding:
+            model.stash_bf16_to_cpu()
 
     torch.manual_seed(seed)
-    x = (0.02 * torch.randn(
-        SHAPE["T"], SHAPE["H"], dtype=torch.bfloat16, device=device
-    )).detach().requires_grad_(True)
-    with enable_quack_gemm(True):
-        if mode == "fp8":
-            with enable_fp8(True):
-                out, loss_val = model(x, use_fp8=True)
-        else:
-            out, loss_val = model(x)
+    x = (0.02 * torch.randn(T, H, dtype=torch.bfloat16, device=device)).detach().requires_grad_(True)
 
-    loss = out.sum() + loss_val
-    loss.backward()
+    w1_p = model.c_fc.weight.permute(1, 2, 0)
+    w2_p = model.c_proj.weight.permute(1, 2, 0)
+
+    if use_token_rounding:
+        # Both BF16 and FP8 use the same token-rounded routing
+        from sonicmoe.functional import count_cumsum, moe_general_routing_inputs
+        Mtile = 128
+        with torch.no_grad():
+            rl = F_torch.linear(x, model.router.weight)
+            sc = F_torch.softmax(rl, dim=-1, dtype=torch.float32).to(torch.bfloat16)
+            tv, ti = sc.topk(K, dim=-1)
+            tv /= tv.sum(dim=-1, keepdim=True)
+            sc.scatter_(-1, ti, tv)
+            cb = sc.clone() - 1; cb.scatter_(1, ti, tv)
+            si = cb.argsort(dim=0, descending=True).int()
+            ef = count_cumsum(ti.view(-1), E, do_cumsum=True)[0]
+            efr = (torch.ceil(ef / Mtile) * Mtile).int()
+            mk = torch.arange(T, device=device, dtype=torch.int32)[:, None].expand(-1, E) < efr[None, :]
+            tok = si[mk]
+            exp = torch.arange(E, device=device, dtype=torch.int32)[None, :].expand(T, -1)[mk]
+            od = tok.argsort().int(); tok = tok[od]; exp = exp[od]
+            rsc = sc[tok, exp].contiguous()
+        out, _ = moe_general_routing_inputs(
+            x, rsc, tok, exp, w1_p, None, w2_p, None,
+            E, model.stream_id, ActivationType.SWIGLU, False,
+        )
+    else:
+        # E≤8: direct moe_TC_softmax_topk_layer (matches nsys workload exactly)
+        out, _, _ = moe_TC_softmax_topk_layer(
+            x, model.router.weight, w1_p, None, w2_p, None,
+            K, model.stream_id, ActivationType.SWIGLU, False,
+        )
+
+    out.sum().backward()
     torch.cuda.synchronize()
 
     payload = {
@@ -3390,6 +3435,29 @@ def run(
         print(f"  Shape: T={SHAPE['T']}, H={SHAPE['H']}, I={SHAPE['I']}, "
               f"E={SHAPE['E']}, K={SHAPE['K']}")
 
+    # ── precision mode: standalone multi-shape precision audit ──
+    if mode == "precision":
+        shapes = nsys_shapes or [SHAPE]
+        results_all = {}
+        for i, shape in enumerate(shapes):
+            shape_key = f"T{shape['T']}_I{shape['I']}_E{shape['E']}K{shape['K']}"
+            saved = dict(SHAPE)
+            SHAPE.update(shape)
+            print(f"\n  [{i+1}/{len(shapes)}] Precision {shape_key} ({len(precision_seeds)} seeds) ...",
+                  flush=True)
+            try:
+                prec = run_precision_audit_isolated(gpu=gpu, seeds=precision_seeds)
+                rr = prec.get("rrmse_pct", {})
+                print(f"    output={rr.get('output','?')}%  dx={rr.get('dx','?')}%  "
+                      f"dw1={rr.get('dw1','?')}%  dw2={rr.get('dw2','?')}%")
+                results_all[shape_key] = prec
+            except Exception as ex:
+                print(f"    ERROR: {ex}")
+                results_all[shape_key] = {"error": str(ex)}
+            finally:
+                SHAPE.update(saved)
+        return results_all
+
     # ── nsys mode: standalone GPU-projection profiling ──
     if mode == "nsys":
         shapes = nsys_shapes or [SHAPE]
@@ -3813,7 +3881,7 @@ def main():
         """),
     )
     parser.add_argument(
-        "--mode", choices=["trace", "profile", "full", "nsys", "report", "quant-bench", "wgrad-bench", "ncu-bench", "wgrad-force"],
+        "--mode", choices=["trace", "profile", "full", "nsys", "report", "precision", "quant-bench", "wgrad-bench", "ncu-bench", "wgrad-force"],
         default="trace",
         help="Introspection depth (default: trace)",
     )

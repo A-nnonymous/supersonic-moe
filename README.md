@@ -138,13 +138,56 @@ The `native-fp8-exploration` branch has a fully functional **zero-materializatio
 
 | T | I | E | BF16 (µs) | FP8 (µs) | Speedup | FP8 Bwd (MiB) | MemΔ |
 |---|---|---|:---:|:---:|:---:|:---:|:---:|
-| **8192** | **1536** | **8** | **4050** | **2739** | **1.48×** | **1547** | +6.0% |
-| 8192 | 1536 | 32 | 4646 | 3008 | **1.54×** | 3624 | +33.2% |
-| 8192 | 1536 | 128 | 7906 | 4192 | **1.89×** | 11562 | +44.8% |
+| **8192** | **1536** | **8** | **3556** | **2791** | **1.27×** | **1547** | +6.0% |
+| 8192 | 1536 | 32 | 3735 | 3013 | **1.24×** | 3624 | +33.9% |
+| 8192 | 1536 | 128 | 5079 | 4047 | **1.26×** | 11562 | +46.5% |
+| 32768 | 1536 | 8 | 15940 | 11501 | **1.39×** | 5359 | +8.9% |
+| 32768 | 1536 | 32 | 16776 | 11659 | **1.44×** | 6891 | +19.1% |
+| 32768 | 1536 | 128 | 18406 | 12556 | **1.47×** | 14532 | +34.9% |
 
-vs Official BF16 (T=8192 I=1536 E=8): 3767µs → FP8 2739µs = **1.38× speedup**
+Precision (5 seeds, FP8 vs BF16 on identical routing — RRMSE %):
 
-> **Methodology:** nsys GPU-projection, 20 iters, isolated subprocesses. E>8 uses official token rounding (Mtile=128). FP8 overhead nearly constant across E (weight cache preserved); GEMM savings scale with E. Full breakdown: `reports/session53_breakdown.md`. nsys-rep: `panzhaowu/output/nsys/`.
+| T | E | output | dx | dw1 | dw2 | Status |
+|---|---|:---:|:---:|:---:|:---:|:---:|
+| 8192 | 8 | 6.52 | 6.53 | 4.71 | 4.92 | PASS |
+| 8192 | 32 | 6.52 | 6.51 | 5.47 | 5.88 | PASS |
+| 8192 | 128 | 6.52 | 6.52 | 6.01 | 6.50 | PASS |
+| 32768 | 8 | 6.55 | 6.56 | 4.12 | 4.19 | PASS |
+| 32768 | 32 | 6.55 | 6.54 | 4.60 | 4.83 | PASS |
+| 32768 | 128 | 6.55 | 6.55 | 5.40 | 5.81 | PASS |
+
+All within guardrails: RRMSE < 10%. Precision tested on same code path as performance (E≤8: `moe_TC_softmax_topk_layer`, E>8: token rounding + `moe_general_routing_inputs`).
+
+> **Methodology:** nsys GPU-projection, 12-20 iters after 5 warmup. Each shape×mode in isolated subprocess (`CUDA_VISIBLE_DEVICES` per GPU). BF16 baseline verified within <1% of official SonicMoE. E>8 FP8 uses official token rounding (Mtile=128). nsys-rep files: `panzhaowu/output/nsys/`.
+
+### How to Benchmark
+
+```bash
+# Single shape (nsys GPU-projection = gold standard)
+CUDA_VISIBLE_DEVICES=0 python tools/introspect.py --mode nsys --gpu 0 \
+  --nsys-iters 20 --nsys-warmup 5 --nsys-shapes 8192,3072,1536,8,8
+
+# Multi-shape parallel (one GPU per shape)
+for pair in "0,8192,3072,1536,8,8" "1,8192,3072,1536,32,8" "2,32768,3072,1536,8,8"; do
+  IFS=',' read g T H I E K <<< "$pair"
+  CUDA_VISIBLE_DEVICES=$g python tools/introspect.py --mode nsys --gpu 0 \
+    --nsys-shapes $T,$H,$I,$E,$K 2>&1 > /tmp/nsys_E${E}_T${T}.log &
+done; wait
+
+# Full report (nsys + memory + precision per shape)
+CUDA_VISIBLE_DEVICES=0 python tools/introspect.py --mode report --gpu 0 \
+  --nsys-shapes 8192,3072,1536,8,8 --precision-seeds 42,123,777,999,2024
+
+# View nsys timeline in Nsight Systems GUI
+nsys-ui /root/.../panzhaowu/output/nsys/<file>.nsys-rep
+```
+
+**Rules:**
+- GPU must be idle (`nvidia-smi` util=0%) before measurement
+- Each shape runs in its own subprocess (no CUTLASS cache cross-contamination)
+- BF16 uses `moe_TC_softmax_topk_layer` directly (same as official)
+- FP8 E≤8 uses stash mode; E>8 uses token rounding + `moe_general_routing_inputs`
+- Expert segments must be 128-aligned (SM100 ISA scale tile constraint)
 
 ### Memory (Session 53, torch.cuda peak, paired with nsys, all 4 GPUs identical)
 
