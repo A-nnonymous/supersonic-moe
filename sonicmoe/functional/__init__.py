@@ -1626,10 +1626,13 @@ class _DownProjection(torch.autograd.Function):
                 from ..quack_utils.blockscaled_fp8_gemm import (
                     _FUSED_WEIGHT_CACHE, _VARLEN_WEIGHT_CACHE,
                 )
-                # Keep ALL weight caches and stashed entries alive. They are
-                # version-keyed and auto-invalidate at optimizer step. Freeing
-                # them corrupts the cache (shared tensor objects) and costs
-                # ~980µs/iter re-quantization at large E.
+                # Selectively evict forward-only caches to reduce peak memory:
+                # w1_fused (fwd GemmGated) and w2_varlen (fwd DownProj) are not
+                # needed in backward. Clearing dict entries (NOT resize_(0) on tensors!)
+                # lets GC reclaim the fp8 data. Backward caches (w2_dgated, w1T_varlen)
+                # will be re-computed on demand (~500µs at E=128, saves ~1755 MiB).
+                _FUSED_WEIGHT_CACHE.clear()
+                _VARLEN_WEIGHT_CACHE.clear()
 
                 # All segments aligned: use blockscaled FP8 path.
                 if ctx._use_fused_blockscaled_gated_flag:
