@@ -1440,7 +1440,9 @@ moe = MoE(num_experts=E, num_experts_per_tok=K, hidden_size=H,
 x = (0.02 * torch.randn(T, H, device=device, dtype=torch.bfloat16)).detach().requires_grad_()
 
 use_fp8 = (mode == "fp8")
-use_token_rounding = (E > 8)
+# Token rounding only needed for FP8 (128-alignment constraint).
+# BF16 handles arbitrary cu_seqlens natively.
+use_token_rounding = use_fp8 and (E > 8)
 
 # Token rounding: pre-compute 128-aligned routing (frozen across iters)
 if use_token_rounding:
@@ -1466,6 +1468,10 @@ if use_token_rounding:
     w1_p = moe.c_fc.weight.permute(1, 2, 0)
     w2_p = moe.c_proj.weight.permute(1, 2, 0)
 
+# Pre-compute weight views for direct moe_TC_softmax_topk_layer calls
+w1_p = moe.c_fc.weight.permute(1, 2, 0)
+w2_p = moe.c_proj.weight.permute(1, 2, 0)
+
 # FP8 frontier = stash mode (only for standard moe(x) path; token rounding
 # uses moe_general_routing_inputs which doesn't support stash).
 if use_fp8:
@@ -1477,6 +1483,8 @@ if use_fp8:
 # Set alignment assumed AFTER stash (stash needs it False during setup).
 functional._ALIGNMENT_ASSUMED = True
 
+from sonicmoe.functional import moe_TC_softmax_topk_layer
+
 def run_iter():
     if use_token_rounding:
         o, ef = moe_general_routing_inputs(
@@ -1484,14 +1492,18 @@ def run_iter():
             w1_p, None, w2_p, None, E, moe.stream_id, ActivationType.SWIGLU, False,
         )
     else:
-        o, ef = moe(x)
+        # Direct low-level call, matching official benchmark exactly.
+        # Avoids MoE.forward() overhead (config resolution, ExitStack, etc.)
+        o, _, _ = moe_TC_softmax_topk_layer(
+            x, moe.router.weight, w1_p, None, w2_p, None,
+            K, moe.stream_id, ActivationType.SWIGLU, False,
+        )
     return o
 
 # Warm up ({warmup} iters)
 for _ in range({warmup}):
     out = run_iter()
-    loss = out.sum()
-    loss.backward()
+    out.sum().backward()
     moe.zero_grad(set_to_none=True)
     if x.grad is not None:
         x.grad = None
@@ -1503,8 +1515,7 @@ torch.cuda.empty_cache()
 torch.cuda.cudart().cudaProfilerStart()
 for _ in range({iters}):
     out = run_iter()
-    loss = out.sum()
-    loss.backward()
+    out.sum().backward()
     moe.zero_grad(set_to_none=True)
     if x.grad is not None:
         x.grad = None
@@ -1646,7 +1657,9 @@ moe = MoE(num_experts=E, num_experts_per_tok=K, hidden_size=H,
 x = (0.02 * torch.randn(T, H, device=device, dtype=torch.bfloat16)).detach().requires_grad_()
 
 use_fp8 = (mode == "fp8")
-use_token_rounding = (E > 8)
+# Token rounding only needed for FP8 (128-alignment constraint).
+# BF16 handles arbitrary cu_seqlens natively.
+use_token_rounding = use_fp8 and (E > 8)
 
 # Token rounding for E>8
 if use_token_rounding:
@@ -3371,8 +3384,11 @@ def run(
         metadata["quack_version"] = "not installed"
 
     print(f"  Device: {gpu_name}")
-    print(f"  Shape: T={SHAPE['T']}, H={SHAPE['H']}, I={SHAPE['I']}, "
-          f"E={SHAPE['E']}, K={SHAPE['K']}")
+    if nsys_shapes:
+        print(f"  Shapes: {len(nsys_shapes)} — {[f'T{s['T']}_E{s['E']}' for s in nsys_shapes]}")
+    else:
+        print(f"  Shape: T={SHAPE['T']}, H={SHAPE['H']}, I={SHAPE['I']}, "
+              f"E={SHAPE['E']}, K={SHAPE['K']}")
 
     # ── nsys mode: standalone GPU-projection profiling ──
     if mode == "nsys":
@@ -3425,6 +3441,121 @@ def run(
 
         print("=" * 90)
         return nsys_data
+
+    # ── report mode: comprehensive per-kernel + memory + precision + autograd ──
+    if mode == "report":
+        shapes = nsys_shapes or [SHAPE]
+        official_python = str(Path(
+            "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/official_bf16/bin/python"
+        ))
+        official_root = str(Path(
+            "/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/official/sonic-moe"
+        ))
+        nsys_output_dir = Path("/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/output/nsys")
+        nsys_output_dir.mkdir(parents=True, exist_ok=True)
+
+        all_reports = {"metadata": metadata, "shapes": {}}
+
+        for shape in shapes:
+            E = shape["E"]
+            shape_key = f"T{shape['T']}_I{shape['I']}_E{E}K{shape['K']}"
+            print(f"\n{'='*80}")
+            print(f"  Report: {shape_key}")
+            print(f"{'='*80}")
+
+            shape_report: dict[str, Any] = {"shape": shape}
+
+            # ── 1. nsys BF16 + FP8 (our branch, aligned with official) ────
+            print(f"\n  [1/3] nsys profiling (bf16 + fp8) ...", flush=True)
+            fp8_nsys = run_nsys_profile(
+                gpu=gpu, warmup=nsys_warmup, iters=nsys_iters, shapes=[shape],
+            )
+            fp8_shape_data = fp8_nsys.get("shapes", {}).get(shape_key, {})
+            shape_report["fp8_frontier"] = fp8_shape_data.get("fp8", {})
+            shape_report["branch_bf16"] = fp8_shape_data.get("bf16", {})
+            shape_report["_nsys_raw"] = fp8_shape_data  # for summary table
+            fp8_us = shape_report["fp8_frontier"].get("per_iter_us", 0)
+            bf16_branch_us = shape_report["branch_bf16"].get("per_iter_us", 0)
+            print(f"    BF16: {bf16_branch_us} µs/iter  FP8: {fp8_us} µs/iter")
+
+            # Speedup (use our branch bf16 — verified aligned with official)
+            if bf16_branch_us > 0 and fp8_us > 0:
+                shape_report["speedup"] = round(bf16_branch_us / fp8_us, 4)
+                print(f"    Speedup: {shape_report['speedup']}×")
+
+            # ── 3. Memory (paired, subprocess) ───────────────────────────
+            print(f"\n  [2/3] Memory breakdown ...", flush=True)
+            for mem_mode in ("bf16", "fp8"):
+                mem = _run_memory_measure(mem_mode, shape, gpu, warmup=3)
+                shape_report[f"memory_{mem_mode}"] = mem
+                if "error" not in mem:
+                    print(f"    {mem_mode}: base={mem['base_mib']:.0f} fwd={mem['peak_fwd_mib']:.0f} bwd={mem['peak_bwd_mib']:.0f} MiB")
+
+            # ── 4. Precision (subprocess-isolated) ───────────────────────
+            print(f"\n  [3/3] Precision ({len(precision_seeds)} seeds) ...", flush=True)
+            # Set SHAPE to current shape so precision subprocess uses correct params
+            saved_shape = dict(SHAPE)
+            SHAPE.update(shape)
+            try:
+                prec = run_precision_audit_isolated(gpu=gpu, seeds=precision_seeds)
+                shape_report["precision"] = prec
+                rr = prec.get("rrmse_pct", {})
+                print(f"    output={rr.get('output','?')}% dx={rr.get('dx','?')}% "
+                      f"dw1={rr.get('dw1','?')}% dw2={rr.get('dw2','?')}%")
+            except Exception as ex:
+                shape_report["precision"] = {"error": str(ex)}
+                print(f"    ERROR: {ex}")
+            finally:
+                SHAPE.update(saved_shape)
+
+            # Budget breakdown (use our branch bf16 since it aligns with official)
+            bf16_data = fp8_shape_data.get("bf16", {})
+            bf16_cats = bf16_data.get("category_summary", {})
+            fp8_cats = shape_report.get("fp8_frontier", {}).get("category_summary", {})
+            if bf16_cats and fp8_cats:
+                all_cats = sorted(set(list(bf16_cats) + list(fp8_cats)))
+                bb = {}
+                for cat in all_cats:
+                    b, f = bf16_cats.get(cat, 0), fp8_cats.get(cat, 0)
+                    bb[cat] = {"bf16": round(b,1), "fp8": round(f,1), "delta": round(f-b,1)}
+                shape_report["budget"] = bb
+
+            all_reports["shapes"][shape_key] = shape_report
+
+        # Write report
+        report_path = ROOT / "reports" / "session53_full_report.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps(all_reports, indent=2, default=str))
+        print(f"\n  → {report_path}")
+
+        # Print final summary
+        print(f"\n{'='*90}")
+        print(f"  FULL REPORT SUMMARY")
+        print(f"{'='*90}")
+        print(f"  {'Shape':<28s} {'BF16':>9s} {'FP8':>9s} {'Speed':>7s} "
+              f"{'BF16bwd':>8s} {'FP8bwd':>8s} {'Prec':>6s}")
+        print(f"  {'-'*28} {'-'*9} {'-'*9} {'-'*7} {'-'*8} {'-'*8} {'-'*6}")
+        for sk, sr in all_reports["shapes"].items():
+            bf = sr.get("fp8_frontier", {}).get("_bf16_per_iter_us",
+                 sr.get("official_bf16", {}).get("per_iter_us", 0))
+            # Use our branch bf16 from the nsys run if available
+            fp8_nsys_data = sr.get("_nsys_raw", {})
+            bf16_data_raw = fp8_nsys_data.get("bf16", {})
+            if bf16_data_raw:
+                bf = bf16_data_raw.get("per_iter_us", bf)
+            fp = sr.get("fp8_frontier", {}).get("per_iter_us", 0)
+            sp = round(bf / fp, 3) if fp > 0 and bf > 0 else 0
+            bf_bwd = sr.get("memory_bf16", {}).get("peak_bwd_mib", 0)
+            fp_bwd = sr.get("memory_fp8", {}).get("peak_bwd_mib", 0)
+            prec = sr.get("precision", {})
+            prec_ok = "PASS" if isinstance(prec, dict) and prec.get("rrmse_pct") and all(
+                prec.get("rrmse_pct", {}).get(t, 999) < 10
+                for t in ["output", "dx"]
+            ) else "?"
+            print(f"  {sk:<28s} {bf:>8.0f}  {fp:>8.0f}  {sp:>6.3f}× "
+                  f"{bf_bwd:>7.0f}M {fp_bwd:>7.0f}M {prec_ok:>6s}")
+        print(f"{'='*90}")
+        return all_reports
 
     # ── quant-bench mode: isolated quant kernel CUDA-event benchmark ──
     if mode == "quant-bench":
@@ -3682,7 +3813,7 @@ def main():
         """),
     )
     parser.add_argument(
-        "--mode", choices=["trace", "profile", "full", "nsys", "quant-bench", "wgrad-bench", "ncu-bench", "wgrad-force"],
+        "--mode", choices=["trace", "profile", "full", "nsys", "report", "quant-bench", "wgrad-bench", "ncu-bench", "wgrad-force"],
         default="trace",
         help="Introspection depth (default: trace)",
     )
