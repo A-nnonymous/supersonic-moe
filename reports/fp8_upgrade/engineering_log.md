@@ -251,6 +251,25 @@
 52. **Weight view refcount prevents stash memory savings.** Python references to weight views keep bf16 storage alive. Create views AFTER stash.
 53. **I scaling dominates FP8 ROI.** GEMM savings ∝ O(I²), quant overhead ∝ O(I). The quadratic-linear gap widens with I.
 
+## Phase 19: MoE Module-Level Test Suite + 0-Size Audit + ernie-core Analysis (Session 54)
+
+- **MoE module test suite** (`tests/ops/test_moe_module.py`): 59 parametrized tests validating the FULL MoE pipeline (permute → up-proj → SwiGLU → down-proj → unpermute). Gold reference uses split-half SwiGLU (ERNIE convention) in float32. BF16 vs Gold: RRMSE=0.0044, cosine=0.99999. FP8 vs Gold: RRMSE=0.065, cosine=0.998.
+- **Weight convention conversion**: `split_to_interleaved()` / `interleaved_to_split()` with bit-exact round-trip verification. SonicMoE uses interleaved (gate=even, up=odd), ERNIE uses split-half (gate=[:I], up=[I:]).
+- **FP8 env var fix**: FP8 is activated via `enable_fp8()` context manager or `SONIC_MOE_FP8_MODE=perf`, NOT `SONICMOE_FP8_ENABLED` (which doesn't exist). Subprocess templates use `SONIC_MOE_FP8_MODE=perf`.
+- **Weight stride fix**: CUTLASS expects `w1` as a `.permute(1,2,0)` view of `(E, 2I, H)` contiguous parameter (non-contiguous strides). Passing a `.contiguous()` tensor with wrong strides causes `RuntimeError: Expected strides[leading_dim] == 1`.
+- **0-size expert audit**: Full audit of all forward/backward paths with empty experts. All components handle `cu_seqlens[e]==cu_seqlens[e+1]` (0-token experts) correctly. 0 % 128 == 0, so alignment check passes. BF16+FP8 forward+backward produce correct output and zero gradients for unused experts.
+- **Empty expert edge cases**: Single-expert routing (7 empty), only-two-active, half-empty — all tested in BF16 fwd+bwd and FP8 fwd+bwd.
+- **ERNIE-core analysis**: Deep read of `ernie_core/models/moe/token_dispatcher/fp8_utils.py`. Key findings: split-half SwiGLU, prob scaling after SwiGLU/before down-proj, `kitchen_quant` for 1×128 blockscaled FP8, `deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous` for grouped GEMM.
+- **Robustness tests added**: Deterministic (bit-exact repeated runs), large tensor (T=4096), routing metadata correctness, numerical stability at varied activation scales, weight conversion round-trip, gold all-same-expert.
+
+### Lessons (Session 54)
+
+54. **FP8 is activated by `enable_fp8()` or `SONIC_MOE_FP8_MODE=perf`.** The `_IS_FP8_ACTIVE` flag (in `sonicmoe/functional/utils.py`) is process-global. Use `enable_fp8()` context manager for in-process switching, subprocesses for isolation.
+55. **Weight tensor strides matter for CUTLASS.** The functional layer expects `w1.permute(1,2,0)` as a non-contiguous view. Creating a contiguous `(2I,H,E)` tensor produces wrong strides. Always store as `(E,2I,H)` and pass `w.permute(1,2,0)`.
+56. **0-size expert segments are safe in all paths.** Triton 0-grid launches are no-ops, CUTLASS varlen scheduler emits 0 rows, `torch.empty(0, K)` is a valid tensor. The only failure is FP8+non-aligned non-empty segments (by design).
+57. **Module-level precision is tighter than op-level.** Op-level RRMSE was ≤7%; module-level (chained permute+GEMM+SwiGLU+GEMM+scatter) is only 6.5% FP8. Error doesn't compound as much as expected because the scatter (weighted sum) acts as a low-pass filter.
+58. **ERNIE-core applies prob scaling BETWEEN SwiGLU and down-proj** (`o2 = swiglu(o1) * probs` then `o3 = o2 @ W2`). SonicMoE applies it AFTER down-proj in `_router_forward`. Mathematically equivalent for linear down-proj but produces different intermediate tensors — matters for numerical precision analysis.
+
 ---
 
 > **Canonical handoff for next agent: `docs/HANDOFF.md`**

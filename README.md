@@ -120,9 +120,28 @@ The reporting policy for every FP8 step is:
 - memory baseline: official bf16
 - performance baselines: previous commit and official bf16
 
-## 🔥 FP8 Blockscaled Status (2026-04-13, Session 53)
+## 🔥 FP8 Blockscaled Status (2026-04-15, Session 54)
 
 The `native-fp8-exploration` branch has a fully functional **zero-materialization** blockscaled FP8 training path for Blackwell (B30Z) with **32×32 isotropic weight quantization**, optional **weight stash** memory optimization, native **CUTLASS / QuACK** FP8 kernels, **Pythonic config API** (`SonicMoEConfig`), **unaligned FP8 padding** (forward only), **epilogue FP8 D output** (z written directly as fp8 by CUTLASS), **NCU-guided quant kernel optimization** (num_warps=1 → 2.3× colwise speedup), **shape-based wgrad FP8 auto-tuning**, and **fused dual row+col quantization**. No TK-sized FP8 activation is materialized.
+
+### Session 54 Additions
+
+- **MoE module-level test suite** (`tests/ops/test_moe_module.py`): 59 tests validating the full MoE pipeline (permute → up-proj → SwiGLU → down-proj → unpermute) against a pure-torch float32 gold reference. BF16 RRMSE=0.0044, FP8 RRMSE=0.065.
+- **Cross-framework weight conversion**: Split-half (ERNIE) ↔ interleaved (SonicMoE) SwiGLU convention conversion, verified bit-exact round-trip.
+- **0-size expert audit**: All forward/backward paths handle 0-token experts correctly (verified with up to 7 empty experts).
+- **Edge-case tests**: Empty experts, deterministic runs, large tensors (T=4096), routing metadata correctness, numerical stability.
+
+For the full handoff document, see [`docs/HANDOFF.md`](docs/HANDOFF.md).
+
+### MoE Module Tests
+
+```bash
+# Full module-level precision test (59 tests, ~4 min)
+CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 python -m pytest tests/ops/test_moe_module.py -v --tb=short
+
+# Edge cases only (empty experts, determinism, stability)
+CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 python -m pytest tests/ops/test_moe_module.py -v -k "empty or deterministic or stability"
+```
 
 ### Session 53 Highlights
 

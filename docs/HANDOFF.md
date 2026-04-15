@@ -1,7 +1,7 @@
 # SonicMoE FP8 Blockscaled Optimization — Complete Handoff
 
 > **Branch:** `native-fp8-exploration`
-> **Date:** 2026-04-14
+> **Date:** 2026-04-15 (Session 54 — MoE module test suite + 0-size audit)
 > **Environment:** quack-kernels 0.3.7, torch 2.11.0+cu130, 8× NVIDIA B30Z (275 GiB), Python 3.13
 > **Python binary:** `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/python`
 > **Activate:** `source /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer/bin/activate`
@@ -15,7 +15,7 @@ FP8 blockscaled (E4M3 data + E8M0 scales, 1×32 blocks) training is **fully func
 - **Speedup:** 1.29× – 1.70×, mean **1.53×** vs official BF16 (nsys GPU-projection)
 - **Memory overhead:** +5% to +10% peak backward (FP8 shadow weight caches)
 - **Precision:** all RRMSE < 7%, cosine > 0.997 (3 seeds, multi-shape)
-- **Tests:** 34/34 contract tests + 20 subtests PASS
+- **Tests:** 59 MoE module tests + ~480 op-level tests, all PASS
 
 ---
 
@@ -303,19 +303,23 @@ FP8 uses 5-10% MORE peak memory than BF16 (4 weight caches). The stash saves bf1
 
 ## 10. Next Steps (Prioritized)
 
+### Immediate — ernie-core FP8 Migration
+1. **Migrate FP8 frontier into ernie-core as optional switch.** The `test_moe_module.py` gold reference validates the full MoE pipeline (permute→up-proj→SwiGLU→down-proj→unpermute) at both split-half (ERNIE) and interleaved (SonicMoE) conventions with weight conversion verified. Key architectural difference: SonicMoE uses **interleaved SwiGLU** (`gate=z[:,0::2], up=z[:,1::2]`), ERNIE-core uses **split-half SwiGLU** (`gate=z[:,:I], up=z[:,I:]`). Weight conversion between conventions is implemented and tested in `tests/ops/test_moe_module.py::split_to_interleaved` / `interleaved_to_split`.
+2. **Cross-framework Paddle↔PyTorch precision validation.** Use `dlpack` or `numpy` as tensor intermediary between frameworks. Run ERNIE-core's `ExpertsGroupGemmContiguousNode` (Paddle, `deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous`) and SonicMoE's blockscaled CUTLASS path (PyTorch) with identical weights+routing, compare output/gradients. The ERNIE-core MoE forward is analyzed in detail in the Session 54 agent transcript (key file: `ernie-core/src/ernie_core/models/moe/token_dispatcher/fp8_utils.py`).
+
 ### High Value
-1. **FP8 native parameters**: Store weights as fp8 natively (eliminate 4 shadow weight caches → save 50% param memory AND remove 5-10% memory overhead). This is the single highest-ROI optimization remaining.
-2. **Fuse dual quant into dSwiGLU epilogue**: Saves 1 HBM read (~80µs). The SwiGLU backward output is immediately quantized — fusing avoids the intermediate bf16 materialization.
-3. **CUTLASS PreAct FP8 z**: Eliminate z-dequant (~130µs). Requires new CUTLASS kernel class that accepts fp8 PreAct with separate scale TMA. Hard but high value.
+3. **FP8 native parameters**: Store weights as fp8 natively (eliminate 4 shadow weight caches → save 50% param memory AND remove 5-10% memory overhead). This is the single highest-ROI optimization remaining.
+4. **Fuse dual quant into dSwiGLU epilogue**: Saves 1 HBM read (~80µs). The SwiGLU backward output is immediately quantized — fusing avoids the intermediate bf16 materialization.
+5. **CUTLASS PreAct FP8 z**: Eliminate z-dequant (~130µs). Requires new CUTLASS kernel class that accepts fp8 PreAct with separate scale TMA. Hard but high value.
 
 ### Medium Value
-4. **8-bit Adam / CPU optimizer integration with training loop**: Reduce optimizer state memory by 4× or offload entirely.
-5. **Stream overlap for quant kernels**: Quant on parallel stream while GEMM runs (~50µs hidden). Requires careful `record_stream` for caching allocator.
-6. **Multi-node distributed training integration**: Current work is single-node. Need to validate FP8 with tensor/expert parallelism.
+6. **8-bit Adam / CPU optimizer integration with training loop**: Reduce optimizer state memory by 4× or offload entirely.
+7. **Stream overlap for quant kernels**: Quant on parallel stream while GEMM runs (~50µs hidden). Requires careful `record_stream` for caching allocator.
+8. **Multi-node distributed training integration**: Current work is single-node. Need to validate FP8 with tensor/expert parallelism.
 
 ### Research
-7. **Dynamic FP8 scaling**: Per-tensor adaptive scaling instead of per-32-block. Could improve precision at the cost of CUTLASS compatibility.
-8. **Training convergence validation**: Current precision audit is single-step RRMSE. Need multi-step convergence study on real training runs.
+9. **Dynamic FP8 scaling**: Per-tensor adaptive scaling instead of per-32-block. Could improve precision at the cost of CUTLASS compatibility.
+10. **Training convergence validation**: Current precision audit is single-step RRMSE. Need multi-step convergence study on real training runs.
 
 ---
 
@@ -333,3 +337,235 @@ FP8 uses 5-10% MORE peak memory than BF16 (4 weight caches). The stash saves bf1
 | Wgrad bench | `reports/wgrad_bench.json` | Wgrad FP8 vs BF16 per-shape |
 | Official BF16 | `/root/paddlejob/.../panzhaowu/lab/official/sonic-moe` | Env: `official_bf16` |
 | Environment docs | `/root/paddlejob/.../panzhaowu/env.md` | Machine setup, compilation |
+
+---
+
+## 12. Op-Level Unit Test Suite (`tests/ops/`)
+
+> **Date:** 2026-04-15
+> **Test count:** 59 MoE module + ~480 op-level parametrized cases (12 test files)
+
+### Overview
+
+Comprehensive 3-way cross-validation suite for every FP8 frontier operator:
+- **Category B (Quant):** 6 files testing quantization kernels (byte-exact against torch gold E8M0)
+- **Category A (GEMM/SwiGLU):** 5 files testing fused operators (torch ↔ BF16 ↔ FP8)
+
+Every comparison reports RRMSE, cosine similarity, max/mean absolute error.
+
+### Test Files
+
+| File | Operators | Tests | Verification |
+|------|-----------|-------|--------------|
+| `test_rowwise_quant.py` | `quantize_and_pack_activation` | fp8/scales byte-exact, roundtrip | torch gold E8M0 |
+| `test_colwise_quant.py` | `colwise_quantize_and_pack`, CuTe variant | fp8/scales vs gold, CuTe=Triton | byte-exact |
+| `test_dual_quant.py` | `dual_quantize_varlen` | row/col match separate | byte-exact |
+| `test_fused_zy1_quant.py` | `fused_z_save_y1_quant` | z/y1 match separate | byte-exact |
+| `test_weight_quant.py` | `quantize_and_pack_weight_iso32` | fp8/scales vs gold | byte-exact |
+| `test_dequant.py` | `dequantize_blockscaled_fp8` | dequant vs gold, roundtrip | RRMSE < 0.05 |
+| `test_swiglu.py` | SwiGLU fwd/bwd (BF16+FP8) | 6 tests: 3-way fwd + 3-way bwd | BF16: atol 2e-2, FP8: RRMSE<10% |
+| `test_gemm_gated.py` | `gemm_gated` (BF16+FP8) | 3-way: torch/BF16/FP8 | BF16: atol 1.4e-2, FP8: RRMSE<10% |
+| `test_gemm_dgated.py` | `gemm_dgated` (BF16 only) | torch/BF16 + determinism + postact | BF16: atol 1.4e-2 |
+| `test_varlen_gemm.py` | `blockscaled_fp8_gemm_varlen` | 3-way (subprocess-isolated) | FP8: RRMSE<10%, cos>0.99 |
+| `test_wgrad_gemm.py` | `blockscaled_fp8_weight_grad_gemm` | 3-way: torch/BF16/FP8 | FP8: RRMSE<10%, cos>0.99 |
+
+### Running
+
+```bash
+# Full suite
+CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 python -m pytest tests/ops/ -v --tb=short
+
+# Smoke only (~100 cases)
+CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 python -m pytest tests/ops/ -v -k smoke
+
+# Without quack (all skipped — verifies guard logic)
+python -m pytest tests/ops/ -v
+```
+
+---
+
+## 13. CUTLASS Blockscaled GEMM Workspace Corruption Bug (quack-kernels 0.3.7)
+
+> **Date discovered:** 2026-04-15
+> **Severity:** Test-only (production NOT affected — see analysis below)
+> **Root cause:** CUTLASS DSL runtime retains internal state tied to GPU memory addresses
+
+### Symptoms
+
+When `blockscaled_fp8_gemm_varlen` is called multiple times in the same process with
+**different `total_M`** values (but same `(K, H, E)`), subsequent calls produce completely
+uncorrelated garbage output:
+- RRMSE ≈ √2 (1.413, the theoretical value for two independent random vectors)
+- Cosine similarity ≈ 0
+- max_abs_err >> expected (e.g., 0.13 instead of 0.003)
+
+### Reproduction
+
+```python
+from sonicmoe.quack_utils.blockscaled_fp8_gemm import (
+    blockscaled_fp8_gemm_varlen, quantize_and_pack_activation, precompute_weight_fp8
+)
+# Call with shape A (M=2048, K=1536, H=3072, E=8) — OK
+# Call with shape B (M=65536, K=1536, H=3072, E=8) — OK
+# Call with shape A again — GARBAGE (RRMSE ≈ √2)
+```
+
+### Root Cause Analysis
+
+The CUTLASS DSL (`cute.compile`) produces compiled CUDA kernels whose internal state
+(likely JIT-compiled module workspace for persistent tile scheduling) retains references
+to GPU memory addresses from prior kernel launches. When PyTorch's CUDA allocator
+reclaims and reuses that memory for different tensor allocations, the stale references
+cause the kernel's tile scheduler to read corrupted data.
+
+**Key findings:**
+1. **NOT** a Python-level cache bug — clearing `_GEMM_FAST_PATH`, `_COMPILE_CACHE`, and calling `torch.cuda.empty_cache()` does NOT fully fix it
+2. The corruption is **deterministic** per process (same shapes always fail)
+3. Running the same call in a **fresh subprocess** always succeeds
+4. The CUTLASS DSL has no public API to clear its internal compiled-module state
+
+### Why Production Training Is SAFE
+
+1. **`total_M = T × K` is constant** across ALL forward/backward calls within a step and across steps (T = batch tokens, K = top-k, both fixed per config)
+2. Only `cu_seqlens_m` (expert routing distribution) varies between steps — and `varlen_args` is recreated fresh each call (line 3626)
+3. **`tile_count_semaphore=None`** in all production paths — no GPU-side semaphore workspace exists
+4. **`_GEMM_FAST_PATH` key includes `total_M`** — different total_M values never share cached state
+
+### Mitigation in Tests
+
+`tests/ops/test_varlen_gemm.py` uses **subprocess isolation** for FP8 tests:
+each `blockscaled_fp8_gemm_varlen` call runs in a fresh Python subprocess via
+`subprocess.run()`, ensuring a clean CUTLASS DSL state. This adds ~3s/test overhead
+but guarantees correctness.
+
+The `conftest.py` also includes an `_isolate_cuda_memory` autouse fixture that clears
+Python-level CUTLASS caches + CUDA allocator between all tests in `tests/ops/`.
+
+### Recommendation
+
+- **Do NOT call `blockscaled_fp8_gemm_varlen` with varying `total_M`** in the same process without restarting the CUDA context
+- If variable `total_M` is needed (e.g., dynamic batching), pad `total_M` to a fixed value
+- File a bug with quack-kernels team: compiled CUTLASS DSL kernels should not retain stale internal workspace references across launches
+
+---
+
+## 14. MoE Module-Level Test Suite (`tests/ops/test_moe_module.py`)
+
+> **Date:** 2026-04-15 (Session 54)
+> **Test count:** 59 parametrized cases, all PASS
+
+### Purpose
+
+Validates the **full MoE forward/backward pipeline** (permute → up-gate projection → SwiGLU → down projection → unpermute) — not just individual ops. Cross-validates SonicMoE's BF16 and FP8 paths against a pure-torch float32 gold reference using ERNIE-core's split-half SwiGLU convention.
+
+### Architecture
+
+- **Gold reference** (`_torch_moe_gold`): Pure float32 per-expert matmul with split-half SwiGLU (`gate=z[:,:I], up=z[:,I:]`). Also has a manual backward (`_torch_moe_gold_backward`) verified against `torch.autograd.grad`.
+- **Weight conversion**: `split_to_interleaved()` / `interleaved_to_split()` convert between ERNIE split-half and SonicMoE interleaved layouts per expert. Round-trip is verified bit-exact.
+- **Deterministic routing**: `_make_deterministic_routing` generates round-robin topk_indices with softmax scores, eliminating routing randomness.
+- **SonicMoE runners**: `_run_sonicmoe_bf16` and `_run_sonicmoe_fp8` call `_UpProjection.apply` + `_DownProjection.apply` directly with pre-computed routing metadata from `TC_topk_router_metadata_triton`.
+
+### Module-Level Precision (Session 54)
+
+| Comparison | Fwd RRMSE | Fwd Cosine | dW RRMSE |
+|-----------|:---------:|:----------:|:--------:|
+| BF16 vs Gold | 0.0044 | 0.99999 | 0.004 |
+| FP8 vs Gold | 0.065 | 0.998 | — |
+| BF16 vs FP8 | 0.065 | 0.998 | — |
+
+### Test Breakdown (59 tests)
+
+| Category | Tests | Key Checks |
+|----------|-------|------------|
+| Gold self-consistency | 6 | Per-element manual verification |
+| BF16 vs Gold | 6 | RRMSE < 1%, cosine > 0.999 |
+| FP8 vs Gold (subprocess) | 6 | RRMSE < 10%, cosine > 0.99 |
+| BF16 vs FP8 (subprocess) | 6 | Cross-check within FP8 tolerance |
+| ERNIE split-half vs Gold | 6 | Exact match + weight round-trip |
+| Gold backward | 1 | autograd vs manual backward match |
+| Empty experts BF16 fwd | 4 | 1-7 empty experts, output correct |
+| Empty experts BF16 bwd | 4 | Zero grads for unused experts |
+| Empty experts FP8 (subprocess) | 4 | 128-aligned, fwd+bwd correct |
+| Deterministic BF16 | 2 | Bit-exact repeated runs |
+| Large tensor (T=4096) | 2 | BF16 + FP8 at production scale |
+| Weight conversion round-trip | 3 | split↔interleaved identity |
+| Routing metadata correctness | 3 | cu_seqlens, gather_idx, s_reverse verified |
+| Routing metadata empty experts | 2 | freq=0, equal cu_seqlens for inactive |
+| BF16 backward vs Gold | 1 | dw1/dw2 RRMSE < 2% |
+| Gold all-same-expert | 1 | No NaN/Inf with degenerate routing |
+| Stability (scale 0.5/2.0) | 2 | No NaN/Inf with varied activation scale |
+
+### Running
+
+```bash
+# Full MoE module suite (59 tests, ~4 min)
+CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 python -m pytest tests/ops/test_moe_module.py -v --tb=short
+
+# Only gold/BF16 (no FP8 subprocess overhead, ~3 min)
+CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 python -m pytest tests/ops/test_moe_module.py -v -k "gold or bf16"
+
+# Only edge cases (empty experts, deterministic, stability)
+CUDA_VISIBLE_DEVICES=0 USE_QUACK_GEMM=1 python -m pytest tests/ops/test_moe_module.py -v -k "empty or deterministic or stability or routing"
+```
+
+---
+
+## 15. 0-Size Expert Audit (Session 54)
+
+### Scenario
+
+When MoE routing assigns 0 tokens to some experts (common with large E, non-uniform workloads, or dropped experts), `cu_seqlens` has consecutive equal values for those experts.
+
+### Audit Results
+
+| Component | Handles 0-size? | Notes |
+|-----------|:---:|-------|
+| `TC_topk_router_metadata_triton` | **YES** | Correctly produces `cu_seqlens[e]==cu_seqlens[e+1]`, `freq[e]=0` |
+| `_all_segments_128_aligned` | **YES** | `0 % 128 == 0`, empty segments pass alignment check |
+| `gemm_gated` (BF16 path) | **YES** | CUTLASS varlen scheduler emits 0 rows for empty segments |
+| `blockscaled_fp8_gemm_varlen` | **YES** | Same — 0-length segments handled by CUTLASS varlen |
+| `quantize_and_pack_activation` | **YES** | `torch.empty(0, K)` + 0-grid Triton launch = no-op |
+| `swiglu_forward_triton` | **YES** | Grid `(0,)` = no-op in Triton |
+| `_DownProjection.forward` | **YES** | Router scatter handles empty expert output correctly |
+| BF16 backward (all paths) | **YES** | Zero gradients for unused experts (verified) |
+| FP8 backward (128-aligned) | **YES** | Empty experts produce zero grads (verified) |
+| FP8 backward (non-aligned) | **EXPECTED FAIL** | `RuntimeError` at line ~1878 (by design — requires token rounding) |
+
+### Key Insight
+
+The FP8 path is safe with 0-token experts **as long as all non-empty expert segments are 128-aligned**. The alignment check correctly treats 0 as aligned. The only failure mode is non-aligned non-empty segments, which raises an explicit error (not a silent bug).
+
+---
+
+## 16. ERNIE-Core Cross-Framework Reference (Session 54)
+
+### ERNIE-core MoE Architecture (analyzed from source)
+
+The ERNIE-core MoE layer (`ernie-core/src/ernie_core/models/moe/`) uses:
+
+- **SwiGLU**: Split-half (`paddle.chunk(x, 2, axis=-1)` → `silu(first) * second`), NOT interleaved
+- **Weight layout**: `up_gate_proj.weight` is `[H, 2*I]` per expert (fused gate+up), `down_proj.weight` is `[I, H]`
+- **Prob scaling**: Applied **AFTER SwiGLU, BEFORE down-proj**: `o2 = swiglu(o1) * probs` then `o3 = o2 @ W2`
+- **FP8**: `float8_e4m3fn` with 128-element block-wise scaling via `kitchen_quant` + `deep_gemm` grouped GEMM
+- **GEMM API**: `deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous` for forward, `deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_masked` for backward
+- **Key file**: `ernie_core/models/moe/token_dispatcher/fp8_utils.py` — contains `ExpertsGroupGemmContiguousNode` with full fwd/bwd
+
+### Differences from SonicMoE
+
+| Aspect | SonicMoE | ERNIE-core |
+|--------|----------|------------|
+| SwiGLU layout | Interleaved (gate=even, up=odd) | Split-half (gate=first, up=second) |
+| Framework | PyTorch + CUTLASS/QuACK | PaddlePaddle + deep_gemm |
+| FP8 quant | E8M0 1×32 blockscaled (ISA-packed) | 1×128 blockscaled (kitchen_quant) |
+| Weight storage | `(E, 2I, H)` → `.permute(1,2,0)` → `(2I, H, E)` | `[E, H, 2*I]` stacked, per-expert views |
+| Prob scaling | Inside `_router_forward` after down-proj | After SwiGLU, before down-proj |
+
+### Cross-Framework Validation Path
+
+To validate FP8 migration fidelity:
+1. Generate shared test data (weights, activations, routing) in numpy/dlpack
+2. Run SonicMoE FP8 forward (PyTorch) → extract output
+3. Run ERNIE-core FP8 forward (Paddle) → extract output
+4. Compare outputs at both module level (full MoE) and op level (individual GEMMs)
+
+The `_torch_moe_gold` function in `test_moe_module.py` serves as the framework-independent float32 reference for both.
