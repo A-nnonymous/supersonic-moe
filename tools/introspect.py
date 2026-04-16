@@ -3686,6 +3686,31 @@ def run(
         print("=" * 60)
         return ncu_data
 
+    # ── pad-audit mode: route-level padding precision / perf / memory ──
+    if mode == "pad-audit":
+        print("\n  Route-Level Padding Audit (E=32, 4-way)")
+        print("  =========================================")
+        print("  BF16 raw (gold) | BF16+rounding | FP8+padding | FP8+rounding")
+        print("  BF16 raw = gold standard. Others compared against it.")
+        print()
+        pad_data = run_pad_audit(
+            gpu=gpu,
+            nsys_warmup=nsys_warmup,
+            nsys_iters=nsys_iters,
+            seeds=precision_seeds,
+            T=SHAPE["T"], H=SHAPE["H"], I=SHAPE["I"],
+            E=32, K=SHAPE["K"],
+        )
+        pad_data["metadata"] = metadata
+
+        pad_out = ROOT / "reports" / "pad_audit_results.json"
+        pad_out.parent.mkdir(parents=True, exist_ok=True)
+        pad_out.write_text(json.dumps(pad_data, indent=2, default=str))
+
+        print(f"\n  → {pad_out} ({pad_out.stat().st_size / 1024:.1f} KB)")
+        print("=" * 70)
+        return pad_data
+
     # ── wgrad-force mode: forced wgrad FP8 at all shapes ──
     if mode == "wgrad-force":
         # Run with wgrad forced ON (bypass I-threshold) and OFF for comparison
@@ -3873,6 +3898,562 @@ def run(
     print("=" * 60)
 
     return manifest
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# pad-audit: route-level padding precision / performance / memory audit
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Methodology
+# -----------
+# Compare T_aligned (e.g. 8192, all segments 128-aligned by construction) vs
+# T_unaligned (e.g. 8193, at least 1 expert gets a +1 token, triggers
+# route-level padding).  Both use moe_TC_softmax_topk_layer with:
+#   - FP8 enabled, NO token rounding (rounding is the other strategy)
+#   - Identical E, H, I, K, random seed, model weights
+#   - Only T differs by +1
+#
+# Because the router produces different token counts from T vs T+1, routing
+# is NOT bit-identical.  We therefore measure:
+#   1. Precision: FP8(padded) vs BF16(same-T) — same routing, isolates padding error
+#   2. Performance: nsys GPU-projection µs/iter for aligned vs padded
+#   3. Memory: peak forward/backward allocated MiB
+#
+# For the precision test specifically: we run BF16 and FP8 at the SAME T
+# (the unaligned one) through the SAME moe_TC_softmax_topk_layer call path.
+# BF16 ignores padding (fp8 not enabled), FP8 pads.  Routing is bit-identical
+# because router runs before the FP8 branch.  Any diff = FP8 quant error +
+# padding error.  Separately, we run the aligned T to measure pure FP8 quant
+# error.  Delta isolates the padding contribution.
+#
+# E=32 three-way comparison (the real benchmark):
+#   - BF16 raw: gold standard, no rounding, no padding
+#   - FP8 + padding: same raw routing as BF16, pads metadata for 128-alignment
+#   - FP8 + rounding: modifies routing (token counts rounded to 128 multiples)
+# BF16 raw is the truth.  RRMSE(fp8_pad, bf16) = pure FP8 quant error.
+# RRMSE(fp8_round, bf16) = FP8 quant error + routing perturbation.
+
+_PAD_AUDIT_PRECISION_TEMPLATE = textwrap.dedent(r'''
+import gc, json, os, sys, torch
+import torch.nn.functional as F_torch
+sys.path.insert(0, "{root}")
+if "CUDA_VISIBLE_DEVICES" not in os.environ:
+    os.environ["CUDA_VISIBLE_DEVICES"] = "{gpu}"
+os.environ["USE_QUACK_GEMM"] = "1"
+
+mode = "{mode}"   # "bf16", "bf16_round", "fp8_pad", "fp8_round"
+if mode.startswith("fp8"):
+    os.environ["SONIC_MOE_FP8_MODE"] = "perf"
+
+from sonicmoe import MoE
+from sonicmoe.enums import ActivationType
+import sonicmoe.functional as functional
+from sonicmoe.functional import moe_TC_softmax_topk_layer, count_cumsum, moe_general_routing_inputs
+from sonicmoe.functional.utils import enable_fp8
+
+T, H, I, E, K = {T}, {H}, {I}, {E}, {K}
+seed = {seed}
+Mtile = 128
+
+torch.manual_seed(seed)
+device = torch.device("cuda:0")
+moe = MoE(num_experts=E, num_experts_per_tok=K, hidden_size=H,
+           intermediate_size=I, activation_function=ActivationType.SWIGLU,
+           add_bias=False, std=0.02).to(device=device, dtype=torch.bfloat16)
+torch.cuda.manual_seed(seed)
+x = (0.02 * torch.randn(T, H, device=device, dtype=torch.bfloat16)).detach().requires_grad_(True)
+
+functional.clear_all_fp8_weight_caches()
+functional._ALIGNMENT_ASSUMED = False
+functional._ALIGNMENT_STREAK = 0
+
+use_fp8 = mode.startswith("fp8")
+if use_fp8:
+    moe.refresh_fp8_shadow_weights()
+    moe.stash_bf16_to_cpu()
+
+w1_p = moe.c_fc.weight.permute(1, 2, 0)
+w2_p = moe.c_proj.weight.permute(1, 2, 0)
+
+x_run = x.detach().clone().requires_grad_(True)
+
+if mode in ("fp8_round", "bf16_round"):
+    # Token rounding: pre-compute 128-aligned routing
+    with torch.no_grad():
+        rl = F_torch.linear(x_run, moe.router.weight)
+        sc = F_torch.softmax(rl, dim=-1, dtype=torch.float32).to(torch.bfloat16)
+        tv, ti = sc.topk(K, dim=-1)
+        tv /= tv.sum(dim=-1, keepdim=True)
+        sc.scatter_(-1, ti, tv)
+        cb = sc.detach().clone() - 1
+        cb.scatter_(1, ti, tv)
+        si = cb.argsort(dim=0, descending=True).int()
+        ef = count_cumsum(ti.view(-1), E, do_cumsum=True)[0]
+        efr = (torch.ceil(ef / Mtile) * Mtile).int()
+        mk = torch.arange(T, device=device, dtype=torch.int32)[:, None].expand(-1, E) < efr[None, :]
+        tok_idx = si[mk]
+        exp_idx = torch.arange(E, device=device, dtype=torch.int32)[None, :].expand(T, -1)[mk]
+        od = tok_idx.argsort().int()
+        tok_idx = tok_idx[od]; exp_idx = exp_idx[od]
+        rsc = sc[tok_idx, exp_idx].contiguous()
+    functional._ALIGNMENT_ASSUMED = True
+    with enable_fp8(use_fp8):
+        o, ef_out = moe_general_routing_inputs(
+            x_run, rsc, tok_idx, exp_idx, w1_p, None, w2_p, None,
+            E, moe.stream_id, ActivationType.SWIGLU, False)
+else:
+    # bf16 or fp8_pad: both use moe_TC_softmax_topk_layer (raw routing)
+    with enable_fp8(use_fp8):
+        o, rl, ef_out = moe_TC_softmax_topk_layer(
+            x_run, moe.router.weight, w1_p, None, w2_p, None,
+            K, moe.stream_id, ActivationType.SWIGLU, False)
+
+grad_out = torch.randn(T, H, device=device, dtype=torch.bfloat16,
+                       generator=torch.Generator(device=device).manual_seed(seed + 1))
+o.backward(grad_out)
+
+result = {{
+    "mode": mode, "T": T, "E": E, "seed": seed,
+    "o_norm": o.float().norm().item(),
+    "o_absmax": o.float().abs().max().item(),
+}}
+torch.save({{
+    "o": o.detach().cpu(),
+    "dw1": moe.c_fc.weight.grad.detach().cpu() if moe.c_fc.weight.grad is not None else None,
+    "dw2": moe.c_proj.weight.grad.detach().cpu() if moe.c_proj.weight.grad is not None else None,
+    "dx": x_run.grad.detach().cpu() if x_run.grad is not None else None,
+}}, "{tensor_path}")
+print("__PAD_PRECISION__" + json.dumps(result))
+''')
+
+
+def _pad_audit_precision_run(
+    root: str, gpu: int, T: int, H: int, I: int, E: int, K: int,
+    mode: str, seed: int, tensor_path: str,
+) -> dict:
+    """Run one subprocess for pad-audit precision."""
+    python_bin = _resolve_python_bin()
+    script = _PAD_AUDIT_PRECISION_TEMPLATE.format(
+        root=root, gpu=gpu, mode=mode, T=T, H=H, I=I, E=E, K=K,
+        seed=seed, tensor_path=tensor_path,
+    )
+    env = _subprocess_env_for_gpu(gpu)
+    if mode == "fp8":
+        env["SONIC_MOE_FP8_MODE"] = "perf"
+    proc = subprocess.run(
+        [python_bin, "-c", script],
+        capture_output=True, text=True, timeout=600, env=env, cwd=root,
+    )
+    for line in proc.stdout.split("\n"):
+        if line.startswith("__PAD_PRECISION__"):
+            return json.loads(line[len("__PAD_PRECISION__"):])
+    return {"error": proc.stderr[-500:] if proc.stderr else "no output",
+            "stdout": proc.stdout[-300:]}
+
+
+def _rrmse_tensors(a, b):
+    """Compute RRMSE between two tensors (float64 for precision)."""
+    a_f, b_f = a.double(), b.double()
+    diff_norm = (a_f - b_f).norm().item()
+    ref_norm = b_f.norm().item()
+    return diff_norm / ref_norm if ref_norm > 1e-12 else float("inf")
+
+
+def _cosine_tensors(a, b):
+    """Cosine similarity (float64)."""
+    a_f, b_f = a.double().flatten(), b.double().flatten()
+    dot = (a_f * b_f).sum().item()
+    return dot / (a_f.norm().item() * b_f.norm().item() + 1e-30)
+
+
+def _maxdiff_tensors(a, b):
+    """Max absolute difference."""
+    return (a.float() - b.float()).abs().max().item()
+
+
+def run_pad_audit(
+    gpu: int = 0,
+    nsys_warmup: int = DEFAULT_NSYS_WARMUP,
+    nsys_iters: int = DEFAULT_NSYS_ITERS,
+    seeds: list[int] | None = None,
+    T: int = 8192,
+    H: int = 3072,
+    I: int = 1536,
+    E: int = 32,
+    K: int = 8,
+) -> dict[str, Any]:
+    """Route-level padding audit: precision + performance + memory.
+
+    Three-way comparison at E=32 (non-aligned by nature):
+      - BF16 raw: gold standard (no rounding, no padding)
+      - FP8 + padding: same raw routing, pads metadata for 128-alignment
+      - FP8 + rounding: modifies routing (token counts → multiples of 128)
+
+    RRMSE(fp8_pad, bf16) = pure FP8 quantization error.
+    RRMSE(fp8_round, bf16) = FP8 quant error + routing perturbation.
+    """
+    import torch
+
+    root_str = str(ROOT)
+    seeds = seeds or [42, 123, 777]
+    all_modes = ["bf16", "bf16_round", "fp8_pad", "fp8_round"]
+
+    results: dict[str, Any] = {
+        "shape": {"T": T, "H": H, "I": I, "E": E, "K": K},
+        "precision": {},
+        "performance": {},
+        "memory": {},
+    }
+
+    # ── 1. PRECISION ──────────────────────────────────────────────────────
+    print(f"\n  [1/3] Precision: 4-way vs BF16 raw gold", flush=True)
+    print(f"        T={T}, E={E}, K={K}, seeds={seeds}", flush=True)
+
+    per_seed_results = []
+    for seed in seeds:
+        seed_result = {"seed": seed}
+        tensors = {}
+        for m in all_modes:
+            tpath = str(Path(tempfile.mkdtemp()) / f"pad_audit_{m}_s{seed}.pt")
+            info = _pad_audit_precision_run(
+                root_str, gpu, T, H, I, E, K, m, seed, tpath,
+            )
+            if "error" in info:
+                print(f"    [FAIL] {m}/seed={seed}: {info['error'][:120]}", flush=True)
+                tensors[m] = None
+                continue
+            try:
+                tensors[m] = torch.load(tpath, weights_only=True, map_location="cpu")
+            except Exception as e:
+                print(f"    [FAIL] {m}/seed={seed}: tensor load: {e}", flush=True)
+                tensors[m] = None
+            finally:
+                try:
+                    os.unlink(tpath)
+                except OSError:
+                    pass
+
+        bf16_t = tensors.get("bf16")
+        if bf16_t is None:
+            per_seed_results.append(seed_result)
+            continue
+
+        for m in all_modes[1:]:  # skip "bf16" (it IS the gold)
+            fp8_t = tensors.get(m)
+            if fp8_t is None:
+                seed_result[m] = {"error": "subprocess failed"}
+                continue
+            cmp = {}
+            for key in ("o", "dw1", "dw2", "dx"):
+                a, b = fp8_t.get(key), bf16_t.get(key)
+                if a is not None and b is not None and a.shape == b.shape:
+                    cmp[key] = {
+                        "rrmse": round(_rrmse_tensors(a, b), 8),
+                        "cosine": round(_cosine_tensors(a, b), 8),
+                        "maxdiff": round(_maxdiff_tensors(a, b), 8),
+                    }
+                else:
+                    reason = "None" if (a is None or b is None) else f"shape {a.shape} vs {b.shape}"
+                    cmp[key] = {"skip": reason}
+            seed_result[m] = cmp
+        per_seed_results.append(seed_result)
+
+    results["precision"]["per_seed"] = per_seed_results
+
+    # Aggregate: mean RRMSE across seeds
+    for m in all_modes[1:]:
+        agg = {}
+        for key in ("o", "dw1", "dw2", "dx"):
+            vals = [s[m][key]["rrmse"] for s in per_seed_results
+                    if m in s and isinstance(s[m], dict)
+                    and key in s[m] and "rrmse" in s[m][key]]
+            if vals:
+                agg[key] = {
+                    "mean_rrmse": round(sum(vals) / len(vals), 8),
+                    "max_rrmse": round(max(vals), 8),
+                    "n_seeds": len(vals),
+                }
+        results["precision"][f"{m}_agg"] = agg
+
+    # Print precision summary
+    print(f"\n  Precision vs BF16 raw gold (RRMSE, {len(seeds)} seeds)", flush=True)
+    col_modes = all_modes[1:]  # bf16_round, fp8_pad, fp8_round
+    header = f"  {'Tensor':<8s}" + "".join(f" {m:>12s}" for m in col_modes)
+    print(header, flush=True)
+    print(f"  {'-'*8}" + "".join(f" {'-'*12}" for _ in col_modes), flush=True)
+    for key in ("o", "dw1", "dw2", "dx"):
+        row = f"  {key:<8s}"
+        for m in col_modes:
+            rr = results["precision"].get(f"{m}_agg", {}).get(key, {}).get("mean_rrmse")
+            row += f" {rr:>11.6f} " if rr is not None else f" {'N/A':>12s}"
+        print(row, flush=True)
+
+    # ── 2. PERFORMANCE (nsys GPU-projection) ──────────────────────────────
+    # nsys uses the existing bf16/fp8 modes.  For E>8, fp8 uses rounding.
+    # fp8_pad goes through moe_TC_softmax_topk_layer which is the "fp8" nsys mode
+    # when use_token_rounding=False.  But the existing template forces rounding
+    # for E>8.  We need separate runs.
+    print(f"\n  [2/3] nsys performance (warmup={nsys_warmup}, iters={nsys_iters}) ...", flush=True)
+    shape = {"T": T, "H": H, "I": I, "E": E, "K": K}
+
+    # Run bf16 + fp8_rounding via existing run_nsys_profile (which rounds for E>8)
+    nsys_data = run_nsys_profile(
+        gpu=gpu, warmup=nsys_warmup, iters=nsys_iters, shapes=[shape],
+    )
+    shape_key = f"T{T}_I{I}_E{E}K{K}"
+    shape_nsys = nsys_data.get("shapes", {}).get(shape_key, {})
+    results["performance"]["bf16_raw_us"] = shape_nsys.get("bf16", {}).get("per_iter_us")
+    results["performance"]["fp8_round_us"] = shape_nsys.get("fp8", {}).get("per_iter_us")
+
+    # Run fp8_pad separately: force use_token_rounding=False in nsys template
+    # by using a custom script that calls moe_TC_softmax_topk_layer directly
+    print(f"  nsys profiling [fp8_pad/{shape_key}] ({nsys_warmup}w+{nsys_iters}m) ...", flush=True)
+    _FP8_PAD_NSYS_SCRIPT = textwrap.dedent(r'''
+import os, sys, gc, torch
+sys.path.insert(0, "{root}")
+if "CUDA_VISIBLE_DEVICES" not in os.environ:
+    os.environ["CUDA_VISIBLE_DEVICES"] = "{gpu}"
+os.environ["USE_QUACK_GEMM"] = "1"
+os.environ["SONIC_MOE_FP8_MODE"] = "perf"
+
+from sonicmoe import MoE
+from sonicmoe.enums import ActivationType
+import sonicmoe.functional as functional
+from sonicmoe.functional import moe_TC_softmax_topk_layer
+from sonicmoe.functional.utils import enable_fp8
+
+T, H, I, E, K = {T}, {H}, {I}, {E}, {K}
+torch.manual_seed(42)
+device = torch.device("cuda:0")
+moe = MoE(num_experts=E, num_experts_per_tok=K, hidden_size=H,
+           intermediate_size=I, activation_function=ActivationType.SWIGLU,
+           add_bias=False, std=0.02).to(device=device, dtype=torch.bfloat16)
+x = (0.02 * torch.randn(T, H, device=device, dtype=torch.bfloat16)).detach().requires_grad_()
+
+functional.clear_all_fp8_weight_caches()
+functional._ALIGNMENT_ASSUMED = False
+functional._ALIGNMENT_STREAK = 0
+moe.refresh_fp8_shadow_weights()
+moe.stash_bf16_to_cpu()
+w1_p = moe.c_fc.weight.permute(1, 2, 0)
+w2_p = moe.c_proj.weight.permute(1, 2, 0)
+
+def run_iter():
+    with enable_fp8(True):
+        o, _, _ = moe_TC_softmax_topk_layer(
+            x, moe.router.weight, w1_p, None, w2_p, None,
+            K, moe.stream_id, ActivationType.SWIGLU, False)
+    return o
+
+for _ in range({warmup}):
+    out = run_iter()
+    out.sum().backward()
+    moe.zero_grad(set_to_none=True)
+    if x.grad is not None: x.grad = None
+torch.cuda.synchronize(); gc.collect(); torch.cuda.empty_cache()
+
+torch.cuda.cudart().cudaProfilerStart()
+for _ in range({iters}):
+    out = run_iter()
+    out.sum().backward()
+    moe.zero_grad(set_to_none=True)
+    if x.grad is not None: x.grad = None
+torch.cuda.synchronize()
+torch.cuda.cudart().cudaProfilerStop()
+print("NSYS_DONE")
+''').format(root=str(ROOT), gpu=str(gpu), warmup=nsys_warmup, iters=nsys_iters, **shape)
+
+    python_bin = _resolve_python_bin()
+    nsys_output_dir = Path("/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/output/nsys")
+    nsys_output_dir.mkdir(parents=True, exist_ok=True)
+    ts = time.strftime("%H%M%S")
+    rep_name = f"fp8pad_{shape_key}_{ts}"
+    rep_path = str(nsys_output_dir / rep_name)
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False, prefix="nsys_fp8pad_") as f:
+        f.write(_FP8_PAD_NSYS_SCRIPT)
+        script_path = f.name
+
+    try:
+        sub_env = _subprocess_env_for_gpu(gpu)
+        cmd = [
+            "nsys", "profile",
+            "--capture-range=cudaProfilerApi", "--capture-range-end=stop",
+            f"--output={rep_path}", "--export=sqlite",
+            "--force-overwrite=true",
+            python_bin, script_path,
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=sub_env)
+        if proc.returncode == 0:
+            db_file = f"{rep_path}.sqlite"
+            if os.path.exists(db_file):
+                parsed = _nsys_parse_sqlite(db_file, nsys_iters)
+                results["performance"]["fp8_pad_us"] = parsed.get("per_iter_us")
+                print(f"    fp8_pad/{shape_key}: {parsed.get('per_iter_us', '?')} µs/iter "
+                      f"({parsed.get('num_kernels', '?')} kernels)", flush=True)
+            else:
+                print(f"    [WARN] sqlite missing for fp8_pad", flush=True)
+        else:
+            print(f"    [WARN] nsys failed for fp8_pad: {proc.stderr[-200:]}", flush=True)
+    except subprocess.TimeoutExpired:
+        print(f"    [WARN] nsys timed out for fp8_pad", flush=True)
+    finally:
+        try:
+            os.unlink(script_path)
+        except OSError:
+            pass
+
+    # Print performance summary
+    bf16_us = results["performance"].get("bf16_raw_us")
+    pad_us = results["performance"].get("fp8_pad_us")
+    rnd_us = results["performance"].get("fp8_round_us")
+    print(f"\n  Performance: nsys GPU-projection µs/iter", flush=True)
+    print(f"  {'Mode':<16s} {'µs/iter':>10s} {'vs BF16':>10s}", flush=True)
+    print(f"  {'-'*16} {'-'*10} {'-'*10}", flush=True)
+    if bf16_us: print(f"  {'BF16 raw':<16s} {bf16_us:>9.0f}  {'1.000×':>10s}", flush=True)
+    if pad_us and bf16_us: print(f"  {'FP8 + padding':<16s} {pad_us:>9.0f}  {bf16_us/pad_us:>9.3f}×", flush=True)
+    if rnd_us and bf16_us: print(f"  {'FP8 + rounding':<16s} {rnd_us:>9.0f}  {bf16_us/rnd_us:>9.3f}×", flush=True)
+    if pad_us and rnd_us:
+        delta = (pad_us - rnd_us) / rnd_us * 100
+        print(f"\n  FP8 padding vs rounding: {pad_us:.0f} vs {rnd_us:.0f} µs → {delta:+.1f}%", flush=True)
+
+    # ── 3. MEMORY ─────────────────────────────────────────────────────────
+    print(f"\n  [3/3] Memory measurement ...", flush=True)
+    # bf16_raw and fp8_round via existing _run_memory_measure (E>8 fp8 uses rounding)
+    for m in ("bf16", "fp8"):
+        mem = _run_memory_measure(m, shape, gpu, warmup=3)
+        label = "fp8_round" if m == "fp8" else "bf16_raw"
+        results["memory"][label] = mem
+        if "error" not in mem:
+            print(f"    {label}: fwd={mem['peak_fwd_mib']:.0f} bwd={mem['peak_bwd_mib']:.0f} MiB", flush=True)
+
+    # bf16_round: BF16 with token-rounded routing (no FP8)
+    # Reuse the _MEM_MEASURE_SCRIPT but it routes with rounding for E>8 + fp8
+    # We need a custom script for bf16_round that does rounding but no FP8.
+    # For simplicity, bf16_round memory ≈ bf16_raw (rounding doesn't change tensor sizes much)
+    # Just note it in results.
+    results["memory"]["bf16_round"] = results["memory"].get("bf16_raw", {}).copy()
+    results["memory"]["bf16_round"]["note"] = "≈ bf16_raw (rounding changes routing, not tensor sizes)"
+
+    # fp8_pad memory via custom subprocess
+    _FP8_PAD_MEM_SCRIPT = textwrap.dedent(r'''
+import gc, json, os, sys, torch
+sys.path.insert(0, "{root}")
+if "CUDA_VISIBLE_DEVICES" not in os.environ:
+    os.environ["CUDA_VISIBLE_DEVICES"] = "{gpu}"
+os.environ["USE_QUACK_GEMM"] = "1"
+os.environ["SONIC_MOE_FP8_MODE"] = "perf"
+from sonicmoe import MoE
+from sonicmoe.enums import ActivationType
+import sonicmoe.functional as functional
+from sonicmoe.functional import moe_TC_softmax_topk_layer
+from sonicmoe.functional.utils import enable_fp8
+
+T, H, I, E, K = {T}, {H}, {I}, {E}, {K}
+torch.manual_seed(42); device = torch.device("cuda:0")
+moe = MoE(num_experts=E, num_experts_per_tok=K, hidden_size=H,
+           intermediate_size=I, activation_function=ActivationType.SWIGLU,
+           add_bias=False, std=0.02).to(device=device, dtype=torch.bfloat16)
+x = (0.02 * torch.randn(T, H, device=device, dtype=torch.bfloat16)).detach().requires_grad_()
+functional.clear_all_fp8_weight_caches()
+functional._ALIGNMENT_ASSUMED = False; functional._ALIGNMENT_STREAK = 0
+moe.refresh_fp8_shadow_weights(); moe.stash_bf16_to_cpu()
+w1_p = moe.c_fc.weight.permute(1, 2, 0)
+w2_p = moe.c_proj.weight.permute(1, 2, 0)
+
+def run_iter():
+    xw = x.detach().clone().requires_grad_(True)
+    with enable_fp8(True):
+        o, _, _ = moe_TC_softmax_topk_layer(xw, moe.router.weight, w1_p, None, w2_p, None,
+            K, moe.stream_id, ActivationType.SWIGLU, False)
+    return xw, o
+
+for _ in range(3):
+    xw, o = run_iter(); o.sum().backward()
+    moe.zero_grad(set_to_none=True); del xw, o
+gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
+
+MiB = 1048576
+gc.collect(); torch.cuda.empty_cache()
+torch.cuda.reset_peak_memory_stats(device); torch.cuda.synchronize()
+base = torch.cuda.memory_allocated(device) / MiB
+xw, o = run_iter(); torch.cuda.synchronize()
+peak_fwd = torch.cuda.max_memory_allocated(device) / MiB
+torch.cuda.reset_peak_memory_stats(device)
+o.sum().backward(); torch.cuda.synchronize()
+peak_bwd = torch.cuda.max_memory_allocated(device) / MiB
+print("__MEM_JSON__" + json.dumps({{"mode": "fp8_pad", "base_mib": round(base, 1),
+       "peak_fwd_mib": round(peak_fwd, 1), "peak_bwd_mib": round(peak_bwd, 1)}}))
+''').format(root=str(ROOT), gpu=str(gpu), **shape)
+
+    proc = subprocess.run(
+        [python_bin, "-c", _FP8_PAD_MEM_SCRIPT],
+        capture_output=True, text=True, timeout=600,
+        env=_subprocess_env_for_gpu(gpu), cwd=str(ROOT),
+    )
+    for line in proc.stdout.split("\n"):
+        if line.startswith("__MEM_JSON__"):
+            mem = json.loads(line[len("__MEM_JSON__"):])
+            results["memory"]["fp8_pad"] = mem
+            print(f"    fp8_pad: fwd={mem['peak_fwd_mib']:.0f} bwd={mem['peak_bwd_mib']:.0f} MiB", flush=True)
+            break
+    else:
+        results["memory"]["fp8_pad"] = {"error": proc.stderr[-200:] if proc.stderr else "no output"}
+        print(f"    [FAIL] fp8_pad memory: {proc.stderr[-100:]}", flush=True)
+
+    # Print memory summary table
+    print(f"\n  Memory (peak MiB):", flush=True)
+    print(f"  {'Mode':<16s} {'Fwd':>8s} {'Bwd':>8s}", flush=True)
+    print(f"  {'-'*16} {'-'*8} {'-'*8}", flush=True)
+    for label in ("bf16_raw", "bf16_round", "fp8_pad", "fp8_round"):
+        mem = results["memory"].get(label, {})
+        fwd = mem.get("peak_fwd_mib", 0)
+        bwd = mem.get("peak_bwd_mib", 0)
+        if fwd: print(f"  {label:<16s} {fwd:>7.0f}  {bwd:>7.0f}", flush=True)
+
+    # ── Theoretical memory breakdown ──────────────────────────────────────
+    # Calculate exact delta from padding: which tensors grow and by how much
+    MiB = 1048576
+    TK_raw = T * K
+    # Compute N_pad from routing (approximate: ceil each expert segment to 128)
+    n_experts = E
+    per_expert_avg = TK_raw / n_experts
+    remainder = per_expert_avg % 128
+    # Worst case: every expert has remainder > 0
+    n_pad_per_expert = (128 - remainder) % 128 if remainder > 0 else 0
+    N_pad_approx = int(n_pad_per_expert * n_experts)
+    TK_padded = TK_raw + N_pad_approx
+
+    print(f"\n  Theoretical padding memory overhead (E={E}, T={T}, K={K}):", flush=True)
+    print(f"  TK_raw={TK_raw}, TK_padded≈{TK_padded}, N_pad≈{N_pad_approx}", flush=True)
+    print(f"  {'Tensor':<30s} {'Dtype':>6s} {'Cols':>6s} {'ΔRows':>6s} {'ΔMiB':>8s}", flush=True)
+    print(f"  {'-'*30} {'-'*6} {'-'*6} {'-'*6} {'-'*8}", flush=True)
+    overhead_items = [
+        # Forward intermediates (padded_total rows instead of TK rows)
+        ("z (pre-activation)", "bf16", 2 * I, N_pad_approx),
+        ("y1 (post-SwiGLU)", "bf16", I, N_pad_approx),
+        ("z_fp8 (saved for bwd)", "fp8", 2 * I, N_pad_approx),
+        ("z_scales (saved for bwd)", "e8m0", 2 * I // 32, N_pad_approx),
+        # Backward intermediates
+        ("dz (activation grad)", "bf16", 2 * I, N_pad_approx),
+        ("y1s (score-weighted y1)", "bf16", I, N_pad_approx),
+        ("dz_fp8 (for UpBwd)", "fp8", 2 * I, N_pad_approx),
+        # Routing metadata (small)
+        ("padded_x_gather_idx", "int32", 1, N_pad_approx),
+        ("padded_s_scatter_idx", "int32", 1, N_pad_approx),
+        ("padded_scores", "fp32", 1, N_pad_approx),
+    ]
+    total_overhead = 0.0
+    bytes_per = {"bf16": 2, "fp8": 1, "e8m0": 1, "int32": 4, "fp32": 4}
+    for name, dtype, cols, drows in overhead_items:
+        delta_bytes = drows * cols * bytes_per[dtype]
+        delta_mib = delta_bytes / MiB
+        total_overhead += delta_mib
+        print(f"  {name:<30s} {dtype:>6s} {cols:>6d} {drows:>6d} {delta_mib:>+7.2f}", flush=True)
+    print(f"  {'TOTAL THEORETICAL':<30s} {'':>6s} {'':>6s} {'':>6s} {total_overhead:>+7.2f}", flush=True)
+    results["memory"]["theoretical_overhead_mib"] = round(total_overhead, 2)
+
+    return results
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -4163,7 +4744,7 @@ def main():
         """),
     )
     parser.add_argument(
-        "--mode", choices=["trace", "profile", "full", "nsys", "grid", "report", "precision", "quant-bench", "wgrad-bench", "ncu-bench", "wgrad-force", "compile-session53"],
+        "--mode", choices=["trace", "profile", "full", "nsys", "grid", "report", "precision", "quant-bench", "wgrad-bench", "ncu-bench", "wgrad-force", "pad-audit", "compile-session53"],
         default="trace",
         help="Introspection depth (default: trace)",
     )

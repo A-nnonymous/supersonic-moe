@@ -210,6 +210,84 @@ def _fused_blockscaled_gated_forward(
     return z, y1
 
 
+# ---------------------------------------------------------------------------
+# Route-level padding: pad routing metadata once so the alignment check
+# sees 128-aligned expert_frequency_offset → entire fwd+bwd runs the proven
+# aligned fast path.  Zero GEMM code changes.
+# ---------------------------------------------------------------------------
+
+def _pad_routing_metadata(
+    expert_frequency_offset: torch.Tensor,  # (E+1,) int32
+    x_gather_idx: torch.Tensor,             # (TK,) int32
+    s_scatter_idx: torch.Tensor,            # (TK,) int32
+    s_reverse_scatter_idx: torch.Tensor,    # (TK,) int32
+    topk_scores: torch.Tensor,              # (T*K,) float32 (already flattened)
+    TK: int, T: int, E: int, K: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, bool]:
+    """Pad routing metadata to ensure 128-aligned expert segments for FP8.
+
+    Padding rows use gather index 0 (arbitrary valid row — data doesn't matter
+    because score=0 nullifies the contribution) and score=0, so they contribute
+    nothing to output or gradients.  No sentinel row is appended to x.
+
+    Returns:
+        (padded_efo, padded_x_gather, padded_s_scatter,
+         padded_s_reverse, padded_scores, padded_total, was_padded)
+    """
+    from ..quack_utils.blockscaled_fp8_gemm import _get_padding_plan
+
+    needs_pad, padded_cu, padded_total, dst_idx = _get_padding_plan(
+        expert_frequency_offset, TK
+    )
+    if not needs_pad:
+        return (expert_frequency_offset, x_gather_idx, s_scatter_idx,
+                s_reverse_scatter_idx, topk_scores, TK, False)
+
+    N_pad = padded_total - TK
+    device = x_gather_idx.device
+
+    # 1. expert_frequency_offset — directly from _get_padding_plan
+    padded_efo = padded_cu
+
+    # 2. x_gather_idx: padding positions → row 0 (arbitrary safe row;
+    #    score=0 nullifies the contribution regardless of data)
+    padded_x_gather = torch.zeros(
+        padded_total, dtype=x_gather_idx.dtype, device=device
+    )
+    padded_x_gather[dst_idx] = x_gather_idx
+
+    # 3. topk_scores: append zeros for padding positions
+    padded_scores = torch.cat([
+        topk_scores,
+        torch.zeros(N_pad, dtype=topk_scores.dtype, device=device),
+    ])
+
+    # 4. s_scatter_idx: real tokens remapped to padded positions,
+    #    padding positions → virtual flat-topk indices T*K .. T*K+N_pad-1
+    padded_s_scatter = torch.empty(
+        padded_total, dtype=s_scatter_idx.dtype, device=device
+    )
+    padded_s_scatter[dst_idx] = s_scatter_idx
+    # Compute pad positions (positions in [0, padded_total) NOT in dst_idx)
+    is_real = torch.zeros(padded_total, dtype=torch.bool, device=device)
+    is_real[dst_idx] = True
+    pad_positions = torch.where(~is_real)[0]
+    # Padding positions get virtual scatter indices beyond T*K
+    padded_s_scatter[pad_positions] = torch.arange(
+        TK, TK + N_pad, dtype=s_scatter_idx.dtype, device=device
+    )
+
+    # 5. s_reverse_scatter_idx: stays (T*K,) — only real tokens need reverse mapping.
+    #    Value remapping: original values pointed into [0, TK), now must point
+    #    into padded positions via dst_idx[original_value].
+    padded_s_reverse = dst_idx[s_reverse_scatter_idx.long()].to(
+        s_reverse_scatter_idx.dtype
+    )
+
+    return (padded_efo, padded_x_gather, padded_s_scatter,
+            padded_s_reverse, padded_scores, padded_total, True)
+
+
 def _padded_blockscaled_gated_forward(
     x: torch.Tensor,
     w1: torch.Tensor,
@@ -1421,7 +1499,7 @@ class _DownProjection(torch.autograd.Function):
 
         # Output must always be bf16 (z may be fp8 when epilogue_quant is active).
         o = torch.empty(T, H, device=z.device, dtype=torch.bfloat16)
-        topk_scores = topk_scores.flatten()
+        topk_scores = topk_scores if topk_scores.ndim == 1 else topk_scores.flatten()
 
         _router_forward(
             y2=y2_for_router,
@@ -1924,7 +2002,15 @@ class _DownProjection(torch.autograd.Function):
         y1s = None  # may already be freed by fused dgated path
         _log_stage_memory("backward:down-proj-postact-release")
         # TC top-K routing
-        if not is_varlen_K:
+        # When route-level padding is active, topk_scores input was (T*K+N_pad,)
+        # flat, but ds is (T*K,) after s_reverse_scatter_idx indexing.  Pad with
+        # zeros so gradient shape matches input shape.
+        N_scores = topk_scores.shape[0]
+        if ds.shape[0] < N_scores:
+            ds = torch.cat([ds, torch.zeros(
+                N_scores - ds.shape[0], dtype=ds.dtype, device=ds.device
+            )])
+        elif not is_varlen_K:
             ds = ds.view(T, K)
 
         return None, dz, dw2, db2, ds, None, *[None] * 11
@@ -2169,12 +2255,27 @@ def moe_TC_softmax_topk_layer(
 
     T = x.size(0)
 
+    # ── Route-level padding for FP8 non-aligned expert segments ──────────
+    # Pad routing metadata once so _all_segments_128_aligned sees aligned
+    # offsets → entire fwd+bwd runs the proven aligned fast path.
+    # Padding rows gather from row 0 with score=0 → zero contribution.
+    # x is NOT modified (no sentinel row).
+    if _fp8_enabled():
+        (expert_frequency_offset, x_gather_idx, s_scatter_idx,
+         s_reverse_scatter_idx, topk_scores_flat, TK, _routing_padded
+        ) = _pad_routing_metadata(
+            expert_frequency_offset, x_gather_idx, s_scatter_idx,
+            s_reverse_scatter_idx, topk_scores.flatten(), TK, T, E, K,
+        )
+        if _routing_padded:
+            topk_scores = topk_scores_flat  # now (T*K+N_pad,) flat
+
     y1, z = _UpProjection.apply(
         x,
         w1,
         b1,
         expert_frequency_offset,
-        T * K,
+        TK,
         K,
         stream_id,
         x_gather_idx,

@@ -1445,3 +1445,284 @@ def test_stability_activation_scale(scale):
     # Relax threshold for larger activations
     threshold = BF16_RRMSE * (1 + scale)
     assert r < threshold, f"RRMSE {r:.6f} >= {threshold:.6f} at scale={scale}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Test 16: Route-level padding — FP8 non-aligned fwd+bwd (subprocess)
+# ═══════════════════════════════════════════════════════════════════════════
+
+_FP8_ROUTE_PAD_TEMPLATE = textwrap.dedent("""\
+    import os, sys, json
+    os.environ["USE_QUACK_GEMM"] = "1"
+    os.environ["SONIC_MOE_FP8_MODE"] = "perf"
+    import torch, torch.nn.functional as F
+    sys.path.insert(0, {project_root!r})
+
+    from tests.ops.test_moe_module import (
+        _make_test_data, _convert_weights_for_sonicmoe,
+        _torch_moe_gold, _torch_moe_gold_backward,
+        rrmse, cosine_sim, split_to_interleaved,
+    )
+    from sonicmoe.functional import (
+        moe_TC_softmax_topk_layer,
+        clear_all_fp8_weight_caches,
+        _refresh_fp8_config,
+    )
+    from sonicmoe.functional.utils import enable_fp8
+    from sonicmoe.enums import ActivationType
+
+    T, H, I, E, K, seed = {T}, {H}, {I}, {E}, {K}, {seed}
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+
+    x, w1_split, w2_gold, topk_indices, topk_scores = _make_test_data(T, H, I, E, K, seed)
+    w1_param, w2_param = _convert_weights_for_sonicmoe(w1_split, w2_gold)
+
+    # Router weights — routing will differ from deterministic, but that's OK
+    router_w = torch.randn(E, H, device="cuda", dtype=torch.bfloat16) * 0.01
+
+    x_input = x.detach().requires_grad_(True)
+    w1_func = w1_param.detach().requires_grad_(True)
+    w2_func = w2_param.detach().requires_grad_(True)
+
+    # Functional layout: parameter (E, 2I, H) -> functional (2I, H, E)
+    w1_f = w1_func.permute(1, 2, 0)
+    w2_f = w2_func.permute(1, 2, 0)
+
+    clear_all_fp8_weight_caches()
+    with enable_fp8(True):
+        _refresh_fp8_config()
+        o, router_logits, expert_freq = moe_TC_softmax_topk_layer(
+            x_input, router_w, w1_f, None, w2_f, None,
+            K=K, stream_id=0, activation_type=ActivationType.SWIGLU,
+        )
+
+    assert o.shape == (T, H), f"Output shape mismatch: {{o.shape}} vs {{(T, H)}}"
+    assert not torch.isnan(o).any(), "Output contains NaN"
+    assert not torch.isinf(o).any(), "Output contains Inf"
+
+    # Run backward
+    grad_out = torch.randn_like(o)
+    o.backward(grad_out)
+
+    assert w1_func.grad is not None, "w1 gradient is None"
+    assert w2_func.grad is not None, "w2 gradient is None"
+    assert not torch.isnan(w1_func.grad).any(), "w1 gradient contains NaN"
+    assert not torch.isnan(w2_func.grad).any(), "w2 gradient contains NaN"
+
+    dw1_norm = w1_func.grad.float().norm().item()
+    dw2_norm = w2_func.grad.float().norm().item()
+    assert dw1_norm > 1e-8, f"dw1 norm too small: {{dw1_norm}}"
+    assert dw2_norm > 1e-8, f"dw2 norm too small: {{dw2_norm}}"
+
+    # Compare FP8 (route-padded) vs BF16 using same router_w (same routing)
+    x_bf16 = x.detach().requires_grad_(True)
+    w1_bf16 = w1_param.detach().requires_grad_(True)
+    w2_bf16 = w2_param.detach().requires_grad_(True)
+    w1_bf16_f = w1_bf16.permute(1, 2, 0)
+    w2_bf16_f = w2_bf16.permute(1, 2, 0)
+
+    o_bf16, _, _ = moe_TC_softmax_topk_layer(
+        x_bf16, router_w, w1_bf16_f, None, w2_bf16_f, None,
+        K=K, stream_id=0, activation_type=ActivationType.SWIGLU,
+    )
+    o_bf16.backward(grad_out.detach())
+
+    r_out = rrmse(o.float(), o_bf16.float())
+    c_out = cosine_sim(o.float(), o_bf16.float())
+    r_dw1 = rrmse(w1_func.grad.float(), w1_bf16.grad.float())
+    r_dw2 = rrmse(w2_func.grad.float(), w2_bf16.grad.float())
+
+    print(json.dumps({{
+        "rrmse_out": round(r_out, 6),
+        "cosine_out": round(c_out, 6),
+        "rrmse_dw1": round(r_dw1, 6),
+        "rrmse_dw2": round(r_dw2, 6),
+        "dw1_norm": round(dw1_norm, 6),
+        "dw2_norm": round(dw2_norm, 6),
+    }}))
+""")
+
+
+@pytest.mark.parametrize("T,H,I,E,K", [
+    pytest.param(300, 768, 384, 32, 8, id="non-aligned-E32"),
+    pytest.param(256, 768, 384, 8, 2, id="aligned-regression"),
+])
+def test_fp8_route_padded_fwd_bwd(T, H, I, E, K):
+    """FP8 route-level padding: fwd+bwd produces valid output and gradients.
+
+    E=32,K=8 with T=300 gives per_expert~75 tokens — non-128-aligned.
+    Route-level padding pads metadata once so aligned fast path runs.
+    """
+    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    script = _FP8_ROUTE_PAD_TEMPLATE.format(
+        project_root=project_root, T=T, H=H, I=I, E=E, K=K, seed=42
+    )
+    env = os.environ.copy()
+    env["USE_QUACK_GEMM"] = "1"
+    env["SONIC_MOE_FP8_MODE"] = "perf"
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, env=env, timeout=600,
+    )
+    if result.returncode != 0:
+        pytest.fail(f"FP8 route-pad subprocess failed:\nstdout: {result.stdout[-500:]}\nstderr: {result.stderr[-500:]}")
+
+    import json
+    for line in result.stdout.strip().splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            metrics = json.loads(line)
+            break
+    else:
+        pytest.fail(f"No JSON output from route-pad subprocess:\n{result.stdout}")
+
+    r_out = metrics["rrmse_out"]
+    c_out = metrics["cosine_out"]
+    r_dw1 = metrics["rrmse_dw1"]
+    r_dw2 = metrics["rrmse_dw2"]
+    print(f"  FP8 route-pad: out RRMSE={r_out:.6f}, cosine={c_out:.6f}")
+    print(f"  FP8 route-pad: dw1 RRMSE={r_dw1:.6f}, dw2 RRMSE={r_dw2:.6f}")
+    assert r_out < FP8_RRMSE, f"output RRMSE {r_out:.6f} >= {FP8_RRMSE}"
+    assert c_out > FP8_COSINE, f"output cosine {c_out:.6f} <= {FP8_COSINE}"
+    assert r_dw1 < FP8_DW_RRMSE, f"dw1 RRMSE {r_dw1:.6f} >= {FP8_DW_RRMSE}"
+    assert r_dw2 < FP8_DW_RRMSE, f"dw2 RRMSE {r_dw2:.6f} >= {FP8_DW_RRMSE}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Test 17: Axiomatic _pad_routing_metadata correctness
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_pad_routing_metadata_axiomatic():
+    """Verify _pad_routing_metadata preserves every token — no drops, no misdirects.
+
+    Axiom: for identical x, weights, routing, the MoE output must satisfy
+        o_padded[t] == o_unpadded[t]  ∀ t ∈ [0, T)
+    where o_unpadded is computed by a per-expert pure-Python gold reference
+    and o_padded uses the padded routing metadata through the same per-expert
+    gold computation (to isolate padding logic from FP8/CUTLASS).
+
+    Uses a small shape (T=10, E=3, K=2) so every value can be enumerated.
+    """
+    from sonicmoe.functional import _pad_routing_metadata
+
+    T, H, I, E, K = 10, 16, 8, 3, 2
+    device = "cuda"
+    gen = torch.Generator(device=device).manual_seed(999)
+
+    x = torch.randn(T, H, device=device, generator=gen, dtype=torch.float32) * 0.1
+    # Split-half weights per expert: (E, 2I, H) and (E, H, I)
+    w1 = torch.randn(E, 2 * I, H, device=device, generator=gen, dtype=torch.float32) * 0.1
+    w2 = torch.randn(E, H, I, device=device, generator=gen, dtype=torch.float32) * 0.1
+
+    # Deterministic routing: token t → experts [(t*K+k) % E for k in 0..K-1]
+    topk_indices = torch.zeros(T, K, dtype=torch.int32, device=device)
+    for t in range(T):
+        for k in range(K):
+            topk_indices[t, k] = (t * K + k) % E
+    topk_scores = torch.rand(T, K, device=device, generator=gen, dtype=torch.float32)
+    topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True)  # normalize
+
+    # ── Compute routing metadata (CPU, int64 for correctness) ──
+    cu, x_gather, s_reverse = _compute_routing_metadata(topk_indices, E)
+    cu_cpu = cu.cpu().tolist()
+    TK = T * K
+
+    # Build s_scatter_idx: for sorted position p, which flat-topk position?
+    # s_scatter_idx[sorted_pos] = flat_topk_pos such that s_reverse[flat_topk_pos] = sorted_pos
+    s_scatter = torch.empty(TK, dtype=torch.int32, device=device)
+    for flat_pos in range(TK):
+        sorted_pos = s_reverse[flat_pos].item()
+        s_scatter[sorted_pos] = flat_pos
+    efo = cu.to(torch.int32)
+
+    # ── Gold: per-expert forward (pure Python, no padding) ──
+    x_gathered = x[x_gather.long()]  # (TK, H)
+    y1_all = torch.zeros(TK, I, dtype=torch.float32, device=device)
+    y2_all = torch.zeros(TK, H, dtype=torch.float32, device=device)
+    for e in range(E):
+        s, end = cu_cpu[e], cu_cpu[e + 1]
+        if s >= end:
+            continue
+        z_e = x_gathered[s:end] @ w1[e].T  # (n, 2I)
+        gate, up = z_e[:, :I], z_e[:, I:]
+        y1_all[s:end] = F.silu(gate) * up
+        y2_all[s:end] = y1_all[s:end] @ w2[e].T  # (n, H)
+
+    # Scatter with scores
+    o_gold = torch.zeros(T, H, dtype=torch.float32, device=device)
+    for t in range(T):
+        for k in range(K):
+            flat = t * K + k
+            sp = s_reverse[flat].item()
+            o_gold[t] += y2_all[sp] * topk_scores[t, k]
+
+    # ── Pad routing metadata ──
+    (pefo, pxg, pss, psr, pscores, pt, padded) = _pad_routing_metadata(
+        efo, x_gather, s_scatter, s_reverse,
+        topk_scores.flatten(), TK, T, E, K,
+    )
+    assert padded, f"Expected padding for T={T}, E={E} but got no padding"
+    pefo_cpu = pefo.cpu().tolist()
+
+    # ── Verify structural invariants ──
+    from sonicmoe.quack_utils.blockscaled_fp8_gemm import _get_padding_plan
+    _, _, _, dst_idx = _get_padding_plan(efo, TK)
+
+    # (A) All real tokens preserved at dst_idx positions
+    assert torch.equal(pxg[dst_idx], x_gather), "x_gather_idx: real tokens not preserved"
+
+    # (B) Original scores preserved
+    assert torch.equal(pscores[:TK], topk_scores.flatten()), "scores: real scores not preserved"
+
+    # (C) Padding scores are zero
+    assert (pscores[TK:] == 0).all(), "scores: padding scores not zero"
+
+    # (D) All padded segments are 128-aligned
+    for e in range(E):
+        seg_len = pefo_cpu[e + 1] - pefo_cpu[e]
+        assert seg_len % 128 == 0, f"Expert {e}: padded segment {seg_len} not 128-aligned"
+
+    # (E) s_reverse_scatter_idx stays (T*K,) — same number of real tokens
+    assert psr.shape[0] == TK, f"s_reverse_scatter_idx resized: {psr.shape[0]} != {TK}"
+
+    # ── Gold with padded metadata (same per-expert Python, on padded layout) ──
+    x_gathered_pad = x[pxg.long()]  # (padded_total, H) — padding rows gather x[0]
+    y1_pad = torch.zeros(pt, I, dtype=torch.float32, device=device)
+    y2_pad = torch.zeros(pt, H, dtype=torch.float32, device=device)
+    for e in range(E):
+        s, end = pefo_cpu[e], pefo_cpu[e + 1]
+        if s >= end:
+            continue
+        z_e = x_gathered_pad[s:end] @ w1[e].T
+        gate, up = z_e[:, :I], z_e[:, I:]
+        y1_pad[s:end] = F.silu(gate) * up
+        y2_pad[s:end] = y1_pad[s:end] @ w2[e].T
+
+    # Scatter padded y2 with padded scores → o_padded
+    o_padded = torch.zeros(T, H, dtype=torch.float32, device=device)
+    for t in range(T):
+        for k in range(K):
+            flat = t * K + k
+            sp = psr[flat].item()          # remapped sorted position in padded space
+            score = pscores[flat].item()   # original score (first T*K entries)
+            o_padded[t] += y2_pad[sp] * score
+
+    # ── The axiom: o_padded == o_gold for every token ──
+    max_diff = (o_padded - o_gold).abs().max().item()
+    per_token_match = (o_padded - o_gold).abs().max(dim=1).values
+    all_match = (per_token_match < 1e-5).all()
+
+    print(f"  pad_routing axiom: max_diff={max_diff:.2e}, all_tokens_match={all_match.item()}")
+    print(f"  per_token_max_diff: {per_token_match.tolist()}")
+    print(f"  padding: TK={TK} → padded_total={pt}, N_pad={pt - TK}")
+
+    assert all_match, (
+        f"Padding changed output for some tokens! max_diff={max_diff:.2e}\n"
+        f"per_token: {per_token_match.tolist()}"
+    )
+    # Extra: verify no token was silently zeroed out
+    for t in range(T):
+        assert o_gold[t].abs().max() > 1e-8, f"Gold output for token {t} is suspiciously zero"
+        assert o_padded[t].abs().max() > 1e-8, f"Padded output for token {t} is suspiciously zero"
