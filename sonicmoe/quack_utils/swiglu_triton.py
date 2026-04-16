@@ -4,11 +4,11 @@ The interleaved layout stores gate/up pairs as z(TK, 2I) where:
   z[:, 0::2] = gate,  z[:, 1::2] = up
 
 Provides seven kernel variants:
-  1. SwiGLU → bf16 (unfused, for non-fp8 paths)
-  2. SwiGLU → blockscaled fp8 + raw e8m0 scales (fused forward quant)
-  3. dSwiGLU → blockscaled fp8 + raw e8m0 scales (fused backward quant)
-  4. SwiGLU → blockscaled fp8 + ISA-packed e8m0 scales (fused forward quant+pack)
-  5. dSwiGLU → blockscaled fp8 + ISA-packed e8m0 scales (fused backward quant+pack)
+  1. SwiGLU -> bf16 (unfused, for non-fp8 paths)
+  2. SwiGLU -> blockscaled fp8 + raw e8m0 scales (fused forward quant)
+  3. dSwiGLU -> blockscaled fp8 + raw e8m0 scales (fused backward quant)
+  4. SwiGLU -> blockscaled fp8 + ISA-packed e8m0 scales (fused forward quant+pack)
+  5. dSwiGLU -> blockscaled fp8 + ISA-packed e8m0 scales (fused backward quant+pack)
   6. dSwiGLU from FP8 z: fused dequant + backward (eliminates bf16 z materialization)
   7. dSwiGLU from FP8 z + dz quant+pack: fused dequant + backward + dz fp8 ISA-pack
      (eliminates bf16 z materialization AND separate dz quantize for act-grad GEMM)
@@ -20,8 +20,12 @@ step entirely.
 """
 
 import torch
+
+_E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", torch.uint8)
+
 import triton
 import triton.language as tl
+from ..triton_utils import wrap_triton_kernel
 
 _GROUP_SIZE: tl.constexpr = 32  # 1×32 blockscaled granularity
 
@@ -33,9 +37,10 @@ _SF_TILE_STORAGE = _SF_TILE_M * (_SF_TILE_K // _SF_VEC_SIZE)  # 512
 
 
 # ===================================================================
-# Forward: z(TK, 2I) → y1(TK, I) bf16  (unfused, legacy)
+# Forward: z(TK, 2I) -> y1(TK, I) bf16  (unfused, legacy)
 # ===================================================================
 
+@wrap_triton_kernel
 @triton.jit
 def _swiglu_fwd_kernel(
     Z_ptr, Y1_ptr,
@@ -62,7 +67,7 @@ def _swiglu_fwd_kernel(
 
 
 def swiglu_forward_triton(z: torch.Tensor) -> torch.Tensor:
-    """Fused SwiGLU forward: z(TK, 2I) → y1(TK, I)."""
+    """Fused SwiGLU forward: z(TK, 2I) -> y1(TK, I)."""
     TK, two_I = z.shape
     assert two_I % 2 == 0
     I = two_I // 2
@@ -81,9 +86,10 @@ def swiglu_forward_triton(z: torch.Tensor) -> torch.Tensor:
 
 
 # ===================================================================
-# Forward fused: z(TK, 2I) → y1_fp8(TK, I) + e8m0_scales(TK, I//32)
+# Forward fused: z(TK, 2I) -> y1_fp8(TK, I) + e8m0_scales(TK, I//32)
 # ===================================================================
 
+@wrap_triton_kernel
 @triton.jit
 def _swiglu_fwd_quant_kernel(
     Z_ptr, Y1_FP8_ptr, SCALE_ptr,
@@ -164,7 +170,7 @@ def swiglu_forward_quant_triton(
 
 
 # ===================================================================
-# Forward fused+packed: z(TK, 2I) → y1_fp8(TK, I) + ISA-packed scales
+# Forward fused+packed: z(TK, 2I) -> y1_fp8(TK, I) + ISA-packed scales
 # ===================================================================
 
 def _div_up(x: int, y: int) -> int:
@@ -175,6 +181,7 @@ def _storage_per_batch(rows: int, cols: int) -> int:
     return _div_up(rows, _SF_TILE_M) * _div_up(cols, _SF_TILE_K) * _SF_TILE_STORAGE
 
 
+@wrap_triton_kernel
 @triton.jit
 def _swiglu_fwd_quant_pack_kernel(
     Z_ptr, Y1_FP8_ptr, PACKED_SCALE_ptr,
@@ -245,6 +252,7 @@ def _swiglu_fwd_quant_pack_kernel(
         tl.store(PACKED_SCALE_ptr + packed_offset, e8m0_byte, mask=row_mask)
 
 
+@wrap_triton_kernel
 @triton.jit
 def _swiglu_fwd_quant_pack_zsave_kernel(
     Z_ptr, Y1_FP8_ptr, PACKED_SCALE_ptr, Z_FP8_ptr, Z_SCALE_ptr,
@@ -359,7 +367,7 @@ def swiglu_forward_quant_pack_triton(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused SwiGLU forward + blockscaled fp8 quantize + ISA scale pack.
 
-    Single Triton kernel: z(TK, 2I) → y1_fp8(TK, I) + ISA-packed scales.
+    Single Triton kernel: z(TK, 2I) -> y1_fp8(TK, I) + ISA-packed scales.
     No intermediate bf16 y1 tensor. Scales are in ISA tile layout ready
     for direct consumption by CUTLASS blockscaled GEMMs.
 
@@ -399,7 +407,7 @@ def swiglu_forward_quant_pack_triton(
         SF_TILE_M=_SF_TILE_M,
         SF_TILE_STORAGE=_SF_TILE_STORAGE,
     )
-    return y1_fp8, packed_scales.view(torch.float8_e8m0fnu)
+    return y1_fp8, packed_scales.view(_E8M0_DTYPE)
 
 
 def swiglu_forward_quant_pack_zsave_triton(
@@ -456,16 +464,17 @@ def swiglu_forward_quant_pack_zsave_triton(
     )
     return (
         y1_fp8,
-        packed_scales.view(torch.float8_e8m0fnu),
+        packed_scales.view(_E8M0_DTYPE),
         z_fp8,
-        z_scales.view(torch.float8_e8m0fnu),
+        z_scales.view(_E8M0_DTYPE),
     )
 
 
 # ===================================================================
-# Backward: (dy1, z, s) → (dz, y1s, ds) bf16  (unfused, legacy)
+# Backward: (dy1, z, s) -> (dz, y1s, ds) bf16  (unfused, legacy)
 # ===================================================================
 
+@wrap_triton_kernel
 @triton.jit
 def _swiglu_bwd_kernel(
     DY1_ptr, Z_ptr, S_ptr,
@@ -533,7 +542,7 @@ def swiglu_backward_triton(
     z: torch.Tensor,
     s: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fused SwiGLU backward: (dy1, z, s) → (dz, y1s, ds).
+    """Fused SwiGLU backward: (dy1, z, s) -> (dz, y1s, ds).
 
     Args:
         dy1: (TK, I) gradient w.r.t. post-activation y1
@@ -564,10 +573,11 @@ def swiglu_backward_triton(
 
 
 # ===================================================================
-# Backward from FP8: (dy1, z_fp8, z_scales, s) → dz(bf16), y1s, ds
+# Backward from FP8: (dy1, z_fp8, z_scales, s) -> dz(bf16), y1s, ds
 # Fuses dequantize + SwiGLU backward, skipping bf16 z materialization.
 # ===================================================================
 
+@wrap_triton_kernel
 @triton.jit
 def _swiglu_bwd_from_fp8_kernel(
     DY1_ptr, Z_FP8_ptr, Z_SCALE_ptr, S_ptr,
@@ -585,7 +595,7 @@ def _swiglu_bwd_from_fp8_kernel(
 
     Reads z in FP8 + E8M0 scales, dequantizes on-the-fly, computes dSwiGLU.
     Eliminates the bf16 z materialization (saves TK*2I*2 bytes DRAM + 1 kernel).
-    Also strictly more precise: fp8→f32 directly (no bf16 roundtrip).
+    Also strictly more precise: fp8->f32 directly (no bf16 roundtrip).
     """
     row = tl.program_id(0)
     dy_base = DY1_ptr + row * stride_dy_row
@@ -613,7 +623,7 @@ def _swiglu_bwd_from_fp8_kernel(
         scales_e8m0 = tl.load(zscale_base + scale_idx, mask=mask)
         scale_f32 = (scales_e8m0.to(tl.int32) << 23).to(tl.float32, bitcast=True)
 
-        # Dequantize fp8 → f32 (skip bf16 intermediate for better precision)
+        # Dequantize fp8 -> f32 (skip bf16 intermediate for better precision)
         gate = gate_fp8.to(tl.float32) * scale_f32
         up = up_fp8.to(tl.float32) * scale_f32
 
@@ -695,9 +705,10 @@ def swiglu_backward_from_fp8_triton(
 
 
 # ===================================================================
-# Backward fused: (dy1, z, s) → dz_fp8 + scales, y1s(bf16), ds
+# Backward fused: (dy1, z, s) -> dz_fp8 + scales, y1s(bf16), ds
 # ===================================================================
 
+@wrap_triton_kernel
 @triton.jit
 def _swiglu_bwd_quant_kernel(
     DY1_ptr, Z_ptr, S_ptr,
@@ -727,7 +738,7 @@ def _swiglu_bwd_quant_kernel(
     s_val = tl.load(S_ptr + row).to(tl.float32)
     ds_acc = 0.0
 
-    # 2I columns → 2I/32 groups for dz quantization
+    # 2I columns -> 2I/32 groups for dz quantization
     # Each group of 32 dz elements = 16 (d_gate, d_up) pairs
     PAIRS_PER_GROUP: tl.constexpr = GROUP_SIZE // 2  # 16
 
@@ -823,9 +834,10 @@ def swiglu_backward_quant_triton(
 
 
 # ===================================================================
-# Dequantize: blockscaled fp8 (TK, D) + e8m0 scales → bf16 (TK, D)
+# Dequantize: blockscaled fp8 (TK, D) + e8m0 scales -> bf16 (TK, D)
 # ===================================================================
 
+@wrap_triton_kernel
 @triton.jit
 def _dequant_blockscaled_fp8_kernel(
     FP8_ptr, SCALES_ptr, OUT_ptr,
@@ -883,10 +895,11 @@ def dequantize_blockscaled_fp8(
 
 
 # ===================================================================
-# Backward fused+packed: (dy1, z, s) → dz_fp8 + ISA-packed scales,
+# Backward fused+packed: (dy1, z, s) -> dz_fp8 + ISA-packed scales,
 #                         y1s(bf16), ds
 # ===================================================================
 
+@wrap_triton_kernel
 @triton.jit
 def _swiglu_bwd_quant_pack_kernel(
     DY1_ptr, Z_ptr, S_ptr,
@@ -1075,14 +1088,15 @@ def swiglu_backward_quant_pack_triton(
         WRITE_DZ_BF16=write_dz_bf16,
     )
     if write_dz_bf16:
-        return dz_fp8, dz_packed_scales.view(torch.float8_e8m0fnu), y1s, ds, dz_bf16
-    return dz_fp8, dz_packed_scales.view(torch.float8_e8m0fnu), y1s, ds
+        return dz_fp8, dz_packed_scales.view(_E8M0_DTYPE), y1s, ds, dz_bf16
+    return dz_fp8, dz_packed_scales.view(_E8M0_DTYPE), y1s, ds
 
 
 # ===================================================================
 # Backward fused: FP8-z dequant + dSwiGLU + dz bf16 + dz fp8 ISA-pack
 # ===================================================================
 
+@wrap_triton_kernel
 @triton.jit
 def _swiglu_bwd_from_fp8_quant_pack_kernel(
     DY1_ptr, Z_FP8_ptr, Z_SCALE_ptr, S_ptr,
@@ -1275,4 +1289,4 @@ def swiglu_backward_from_fp8_quant_pack_triton(
         SF_TILE_M=_SF_TILE_M,
         SF_TILE_STORAGE=_SF_TILE_STORAGE,
     )
-    return dz, dz_fp8, dz_packed_scales.view(torch.float8_e8m0fnu), y1s, ds
+    return dz, dz_fp8, dz_packed_scales.view(_E8M0_DTYPE), y1s, ds

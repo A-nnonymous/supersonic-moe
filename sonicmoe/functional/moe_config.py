@@ -121,7 +121,7 @@ class HopperWgmma_MoE_Up_proj_Fwd:
         self.max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(
             up_config.cluster_shape_mnk[0] * up_config.cluster_shape_mnk[1]
         )
-        self.current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        self.current_stream = cuda.CUstream(torch.cuda.current_stream().stream_base.raw_stream)
 
     @cute.jit
     def __call__(
@@ -472,7 +472,7 @@ class HopperWgmma_MoE_Up_proj_ActGrad_Bwd:
         self.max_active_clusters = cutlass.utils.HardwareInfo().get_max_active_clusters(
             dx_config.cluster_shape_mnk[0] * dx_config.cluster_shape_mnk[1]
         )
-        self.current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        self.current_stream = cuda.CUstream(torch.cuda.current_stream().stream_base.raw_stream)
 
     @cute.jit
     def __call__(

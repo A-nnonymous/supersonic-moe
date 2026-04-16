@@ -7,7 +7,7 @@ from typing import Callable, NamedTuple, Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.torch as cutlass_torch
+import cuda.bindings.driver as cuda
 import cutlass.utils.blackwell_helpers as sm100_utils
 import quack.activation
 import quack.sm90_utils as sm90_utils
@@ -27,10 +27,11 @@ from quack.layout_utils import permute_gated_Cregs_b16
 
 from torch import Tensor
 
+_E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", torch.uint8)
 
 _TORCH_TO_CUTLASS_DTYPE = {
     torch.float8_e4m3fn: cutlass.Float8E4M3FN,
-    torch.float8_e8m0fnu: cutlass.Float8E8M0FNU,
+    _E8M0_DTYPE: cutlass.Float8E8M0FNU,
     torch.uint8: cutlass.Uint8,
     torch.float16: cutlass.Float16,
     torch.bfloat16: cutlass.BFloat16,
@@ -41,7 +42,7 @@ _TORCH_TO_CUTLASS_DTYPE = {
 
 
 def _is_runtime_fp8_tensor(tensor: Tensor) -> bool:
-    return tensor.dtype in {torch.float8_e4m3fn, torch.float8_e8m0fnu}
+    return tensor.dtype in {torch.float8_e4m3fn, _E8M0_DTYPE}
 
 
 def _make_cute_tensor_dynamic(tensor: Tensor, leading_dim: int) -> cute.Tensor:
@@ -191,7 +192,7 @@ class BlockscaledScaleStore(EpiOp):
         if const_expr(param is not None):
             tile_M = gemm.cta_tile_shape_mnk[0]
             tile_N = gemm.cta_tile_shape_mnk[1]
-            # Thread-to-M-row: SM100 Ld32x32bOp maps tidx → M-row within tile
+            # Thread-to-M-row: SM100 Ld32x32bOp maps tidx -> M-row within tile
             m_in_tile = ctx.tidx % tile_M
             if const_expr(ctx.varlen_manager.varlen_m):
                 batch_start = ctx.varlen_manager.params.cu_seqlens_m[ctx.tile_coord_mnkl[3]]
@@ -449,7 +450,7 @@ def gemm_gated(
         A_idx,
     )
 
-    current_stream = cutlass_torch.current_stream()
+    current_stream = cuda.CUstream(torch.cuda.current_stream().stream_base.raw_stream)
 
     blockscaled = a_scales is not None and b_scales is not None
     sf_vec_size = 32 if blockscaled else None

@@ -7,7 +7,7 @@ from typing import Callable, NamedTuple, Optional
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.torch as cutlass_torch
+import cuda.bindings.driver as cuda
 import quack.activation
 import quack.layout_utils as layout_utils
 import quack.utils as utils
@@ -31,10 +31,11 @@ from quack.gemm_sm100 import GemmSm100
 from quack.gemm_wrapper_utils import GemmWrapperBase
 from torch import Tensor
 
+_E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", torch.uint8)
 
 _TORCH_TO_CUTLASS_DTYPE = {
     torch.float8_e4m3fn: cutlass.Float8E4M3FN,
-    torch.float8_e8m0fnu: cutlass.Float8E8M0FNU,
+    _E8M0_DTYPE: cutlass.Float8E8M0FNU,
     torch.uint8: cutlass.Uint8,
     torch.int16: cutlass.Int16,
     torch.float16: cutlass.Float16,
@@ -46,7 +47,7 @@ _TORCH_TO_CUTLASS_DTYPE = {
 
 
 def _is_runtime_fp8_tensor(tensor: Tensor) -> bool:
-    return tensor.dtype in {torch.float8_e4m3fn, torch.float8_e8m0fnu}
+    return tensor.dtype in {torch.float8_e4m3fn, _E8M0_DTYPE}
 
 
 def _make_cute_tensor_dynamic(tensor: Tensor, leading_dim: int) -> cute.Tensor:
@@ -239,7 +240,7 @@ class GemmDGatedSm100(GemmDGatedMixin, GemmSm100):
 
 @dsl_user_op
 def _fp8e4m3_to_f32(x, *, loc=None, ip=None) -> Float32:
-    """Convert scalar f8E4M3FN to f32 via PTX: fp8 → f16 → f32."""
+    """Convert scalar f8E4M3FN to f32 via PTX: fp8 -> f16 -> f32."""
     from cutlass._mlir.dialects import arith as _arith
     x_i8 = llvm.bitcast(T.i8(), x.ir_value(loc=loc, ip=ip) if hasattr(x, 'ir_value') else x,
                          loc=loc, ip=ip)
@@ -397,7 +398,7 @@ class GemmDGatedFP8PreActMixin(GemmDGatedMixin):
                 tRS_rFP8[2 * i] = fp8_tensor[m_abs, n0]
                 tRS_rFP8[2 * i + 1] = fp8_tensor[m_abs, n0 + Int32(1)]
 
-            # Vectorized fp8→f32 (DSL auto-packs vec4 → nvgpu.cvt_fpext)
+            # Vectorized fp8->f32 (DSL auto-packs vec4 -> nvgpu.cvt_fpext)
             tRS_rXY_f32x2 = cute.make_rmem_tensor(tRS_rXY_bf16_layout.shape, Float32)
             tRS_rXY_f32x2.store(tRS_rFP8.load().to(Float32))
 
@@ -509,20 +510,20 @@ class GemmDGatedFP8PreActMixin(GemmDGatedMixin):
 class GemmDGatedFP8CLoadMixin(GemmDGatedMixin):
     """GemmDGated with TMA-based fp8 C load.
 
-    Loads fp8 z (PreAct) via TMA to smem, then fp8→f32 conversion in registers.
+    Loads fp8 z (PreAct) via TMA to smem, then fp8->f32 conversion in registers.
     Eliminates 384MB z_bf16 temporary buffer.
 
     Key insight: View z_fp8 (TK, 2I) fp8 as (TK, I) Int16 to match D's shape.
     Each Int16 = 2 packed fp8 values (gate + up), mirroring D's f32 = 2 packed bf16.
     This avoids changing the epi_tile (shared by kernel for both C and D).
 
-    C tensor: z_fp8.view(int16) → (TK, I) Int16
+    C tensor: z_fp8.view(int16) -> (TK, I) Int16
     Scale tensor: z_scales (TK, 2I/32) uint8 — loaded via EpiOp LDG
 
     Key overrides:
     - _setup_attributes: create Int16 smem layout for C (same epi_tile, different dtype)
-    - epilog_smem_load_and_partition: double the register layout (Int16 → 2 fp8 elements)
-    - epi_visit_subtile: unpack Int16 → 2 fp8 → 2 f32 + blockscaled dequant + dSwiGLU
+    - epilog_smem_load_and_partition: double the register layout (Int16 -> 2 fp8 elements)
+    - epi_visit_subtile: unpack Int16 -> 2 fp8 -> 2 f32 + blockscaled dequant + dSwiGLU
     - epi_to_underlying_arguments: handle Int16 c_dtype
     """
 
@@ -558,7 +559,7 @@ class GemmDGatedFP8CLoadMixin(GemmDGatedMixin):
         super()._setup_attributes(epilogue_args, varlen_args)
         if const_expr(self.c_dtype is not None and self.c_dtype == cutlass.Int16):
             import cutlass.utils.blackwell_helpers as sm100_utils
-            # Int16 C: same shape as D, but 16-bit element → different smem swizzle
+            # Int16 C: same shape as D, but 16-bit element -> different smem swizzle
             self.epi_c_smem_layout_staged = sm100_utils.make_smem_layout_epi(
                 self.c_dtype, self.c_layout, self.epi_tile, self.epi_c_stage
             )
@@ -569,7 +570,7 @@ class GemmDGatedFP8CLoadMixin(GemmDGatedMixin):
         """Override: for Int16 C, keep register layout same as D (N elements).
 
         Int16 C has N elements (same as D's N f32). No doubling needed here.
-        In epi_visit_subtile, we recast N Int16 → 2N fp8 → 2N f32.
+        In epi_visit_subtile, we recast N Int16 -> 2N fp8 -> 2N f32.
         """
         if const_expr(dtype == cutlass.Int16):
             # Same register shape as D (N elements), just Int16 dtype.
@@ -605,7 +606,7 @@ class GemmDGatedFP8CLoadMixin(GemmDGatedMixin):
         if const_expr(self.c_dtype == cutlass.Int16):
             # ── Int16 C path: tRS_rC has N Int16 elements from TMA ──
             # Each Int16 = 2 packed fp8 values (gate + up)
-            # Recast N Int16 → 2N fp8, then convert to 2N f32
+            # Recast N Int16 -> 2N fp8, then convert to 2N f32
             tRS_rC_fp8 = cute.recast_tensor(tRS_rC, cutlass.Float8E4M3FN)
             tRS_rXY_f32x2 = cute.make_rmem_tensor(tRS_rC_fp8.layout.shape, Float32)
             tRS_rXY_f32x2.store(tRS_rC_fp8.load().to(Float32))
@@ -773,7 +774,7 @@ def gemm_dgated(
         else:
             Out = Out.mT.view(torch.float32).mT
         # View fp8 (TK, 2I) as int16 (TK, I) — 2 fp8 per int16
-        PreAct = preact_fp8.view(torch.int16)  # (TK, 2I) fp8 → (TK, I) int16
+        PreAct = preact_fp8.view(torch.int16)  # (TK, 2I) fp8 -> (TK, I) int16
     else:
         assert Out.dtype == PreAct.dtype
         implicit_dtype = torch2cute_dtype_map[Out.dtype]
@@ -881,7 +882,7 @@ def gemm_dgated(
         A_idx,
     )
 
-    current_stream = cutlass_torch.current_stream()
+    current_stream = cuda.CUstream(torch.cuda.current_stream().stream_base.raw_stream)
 
     blockscaled = a_scales is not None and b_scales is not None
     sf_vec_size = 32 if blockscaled else None

@@ -5,6 +5,7 @@
 from functools import partial
 from typing import Literal, Optional, Tuple
 
+import paddle
 import torch
 from quack.autotuner import AutotuneConfig, autotune
 from quack.cute_dsl_utils import get_device_capacity
@@ -12,11 +13,31 @@ from quack.gemm_config import GemmConfig, get_all_configs
 from quack.gemm_interface import default_config, prune_invalid_gemm_configs as prune_invalid_gemm_configs_base
 from torch import Tensor
 
+
+def _custom_op_or_plain(name, **kwargs):
+    """torch.library.custom_op that falls back to plain function if already registered."""
+    def decorator(fn):
+        try:
+            return torch.library.custom_op(name, **kwargs)(fn)
+        except ValueError:
+            return fn
+    return decorator
+
+
+def _register_fake_safe(name):
+    """torch.library.register_fake that silently skips if registration fails."""
+    def decorator(fn):
+        try:
+            return torch.library.register_fake(name)(fn)
+        except (ValueError, RuntimeError):
+            return fn
+    return decorator
+
 from .gemm_dgated import gemm_dgated as gemm_dgated_sm90_sm100
 from .gemm_gated import gemm_gated as gemm_gated_sm90_sm100
 
 
-default_device_capacity = get_device_capacity(torch.device("cuda"))
+default_device_capacity = get_device_capacity(paddle.device("cuda"))
 
 
 def _uses_blockscaled_runtime(a_scales: Optional[Tensor], b_scales: Optional[Tensor]) -> bool:
@@ -251,7 +272,7 @@ def gemm_gated(
     return preact_out, postact_out
 
 
-@torch.library.custom_op(
+@_custom_op_or_plain(
     "quack::gemm_gated_out",
     mutates_args=("preact_out", "postact_out"),
     device_types="cuda",
@@ -340,7 +361,7 @@ def gemm_dgated(
         return dx_out, postact_out, colvec_reduce_final
 
 
-@torch.library.custom_op(
+@_custom_op_or_plain(
     "quack::gemm_dgated_out",
     mutates_args=("dx_out", "postact_out"),
     device_types="cuda",
@@ -382,7 +403,7 @@ def gemm_dgated_out(
     )
 
 
-@torch.library.register_fake("quack::gemm_dgated_out")
+@_register_fake_safe("quack::gemm_dgated_out")
 def gemm_dgated_out_fake(
     A: Tensor,  # (M, K) or (L, M, K) or (total_M, K) if varlen_m or (whatever, K) if gather_A with varlen_m
     B: Tensor,  # (K, N) or (L, K, N)

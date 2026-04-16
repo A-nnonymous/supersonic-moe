@@ -39,6 +39,7 @@ import triton.language as tl
 
 from ..functional.fp8_protocol import FP8Protocol, FP8ScaleGranularity
 from ..functional.fp8_quant import quantize_activation_blockwise
+from ..triton_utils import wrap_triton_kernel
 
 _VEC_SIZE = 32  # blockscale granularity (E8M0 group size)
 
@@ -53,6 +54,7 @@ def _prune_blockscaled_configs(configs, nargs, **kwargs):
     return [c for c in configs if c.kwargs.get("BLOCK_K", 32) <= K]
 
 
+@wrap_triton_kernel
 @triton.autotune(
     configs=[
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128}, num_stages=3, num_warps=8),
@@ -203,8 +205,8 @@ def precompute_weight_fp8_raw_scales(
     w_scales : Tensor (E, H, I // 32) uint8 — raw E8M0 blockscales along I.
     """
     key = (
-        w.untyped_storage().data_ptr(),
-        w._version,
+        w.data_ptr(),
+        w._inplace_version(),
         tuple(w.shape),
         tuple(w.stride()),
     )
@@ -212,11 +214,11 @@ def precompute_weight_fp8_raw_scales(
     if cached is not None:
         return cached
 
-    # (H, I, E) → (E, H, I) contiguous.  Blockscales along last dim = I = K.
+    # (H, I, E) -> (E, H, I) contiguous.  Blockscales along last dim = I = K.
     w_ehi = w.permute(2, 0, 1).contiguous()
     proto = FP8Protocol(scale_granularity=FP8ScaleGranularity.BLOCK_1X32)
     w_fp8, w_scales_e8m0 = quantize_activation_blockwise(w_ehi, proto)
-    # e8m0fnu → uint8 view (same bits)
+    # e8m0fnu -> uint8 view (same bits)
     w_scales_raw = w_scales_e8m0.view(torch.uint8).contiguous()
 
     result = (w_fp8, w_scales_raw)

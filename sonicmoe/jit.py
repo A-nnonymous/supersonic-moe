@@ -9,19 +9,26 @@ from typing import Callable
 from uuid import uuid4
 
 import torch
+from filelock import FileLock
 from torch.utils.cpp_extension import load as load_cpp_extension
 
 
 _CPP_MODULE_PREFIX = "sonicmoe"
-_GLOBAL_RANK = int(os.getenv("RANK", 0))
-_WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
+# _GLOBAL_RANK = int(os.getenv("RANK", 0))
+# _WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
 
 _ALL_COMPILED_MODULES = {}
 
 
-@torch.compiler.disable
+# @torch.compiler.disable
 def _get_cpp_function(function_name: str, module_name: str, source_files: list[str], build_directory: str) -> Callable:
     module_name = f"{_CPP_MODULE_PREFIX}_{module_name}"
+
+    if torch.distributed.is_initialized():
+        _GLOBAL_RANK = torch.distributed.get_rank()
+        _WORLD_SIZE = torch.distributed.get_world_size()
+    else:
+        _WORLD_SIZE = 1
 
     extra_cflags = ["-O3", "-Wall", "-shared", "-fPIC", "-fdiagnostics-color"]
     extra_cuda_cflags = ["-O3", "-lineinfo"]
@@ -34,53 +41,20 @@ def _get_cpp_function(function_name: str, module_name: str, source_files: list[s
     module = _ALL_COMPILED_MODULES.get(module_name, None)
 
     if module is None:
-        if torch.distributed.is_initialized():
-            os.makedirs(build_directory, exist_ok=True)
+        os.makedirs(build_directory, exist_ok=True)
 
-            if _GLOBAL_RANK == 0:
-                module = load_cpp_extension(
-                    module_name,
-                    sources=source_files,
-                    with_cuda=True,
-                    extra_cflags=extra_cflags,
-                    extra_cuda_cflags=extra_cuda_cflags,
-                    extra_include_paths=extra_include_paths,
-                    build_directory=build_directory,
-                    verbose=True,
-                )
-
-            torch.distributed.barrier()
-
-            if _GLOBAL_RANK != 0:
-                module = load_cpp_extension(
-                    module_name,
-                    sources=source_files,
-                    with_cuda=True,
-                    extra_cflags=extra_cflags,
-                    extra_cuda_cflags=extra_cuda_cflags,
-                    extra_include_paths=extra_include_paths,
-                    build_directory=build_directory,
-                    verbose=False,
-                )
-        else:
-            if _WORLD_SIZE > 1:
-                build_directory = os.path.join(build_directory, str(uuid4()))
-
-            os.makedirs(build_directory, exist_ok=True)
-
+        lock_path = os.path.join(build_directory, f"{module_name}.lock")
+        with FileLock(lock_path):
             module = load_cpp_extension(
                 module_name,
                 sources=source_files,
-                with_cuda=True,
-                extra_cflags=extra_cflags,
+                # with_cuda=True,
+                extra_cxx_cflags=extra_cflags,
                 extra_cuda_cflags=extra_cuda_cflags,
                 extra_include_paths=extra_include_paths,
                 build_directory=build_directory,
                 verbose=True,
             )
-
-            if _WORLD_SIZE > 1:
-                rmtree(build_directory, ignore_errors=True)
 
         _ALL_COMPILED_MODULES[module_name] = module
 

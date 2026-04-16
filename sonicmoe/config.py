@@ -7,7 +7,7 @@
 Replaces environment-variable-based configuration with a structured dataclass.
 Environment variables are still respected as the lowest-priority fallback.
 
-Priority order (highest → lowest):
+Priority order (highest -> lowest):
   1. Explicit field values in ``SonicMoEConfig``
   2. ``enable_fp8()`` / ``enable_quack_gemm()`` context managers
   3. Environment variables (``SONIC_MOE_FP8_MODE``, ``USE_QUACK_GEMM``, etc.)

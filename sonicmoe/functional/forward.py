@@ -2,6 +2,8 @@
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
 
+from __future__ import annotations
+
 import cuda.bindings.driver as cuda
 import cutlass.cute as cute
 import torch
@@ -12,6 +14,7 @@ from quack.cute_dsl_utils import torch2cute_dtype_map
 
 from ..enums import LIBRARY_NAME, TENSORMAP, ActivationType
 from ..utils import convert_torch_tensor_to_cute_tensor
+from ..triton_utils import wrap_triton_kernel
 from .moe_config import HopperWgmma_MoE_Down_proj_Fwd, HopperWgmma_MoE_Up_proj_Fwd
 from .reduction_over_k_gather import token_gather_and_sum_varlen_K_triton
 from .topk_softmax import TopK_Softmax
@@ -37,7 +40,7 @@ def _topk_fwd(
     )
 
     x_tensor, values_tensor, indices_tensor = [convert_from_dlpack(tensor) for tensor in (x, values, indices)]
-    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    current_stream = cuda.CUstream(torch.cuda.current_stream().stream_base.raw_stream)
     compile_key = (input_dtype, output_dtype, N, k, require_softmax_fusion)
     if compile_key not in _topk_fwd.compile_cache:
         topk_op = TopK_Softmax(input_dtype, output_dtype, N, k, require_softmax_fusion)
@@ -202,6 +205,7 @@ def _router_forward(
     )
 
 
+@wrap_triton_kernel
 @triton.jit
 def _softmax_fwd_small_kernel(
     logits_ptr, stride_lm: tl.constexpr, stride_ln: tl.constexpr, K: tl.constexpr, BLOCK_K: tl.constexpr

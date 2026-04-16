@@ -1,9 +1,12 @@
 # ********************************************************************************
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
+from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+
+from typing import Optional
 
 import torch
 
@@ -23,7 +26,7 @@ class FP8ScaleEncoding(Enum):
 
     @property
     def torch_dtype(self) -> torch.dtype:
-        return torch.float8_e8m0fnu
+        return getattr(torch, "float8_e8m0fnu", torch.uint8)
 
 
 class FP8ScaleGranularity(Enum):
@@ -66,7 +69,7 @@ def get_default_fp8_protocol() -> FP8Protocol:
     return FP8Protocol()
 
 
-def is_blackwell_device(device: torch.device | None = None) -> bool:
+def is_blackwell_device(device: Optional[torch.device] = None) -> bool:
     if device is None:
         if not torch.cuda.is_available():
             return False
@@ -100,7 +103,7 @@ def validate_fp8_protocol(protocol: FP8Protocol) -> FP8Protocol:
 
 def validate_fp8_runtime_support(
     protocol: FP8Protocol,
-    device: torch.device | None = None,
+    device: Optional[torch.device] = None,
     quack_enabled: bool | None = None,
 ) -> FP8Protocol:
     validate_fp8_protocol(protocol)

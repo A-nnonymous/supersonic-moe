@@ -500,7 +500,7 @@ class HopperWgmma_MoE_kernel:
         block_M, block_N = tile_coord_mnkl[0], tile_coord_mnkl[1]
         M_offset = block_M * const_expr(self.tile_M) + MIdx_cur_group
 
-        tDcD0 = D_r2g_thr_copy.partition_D(tcDgcD_flat_partition[None, None, *epi_tile_layout.get_hier_coord(0)])
+        tDcD0 = D_r2g_thr_copy.partition_D(tcDgcD_flat_partition[(None, None) + tuple(epi_tile_layout.get_hier_coord(0))])
         num_load_per_thread = const_expr(cute.size(tDcD0, mode=[1]))
 
         tmDIdx = cute.make_rmem_tensor((epi_tile_num * num_load_per_thread,), dtype=mDIdx.element_type)
@@ -508,7 +508,7 @@ class HopperWgmma_MoE_kernel:
 
         for epi_idx in cutlass.range_constexpr(epi_tile_num):
             tDcD_slice = D_r2g_thr_copy.partition_D(
-                tcDgcD_flat_partition[None, None, *epi_tile_layout.get_hier_coord(epi_idx)]
+                tcDgcD_flat_partition[(None, None) + tuple(epi_tile_layout.get_hier_coord(epi_idx))]
             )
 
             for i in cutlass.range_constexpr(num_load_per_thread):
@@ -2491,7 +2491,7 @@ class HopperWgmma_MoE_kernel:
                         cute.autovec_copy(tDsD, tDrD)
 
                         tDcD_slice = D_r2g_thr_copy.partition_D(
-                            tcDgcD_flat_partition[None, None, *epi_tile_layout.get_hier_coord(epi_idx)]
+                            tcDgcD_flat_partition[(None, None) + tuple(epi_tile_layout.get_hier_coord(epi_idx))]
                         )
                         self.store_D_scatter(
                             mD_mnl,

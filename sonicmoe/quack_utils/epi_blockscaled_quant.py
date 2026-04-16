@@ -14,10 +14,10 @@
 #
 # SM100 Ld32x32bOp TMEM load: 1 M-row per thread, all N-elements local.
 # For epi_tile_n=32 (bf16 D): each thread holds 32 z-elements = 1 group.
-# → amax + E8M0 + clamp-cast is entirely register-local.
+# -> amax + E8M0 + clamp-cast is entirely register-local.
 #
 # For postact (y1): epi_tile_n/2 = 16 elements per thread = half group.
-# → Need to accumulate amax across 2 consecutive subtile visits.
+# -> Need to accumulate amax across 2 consecutive subtile visits.
 #
 # === CUTLASS DSL primitives needed ===
 #

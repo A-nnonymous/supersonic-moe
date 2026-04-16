@@ -7,6 +7,43 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
+#include <utils/scalar_type_conversion.h>
+
+#ifndef DISPATCH_INT_KERNEL
+namespace detail {
+inline at::ScalarType scalar_type(
+    at::ScalarType s) {
+  return s;
+}
+} // namespace detail
+
+#define AT_DISPATCH_SWITCH(                                           \
+    TYPE, NAME, ...)                        \
+  [&] {                                                                     \
+    const auto& the_type = TYPE;                                            \
+    constexpr const char* at_dispatch_name = NAME;                          \
+    /* don't use TYPE again in case it is an expensive or side-effect op */ \
+    at::ScalarType _st = ::detail::scalar_type(the_type);                 \
+    switch (_st) {                                                          \
+      __VA_ARGS__                                                           \
+      default:                                                              \
+        PADDLE_THROW(::common::errors::Unimplemented(                       \
+            '"',                                                            \
+            at_dispatch_name,                                               \
+            "\" not implemented for '",                                     \
+            phi::DataTypeToString(compat::_PD_AtenScalarTypeToPhiDataType(_st)), \
+            "'"));                                                           \
+    }                                                                       \
+  }()
+
+#define AT_PRIVATE_CASE_TYPE_USING_HINT(enum_type, HINT, ...) \
+  case enum_type: {                                                          \
+    using HINT [[maybe_unused]] =                                            \
+        c10::impl::ScalarTypeToCPPTypeT<enum_type>;            \
+    return __VA_ARGS__();                                                    \
+  }
+
+#endif
 
 #define CHECK_CUDA_TENSOR(x) TORCH_CHECK(x.device().is_cuda(), #x " must be a CUDA tensor")
 #define CHECK_CONTIGUOUS_TENSOR(x) TORCH_CHECK(x.is_contiguous(), #x " must be contiguous")
