@@ -2,10 +2,13 @@
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
 
+from __future__ import annotations
+
 from typing import Callable
 from contextlib import ExitStack
 
 import torch
+import paddle
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -149,7 +152,7 @@ class Experts(nn.Module):
         self, input: torch.Tensor, expert_frequency: torch.Tensor | None, return_list: bool = False
     ) -> list[torch.Tensor] | torch.Tensor:
         if isinstance(input, torch.Tensor):
-            input = input.split(expert_frequency.tolist(), dim=0)
+            input = paddle.compat.split(input, expert_frequency.tolist(), dim=0)
         else:
             assert expert_frequency is None
 
@@ -217,7 +220,7 @@ class MoE(nn.Module):
             std=std,
         )
 
-        self.stream_id = torch.cuda.current_stream().cuda_stream
+        self.stream_id = torch.cuda.current_stream().stream_base.raw_stream
 
     @torch.no_grad()
     def prefetch_fp8_weights(self, protocol: FP8Protocol) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
@@ -250,7 +253,7 @@ class MoE(nn.Module):
         w1.fp8_fused_gated_scales = w1_scales
 
         # Backward act-grad path: blockscaled_fp8_gemm_varlen expects (I, H, E) for w2^T
-        w2_for_varlen = w2.permute(1, 2, 0)  # (H, I, E) → permute for varlen
+        w2_for_varlen = w2.permute(1, 2, 0)  # (H, I, E) -> permute for varlen
         w2_fp8_varlen, w2_scales_varlen = precompute_weight_fp8(w2_for_varlen)
         w2.fp8_varlen = w2_fp8_varlen
         w2.fp8_varlen_scales = w2_scales_varlen
@@ -404,14 +407,14 @@ class MoE(nn.Module):
         dict or None
             If verify_precision: {"w1_update_norm": float, "w2_update_norm": float,
             "w1_quant_rrmse": float, "w2_quant_rrmse": float} — quantization RRMSE
-            measures how much the bf16→fp8 roundtrip loses relative to the bf16 weight.
+            measures how much the bf16->fp8 roundtrip loses relative to the bf16 weight.
         """
         assert getattr(self, '_stashed', False), (
             "optimizer_step_stashed requires weights to be stashed. "
             "Call stash_bf16_to_cpu() first."
         )
 
-        # 1. Unstash: CPU→GPU (bf16 temporarily on GPU)
+        # 1. Unstash: CPU->GPU (bf16 temporarily on GPU)
         self.unstash_bf16()
 
         # Snapshot bf16 weights before optimizer step (for precision tracking)
@@ -441,14 +444,14 @@ class MoE(nn.Module):
                 stats[f"{name}_update_rel"] = round(
                     float(update.norm().item() / bf16_post.norm().clamp(min=1e-8).item() * 100), 4
                 )
-                # Quantization error: bf16 → fp8 → bf16 roundtrip
+                # Quantization error: bf16 -> fp8 -> bf16 roundtrip
                 # Use the same quantize function as refresh_fp8_shadow_weights
                 from .quack_utils.blockscaled_fp8_gemm import _quantize_weight_3d_triton
                 enk = bf16_post.contiguous()  # (E, dim0, dim1) contiguous
                 fp8_3d, _ = _quantize_weight_3d_triton(enk)
                 # fp8_3d is (E, dim0, dim1) fp8. Dequant = cast back (loses scale info)
                 # True quant error = |bf16 - dequant(quant(bf16))|
-                # Since blockscaled uses per-32-element scales, casting fp8→bf16
+                # Since blockscaled uses per-32-element scales, casting fp8->bf16
                 # without scales gives wrong values. Instead measure the relative
                 # magnitude of the step vs the quantization grid spacing.
                 fp8_max = 448.0  # E4M3 max
@@ -460,7 +463,7 @@ class MoE(nn.Module):
                 )
             del w1_pre, w2_pre
 
-        # 5. Re-stash: bf16→CPU, free GPU (permanent stash restored)
+        # 5. Re-stash: bf16->CPU, free GPU (permanent stash restored)
         self.stash_bf16_to_cpu()
 
         return stats
@@ -468,7 +471,7 @@ class MoE(nn.Module):
     @torch.no_grad()
     def setup_cpu_optimizer(
         self,
-        optimizer_cls: type = torch.optim.Adam,
+        optimizer_cls: type = None,
         **optim_kwargs,
     ) -> None:
         """Move master weights + optimizer to CPU. Only FP8 shadows remain on GPU.
@@ -484,6 +487,8 @@ class MoE(nn.Module):
                 loss.backward()
                 stats = moe.cpu_optimizer_step()
         """
+        if optimizer_cls is None:
+            optimizer_cls = torch.optim.Adam
         self.refresh_fp8_shadow_weights()
 
         # CPU bf16 masters (pinned for fast transfers)
@@ -501,7 +506,7 @@ class MoE(nn.Module):
 
     @torch.no_grad()
     def cpu_optimizer_step(self, *, verify_precision: bool = False) -> dict | None:
-        """Optimizer step: GPU grad → CPU Adam → GPU FP8 refresh.
+        """Optimizer step: GPU grad -> CPU Adam -> GPU FP8 refresh.
 
         Bf16 weights briefly materialize on GPU only during refresh_fp8_shadow_weights.
         """
@@ -509,7 +514,7 @@ class MoE(nn.Module):
         device = self.c_fc.weight.device
         stats = {} if verify_precision else None
 
-        # 1. GPU bf16 grad → CPU fp32 master.grad
+        # 1. GPU bf16 grad -> CPU fp32 master.grad
         for name, param in self.named_parameters():
             if param.grad is not None and name in self._cpu_masters:
                 self._cpu_masters[name].grad = param.grad.float().cpu()
@@ -519,7 +524,7 @@ class MoE(nn.Module):
         self._cpu_optimizer.step()
         self._cpu_optimizer.zero_grad()
 
-        # 3. CPU master → GPU bf16 → refresh FP8 → re-stash
+        # 3. CPU master -> GPU bf16 -> refresh FP8 -> re-stash
         self.unstash_bf16()
         for name, param in self.named_parameters():
             if name in self._cpu_masters:
@@ -644,7 +649,7 @@ class MoE(nn.Module):
         selected_experts = selected_experts.flatten()
 
         with torch.no_grad():
-            sorted_expert_idxs, sorted_scattered_idxs = selected_experts.sort()
+            sorted_expert_idxs, sorted_scattered_idxs = paddle.compat.sort(selected_experts)
 
         is_num_experts_multiple_of_4 = self.num_experts % 4 == 0
 
@@ -702,7 +707,7 @@ class MoE(nn.Module):
 
             hidden_states = hidden_states * batch_gates.unsqueeze(-1)
             zeros = torch.zeros((T, self.hidden_size), dtype=torch.float32, device=hidden_states.device)
-            hidden_states = zeros.index_add(0, fan_in_index, hidden_states)
+            hidden_states = zeros.index_add(0, fan_in_index, hidden_states.float())
         else:
             raise ValueError(f"unexpected kernel_backend_moe ({kernel_backend_moe})")
 

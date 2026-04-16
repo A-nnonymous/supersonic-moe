@@ -2,6 +2,8 @@
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
 
+from __future__ import annotations
+
 import torch
 
 from .fp8_protocol import FP8Protocol, validate_fp8_runtime_support

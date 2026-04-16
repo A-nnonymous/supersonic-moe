@@ -7,6 +7,8 @@ import math
 from typing import Optional
 
 import torch
+
+_E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", torch.uint8)
 from torch import Tensor
 
 import cutlass
@@ -115,9 +117,9 @@ class ColwiseQuantOp:
         else:
             # Cooperative coalesced gather: warp-level row loads.
             # Each warp loads 1 full row per iteration (32 consecutive cols
-            # by 32 lanes → perfectly coalesced along dim axis).
+            # by 32 lanes -> perfectly coalesced along dim axis).
             # 8 warps × 32 iterations = 256 rows = TILE_TK.
-            # NCU-guided: fixes 2.1 bytes/sector LD efficiency → ~32 bytes/sector.
+            # NCU-guided: fixes 2.1 bytes/sector LD efficiency -> ~32 bytes/sector.
             warp_ld = tidx // 32
             lane_ld = tidx % 32
             dim_col_ld = bid_dim * const_expr(TILE_DIM) + lane_ld
@@ -284,7 +286,7 @@ def colwise_quantize_cute(
         else:
             scale_out = torch.full((1, per_batch_storage), 127, dtype=torch.uint8, device=src.device)
         compiled_fn(src, fp8_out, scale_out.view(-1), gather_dummy)
-        return fp8_out, scale_out.view(torch.float8_e8m0fnu)
+        return fp8_out, scale_out.view(_E8M0_DTYPE)
     else:
         scale_out = torch.empty(num_groups, dim, dtype=torch.uint8, device=src.device)
         compiled_fn(src, fp8_out, scale_out, gather_dummy)

@@ -104,7 +104,7 @@ def TC_topk_router_metadata_triton(
         E_POW2=E_POW2,
     )
 
-    torch.sum(col_partial_sum_trans, dim=1, dtype=torch.int32, out=expert_frequency)
+    expert_frequency.copy_(torch.sum(col_partial_sum_trans, dim=1, dtype=torch.int32))
     col_partial_sum = col_partial_sum_trans.T  # [n_tiles, E]
 
     # ── Kernel 2: stage1 ─────────────────────────────────────────────────────

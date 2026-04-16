@@ -2,6 +2,8 @@
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
 
+from __future__ import annotations
+
 import torch
 
 from ..enums import LIBRARY_NAME
@@ -22,7 +24,7 @@ def count_cumsum(x: torch.Tensor, E: int, do_cumsum: bool = True) -> torch.Tenso
 
     count_output = torch.empty(E, dtype=torch.int32, device=x.device)
     cumsum_output = torch.empty(E, dtype=torch.int32, device=x.device) if do_cumsum else None
-    stream = torch.cuda.current_stream(x.device).cuda_stream
+    stream = torch.cuda.current_stream(x.device).stream_base.raw_stream
 
     count_cumsum_cuda(x=x, count_output=count_output, cumsum_output=cumsum_output, stream=stream)
 

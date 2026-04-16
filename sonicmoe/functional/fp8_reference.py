@@ -2,6 +2,8 @@
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 import torch

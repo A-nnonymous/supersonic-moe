@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 
 from ..utils import get_powers_of_2
+from ..triton_utils import wrap_triton_kernel
 
 
 ### This triton impl is equivalent as the cute-dsl impl shown above,
@@ -46,6 +47,7 @@ def _prune_triton_autotune_config(configs, nargs, **kw):
         return pruned_configs
 
 
+@wrap_triton_kernel
 @triton.autotune(
     configs=_get_triton_autotune_configs(),
     key=["H", "MAX_K", "w_is_None", "is_varlen_K"],

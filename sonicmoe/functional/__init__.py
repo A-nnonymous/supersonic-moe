@@ -2,6 +2,8 @@
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
 
+from __future__ import annotations
+
 import collections
 import os
 
@@ -45,8 +47,12 @@ from .fp8_protocol import (
     validate_fp8_protocol,
     validate_fp8_runtime_support,
 )
-from .fp8_cutely_fused import apply_activation_fp8_protocol_cutely_fused
-from .fp8_cutely_fused import apply_preact_activation_fp8_protocol_cutely_fused
+try:
+    from .fp8_cutely_fused import apply_activation_fp8_protocol_cutely_fused
+    from .fp8_cutely_fused import apply_preact_activation_fp8_protocol_cutely_fused
+except ImportError:
+    apply_activation_fp8_protocol_cutely_fused = None
+    apply_preact_activation_fp8_protocol_cutely_fused = None
 from .fp8_reference import (
     FP8Tensor,
     apply_activation_fp8_protocol,
@@ -56,6 +62,8 @@ from .fp8_reference import (
 from .forward import _router_forward, _softmax_topk_fwd
 from .triton_kernels import TC_topk_router_metadata_triton
 from .utils import enable_fp8, enable_quack_gemm, is_fp8_active, is_using_quack_gemm
+
+_E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", torch.uint8)
 
 
 # ---------------------------------------------------------------------------
@@ -80,7 +88,7 @@ from ..quack_utils.blockscaled_fp8_gemm import (
 
 
 def _swiglu_forward_interleaved(z: torch.Tensor) -> torch.Tensor:
-    """Apply SwiGLU on interleaved pre-activation z(TK, 2I) → y1(TK, I)."""
+    """Apply SwiGLU on interleaved pre-activation z(TK, 2I) -> y1(TK, I)."""
     return swiglu_forward_triton(z)
 
 
@@ -105,7 +113,7 @@ def _fused_blockscaled_gated_forward(
 
     Zero-materialization path (SonicMoE design principle):
     1. quantize_and_pack_activation(x) on T-sized tensor (~2-8µs)
-    2. ISA-packed scale gather T→TK (~3-8µs, tiny I/O)
+    2. ISA-packed scale gather T->TK (~3-8µs, tiny I/O)
     3. Custom GemmGatedSm100ZeroMat kernel: T-FP8 + A_idx + TK-scales
     No TK-sized FP8 activation is materialized in HBM.
 
@@ -133,7 +141,7 @@ def _fused_blockscaled_gated_forward(
     # Step 1: Quantize at T-size (NOT TK)
     x_fp8, x_scales_t = quantize_and_pack_activation(x)
 
-    # Step 2: Gather ISA-packed scales T→TK (~3-8µs)
+    # Step 2: Gather ISA-packed scales T->TK (~3-8µs)
     TK = x_gather_idx.shape[0]
     K = x.shape[1]
     k_tiles = _div_up(K, _SF_TILE_K)
@@ -150,20 +158,20 @@ def _fused_blockscaled_gated_forward(
         SF_TILE_M=_SF_TILE_M, SF_TILE_STORAGE=_SF_TILE_STORAGE,
         BLOCK_ROWS=BLOCK_ROWS, GROUPS_PER_K_TILE=_SF_TILE_K // _SF_VEC_SIZE,
     )
-    x_scales_tk_e8m0 = x_scales_tk.view(torch.float8_e8m0fnu)
+    x_scales_tk_e8m0 = x_scales_tk.view(_E8M0_DTYPE)
     del x_scales_t
 
     # Step 3: Zero-materialization GEMM via standard interface.
     # gemm_gated() with A_idx auto-selects GemmGatedSm100ZeroMat on SM100,
     # which gathers A rows inside the kernel (no TK FP8 materialization).
     # When epilogue quant is enabled, D output is fp8 directly (no bf16 round-trip).
-    # The epilogue multiplies z by quant_scale in registers → hardware fp8 saturating
+    # The epilogue multiplies z by quant_scale in registers -> hardware fp8 saturating
     # cast writes z_fp8 to D. This eliminates the standalone z quant kernel
     # and halves D bandwidth (192MB fp8 vs 384MB bf16).
     cfg = _get_fp8_config()
     epilogue_quant = cfg.epilogue_quant and cfg.save_z_fp8
     if epilogue_quant:
-        N = w1.shape[0]  # (2I, H, E) → w1.shape[0] = 2I
+        N = w1.shape[0]  # (2I, H, E) -> w1.shape[0] = 2I
         z_scale_out = torch.empty(TK, N // 32, dtype=torch.uint8, device=x.device)
     else:
         z_scale_out = None
@@ -196,7 +204,7 @@ def _fused_blockscaled_gated_forward(
         # z is fp8 from CUTLASS.  Store in prequant cache for backward,
         # then replace with a lightweight bf16 placeholder for autograd.
         z_fp8 = z
-        z_scales = z_scale_out.view(torch.float8_e8m0fnu)
+        z_scales = z_scale_out.view(_E8M0_DTYPE)
         _PREQUANTIZED_SCALES["z_fp8"] = (z_fp8, z_scales)
         # Lightweight bf16 placeholder: 2 bytes of storage, broadcast to (TK, 2I)
         # via zero strides.  autograd only needs the tensor as a graph node;
@@ -324,17 +332,17 @@ def _padded_blockscaled_gated_forward(
     # Step 1: Quantize at T-size (same as aligned path — no padding here)
     x_fp8, x_scales_t = quantize_and_pack_activation(x)
 
-    # Step 2: Pad gather indices (padding rows → row 0, safe arbitrary data)
+    # Step 2: Pad gather indices (padding rows -> row 0, safe arbitrary data)
     padded_gather_idx = torch.zeros(
         padded_total, dtype=x_gather_idx.dtype, device=x_gather_idx.device
     )
     padded_gather_idx[dst_idx] = x_gather_idx
 
-    # Step 3: Gather ISA-packed scales T→TK_padded
+    # Step 3: Gather ISA-packed scales T->TK_padded
     K = x.shape[1]
     k_tiles = _div_up(K, _SF_TILE_K)
     per_batch_tk = _storage_per_batch(padded_total, K)
-    # padded_total is 128-aligned by construction → torch.empty is safe
+    # padded_total is 128-aligned by construction -> torch.empty is safe
     x_scales_tk = torch.empty(
         (1, per_batch_tk), dtype=torch.uint8, device=x.device
     )
@@ -353,7 +361,7 @@ def _padded_blockscaled_gated_forward(
         BLOCK_ROWS=BLOCK_ROWS,
         GROUPS_PER_K_TILE=_SF_TILE_K // _SF_VEC_SIZE,
     )
-    x_scales_tk_e8m0 = x_scales_tk.view(torch.float8_e8m0fnu)
+    x_scales_tk_e8m0 = x_scales_tk.view(_E8M0_DTYPE)
     del x_scales_t
 
     # Step 4: Weight FP8 (cached — same as aligned path)
@@ -397,7 +405,7 @@ def _use_epilogue_quant() -> bool:
     - Eliminates standalone _quantize_flat_v2_kernel (~141 µs)
     - Eliminates z.to(fp8) cast (~288 µs)
     - Never allocates bf16 z (saves 384 MiB allocation + write bandwidth)
-    - Direct fp32→fp8 path is more precise than fp32→bf16→fp8 (one less rounding)
+    - Direct fp32->fp8 path is more precise than fp32->bf16->fp8 (one less rounding)
     """
     from ..config import get_active_config
     cfg = get_active_config()
@@ -525,8 +533,8 @@ def _matches_prequant_tensor(lhs: torch.Tensor | None, rhs: torch.Tensor | None)
         and lhs.dtype == rhs.dtype
         and tuple(lhs.shape) == tuple(rhs.shape)
         and tuple(lhs.stride()) == tuple(rhs.stride())
-        and lhs.storage_offset() == rhs.storage_offset()
-        and lhs.untyped_storage().data_ptr() == rhs.untyped_storage().data_ptr()
+        and lhs._offset() == rhs._offset()
+        and lhs.data_ptr() == rhs.data_ptr()
     )
 
 
@@ -757,8 +765,8 @@ _FP8_WEIGHT_CACHE: dict[tuple[int, int, str], torch.Tensor] = {}
 
 # Permuted + contiguous caches for gemm_gated / gemm_dgated custom kernels
 _TAG_PERM = {
-    "w1_ekh": (2, 1, 0),  # (2I,H,E) → (E,H,2I) contiguous — gemm_gated
-    "w2_ehi": (2, 0, 1),  # (H,I,E)  → (E,H,I)  contiguous — gemm_dgated
+    "w1_ekh": (2, 1, 0),  # (2I,H,E) -> (E,H,2I) contiguous — gemm_gated
+    "w2_ehi": (2, 0, 1),  # (H,I,E)  -> (E,H,I)  contiguous — gemm_dgated
 }
 
 
@@ -779,7 +787,7 @@ _PER_TENSOR_EVICTED: bool = False
 def _get_cached_fp8_weight(w: torch.Tensor, tag: str) -> torch.Tensor:
     """Return a cached fp8 copy of *w*. Always cached (essential for fused kernels)."""
     global _PER_TENSOR_EVICTED
-    key = (w.untyped_storage().data_ptr(), w._version, tag)
+    key = (w.data_ptr(), w._inplace_version(), tag)
     cached = _FP8_WEIGHT_CACHE.get(key)
     if cached is not None:
         return cached
@@ -802,7 +810,7 @@ def _get_fp8_weight_orig(w: torch.Tensor) -> torch.Tensor:
     global _PER_TENSOR_EVICTED
     if _fp8_mode() != "perf":
         return w.to(torch.float8_e4m3fn)
-    key = (w.untyped_storage().data_ptr(), w._version)
+    key = (w.data_ptr(), w._inplace_version())
     cached = _FP8_ORIG_CACHE.get(key)
     if cached is not None:
         return cached
@@ -957,12 +965,12 @@ class TC_Softmax_Topk_Router_Function(torch.autograd.Function):
     def backward(ctx, dtopk_score: torch.Tensor, _: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         T, K = dtopk_score.size()
 
-        topk_router_score, topk_router_indices = ctx.saved_tensors
+        topk_router_score, topk_router_indices = ctx.saved_tensor()
         dlogits = torch.zeros(T, ctx.E, dtype=ctx.dtype, device=topk_router_score.device)
 
         _softmax_topk_bwd(dlogits, None, dtopk_score, topk_router_score, topk_router_indices, K)
 
-        return dlogits, None, None
+        return (dlogits,)
 
 
 class _UpProjection(torch.autograd.Function):
@@ -995,7 +1003,7 @@ class _UpProjection(torch.autograd.Function):
         use_quack_gemm = is_using_quack_gemm()
 
         if use_quack_gemm:
-            assert not torch.compiler.is_compiling()
+            # assert not torch.compiler.is_compiling()  # Paddle compat
             assert is_glu_activation, "QuACK GEMM does not support non GLU activation yet"
             cfg = _get_fp8_config()
             if cfg.enabled:
@@ -1020,14 +1028,14 @@ class _UpProjection(torch.autograd.Function):
                                 fused_z_save_y1_quant(z, y1)
                             )
                             _PREQUANTIZED_SCALES["z_fp8"] = (z_fp8, z_raw_scales)
-                            z.untyped_storage().resize_(0)
+                            # z.untyped_storage().resize_(0)
                         else:
                             # Split quantization: z first, free z bf16, then y1.
                             # This avoids z_bf16+y1_bf16+z_fp8+y1_fp8 all coexisting
                             # and reduces forward peak by ~96 MiB at Ernie shape.
                             z_fp8, z_raw_scales = quantize_activation_blockscaled_fast(z)
                             _PREQUANTIZED_SCALES["z_fp8"] = (z_fp8, z_raw_scales)
-                            z.untyped_storage().resize_(0)
+                            # z.untyped_storage().resize_(0)
                             y1_fp8, y1_packed_scales = quantize_and_pack_activation(y1)
                     else:
                         # z_fp8 already populated by epilogue quant inside
@@ -1036,7 +1044,7 @@ class _UpProjection(torch.autograd.Function):
                         # No resize needed — storage is already 0.
                         y1_fp8, y1_packed_scales = quantize_and_pack_activation(y1)
                     _PREQUANTIZED_SCALES["fwd"] = (y1, y1_fp8, y1_packed_scales)
-                    y1.untyped_storage().resize_(0)
+                    # y1.untyped_storage().resize_(0)
                 elif aligned:
                     w1_fp8, w1_scales = precompute_weight_fp8(w1)
                     # All segments 128-aligned: use fused gather+quantize
@@ -1105,6 +1113,9 @@ class _UpProjection(torch.autograd.Function):
         # Legacy compat: keep individual flags for code that reads them directly.
         ctx._fp8_enabled = ctx._fp8_cfg.enabled
         ctx._alignment_assumed = ctx._fp8_cfg.alignment_assumed
+        # Track which optional tensor inputs were actually provided (for Paddle backward return count)
+        ctx._has_b1 = b1 is not None
+        ctx._has_num_activated = num_activated_expert_per_token_offset is not None
 
         # Weight decoupling: in FP8+aligned mode, backward doesn't need bf16 w1 data
         # (only uses fp8 cache + metadata). This enables stash_bf16_to_cpu() to
@@ -1153,7 +1164,7 @@ class _UpProjection(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, _: None, dz: torch.Tensor):
-        is_compiling = torch.compiler.is_compiling()
+        is_compiling = False
 
         if not is_compiling:
             assert _ is None
@@ -1178,7 +1189,7 @@ class _UpProjection(torch.autograd.Function):
                 s_scatter_idx,
                 s_reverse_scatter_idx,
                 num_activated_expert_per_token_offset,
-            ) = ctx.saved_tensors
+            ) = ctx.saved_tensor()
             w1_shape = ctx._w1_shape   # (2I, H, E)
             w1_dtype = ctx._w1_dtype
             w1_device = ctx._w1_device
@@ -1192,7 +1203,7 @@ class _UpProjection(torch.autograd.Function):
                 s_scatter_idx,
                 s_reverse_scatter_idx,
                 num_activated_expert_per_token_offset,
-            ) = ctx.saved_tensors
+            ) = ctx.saved_tensor()
             w1_shape = w1.shape
             w1_dtype = w1.dtype
             w1_device = w1.device
@@ -1244,7 +1255,7 @@ class _UpProjection(torch.autograd.Function):
                     bwd_col = _PREQUANTIZED_SCALES.pop("bwd_col", None)
 
                     # Stream-overlapped quant pipeline:
-                    # S0 (main): dz_col (if not pre-computed) → free dz_bf16 → wait S1 → GEMM
+                    # S0 (main): dz_col (if not pre-computed) -> free dz_bf16 -> wait S1 -> GEMM
                     # S1 (side): x_col (Triton nw=1, handles gather)
                     _side_stream = _get_dequant_stream()
                     _side_stream.wait_stream(torch.cuda.current_stream())
@@ -1263,7 +1274,7 @@ class _UpProjection(torch.autograd.Function):
                             dz_bf16, logical_rows=w1_shape[0], logical_cols=TK,
                         )
                     # FREE dz_bf16 NOW (-384 MiB before wgrad GEMM!)
-                    dz.untyped_storage().resize_(0)
+                    # dz.untyped_storage().resize_(0)
                     del dz_bf16
 
                     # Sync: GEMM needs both quant outputs
@@ -1295,7 +1306,7 @@ class _UpProjection(torch.autograd.Function):
                 # Phase 2: Free dz bf16 storage (~384 MiB at Ernie shape).
                 # FP8 wgrad already freed it in step 2 above; BF16 path frees here.
                 if not ctx._fp8_cfg.fp8_wgrad:
-                    dz.untyped_storage().resize_(0)
+                    # dz.untyped_storage().resize_(0)
                     del dz_bf16
 
                 # Phase 3: Actgrad using FP8 dz (avoids dz_bf16 + dx_expanded coexistence).
@@ -1372,7 +1383,15 @@ class _UpProjection(torch.autograd.Function):
         )
         _log_stage_memory("backward:token-reduce")
 
-        return dx_reduced, dw1, db1, *[None] * 12
+        # Paddle PyLayer: return grads only for tensor inputs (not int/bool/enum)
+        grads = [dx_reduced, dw1]
+        if ctx._has_b1:
+            grads.append(db1)
+        # expert_frequency_offset, x_gather_idx, s_scatter_idx, s_reverse_scatter_idx
+        grads.extend([None, None, None, None])
+        if ctx._has_num_activated:
+            grads.append(None)
+        return tuple(grads)
 
 
 class _DownProjection(torch.autograd.Function):
@@ -1403,7 +1422,7 @@ class _DownProjection(torch.autograd.Function):
         use_quack_gemm = is_using_quack_gemm()
 
         if use_quack_gemm:
-            assert not torch.compiler.is_compiling()
+            # assert not torch.compiler.is_compiling()  # Paddle compat
 
             assert b2 is None
             cfg = _get_fp8_config()
@@ -1524,9 +1543,14 @@ class _DownProjection(torch.autograd.Function):
         ctx._fp8_enabled_flag = ctx._fp8_cfg.enabled
         ctx._alignment_assumed_flag = ctx._fp8_cfg.alignment_assumed
         ctx._use_fused_blockscaled_gated_flag = ctx._fp8_cfg.fused_gated
+        # Track which optional tensor inputs were actually provided (for Paddle backward return count)
+        ctx._has_b2 = b2 is not None
+        ctx._has_num_activated = num_activated_expert_per_token_offset is not None
+        # Track stop_gradient for topk_scores (Paddle requires None for stop_gradient inputs)
+        ctx._topk_scores_needs_grad = not topk_scores.stop_gradient
 
         # Memory optimization: store z in FP8 to save ~50% of z's memory.
-        # At Ernie shape (TK=65536, 2I=3072), z is 384MB BF16 → ~213MB FP8 = ~171MB saved.
+        # At Ernie shape (TK=65536, 2I=3072), z is 384MB BF16 -> ~213MB FP8 = ~171MB saved.
         # Accept fp8 z when prequant cache already holds the fp8+scales pair
         # (e.g. epilogue quant produced them), even if z.dtype is no longer bf16.
         z_has_prequant = "z_fp8" in _PREQUANTIZED_SCALES
@@ -1560,7 +1584,7 @@ class _DownProjection(torch.autograd.Function):
                     z_fp8 = z
                     z_raw_scales = torch.ones(
                         z.shape[0], z.shape[1] // 32,
-                        dtype=torch.float8_e8m0fnu, device=z.device
+                        dtype=_E8M0_DTYPE, device=z.device
                     )
                 else:
                     z_fp8, z_raw_scales = quantize_activation_blockscaled_fast(z)
@@ -1636,7 +1660,7 @@ class _DownProjection(torch.autograd.Function):
                     x_gather_idx,
                     s_scatter_idx,
                     s_reverse_scatter_idx,
-                ) = ctx.saved_tensors
+                ) = ctx.saved_tensor()
                 w2_shape = ctx._w2_shape   # (H, I, E)
                 w2_dtype = ctx._w2_dtype
                 w2_device = ctx._w2_device
@@ -1651,7 +1675,7 @@ class _DownProjection(torch.autograd.Function):
                     x_gather_idx,
                     s_scatter_idx,
                     s_reverse_scatter_idx,
-                ) = ctx.saved_tensors
+                ) = ctx.saved_tensor()
                 w2_shape = w2.shape
                 w2_dtype = w2.dtype
                 w2_device = w2.device
@@ -1668,7 +1692,7 @@ class _DownProjection(torch.autograd.Function):
                 x_gather_idx,
                 s_scatter_idx,
                 s_reverse_scatter_idx,
-            ) = ctx.saved_tensors
+            ) = ctx.saved_tensor()
             w2_shape = w2.shape
             w2_dtype = w2.dtype
             w2_device = w2.device
@@ -1682,7 +1706,7 @@ class _DownProjection(torch.autograd.Function):
         _reset_stage_memory_probe()
 
         if use_quack_gemm:
-            assert not torch.compiler.is_compiling()
+            # assert not torch.compiler.is_compiling()  # Paddle compat
             assert is_glu(activation_type), "QuACK GEMM does not support non GLU activation yet"
 
             s = topk_scores[s_scatter_idx]
@@ -1694,8 +1718,8 @@ class _DownProjection(torch.autograd.Function):
                 # at larger shapes where dgated peak exceeds wgrad peak,
                 # this saves ~37 MiB.
                 # Backward-needed caches survive via ctx references:
-                #   w2_dgated  → ctx._w2_dgated_fp8 (DownProj dgated)
-                #   w1T_varlen → UpProj ctx._w1T_fp8 (actgrad)
+                #   w2_dgated  -> ctx._w2_dgated_fp8 (DownProj dgated)
+                #   w1T_varlen -> UpProj ctx._w1T_fp8 (actgrad)
                 #
                 # NOTE: keep _VARLEN_WEIGHT_CACHE alive — it is keyed by
                 # (data_ptr, _version) so stale entries auto-invalidate at
@@ -1753,7 +1777,7 @@ class _DownProjection(torch.autograd.Function):
                         SF_TILE_M=_SF_TILE_M, SF_TILE_STORAGE=_SF_TILE_STORAGE,
                         BLOCK_ROWS=128, GROUPS_PER_K_TILE=_SF_TILE_K // _SF_VEC_SIZE,
                     )
-                    dout_scales = dout_scales_tk.view(torch.float8_e8m0fnu)
+                    dout_scales = dout_scales_tk.view(_E8M0_DTYPE)
                     del dout_scales_t, dout_scales_tk
 
                     # Synchronize: gemm_dgated_kernel needs dout_fp8/dout_scales
@@ -1842,7 +1866,7 @@ class _DownProjection(torch.autograd.Function):
                             dual_quantize_varlen(dz, dz.shape[0], dz.shape[1])
                         _PREQUANTIZED_SCALES["bwd"] = (dz, dz_fp8, dz_packed_scales)
                         _PREQUANTIZED_SCALES["bwd_col"] = (dz_col_fp8, dz_col_scales)
-                        dz.untyped_storage().resize_(0)
+                        # dz.untyped_storage().resize_(0)
 
                         # Triton colwise quant with gather (faster than CuTe for indirect access)
                         dout_col_fp8, dout_col_sc = colwise_quantize_and_pack(
@@ -1907,7 +1931,7 @@ class _DownProjection(torch.autograd.Function):
                     if z_fp8 is not None:
                         if ctx._fp8_cfg.fused_swiglu_quant:
                             # Decomposed path (faster than fully-fused):
-                            # 1. Dequant z_fp8 → z_bf16  (~0.046ms, BLOCK_ROWS=16)
+                            # 1. Dequant z_fp8 -> z_bf16  (~0.046ms, BLOCK_ROWS=16)
                             # 2. dSwiGLU + quant + ISA-pack + dz_bf16  (~0.36ms, single kernel)
                             # Total ~0.41ms vs fused 0.47ms (12% faster)
                             from sonicmoe.quack_utils.swiglu_triton import (
@@ -2013,7 +2037,17 @@ class _DownProjection(torch.autograd.Function):
         elif not is_varlen_K:
             ds = ds.view(T, K)
 
-        return None, dz, dw2, db2, ds, None, *[None] * 11
+        # Paddle PyLayer: return grads only for tensor inputs (not int/bool/enum/None)
+        # Tensor inputs: y1, z, w2, [b2], topk_scores, selected_experts, expert_frequency_offset,
+        #   x_gather_idx, s_scatter_idx, s_reverse_scatter_idx, [num_activated_expert_per_token_offset]
+        grads = [None, dz, dw2]  # y1, z, w2
+        if ctx._has_b2:
+            grads.append(db2)
+        grads.extend([ds if ctx._topk_scores_needs_grad else None, None, None])  # topk_scores, selected_experts, expert_frequency_offset
+        grads.extend([None, None, None])  # x_gather_idx, s_scatter_idx, s_reverse_scatter_idx
+        if ctx._has_num_activated:
+            grads.append(None)
+        return tuple(grads)
 
 
 def _moe_tc_softmax_topk_layer_quack_inference(
@@ -2117,7 +2151,7 @@ def _moe_tc_softmax_topk_layer_quack_inference(
             _reset_stage_memory_probe()
             if _fp8_enabled():
                 # y1 was computed via FP8 tensor cores; convert to bf16 and
-                # skip the quant→dequant round-trip.
+                # skip the quant->dequant round-trip.
                 if y1.dtype != x.dtype:
                     y1 = y1.to(x.dtype)
             else:
@@ -2294,7 +2328,7 @@ def moe_TC_softmax_topk_layer(
         cfg = _get_fp8_config()
         if cfg.enabled and cfg.fused_gated and cfg.alignment_assumed and is_using_quack_gemm():
             # Blockscaled FP8 path: y1 was already quantized inside _UpProjection
-            # (prequant cache holds fp8+scales).  Skip the adapter's quant→dequant
+            # (prequant cache holds fp8+scales).  Skip the adapter's quant->dequant
             # round-trip which costs ~250µs and is redundant.
             pass
         elif cfg.alignment_assumed and is_using_quack_gemm():

@@ -98,7 +98,7 @@ def rowmajor_to_sgl_tiled(
     n_tr = rows_per_expert // 128
     n_tc = n_groups // 4
     x = sc.reshape(n_experts, n_tr, 128, n_tc, 4)
-    x = x.reshape(n_experts, n_tr, 4, 32, n_tc, 4)  # 128 → (r1=4, r0=32)
+    x = x.reshape(n_experts, n_tr, 4, 32, n_tc, 4)  # 128 -> (r1=4, r0=32)
     x = x.permute(0, 1, 4, 3, 2, 5).contiguous()  # (E, tr, tc, r0, r1, g)
     return x.reshape(n_experts * rows_per_expert, n_groups)
 
@@ -132,7 +132,7 @@ def precompute_weight_fp8_sgl(
         return _SGL_WEIGHT_CACHE[key]
 
     E = w.shape[-1]
-    # (dim0, dim1, E) → (E, dim0, dim1) contiguous
+    # (dim0, dim1, E) -> (E, dim0, dim1) contiguous
     w_ehi = w.permute(2, 0, 1).contiguous()
     dim0, dim1 = w_ehi.shape[1], w_ehi.shape[2]
     n_groups = dim1 // 32
@@ -177,7 +177,7 @@ def _build_pad_indices(
     expert_tokens: torch.Tensor,
     total_M: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Vectorised src→dst index mapping for per-expert padding.
+    """Vectorised src->dst index mapping for per-expert padding.
 
     Returns (src_idx, dst_idx) such that ``buf[dst_idx] = a[src_idx]``
     copies each expert's tokens to padded positions.  O(total_M) work,
@@ -271,7 +271,7 @@ def sgl_mxfp8_gemm_varlen(
 
     if use_fast_tile:
         # Scales are already contiguous per expert in cu_seqlens_m order;
-        # each expert block is exactly max_sp rows → tile in one call.
+        # each expert block is exactly max_sp rows -> tile in one call.
         sfa_tiled = rowmajor_to_sgl_tiled(a_scales_uint8, E, max_sp, n_groups)
         blockscale_offsets = act_offsets.clone()
     else:

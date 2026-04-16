@@ -9,8 +9,8 @@
 # within the scale tensor bounds.
 #
 # Usage:
-#   1. quantize_and_pack_activation(x) → x_fp8 (T,K) + x_scales_t (T-ISA)
-#   2. gather_isa_packed_scales(x_scales_t, A_idx) → x_scales_tk (TK-ISA)
+#   1. quantize_and_pack_activation(x) -> x_fp8 (T,K) + x_scales_t (T-ISA)
+#   2. gather_isa_packed_scales(x_scales_t, A_idx) -> x_scales_tk (TK-ISA)
 #   3. Call gemm with A=x_fp8, A_idx=gather_idx, a_scales=x_scales_tk
 #      using GemmGatedSm100ZeroMat instead of GemmGatedSm100
 #
@@ -24,13 +24,12 @@ from typing import Optional, Type
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.torch as cutlass_torch
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 import quack.activation
 import quack.copy_utils as copy_utils
-from cutlass import Float32, Int32, const_expr
 import cuda.bindings.driver as cuda
+from cutlass import Float32, Int32, const_expr
 from quack.gemm_sm100 import GemmSm100
 from quack.gemm_wrapper_utils import GemmWrapperBase
 from quack.layout_utils import permute_gated_Cregs_b16
@@ -403,12 +402,14 @@ from functools import partial
 from torch import Tensor
 import torch
 
+_E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", torch.uint8)
+
 from cutlass.cute.runtime import from_dlpack
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
 
 _TORCH_TO_CUTLASS = {
     torch.float8_e4m3fn: cutlass.Float8E4M3FN,
-    torch.float8_e8m0fnu: cutlass.Float8E8M0FNU,
+    _E8M0_DTYPE: cutlass.Float8E8M0FNU,
     torch.uint8: cutlass.Uint8,
     torch.float16: cutlass.Float16,
     torch.bfloat16: cutlass.BFloat16,
@@ -425,7 +426,7 @@ _zeromat_compile_cache: dict = {}
 
 
 def _make_cute(tensor: Tensor, leading_dim: int) -> cute.Tensor:
-    if tensor.dtype in {torch.float8_e4m3fn, torch.float8_e8m0fnu}:
+    if tensor.dtype in {torch.float8_e4m3fn, _E8M0_DTYPE}:
         storage = tensor.detach().view(torch.uint8)
         ct = from_dlpack(storage, assumed_align=16)
         ct.element_type = _TORCH_TO_CUTLASS[tensor.dtype]
@@ -494,7 +495,7 @@ def gemm_gated_zeromat(
     epi_args = GemmCls.EpilogueArguments(tensor_infos["PostAct"].cute_tensor, act_fn)
     scheduler_args = GemmWrapperBase.create_scheduler_args(max_active_clusters, None, max_swizzle_size=8)
     varlen_args = GemmWrapperBase.create_varlen_args(cu_seqlens_m, None, A_idx)
-    current_stream = cutlass_torch.current_stream()
+    current_stream = cuda.CUstream(torch.cuda.current_stream().stream_base.raw_stream)
 
     a_scale_cute = _make_cute(a_scales, leading_dim=1)
     b_scale_cute = _make_cute(b_scales, leading_dim=1)

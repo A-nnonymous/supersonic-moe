@@ -1,17 +1,19 @@
 """CuTe DSL dual blockscaled FP8 quantize — [32][33] padded smem design.
 
-Single HBM read → padded smem → both row and col quant bank-conflict-free.
+Single HBM read -> padded smem -> both row and col quant bank-conflict-free.
 Inspired by Paddle's shm[128][129] technique.
 
 Tile: (TILE_TK=256, TILE_DIM=32), smem stride 33 (not 32).
-Phase A (col quant): 8 warps, lane=dim col, reads sSrc[tk, lane] → stride-33 rows, no bank conflict
-Phase B (row quant): 256 threads, each reads sSrc[tidx, 0..31] → consecutive cols, no bank conflict
+Phase A (col quant): 8 warps, lane=dim col, reads sSrc[tk, lane] -> stride-33 rows, no bank conflict
+Phase B (row quant): 256 threads, each reads sSrc[tidx, 0..31] -> consecutive cols, no bank conflict
 Both directions conflict-free thanks to +1 padding.
 """
 import math
 from typing import Optional
 
 import torch
+
+_E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", torch.uint8)
 from torch import Tensor
 
 import cutlass
@@ -181,7 +183,7 @@ class DualQuantOp:
         # Phase B: Row quant — re-read smem, per-row amax via warp shuffle
         # Same warp mapping: warp_id=TK group, lane=dim col.
         # For each TK row j in group: all 32 lanes have val for different dim cols.
-        # Butterfly shuffle MAX → row_amax. Then scale+store fp8.
+        # Butterfly shuffle MAX -> row_amax. Then scale+store fp8.
         # Process 4 rows at a time for fp8 batch cast.
         # ═══════════════════════════════════════════════════════════════════
         for j4 in cutlass.range(const_expr(GROUP_SIZE // 4)):
@@ -278,5 +280,5 @@ def dual_quantize_varlen_cute(src: Tensor, TK: int, dim: int):
     fn = _compile_dual_quant(dtype_width, TK, dim)
     fn(src, col_fp8, col_scales.view(-1), row_fp8, row_scales.view(-1))
 
-    return (row_fp8, row_scales.view(torch.float8_e8m0fnu),
-            col_fp8, col_scales.view(torch.float8_e8m0fnu))
+    return (row_fp8, row_scales.view(_E8M0_DTYPE),
+            col_fp8, col_scales.view(_E8M0_DTYPE))

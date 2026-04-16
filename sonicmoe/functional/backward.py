@@ -2,6 +2,8 @@
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
 
+from __future__ import annotations
+
 from typing import Optional
 
 import cuda.bindings.driver as cuda
@@ -12,6 +14,7 @@ import triton.language as tl
 
 from ..enums import LIBRARY_NAME, TENSORMAP, ActivationType
 from ..utils import ceil_divide, convert_torch_tensor_to_cute_tensor, get_powers_of_2
+from ..triton_utils import wrap_triton_kernel
 from .moe_config import (
     HopperWgmma_MoE_Down_proj_ActGrad_Bwd,
     HopperWgmma_MoE_Down_proj_WeightGrad_Bwd,
@@ -28,6 +31,7 @@ def _get_autotune_configs_for_db2_and_ds() -> list[triton.Config]:
     return configs
 
 
+@wrap_triton_kernel
 @triton.autotune(
     configs=_get_autotune_configs_for_db2_and_ds(),
     key=["H", "E"],
@@ -124,6 +128,7 @@ def _prune_triton_autotune_config(configs, nargs, **kw):
     return pruned_configs
 
 
+@wrap_triton_kernel
 @triton.autotune(
     configs=_get_autotune_configs_for_db1(),
     key=["I", "E"],
@@ -169,6 +174,7 @@ def db1_kernel(
         tl.store(db1_ptr + db1_offsets, db1_acc, mask=i_mask)
 
 
+@wrap_triton_kernel
 @triton.jit
 def _colsum_smallN_kernel(
     y_ptr,  # *mut  T, shape [M]
@@ -434,7 +440,7 @@ def _down_projection_backward_act(
         if ds_partial.size(1) == 1:
             ds.copy_(ds_partial.view(-1))
         elif ds_partial.size(1) <= 32:
-            torch.sum(ds_partial, dim=-1, dtype=ds.dtype, out=ds)
+            ds.copy_(torch.sum(ds_partial, dim=-1, dtype=ds.dtype))
         else:
             M, N = ds_partial.size()
 
@@ -474,7 +480,7 @@ def _down_projection_backward_act(
         if NUM_H_BLOCKS == 1:
             ds.copy_(new_ds_partial.view(-1))
         else:
-            torch.sum(new_ds_partial, dim=-1, dtype=ds.dtype, out=ds)
+            ds.copy_(torch.sum(new_ds_partial, dim=-1, dtype=ds.dtype))
 
 
 _down_projection_backward_act.compile_cache = {}

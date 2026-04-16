@@ -2,6 +2,42 @@
 # Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 # ********************************************************************************
 
+import paddle
+import inspect
+
+if not (hasattr(paddle.library.CustomOpDef, "__call__") and inspect.isfunction(paddle.library.CustomOpDef.__call__)):
+    def __call__(self, *args, **kwargs):
+        return getattr(getattr(paddle.ops, self._namespace), self._name)(*args, **kwargs)
+    paddle.library.CustomOpDef.__call__ = __call__
+
+
+def torch_compat_empty(*args, **kwargs):
+    if "device" in kwargs and kwargs["device"] == "cuda":
+        del kwargs["device"]
+    return paddle.empty(*args, **kwargs)
+
+
+def torch_compat_corrcoef(input):
+    """Pearson correlation coefficient matrix — matches torch.corrcoef."""
+    x = input.cast("float32") if input.dtype != paddle.float32 else input
+    x = x - x.mean(axis=-1, keepdim=True)
+    cov = x @ x.T / (x.shape[-1] - 1)
+    stddev = cov.diag().sqrt()
+    outer = stddev.unsqueeze(1) * stddev.unsqueeze(0)
+    return cov / outer.clip(min=1e-12)
+
+
+paddle.corrcoef = torch_compat_corrcoef
+
+
+paddle.compat.proxy._extend_torch_proxy_overrides(
+    {
+        "torch.empty": paddle.compat.proxy.RawOverriddenAttribute(torch_compat_empty),
+        "torch.corrcoef": paddle.compat.proxy.RawOverriddenAttribute(torch_compat_corrcoef),
+    }
+)
+
+
 __version__ = "0.1.1"
 
 from .count_cumsum import count_cumsum

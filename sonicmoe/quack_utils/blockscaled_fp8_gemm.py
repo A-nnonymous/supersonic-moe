@@ -11,9 +11,12 @@ from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.torch as cutlass_torch
+import cuda.bindings.driver as cuda
 import cutlass.utils.blockscaled_layout as _upstream_blockscaled_utils
 import torch
+
+_E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", torch.uint8)
+
 import triton
 import triton.language as tl
 from cutlass import Float32, const_expr
@@ -49,6 +52,7 @@ from ..functional.fp8_quant import quantize_activation_blockwise, round_scale_to
 # ---------------------------------------------------------------------------
 
 import threading as _threading
+from ..triton_utils import wrap_triton_kernel
 
 _SFA_M_OVERRIDE = _threading.local()
 
@@ -78,12 +82,12 @@ def _tile_atom_to_shape_SF_rank_aware(
     """
     rank = cute.rank(Shape)
     if const_expr(rank == 2):
-        # varlen: (total_M, K) → ((Atom_MN, Rest_MN), (Atom_K, Rest_K))
+        # varlen: (total_M, K) -> ((Atom_MN, Rest_MN), (Atom_K, Rest_K))
         sf_layout = cute.tile_to_shape(
             BlockScaledBasicChunk(sf_vec_size).layout, Shape, (2, 1)
         )
     else:
-        # grouped/batched: (M, K, L) → ((Atom_MN, Rest_MN), (Atom_K, Rest_K), RestL)
+        # grouped/batched: (M, K, L) -> ((Atom_MN, Rest_MN), (Atom_K, Rest_K), RestL)
         sf_layout = cute.tile_to_shape(
             BlockScaledBasicChunk(sf_vec_size).layout, Shape, (2, 1, 3)
         )
@@ -106,14 +110,14 @@ _WEIGHT_CACHE: dict[
     tuple[torch.Tensor, torch.Tensor],
 ] = {}
 _COMPILE_CACHE: dict[tuple[object, ...], object] = {}
-_PAD_PLAN_CACHE: dict = {}       # content-key → plan
+_PAD_PLAN_CACHE: dict = {}       # content-key -> plan
 # Fast-path cache: skip validation/tensor-info/compile-key on steady-state calls.
 # Maps (total_M, K, H, E, out_dtype, w_shape, w_stride, a_sc_cols, w_sc_shape, dev)
-#   → (compiled_fn, scheduler_args, epi_args)
+#   -> (compiled_fn, scheduler_args, epi_args)
 _GEMM_FAST_PATH: dict[tuple, tuple] = {}
 _TORCH_TO_CUTLASS_DTYPE = {
     torch.float8_e4m3fn: cutlass.Float8E4M3FN,
-    torch.float8_e8m0fnu: cutlass.Float8E8M0FNU,
+    _E8M0_DTYPE: cutlass.Float8E8M0FNU,
     torch.uint8: cutlass.Uint8,
     torch.bfloat16: cutlass.BFloat16,
     torch.float16: cutlass.Float16,
@@ -237,7 +241,7 @@ def _blockscaled_protocol(protocol: FP8Protocol) -> FP8Protocol:
 
 
 def _is_runtime_fp8_tensor(tensor: torch.Tensor) -> bool:
-    return tensor.dtype in {torch.float8_e4m3fn, torch.float8_e8m0fnu}
+    return tensor.dtype in {torch.float8_e4m3fn, _E8M0_DTYPE}
 
 
 def _make_cute_tensor_dynamic(tensor: torch.Tensor, leading_dim: int) -> cute.Tensor:
@@ -254,12 +258,12 @@ def _weight_cache_key(
     protocol: FP8Protocol,
 ) -> tuple[int, int, tuple[int, ...], tuple[int, ...], int | None, int, str, str, str, str]:
     return (
-        weight.untyped_storage().data_ptr(),
+        weight.data_ptr(),
         id(weight),  # guards against CUDA memory reuse after del
         tuple(weight.shape),
         tuple(weight.stride()),
         weight.device.index,
-        weight._version,
+        weight._inplace_version(),
         protocol.activation_dtype.value,
         protocol.scale_encoding.value,
         protocol.scale_granularity.value,
@@ -276,8 +280,8 @@ def _quantize_w2_cached(
     # Key on storage identity + version + view layout so that repeated
     # permute() calls on the same underlying Parameter hit cache.
     key = (
-        w2.untyped_storage().data_ptr(),
-        w2._version,
+        w2.data_ptr(),
+        w2._inplace_version(),
         tuple(w2.shape),
         tuple(w2.stride()),
     )
@@ -305,7 +309,7 @@ def clear_fused_weight_cache() -> None:
     """Clear the fused-gated/dgated weight cache to eagerly release GPU memory.
 
     In training the optimizer step invalidates these entries anyway
-    (via ``w._version``), so clearing between forward and backward is free.
+    (via ``w._inplace_version()``), so clearing between forward and backward is free.
     Saves ~74 MiB (w1 fused cache) during the down-projection and backward.
     """
     _FUSED_WEIGHT_CACHE.clear()
@@ -317,12 +321,12 @@ def evict_fp8_weight_cache_entry(w: torch.Tensor) -> None:
     Call this right after a cached FP8 weight has been consumed to release
     GPU memory eagerly instead of waiting for the global cache clear at the
     next optimizer step.  In training the cache would miss anyway (because
-    ``w._version`` increments on each in-place update), so the eviction
+    ``w._inplace_version()`` increments on each in-place update), so the eviction
     adds zero overhead.
     """
     key = (
-        w.untyped_storage().data_ptr(),
-        w._version,
+        w.data_ptr(),
+        w._inplace_version(),
         tuple(w.shape),
         tuple(w.stride()),
     )
@@ -403,9 +407,10 @@ def prefetch_blockscaled_w2_fp8(
 # ---------------------------------------------------------------------------
 # Fast fused blockscaled quantization kernel for flat 2D activations
 # ---------------------------------------------------------------------------
-# Single-pass: read bf16 → compute per-32 amax → E8M0 scale → quantize → write fp8 + scales
+# Single-pass: read bf16 -> compute per-32 amax -> E8M0 scale -> quantize -> write fp8 + scales
 # Replaces the Python quantize_activation_blockwise which does ~8 separate kernel launches.
 
+@wrap_triton_kernel
 @triton.jit
 def _quantize_flat_blockscaled_kernel(
     src_ptr,
@@ -472,6 +477,7 @@ def _quantize_flat_blockscaled_kernel(
         tl.store(scale_ptrs, e8m0_byte, mask=row_mask_1d)
 
 
+@wrap_triton_kernel
 @triton.jit
 def _quantize_flat_v2_kernel(
     src_ptr, dst_fp8_ptr, dst_scale_ptr,
@@ -578,16 +584,17 @@ def quantize_activation_blockscaled_fast(
 # Fused z-save + y1-quant kernel
 # ---------------------------------------------------------------------------
 # After the forward GemmGated GEMM, we need to:
-#   1. quantize z (TK, 2I) → FP8 with raw E8M0 scales  (for backward z-save)
-#   2. quantize y1 (TK, I) → FP8 with ISA-packed scales (for FP8 down-proj)
+#   1. quantize z (TK, 2I) -> FP8 with raw E8M0 scales  (for backward z-save)
+#   2. quantize y1 (TK, I) -> FP8 with ISA-packed scales (for FP8 down-proj)
 # These share the same row dimension (TK) and are independent. Fusing them
 # into a single kernel eliminates one launch overhead and improves SM
 # utilization while both tensors are L2-hot from the GEMM output.
 # ---------------------------------------------------------------------------
 
+@wrap_triton_kernel
 @triton.jit
 def _fused_z_save_y1_quant_kernel(
-    # --- z tensor (TK, 2I) → raw scales ---
+    # --- z tensor (TK, 2I) -> raw scales ---
     z_src_ptr,
     z_dst_fp8_ptr,
     z_dst_scale_ptr,
@@ -599,7 +606,7 @@ def _fused_z_save_y1_quant_kernel(
     z_scale_stride_row,
     z_scale_stride_col,
     z_col_blocks,          # ceil(z_num_groups / Z_GROUPS_PER_BLOCK)
-    # --- y1 tensor (TK, I) → ISA-packed scales ---
+    # --- y1 tensor (TK, I) -> ISA-packed scales ---
     y1_src_ptr,
     y1_dst_fp8_ptr,
     y1_dst_packed_scale_ptr,
@@ -623,11 +630,11 @@ def _fused_z_save_y1_quant_kernel(
     """Fused quantization of z (raw E8M0) and y1 (ISA-packed E8M0).
 
     2D grid: (row_blocks, z_col_blocks + y1_k_tiles).
-    pid_1 < z_col_blocks  → process Z_GROUPS_PER_BLOCK groups of z (raw scales)
-    pid_1 >= z_col_blocks → process 1 k-tile of y1 (ISA-packed scales)
+    pid_1 < z_col_blocks  -> process Z_GROUPS_PER_BLOCK groups of z (raw scales)
+    pid_1 >= z_col_blocks -> process 1 k-tile of y1 (ISA-packed scales)
 
     Ernie shape: grid=(2048, 8+12)=(2048, 20) = 40960 blocks
-    vs old 1D: (2048,) = 2048 blocks → 20× more parallelism.
+    vs old 1D: (2048,) = 2048 blocks -> 20× more parallelism.
     """
     row_base = tl.program_id(0) * BLOCK_ROWS
     work_id = tl.program_id(1)
@@ -740,8 +747,8 @@ def fused_z_save_y1_quant(
     """Fused quantization of z (raw scales) and y1 (ISA-packed scales).
 
     Replaces two separate kernel launches:
-      quantize_activation_blockscaled_fast(z)  → z_fp8, z_raw_scales
-      quantize_and_pack_activation(y1)          → y1_fp8, y1_packed_scales
+      quantize_activation_blockscaled_fast(z)  -> z_fp8, z_raw_scales
+      quantize_and_pack_activation(y1)          -> y1_fp8, y1_packed_scales
 
     Uses a 2D grid (row_blocks, z_col_blocks + y1_k_tiles) so that z and y1
     quantization run as independent column-parallel work units.  Each block
@@ -838,9 +845,9 @@ def fused_z_save_y1_quant(
     )
     return (
         z_fp8,
-        z_scale_out.view(torch.float8_e8m0fnu),
+        z_scale_out.view(_E8M0_DTYPE),
         y1_fp8,
-        y1_packed_scales.view(torch.float8_e8m0fnu),
+        y1_packed_scales.view(_E8M0_DTYPE),
     )
 
 
@@ -907,6 +914,7 @@ def _pack_quantize_expert_segments_kernel(
     tl.store(scale_ptrs, dequant_scale, mask=row_offsets < expert_len)
 
 
+@wrap_triton_kernel
 @triton.jit
 def _pack_expert_segments_kernel(
     src_ptr,
@@ -953,6 +961,7 @@ def _pack_expert_segments_kernel(
     tl.store(dst_ptrs, values, mask=store_mask)
 
 
+@wrap_triton_kernel
 @triton.jit
 def _unpack_expert_segments_kernel(
     src_ptr,
@@ -998,11 +1007,12 @@ def _unpack_expert_segments_kernel(
 # ---------------------------------------------------------------------------
 # Fused transpose + quantize + ISA-pack kernel for weight-gradient data prep
 # ---------------------------------------------------------------------------
-# Single pass: read flat expert-sorted (TK, dim) bf16 →
-#   transpose+quantize → write (E*dim, capacity) fp8 + ISA-packed scales.
+# Single pass: read flat expert-sorted (TK, dim) bf16 ->
+#   transpose+quantize -> write (E*dim, capacity) fp8 + ISA-packed scales.
 # Optional gather_idx fuses the gather step too.
 # Eliminates the separate pack_blockscaled_1x32_scales call entirely.
 
+@wrap_triton_kernel
 @triton.jit
 def _fused_transpose_quantize_kernel(
     src_ptr,           # (TK, dim) bf16
@@ -1050,7 +1060,7 @@ def _fused_transpose_quantize_kernel(
     src_ptrs = src_ptr + src_rows[:, None] * src_stride_row + dim_offs[None, :] * src_stride_col
     values = tl.load(src_ptrs, mask=dim_mask, other=0.0).to(tl.float32)
 
-    # Transpose in registers: (GROUP_SIZE, BLOCK_DIM) → (BLOCK_DIM, GROUP_SIZE)
+    # Transpose in registers: (GROUP_SIZE, BLOCK_DIM) -> (BLOCK_DIM, GROUP_SIZE)
     values_t = tl.trans(values)
 
     # Blockscaled E8M0 quantization (per row of BLOCK_DIM, over GROUP_SIZE elements)
@@ -1105,6 +1115,7 @@ def _fused_transpose_quantize_kernel(
     tl.store(scale_ptrs, e8m0_byte, mask=dim_offs < dim)
 
 
+@wrap_triton_kernel
 @triton.jit
 def _warp32x32_transpose_quant_kernel(
     src_ptr, gather_idx_ptr,
@@ -1200,14 +1211,14 @@ def fused_transpose_quantize_for_wgrad(
     GROUP_SIZE = _SF_VEC_SIZE  # 32
     BLOCK_DIM = 32  # 32x32 tile for minimal L1 pressure
     # Heuristic: larger GPB reduces grid overhead but increases register pressure
-    # NCU shows 72 regs/thread with GPB=16. Try GPB=8 for less reg → more occupancy.
+    # NCU shows 72 regs/thread with GPB=16. Try GPB=8 for less reg -> more occupancy.
     GROUPS_PER_BLOCK = 8
 
     fp8_flat = torch.empty(num_experts * dim, capacity, dtype=torch.float8_e4m3fn, device=device)
 
     # Pre-allocate ISA-packed scales directly (fill with 1s = E8M0 exponent 127 = scale 1.0)
     per_batch_storage = _storage_per_batch(dim, capacity)
-    packed_scales = torch.ones(num_experts, per_batch_storage, dtype=torch.float8_e8m0fnu, device=device)
+    packed_scales = torch.ones(num_experts, per_batch_storage, dtype=_E8M0_DTYPE, device=device)
 
     total_groups = capacity // GROUP_SIZE
     grid = (num_experts * _div_up(dim, BLOCK_DIM), _div_up(total_groups, GROUPS_PER_BLOCK))
@@ -1243,6 +1254,7 @@ def fused_transpose_quantize_for_wgrad(
 # Dual quantization: read bf16 once, produce row-major + col-major fp8
 # ---------------------------------------------------------------------------
 
+@wrap_triton_kernel
 @triton.jit
 def _dual_quantize_kernel(
     # Input
@@ -1302,7 +1314,7 @@ def _dual_quantize_kernel(
     values = tl.load(src_ptrs, mask=dim_mask, other=0.0).to(tl.float32)
 
     # ═══════════════════════════════════════════════════════════════════
-    # OUTPUT 2: Col-major (transposed) quantization → (E*H, capacity) fp8
+    # OUTPUT 2: Col-major (transposed) quantization -> (E*H, capacity) fp8
     # Groups of 32 along capacity (the K dimension for wgrad GEMM)
     # ═══════════════════════════════════════════════════════════════════
     values_t = tl.trans(values)  # (128, 32)
@@ -1340,7 +1352,7 @@ def _dual_quantize_kernel(
     tl.store(col_scale_ptrs, col_e8m0_byte, mask=dim_offs < H)
 
     # ═══════════════════════════════════════════════════════════════════
-    # OUTPUT 1: Row-major quantization → (T, H) fp8
+    # OUTPUT 1: Row-major quantization -> (T, H) fp8
     # Groups of 32 along H (the K dimension for actgrad GEMM)
     # Process 4 groups within the 128-dim block, pack into uint32
     # Re-uses the ALREADY-LOADED values — but re-computes amax per group.
@@ -1469,9 +1481,9 @@ def dual_quantize_and_pack(
     col_fp8_3d = col_fp8_flat.reshape(num_experts, H, capacity)
     return (
         row_fp8,
-        row_scales.view(torch.float8_e8m0fnu),
+        row_scales.view(_E8M0_DTYPE),
         col_fp8_3d,
-        col_scales.view(torch.float8_e8m0fnu),
+        col_scales.view(_E8M0_DTYPE),
     )
 
 
@@ -1482,6 +1494,7 @@ def dual_quantize_and_pack(
 # the logical (dim, TK) layout that CUTLASS sees after .T view.
 # Optional gather_idx fuses scatter-read into the quantize pass.
 
+@wrap_triton_kernel
 @triton.jit
 def _colwise_quantize_and_pack_kernel(
     src_ptr,
@@ -1562,11 +1575,12 @@ def _colwise_quantize_and_pack_kernel(
 # ---------------------------------------------------------------------------
 # Fused transpose + rowwise quantize for wgrad operands
 # ---------------------------------------------------------------------------
-# Instead of colwise quant on (TK, dim) → scattered access,
+# Instead of colwise quant on (TK, dim) -> scattered access,
 # we transpose + rowwise quant in a single kernel:
-#   Read (TK, dim) bf16 → SMEM transpose → write (dim, TK) FP8 + ISA scales
+#   Read (TK, dim) bf16 -> SMEM transpose -> write (dim, TK) FP8 + ISA scales
 # This converts the cache-hostile colwise pattern into cache-friendly rowwise.
 
+@wrap_triton_kernel
 @triton.jit
 def _fused_transpose_rowquant_kernel(
     src_ptr,              # (TK, dim) bf16 source, row-major
@@ -1620,7 +1634,7 @@ def _fused_transpose_rowquant_kernel(
     # Transpose: now process as (TILE_DIM, TILE_TK) — each "row" is one dim element
     # For rowwise quant, we need amax over groups of GROUP_SIZE along TK axis
     # Reshape values to (TILE_DIM, TILE_TK) by transposing
-    # Triton: values[tk, d] → transposed[d, tk]
+    # Triton: values[tk, d] -> transposed[d, tk]
     # We process group-by-group along TK within this tile
 
     # ISA layout for output (dim, TK): dim is M-axis, TK is K-axis
@@ -1636,7 +1650,7 @@ def _fused_transpose_rowquant_kernel(
         group_mask = (pid_tk * TILE_TK + group_tk_offs) < TK
 
         # Extract the (GROUP_SIZE, TILE_DIM) sub-tile from values
-        # values[group_tk_offs, :] → (GROUP_SIZE, TILE_DIM)
+        # values[group_tk_offs, :] -> (GROUP_SIZE, TILE_DIM)
         subtile = tl.load(
             src_ptr + (src_rows[group_tk_start:group_tk_start + GROUP_SIZE] if HAS_GATHER
                        else (pid_tk * TILE_TK + group_tk_offs).to(tl.int64))[:, None] * src_stride_row
@@ -1645,7 +1659,7 @@ def _fused_transpose_rowquant_kernel(
             other=0.0,
         ).to(tl.float32)
 
-        # Amax along GROUP_SIZE (axis=0) → per-dim-element scale
+        # Amax along GROUP_SIZE (axis=0) -> per-dim-element scale
         block_amax = tl.max(tl.abs(subtile), axis=0)  # (TILE_DIM,)
 
         # Pure-integer E8M0 computation
@@ -1739,7 +1753,7 @@ def fused_transpose_quantize_and_pack(
         SF_TILE_STORAGE=_SF_TILE_STORAGE,
         GROUPS_PER_TILE=groups_per_tile,
     )
-    return fp8_out, packed_scales.view(torch.float8_e8m0fnu)
+    return fp8_out, packed_scales.view(_E8M0_DTYPE)
 
 
 def colwise_quantize_and_pack(
@@ -1788,7 +1802,7 @@ def colwise_quantize_and_pack(
     gather_ptr = gather_idx if has_gather else src
 
     # NCU-guided: num_warps=1 reduces register pressure per block, allowing
-    # more blocks in-flight on each SM → 2.3× speedup at TK=65536 (verified
+    # more blocks in-flight on each SM -> 2.3× speedup at TK=65536 (verified
     # bitwise identical to num_warps=4 across all shapes).
     _colwise_quantize_and_pack_kernel[grid](
         src, gather_ptr, fp8_out, packed_scales,
@@ -1804,7 +1818,7 @@ def colwise_quantize_and_pack(
         SF_TILE_STORAGE=_SF_TILE_STORAGE,
         num_warps=1,
     )
-    return fp8_out, packed_scales.view(torch.float8_e8m0fnu)
+    return fp8_out, packed_scales.view(_E8M0_DTYPE)
 
 
 
@@ -1812,6 +1826,7 @@ def colwise_quantize_and_pack(
 # Dual row+col quantize for fused actgrad+wgrad data prep
 # ---------------------------------------------------------------------------
 
+@wrap_triton_kernel
 @triton.jit
 def _dual_varlen_quantize_kernel(
     src_ptr,            # (TK, dim) bf16
@@ -1985,8 +2000,8 @@ def dual_quantize_varlen(
         num_warps=1,
     )
     return (
-        row_fp8, row_scales.view(torch.float8_e8m0fnu),
-        col_fp8, col_scales.view(torch.float8_e8m0fnu),
+        row_fp8, row_scales.view(_E8M0_DTYPE),
+        col_fp8, col_scales.view(_E8M0_DTYPE),
     )
 
 
@@ -2047,7 +2062,7 @@ def _run_cutlass_blockscaled_gemm_varlen_k(
         varlen_args = GemmWrapperBase.create_varlen_args(
             cu_seqlens_m=None, cu_seqlens_k=cu_seqlens_k, A_idx=None,
         )
-        stream = cutlass_torch.current_stream()
+        stream = cuda.CUstream(torch.cuda.current_stream().stream_base.raw_stream)
         compiled(
             a_cute, b_cute, d_cute, None,
             epi_args, scheduler_args, varlen_args, stream,
@@ -2103,7 +2118,7 @@ def _run_cutlass_blockscaled_gemm_varlen_k(
         cu_seqlens_m=None, cu_seqlens_k=cu_seqlens_k, A_idx=None,
     )
     epi_args = GemmDefaultSm100.EpilogueArguments()
-    current_stream = cutlass_torch.current_stream()
+    current_stream = cuda.CUstream(torch.cuda.current_stream().stream_base.raw_stream)
     a_scale_cute = _make_cute_tensor_dynamic(a_scales, leading_dim=1)
     b_scale_cute = _make_cute_tensor_dynamic(b_scales, leading_dim=1)
 
@@ -2379,7 +2394,7 @@ def blockscaled_fp8_gemm_grouped(
     )
     varlen_args = None
     epi_args = GemmDefaultSm100.EpilogueArguments()
-    current_stream = cutlass_torch.current_stream()
+    current_stream = cuda.CUstream(torch.cuda.current_stream().stream_base.raw_stream)
     a_scale_cute = _make_cute_tensor_dynamic(packed_a_scales, leading_dim=1)
     b_scale_cute = _make_cute_tensor_dynamic(weight_scales, leading_dim=1)
 
@@ -2443,6 +2458,7 @@ def blockscaled_fp8_gemm_grouped(
     return grouped_out
 
 
+@wrap_triton_kernel
 @triton.jit
 def _quantize_and_pack_kernel(
     src_ptr,
@@ -2521,6 +2537,7 @@ def _quantize_and_pack_kernel(
     tl.store(scale_ptr_i32 + packed_offset_i32, packed_scale_i32, mask=row_mask_1d)
 
 
+@wrap_triton_kernel
 @triton.jit
 def _gather_quantize_and_pack_kernel(
     src_ptr,          # original (T, K) tensor
@@ -2658,7 +2675,7 @@ def gather_quantize_and_pack_activation(
         SF_TILE_STORAGE=_SF_TILE_STORAGE,
         SAFE_INT64=_needs_int64,
     )
-    return fp8_out, packed_scales.view(torch.float8_e8m0fnu)
+    return fp8_out, packed_scales.view(_E8M0_DTYPE)
 
 
 def quantize_and_pack_activation(
@@ -2667,7 +2684,7 @@ def quantize_and_pack_activation(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize bf16 activation to blockscaled FP8 with ISA-packed scales.
 
-    Single fused Triton kernel: bf16 → fp8 + ISA-layout packed E8M0 scales.
+    Single fused Triton kernel: bf16 -> fp8 + ISA-layout packed E8M0 scales.
     Eliminates the intermediate raw_scales tensor and fancy-indexing scatter.
 
     Parameters
@@ -2726,12 +2743,12 @@ def quantize_and_pack_activation(
         GROUPS_PER_K_TILE=groups_per_k_tile,
         SAFE_INT64=_needs_int64,
     )
-    return fp8_out, packed_scales.view(torch.float8_e8m0fnu)
+    return fp8_out, packed_scales.view(_E8M0_DTYPE)
 
 
 
 # ---------------------------------------------------------------------------
-# Three-step optimized gather: T-quant → fp8_gather → scale_gather
+# Three-step optimized gather: T-quant -> fp8_gather -> scale_gather
 # ---------------------------------------------------------------------------
 # Replaces the monolithic gather_quantize_and_pack_activation when the source
 # tensor T is small enough to fit in L2 cache (e.g., T=4096..8192, K≤4096).
@@ -2741,6 +2758,7 @@ def quantize_and_pack_activation(
 # Total ~20-40µs vs ~96-99µs for gather_quantize_and_pack_activation.
 # Numerically identical: scale for row r is computed from x[r, :] regardless.
 
+@wrap_triton_kernel
 @triton.jit
 def _gather_isa_packed_scales_kernel(
     src_scale_ptr,     # ISA-packed scales for T rows (uint8)
@@ -2796,7 +2814,7 @@ def fast_gather_quantize_and_pack_activation(
     gather_idx: torch.Tensor,
     group_size: int = _SF_VEC_SIZE,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Three-step optimized gather+quantize: T-quant → fp8_gather → scale_gather.
+    """Three-step optimized gather+quantize: T-quant -> fp8_gather -> scale_gather.
 
     Numerically identical to gather_quantize_and_pack_activation, but 3-5x
     faster when T << TK (common in MoE with high top-K).
@@ -2854,13 +2872,14 @@ def fast_gather_quantize_and_pack_activation(
     )
 
     del x_fp8_t, scales_t
-    return fp8_out, packed_scales_tk.view(torch.float8_e8m0fnu)
+    return fp8_out, packed_scales_tk.view(_E8M0_DTYPE)
 
 
+@wrap_triton_kernel
 @triton.jit
 def _pad_quantize_and_pack_kernel(
     src_ptr,               # original (total_M, K) bf16
-    src_idx_ptr,           # (padded_total,) int64 — padded → original row, -1 for pad
+    src_idx_ptr,           # (padded_total,) int64 — padded -> original row, -1 for pad
     dst_fp8_ptr,           # (padded_total, K) fp8 output
     dst_packed_scale_ptr,  # ISA-packed scales for padded layout
     rows,                  # padded_total
@@ -2950,7 +2969,7 @@ def pad_quantize_and_pack_activation(
 
     Instead of allocating a (padded_total, K) bf16 buffer, scattering, then
     quantizing 25% more rows, this function:
-    1. Computes the inverse mapping (padded_row → original_row)
+    1. Computes the inverse mapping (padded_row -> original_row)
     2. Runs a single kernel that reads from original data and writes padded
        fp8 + ISA-packed scales directly
 
@@ -2958,7 +2977,7 @@ def pad_quantize_and_pack_activation(
     ----------
     a : Tensor (total_M, K) bf16 — original (non-padded) activation.
     padded_total : int — total padded rows.
-    dst_idx : Tensor (total_M,) int64 — original → padded row mapping.
+    dst_idx : Tensor (total_M,) int64 — original -> padded row mapping.
 
     Returns
     -------
@@ -2969,7 +2988,7 @@ def pad_quantize_and_pack_activation(
     num_groups = _div_up(K, group_size)
     k_tiles = _div_up(K, _SF_TILE_K)
 
-    # Compute inverse index: padded_row → original_row (cached)
+    # Compute inverse index: padded_row -> original_row (cached)
     cache_key = (total_M, padded_total, id(dst_idx))
     src_idx = _SRC_IDX_CACHE.get(cache_key)
     if src_idx is None:
@@ -3004,7 +3023,7 @@ def pad_quantize_and_pack_activation(
         SF_TILE_M=_SF_TILE_M,
         SF_TILE_STORAGE=_SF_TILE_STORAGE,
     )
-    return fp8_out, packed_scales.view(torch.float8_e8m0fnu)
+    return fp8_out, packed_scales.view(_E8M0_DTYPE)
 
 
 def quantize_and_pack_activation_varlen(
@@ -3015,9 +3034,9 @@ def quantize_and_pack_activation_varlen(
     """Quantize varlen activation to blockscaled FP8 with per-expert ISA-packed scales.
 
     Three-step pipeline:
-    1. Quantize entire (TK, K) in one kernel → fp8 + raw E8M0 scales (TK, num_groups)
+    1. Quantize entire (TK, K) in one kernel -> fp8 + raw E8M0 scales (TK, num_groups)
     2. Reshape raw scales to per-expert (E, max_TPE, num_groups) with padding
-    3. ISA-pack → (E, per_expert_storage) packed scales
+    3. ISA-pack -> (E, per_expert_storage) packed scales
 
     For uniform TPE, step 2 is a zero-copy reshape.
 
@@ -3051,7 +3070,7 @@ def quantize_and_pack_activation_varlen(
         empty_scales = torch.full(
             (E, per_batch_storage), 127, dtype=torch.uint8, device=x.device
         )
-        return fp8_data, empty_scales.view(torch.float8_e8m0fnu)
+        return fp8_data, empty_scales.view(_E8M0_DTYPE)
 
     raw_uint8 = raw_scales.view(torch.uint8)
     min_tpe = min(cpu_lens)
@@ -3072,11 +3091,12 @@ def quantize_and_pack_activation_varlen(
 
     # Step 3: ISA-pack the 3D scales
     packed = pack_blockscaled_1x32_scales(
-        padded_scales.view(torch.float8_e8m0fnu), K
+        padded_scales.view(_E8M0_DTYPE), K
     )
     return fp8_data, packed
 
 
+@wrap_triton_kernel
 @triton.jit
 def _quantize_and_pack_iso32_kernel(
     src_ptr, dst_fp8_ptr, dst_packed_scale_ptr,
@@ -3199,7 +3219,7 @@ def quantize_and_pack_weight_iso32(
         SF_TILE_M=_SF_TILE_M, SF_TILE_STORAGE=_SF_TILE_STORAGE,
         GROUPS_PER_K_TILE=groups_per_k_tile,
     )
-    return fp8_out, packed.view(torch.float8_e8m0fnu)
+    return fp8_out, packed.view(_E8M0_DTYPE)
 
 
 def _quantize_weight_3d_triton(
@@ -3263,8 +3283,8 @@ def precompute_weight_fp8(
     w_scales : Tensor packed float8_e8m0fnu in ISA layout
     """
     key = (
-        w.untyped_storage().data_ptr(),
-        w._version,
+        w.data_ptr(),
+        w._inplace_version(),
         tuple(w.shape),
         tuple(w.stride()),
     )
@@ -3318,8 +3338,8 @@ def precompute_weight_fp8_for_fused_gated(
         of the contiguous layout)
     """
     key = (
-        w.untyped_storage().data_ptr(),
-        w._version,
+        w.data_ptr(),
+        w._inplace_version(),
         tuple(w.shape),
         tuple(w.stride()),
     )
@@ -3362,8 +3382,8 @@ def precompute_weight_fp8_for_fused_dgated(
     w_scales : Tensor packed float8_e8m0fnu in ISA layout (scales along K=H)
     """
     key = (
-        w.untyped_storage().data_ptr(),
-        w._version,
+        w.data_ptr(),
+        w._inplace_version(),
         tuple(w.shape),
         tuple(w.stride()),
     )
@@ -3371,7 +3391,7 @@ def precompute_weight_fp8_for_fused_dgated(
     if cached is not None:
         return cached
 
-    # w is (H, I, E) → (E, I, H) contiguous = (E, N, K) physical layout
+    # w is (H, I, E) -> (E, I, H) contiguous = (E, N, K) physical layout
     w_enk = w.permute(2, 1, 0).contiguous()  # (E, N=I, K=H) contiguous
     w_fp8_enk, w_scales_packed = _quantize_weight_3d_triton(w_enk)
     # Return .mT view (E, K=H, N=I) so gemm_dgated_tuned's B.mT recovers (E, N=I, K=H)
@@ -3402,8 +3422,8 @@ def precompute_weight_fp8_for_direct_fused_dgated(
     w_scales : Tensor packed float8_e8m0fnu in ISA layout (scales along K=H).
     """
     key = (
-        w.untyped_storage().data_ptr(),
-        w._version,
+        w.data_ptr(),
+        w._inplace_version(),
         tuple(w.shape),
         tuple(w.stride()),
     )
@@ -3615,7 +3635,7 @@ def _run_cutlass_blockscaled_gemm(
     if cached is not None:
         compiled, scheduler_args, epi_args = cached
         out = torch.empty(total_M, H, dtype=out_dtype, device=device)
-        # B permute for varlen_m: (H,K,E) → (K,E,H)
+        # B permute for varlen_m: (H,K,E) -> (K,E,H)
         w_permuted = w_fp8.permute(1, 2, 0)
         # Cute tensors — all row-major (leading_dim=1) in production
         a_cute = _make_cute_tensor_dynamic(a_fp8, leading_dim=1)
@@ -3626,7 +3646,7 @@ def _run_cutlass_blockscaled_gemm(
         varlen_args = GemmWrapperBase.create_varlen_args(
             cu_seqlens_m, cu_seqlens_k=None, A_idx=None,
         )
-        stream = cutlass_torch.current_stream()
+        stream = cuda.CUstream(torch.cuda.current_stream().stream_base.raw_stream)
         compiled(
             a_cute, b_cute, d_cute, None,
             epi_args, scheduler_args, varlen_args, stream,
@@ -3695,7 +3715,7 @@ def _run_cutlass_blockscaled_gemm(
     )
 
     epi_args = GemmDefaultSm100.EpilogueArguments()
-    current_stream = cutlass_torch.current_stream()
+    current_stream = cuda.CUstream(torch.cuda.current_stream().stream_base.raw_stream)
     a_scale_cute = _make_cute_tensor_dynamic(a_scales_packed, leading_dim=1)
     b_scale_cute = _make_cute_tensor_dynamic(w_scales_packed, leading_dim=1)
 
@@ -3885,7 +3905,7 @@ def blockscaled_fp8_weight_grad_gemm(
 
     # 6. Run CUTLASS grouped blockscaled GEMM
     #    A_cutlass (E, M=dim_A, K=cap)  @  B_cutlass (E, N=dim_B, K=cap)^T
-    #    → D (E, M=dim_A, N=dim_B)
+    #    -> D (E, M=dim_A, N=dim_B)
     config = default_config(device)
     if config.swap_ab:
         raise RuntimeError("blockscaled_fp8_weight_grad_gemm does not support swap_ab")
@@ -3935,7 +3955,7 @@ def blockscaled_fp8_weight_grad_gemm(
     )
     varlen_args = None
     epi_args = GemmDefaultSm100.EpilogueArguments()
-    current_stream = cutlass_torch.current_stream()
+    current_stream = cuda.CUstream(torch.cuda.current_stream().stream_base.raw_stream)
     a_scale_cute = _make_cute_tensor_dynamic(packed_a_scales, leading_dim=1)
     b_scale_cute = _make_cute_tensor_dynamic(packed_b_scales, leading_dim=1)
 
@@ -4133,7 +4153,7 @@ def blockscaled_fp8_weight_grad_gemm_fast(
     )
     varlen_args = None
     epi_args = GemmDefaultSm100.EpilogueArguments()
-    current_stream = cutlass_torch.current_stream()
+    current_stream = cuda.CUstream(torch.cuda.current_stream().stream_base.raw_stream)
     a_scale_cute = _make_cute_tensor_dynamic(packed_a_scales, leading_dim=1)
     b_scale_cute = _make_cute_tensor_dynamic(packed_b_scales, leading_dim=1)
 

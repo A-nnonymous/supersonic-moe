@@ -22,8 +22,8 @@ def _safe_get_device_capacity(device=None):
     return _orig_gdc(device)
 
 
-_safe_get_device_capacity.cache_info = _orig_gdc.cache_info
-_safe_get_device_capacity.cache_clear = _orig_gdc.cache_clear
+_safe_get_device_capacity.cache_info = getattr(_orig_gdc, "cache_info", None)
+_safe_get_device_capacity.cache_clear = getattr(_orig_gdc, "cache_clear", None)
 
 _qgi.get_device_capacity = _safe_get_device_capacity
 # ---------------------------------------------------------------------------

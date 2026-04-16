@@ -9,6 +9,9 @@ that uses ERNIE-core's split-half SwiGLU convention.
 Weight conversion between split-half (ERNIE) and interleaved (SonicMoE) is verified
 explicitly.
 """
+import paddle
+paddle.enable_compat()
+
 import os
 import subprocess
 import sys
@@ -27,6 +30,17 @@ from tests.ops.conftest import (
 )
 
 pytestmark = [requires_blackwell, requires_quack]
+
+
+def _assert_close(actual, expected, atol=1e-5, rtol=0):
+    """Paddle-compatible replacement for _assert_close."""
+    diff = (actual.float() - expected.float()).abs()
+    limit = atol + rtol * expected.float().abs()
+    if not (diff <= limit).all():
+        max_diff = diff.max().item()
+        raise AssertionError(
+            f"Tensors not close: max abs diff={max_diff}, atol={atol}, rtol={rtol}"
+        )
 
 # ---------------------------------------------------------------------------
 # Shapes: (T, H, I, E, K)
@@ -93,9 +107,8 @@ def _make_deterministic_routing(T: int, E: int, K: int, device: str = "cuda"):
             topk_indices[t, k] = (t * K + k) % E
 
     # Generate random logits and pick scores from selected experts
-    gen = torch.Generator(device=device)
-    gen.manual_seed(42)
-    logits = torch.randn(T, E, device=device, generator=gen, dtype=torch.float32)
+    paddle.seed(42)  # fixed seed for routing scores
+    logits = torch.randn(T, E, device=device, dtype=torch.float32)
     # Gather logits for selected experts
     gathered = logits.gather(1, topk_indices.long())
     topk_scores = F.softmax(gathered, dim=-1)
@@ -573,17 +586,14 @@ def _make_test_data(T, H, I, E, K, seed, device="cuda"):
         topk_indices: (T, K) int32
         topk_scores: (T, K) float32
     """
-    gen = torch.Generator(device=device)
-    gen.manual_seed(seed)
-    cpu_gen = torch.Generator()
-    cpu_gen.manual_seed(seed)
+    paddle.seed(seed)
 
-    x = torch.randn(T, H, generator=gen, device=device, dtype=torch.float32)
+    x = torch.randn(T, H, device=device, dtype=torch.float32)
     x = (x * 0.02).to(torch.bfloat16)  # realistic activation scale
 
     # Weights in split-half (gold convention)
-    w1_split = torch.randn(E, 2 * I, H, generator=gen, device=device, dtype=torch.float32) * 0.02
-    w2 = torch.randn(E, H, I, generator=gen, device=device, dtype=torch.float32) * 0.02
+    w1_split = torch.randn(E, 2 * I, H, device=device, dtype=torch.float32) * 0.02
+    w2 = torch.randn(E, H, I, device=device, dtype=torch.float32) * 0.02
 
     topk_indices, topk_scores = _make_deterministic_routing(T, E, K, device)
 
@@ -622,8 +632,7 @@ def _convert_weights_for_sonicmoe(w1_split, w2_gold):
 @pytest.mark.parametrize("seed", SEEDS, ids=[f"seed{s}" for s in SEEDS])
 def test_gold_self_consistency(T, H, I, E, K, seed):
     """Gold forward matches manual per-element computation for a tiny case."""
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
+    paddle.seed(seed)
 
     # Use a tiny shape so we can verify element-by-element
     T_tiny, H_tiny, I_tiny, E_tiny, K_tiny = 4, 32, 16, 2, 2
@@ -668,7 +677,7 @@ def test_gold_self_consistency(T, H, I, E, K, seed):
             pos = s_rev_cpu[t * K_tiny + k].item()
             o_manual[t] += y2_manual[pos] * topk_scores[t, k].float().item()
 
-    torch.testing.assert_close(o, o_manual, atol=1e-5, rtol=0)
+    _assert_close(o, o_manual, atol=1e-5, rtol=0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -679,8 +688,7 @@ def test_gold_self_consistency(T, H, I, E, K, seed):
 @pytest.mark.parametrize("seed", SEEDS, ids=[f"seed{s}" for s in SEEDS])
 def test_sonicmoe_bf16_vs_gold(T, H, I, E, K, seed):
     """SonicMoE BF16 output should closely match gold float32 reference."""
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
+    paddle.seed(seed)
 
     x, w1_split, w2, topk_indices, topk_scores = _make_test_data(T, H, I, E, K, seed)
 
@@ -710,6 +718,8 @@ _FP8_SUBPROCESS_TEMPLATE = textwrap.dedent("""\
     import os, sys, json
     os.environ["USE_QUACK_GEMM"] = "1"
     os.environ["SONIC_MOE_FP8_MODE"] = "perf"
+    import paddle
+    paddle.enable_compat()
     import torch
     sys.path.insert(0, {project_root!r})
 
@@ -720,8 +730,7 @@ _FP8_SUBPROCESS_TEMPLATE = textwrap.dedent("""\
     )
 
     T, H, I, E, K, seed = {T}, {H}, {I}, {E}, {K}, {seed}
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
+    paddle.seed(seed)
 
     x, w1_split, w2, topk_indices, topk_scores = _make_test_data(T, H, I, E, K, seed)
     o_gold = _torch_moe_gold(x, w1_split, w2, topk_indices, topk_scores)
@@ -784,6 +793,8 @@ def test_sonicmoe_fp8_vs_gold(T, H, I, E, K, seed):
 _BF16_VS_FP8_SUBPROCESS_TEMPLATE = textwrap.dedent("""\
     import os, sys, json
     os.environ["USE_QUACK_GEMM"] = "1"
+    import paddle
+    paddle.enable_compat()
     import torch
     sys.path.insert(0, {project_root!r})
 
@@ -794,8 +805,7 @@ _BF16_VS_FP8_SUBPROCESS_TEMPLATE = textwrap.dedent("""\
     )
 
     T, H, I, E, K, seed = {T}, {H}, {I}, {E}, {K}, {seed}
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
+    paddle.seed(seed)
 
     x, w1_split, w2, topk_indices, topk_scores = _make_test_data(T, H, I, E, K, seed)
     w1_param, w2_param = _convert_weights_for_sonicmoe(w1_split, w2)
@@ -860,8 +870,7 @@ def test_ernie_split_half_vs_gold(T, H, I, E, K, seed):
     Also validates round-trip weight conversion:
       split -> interleaved -> split should recover original.
     """
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
+    paddle.seed(seed)
 
     x, w1_split, w2, topk_indices, topk_scores = _make_test_data(T, H, I, E, K, seed)
 
@@ -900,14 +909,14 @@ def test_ernie_split_half_vs_gold(T, H, I, E, K, seed):
             o_check[t] += y2_check[pos] * topk_scores[t, k].float().item()
 
     # Must match gold exactly (both are float32 with same math)
-    torch.testing.assert_close(o_gold, o_check, atol=1e-5, rtol=0)
+    _assert_close(o_gold, o_check, atol=1e-5, rtol=0)
 
     # Also test round-trip weight conversion
     for e in range(E):
         w1_orig = w1_split[e]  # (2I, H)
         w1_inter = split_to_interleaved(w1_orig)
         w1_back = interleaved_to_split(w1_inter)
-        torch.testing.assert_close(w1_orig, w1_back, atol=0, rtol=0)
+        _assert_close(w1_orig, w1_back, atol=0, rtol=0)
 
     # Verify interleaved version with SonicMoE's swiglu convention
     # x_gathered @ w1_interleaved.T gives z_interleaved
@@ -921,7 +930,7 @@ def test_ernie_split_half_vs_gold(T, H, I, E, K, seed):
         gate_inter = z_inter[:, 0::2]
         up_inter = z_inter[:, 1::2]
         y1_inter = F.silu(gate_inter) * up_inter
-        torch.testing.assert_close(y1_check[s:end], y1_inter, atol=1e-5, rtol=0)
+        _assert_close(y1_check[s:end], y1_inter, atol=1e-5, rtol=0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -931,8 +940,7 @@ def test_ernie_split_half_vs_gold(T, H, I, E, K, seed):
 @pytest.mark.parametrize("seed", SEEDS[:1], ids=[f"seed{SEEDS[0]}"])
 def test_gold_backward_self_consistency(seed):
     """Gold backward matches torch.autograd.grad on the gold forward."""
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
+    paddle.seed(seed)
 
     T_tiny, H_tiny, I_tiny, E_tiny, K_tiny = 4, 32, 16, 2, 2
     x, w1_split, w2, topk_indices, topk_scores = _make_test_data(
@@ -980,10 +988,8 @@ def _make_sparse_routing(T, E, K, active_experts, device="cuda"):
     for t in range(T):
         for k in range(K):
             topk_indices[t, k] = active[(t * K + k) % n_active]
-
-    gen = torch.Generator(device=device)
-    gen.manual_seed(42)
-    logits = torch.randn(T, E, device=device, generator=gen, dtype=torch.float32)
+    paddle.seed(42)  # fixed seed for routing scores
+    logits = torch.randn(T, E, device=device, dtype=torch.float32)
     gathered = logits.gather(1, topk_indices.long())
     topk_scores = F.softmax(gathered, dim=-1)
     return topk_indices, topk_scores
@@ -1005,14 +1011,10 @@ _EMPTY_EXPERT_SCENARIOS = [
 @pytest.mark.parametrize("T, H, I, E, K, active_experts", _EMPTY_EXPERT_SCENARIOS)
 def test_empty_experts_bf16_forward(T, H, I, E, K, active_experts):
     """BF16 forward produces correct output when some experts receive 0 tokens."""
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
-
-    gen = torch.Generator(device="cuda")
-    gen.manual_seed(42)
-    x = (torch.randn(T, H, generator=gen, device="cuda", dtype=torch.float32) * 0.02).to(torch.bfloat16)
-    w1_split = torch.randn(E, 2 * I, H, generator=gen, device="cuda", dtype=torch.float32) * 0.02
-    w2 = torch.randn(E, H, I, generator=gen, device="cuda", dtype=torch.float32) * 0.02
+    paddle.seed(42)
+    x = (torch.randn(T, H, device="cuda", dtype=torch.float32) * 0.02).to(torch.bfloat16)
+    w1_split = torch.randn(E, 2 * I, H, device="cuda", dtype=torch.float32) * 0.02
+    w2 = torch.randn(E, H, I, device="cuda", dtype=torch.float32) * 0.02
 
     topk_indices, topk_scores = _make_sparse_routing(T, E, K, active_experts)
 
@@ -1030,14 +1032,10 @@ def test_empty_experts_bf16_forward(T, H, I, E, K, active_experts):
 @pytest.mark.parametrize("T, H, I, E, K, active_experts", _EMPTY_EXPERT_SCENARIOS)
 def test_empty_experts_bf16_backward(T, H, I, E, K, active_experts):
     """BF16 backward gives zero gradients for unused experts."""
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
-
-    gen = torch.Generator(device="cuda")
-    gen.manual_seed(42)
-    x = (torch.randn(T, H, generator=gen, device="cuda", dtype=torch.float32) * 0.02).to(torch.bfloat16)
-    w1_split = torch.randn(E, 2 * I, H, generator=gen, device="cuda", dtype=torch.float32) * 0.02
-    w2 = torch.randn(E, H, I, generator=gen, device="cuda", dtype=torch.float32) * 0.02
+    paddle.seed(42)
+    x = (torch.randn(T, H, device="cuda", dtype=torch.float32) * 0.02).to(torch.bfloat16)
+    w1_split = torch.randn(E, 2 * I, H, device="cuda", dtype=torch.float32) * 0.02
+    w2 = torch.randn(E, H, I, device="cuda", dtype=torch.float32) * 0.02
 
     topk_indices, topk_scores = _make_sparse_routing(T, E, K, active_experts)
     w1_p, w2_p = _convert_weights_for_sonicmoe(w1_split, w2)
@@ -1066,6 +1064,8 @@ _FP8_EMPTY_EXPERT_TEMPLATE = textwrap.dedent("""\
     import os, sys, json
     os.environ["USE_QUACK_GEMM"] = "1"
     os.environ["SONIC_MOE_FP8_MODE"] = "perf"
+    import paddle
+    paddle.enable_compat()
     import torch, torch.nn.functional as F
     sys.path.insert(0, {project_root!r})
 
@@ -1077,12 +1077,10 @@ _FP8_EMPTY_EXPERT_TEMPLATE = textwrap.dedent("""\
 
     T, H, I, E, K = {T}, {H}, {I}, {E}, {K}
     active_experts = {active_experts!r}
-    torch.manual_seed(42); torch.cuda.manual_seed(42)
-
-    gen = torch.Generator(device="cuda"); gen.manual_seed(42)
-    x = (torch.randn(T, H, generator=gen, device="cuda", dtype=torch.float32) * 0.02).to(torch.bfloat16)
-    w1_split = torch.randn(E, 2*I, H, generator=gen, device="cuda", dtype=torch.float32) * 0.02
-    w2 = torch.randn(E, H, I, generator=gen, device="cuda", dtype=torch.float32) * 0.02
+    paddle.seed(42)
+    x = (torch.randn(T, H, device="cuda", dtype=torch.float32) * 0.02).to(torch.bfloat16)
+    w1_split = torch.randn(E, 2*I, H, device="cuda", dtype=torch.float32) * 0.02
+    w2 = torch.randn(E, H, I, device="cuda", dtype=torch.float32) * 0.02
 
     topk_indices, topk_scores = _make_sparse_routing(T, E, K, active_experts)
     o_gold = _torch_moe_gold(x, w1_split, w2, topk_indices, topk_scores)
@@ -1160,8 +1158,7 @@ def test_empty_experts_fp8(T, H, I, E, K, active_experts, need_grad):
 @pytest.mark.parametrize("T, H, I, E, K", MOE_SHAPES)
 def test_deterministic_bf16(T, H, I, E, K):
     """BF16 forward is deterministic: same inputs -> same outputs."""
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
+    paddle.seed(42)
 
     x, w1_split, w2, topk_indices, topk_scores = _make_test_data(T, H, I, E, K, 42)
     w1_p, w2_p = _convert_weights_for_sonicmoe(w1_split, w2)
@@ -1169,7 +1166,7 @@ def test_deterministic_bf16(T, H, I, E, K):
     o1, _, _, _ = _run_sonicmoe_bf16(x, w1_p, w2_p, topk_indices, topk_scores, E, K)
     o2, _, _, _ = _run_sonicmoe_bf16(x, w1_p, w2_p, topk_indices, topk_scores, E, K)
 
-    torch.testing.assert_close(o1, o2, atol=0, rtol=0)
+    _assert_close(o1, o2, atol=0, rtol=0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1181,8 +1178,7 @@ def test_deterministic_bf16(T, H, I, E, K):
 ])
 def test_large_tensor_bf16_vs_gold(T, H, I, E, K):
     """Large shape BF16 forward matches gold within tolerance."""
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
+    paddle.seed(42)
 
     x, w1_split, w2, topk_indices, topk_scores = _make_test_data(T, H, I, E, K, 42)
     o_gold = _torch_moe_gold(x, w1_split, w2, topk_indices, topk_scores)
@@ -1245,13 +1241,13 @@ def test_weight_conversion_roundtrip(I_val):
     # Round-trip: split -> interleaved -> split
     w_inter = split_to_interleaved(w)
     w_back = interleaved_to_split(w_inter)
-    torch.testing.assert_close(w, w_back, atol=0, rtol=0)
+    _assert_close(w, w_back, atol=0, rtol=0)
 
     # Round-trip: interleaved -> split -> interleaved
     w2 = torch.randn(2 * I_val, 768, device="cuda", dtype=torch.float32)
     w2_split = interleaved_to_split(w2)
     w2_back = split_to_interleaved(w2_split)
-    torch.testing.assert_close(w2, w2_back, atol=0, rtol=0)
+    _assert_close(w2, w2_back, atol=0, rtol=0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1367,8 +1363,7 @@ def test_routing_metadata_empty_experts(T, E, K, active_experts):
 @pytest.mark.parametrize("seed", SEEDS[:1], ids=[f"seed{SEEDS[0]}"])
 def test_sonicmoe_bf16_backward_vs_gold(T, H, I, E, K, seed):
     """SonicMoE BF16 weight gradients match gold backward within tolerance."""
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
+    paddle.seed(seed)
 
     x, w1_split, w2, topk_indices, topk_scores = _make_test_data(T, H, I, E, K, seed)
     w1_p, w2_p = _convert_weights_for_sonicmoe(w1_split, w2)
@@ -1403,11 +1398,9 @@ def test_sonicmoe_bf16_backward_vs_gold(T, H, I, E, K, seed):
 def test_gold_all_same_expert():
     """Gold forward works when all tokens are routed to the same expert."""
     T, H, I, E, K = 8, 64, 32, 4, 1
-    gen = torch.Generator(device="cuda")
-    gen.manual_seed(42)
-    x = (torch.randn(T, H, generator=gen, device="cuda") * 0.02).to(torch.bfloat16)
-    w1 = torch.randn(E, 2 * I, H, generator=gen, device="cuda") * 0.02
-    w2 = torch.randn(E, H, I, generator=gen, device="cuda") * 0.02
+    x = (torch.randn(T, H, device="cuda") * 0.02).to(torch.bfloat16)
+    w1 = torch.randn(E, 2 * I, H, device="cuda") * 0.02
+    w2 = torch.randn(E, H, I, device="cuda") * 0.02
 
     topk_indices = torch.zeros(T, K, dtype=torch.int32, device="cuda")
     topk_scores = torch.ones(T, K, device="cuda")
@@ -1426,12 +1419,10 @@ def test_gold_all_same_expert():
 def test_stability_activation_scale(scale):
     """BF16 forward remains stable with different activation scales."""
     T, H, I, E, K = 256, 768, 384, 8, 2
-    gen = torch.Generator(device="cuda")
-    gen.manual_seed(42)
 
-    x = (torch.randn(T, H, generator=gen, device="cuda") * scale).to(torch.bfloat16)
-    w1_split = torch.randn(E, 2 * I, H, generator=gen, device="cuda") * 0.02
-    w2 = torch.randn(E, H, I, generator=gen, device="cuda") * 0.02
+    x = (torch.randn(T, H, device="cuda") * scale).to(torch.bfloat16)
+    w1_split = torch.randn(E, 2 * I, H, device="cuda") * 0.02
+    w2 = torch.randn(E, H, I, device="cuda") * 0.02
 
     topk_indices, topk_scores = _make_deterministic_routing(T, E, K)
     o_gold = _torch_moe_gold(x, w1_split, w2, topk_indices, topk_scores)

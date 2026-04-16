@@ -44,7 +44,7 @@ def _bitmatrix_metadata_compute_stage1(
             curr_sum += tl.sum(tile_counts, 0)
             tl.store(expert_partial_sum_ptr + offs, excl_cumsum, mask=offs < n_tiles)
     elif pid == E:
-        # Exclusive prefix sum of per-expert total counts → expert_offs[e].
+        # Exclusive prefix sum of per-expert total counts -> expert_offs[e].
         # expert_freq_offset[e] = total entries routed to expert e (from A.sum(dim=1)).
         # expert_offs[e] = sum of expert_freq_offset[0..e-1] = global start of expert e.
         curr_sum = 0
