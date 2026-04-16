@@ -1600,19 +1600,19 @@ def test_pad_routing_metadata_axiomatic():
 
     T, H, I, E, K = 10, 16, 8, 3, 2
     device = "cuda"
-    gen = torch.Generator(device=device).manual_seed(999)
+    paddle.seed(999)
 
-    x = torch.randn(T, H, device=device, generator=gen, dtype=torch.float32) * 0.1
+    x = torch.randn(T, H, device=device, dtype=torch.float32) * 0.1
     # Split-half weights per expert: (E, 2I, H) and (E, H, I)
-    w1 = torch.randn(E, 2 * I, H, device=device, generator=gen, dtype=torch.float32) * 0.1
-    w2 = torch.randn(E, H, I, device=device, generator=gen, dtype=torch.float32) * 0.1
+    w1 = torch.randn(E, 2 * I, H, device=device, dtype=torch.float32) * 0.1
+    w2 = torch.randn(E, H, I, device=device, dtype=torch.float32) * 0.1
 
     # Deterministic routing: token t → experts [(t*K+k) % E for k in 0..K-1]
     topk_indices = torch.zeros(T, K, dtype=torch.int32, device=device)
     for t in range(T):
         for k in range(K):
             topk_indices[t, k] = (t * K + k) % E
-    topk_scores = torch.rand(T, K, device=device, generator=gen, dtype=torch.float32)
+    topk_scores = torch.rand(T, K, device=device, dtype=torch.float32)
     topk_scores = topk_scores / topk_scores.sum(dim=-1, keepdim=True)  # normalize
 
     # ── Compute routing metadata (CPU, int64 for correctness) ──
@@ -1662,13 +1662,13 @@ def test_pad_routing_metadata_axiomatic():
     _, _, _, dst_idx = _get_padding_plan(efo, TK)
 
     # (A) All real tokens preserved at dst_idx positions
-    assert torch.equal(pxg[dst_idx], x_gather), "x_gather_idx: real tokens not preserved"
+    assert (pxg[dst_idx] == x_gather).all().item(), "x_gather_idx: real tokens not preserved"
 
     # (B) Original scores preserved
-    assert torch.equal(pscores[:TK], topk_scores.flatten()), "scores: real scores not preserved"
+    assert (pscores[:TK] == topk_scores.flatten()).all().item(), "scores: real scores not preserved"
 
     # (C) Padding scores are zero
-    assert (pscores[TK:] == 0).all(), "scores: padding scores not zero"
+    assert (pscores[TK:] == 0).all().item(), "scores: padding scores not zero"
 
     # (D) All padded segments are 128-aligned
     for e in range(E):
@@ -1702,16 +1702,16 @@ def test_pad_routing_metadata_axiomatic():
 
     # ── The axiom: o_padded == o_gold for every token ──
     max_diff = (o_padded - o_gold).abs().max().item()
-    per_token_match = (o_padded - o_gold).abs().max(dim=1).values
-    all_match = (per_token_match < 1e-5).all()
+    per_token_diff = [(o_padded[t] - o_gold[t]).abs().max().item() for t in range(T)]
+    all_match = all(d < 1e-5 for d in per_token_diff)
 
-    print(f"  pad_routing axiom: max_diff={max_diff:.2e}, all_tokens_match={all_match.item()}")
-    print(f"  per_token_max_diff: {per_token_match.tolist()}")
-    print(f"  padding: TK={TK} → padded_total={pt}, N_pad={pt - TK}")
+    print(f"  pad_routing axiom: max_diff={max_diff:.2e}, all_tokens_match={all_match}")
+    print(f"  per_token_max_diff: {per_token_diff}")
+    print(f"  padding: TK={TK} -> padded_total={pt}, N_pad={pt - TK}")
 
     assert all_match, (
         f"Padding changed output for some tokens! max_diff={max_diff:.2e}\n"
-        f"per_token: {per_token_match.tolist()}"
+        f"per_token: {per_token_diff}"
     )
     # Extra: verify no token was silently zeroed out
     for t in range(T):
