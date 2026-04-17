@@ -1,1640 +1,1066 @@
-#!/usr/bin/env python3
-"""
-SonicMoE FP8 Blockscaled — Publication-Quality Visualization Suite
-===================================================================
+"""SonicMoE fig1–10: Session 53 data-driven figure suite.
 
-Ten data-driven figures for the zero-materialization FP8 training path
-on Blackwell (B200). All numerical data is loaded from artifact JSONs
-(``manifest.json``, ``mem_breakdown.json``, ``kernel_breakdown.json``).
+All figures consume **session-53 artifacts only**:
+  • reports/fp8_frontier_path_analysis.json  — path analysis, budget anchor, precision anchor
+  • reports/quant_bench_final.json           — quantization kernel latency benchmarks
+  • reports/grid_session53/session53_grid_full.json — 27-shape performance grid
 
-Figures
--------
-  1. Executive Summary        — 3-panel: speedup, memory, precision
-  2. Performance Waterfall    — BF16 -> GEMM savings -> quant overhead -> FP8
-  3. Memory Lifecycle         — 6-checkpoint BF16 vs FP8 trajectory
-  4. Backward Peak Breakdown  — 100% tensor-level audit
-  5. Kernel-Level Comparison  — per-kernel BF16 vs FP8 grouped bars
-  6. Precision State Matrix   — dtype heatmap at each tensor x phase cell
-  7. Precision Profile        — RRMSE + cosine with pass thresholds
-  8. Optimization Design Space — shipped gains vs dead ends
-  9. Buffer Lifecycle Gantt   — per-buffer bars, dtype-coloured, event markers
- 10. Dtype Transformation Flow — operator-level FP8 quantization pipeline
-
-Usage
------
-    python -m visualization
-    python visualization/sonicmoe_dataflow.py
-
-Output: <repo_root>/assets/
-Current checked-in artifacts come from a shared-cluster, low-util B200 rerun.
+No legacy manifest.json or benchmark_manifest.json is used.
 """
 from __future__ import annotations
 
 import json
-import pathlib
-from collections import defaultdict
-from dataclasses import dataclass
-from typing import Optional
+import textwrap
+from pathlib import Path
+from typing import Any
 
 import matplotlib
 matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import matplotlib.ticker as mticker
+import numpy as np
 
-import matplotlib.pyplot as plt                              # noqa: E402
-import matplotlib.patches as mpatches                        # noqa: E402
-import matplotlib.ticker as mticker                          # noqa: E402
-from matplotlib.patches import Patch                         # noqa: E402
-from matplotlib.colors import ListedColormap, BoundaryNorm   # noqa: E402
-from matplotlib.font_manager import FontProperties           # noqa: E402
-import numpy as np                                           # noqa: E402
-import seaborn as sns                                        # noqa: E402
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Global Configuration
-# ═══════════════════════════════════════════════════════════════════════════
-
-ROOT = pathlib.Path(__file__).resolve().parent.parent
+# ── paths ────────────────────────────────────────────────────────────────────
+ROOT   = Path(__file__).resolve().parent.parent
 ASSETS = ROOT / "assets"
+_PATH_ANALYSIS = ROOT / "reports" / "fp8_frontier_path_analysis.json"
+_QUANT_BENCH   = ROOT / "reports" / "quant_bench_final.json"
+_GRID_FULL     = ROOT / "reports" / "grid_session53" / "session53_grid_full.json"
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Ground-Truth Data Loading
-# ═══════════════════════════════════════════════════════════════════════════
+# ── shared style ─────────────────────────────────────────────────────────────
+C_BF16   = "#3B82F6"
+C_FP8    = "#F97316"
+C_SAVE   = "#10B981"
+C_COST   = "#EF4444"
+C_TEXT   = "#1F2937"
+C_NEUTRAL= "#6B7280"
+C_GRID   = "#E5E7EB"
+C_PANEL  = "#F9FAFB"
+_HW      = "NVIDIA B30Z (SM100)"
 
-def _load_profiling_data():
-    """Load measured profiling JSON; return (mem_data, kernel_data) dicts."""
-    mem_path = ROOT / "mem_breakdown.json"
-    kern_path = ROOT / "kernel_breakdown.json"
-    mem = json.loads(mem_path.read_text()) if mem_path.exists() else None
-    kern = json.loads(kern_path.read_text()) if kern_path.exists() else None
-    return mem, kern
+STAGE_NAMES = [
+    "Router &\nMeta",
+    "UpProj\nFwd",
+    "DnProj\nFwd",
+    "DnProj\nBwd",
+    "UpBwd\n(wgrad)",
+    "UpBwd\n(actgrad)",
+]
 
-
-def _load_manifest() -> Optional[dict]:
-    """Load introspection manifest if available.
-
-    The manifest is produced by ``tools/introspect.py`` and contains
-    auto-extracted tensor lifecycle, memory trajectory, kernel timing,
-    and precision data.  When present, visualization figures can derive
-    data from it instead of hardcoded constants.
-    """
-    manifest_path = ROOT / "manifest.json"
-    if not manifest_path.exists():
-        return None
-    try:
-        m = json.loads(manifest_path.read_text())
-        if m.get("version", 0) >= 1:
-            return m
-    except (json.JSONDecodeError, KeyError):
-        pass
-    return None
-
-
-def _manifest_bufs(manifest: dict, mode: str) -> Optional[list]:
-    """Convert manifest tensor records to _Buf objects for fig9.
-
-    Filters out trivially small tensors (< 0.1 MiB) to keep the Gantt
-    chart readable — they contribute negligible memory pressure.
-    Returns None if manifest doesn't have the required data.
-    """
-    mode_data = manifest.get("modes", {}).get(mode)
-    if not mode_data or "tensors" not in mode_data:
-        return None
-
-    _MIN_MIB = 0.1  # omit buffers below this threshold
-
-    bufs = []
-    for t in mode_data["tensors"]:
-        size = t.get("size_mib", 0)
-        if size < _MIN_MIB:
-            continue
-        dtype_map = {
-            "torch.bfloat16": "BF16",
-            "torch.float8_e4m3fn": "FP8",
-            "torch.float32": "FP32",
-            "torch.int32": "INT32",
-            "torch.uint8": "SCALE",
-        }
-        dtype_str = dtype_map.get(t["dtype"], "BF16")
-        shape_str = "×".join(str(s) for s in t["shape"])
-        alive = (t.get("create_phase", 0), t.get("free_phase", 5))
-        events = []
-        for ev in t.get("events", []):
-            if "prequant" in ev:
-                phase = alive[0]
-                events.append((phase, "\u26a1"))
-            elif "recomp" in ev.lower():
-                events.append((alive[0], "\u21bb"))
-        bufs.append(_Buf(
-            name=t["name"], dtype=dtype_str, shape=shape_str,
-            mib=size, alive=alive, events=events,
-        ))
-    return bufs if bufs else None
-
-
-def _manifest_memory_trajectory(manifest: dict, mode: str) -> Optional[dict]:
-    """Extract memory trajectory from manifest for a given mode."""
-    mode_data = manifest.get("modes", {}).get(mode)
-    if not mode_data:
-        return None
-    return mode_data.get("memory_trajectory")
-
-
-def _manifest_precision_audit(manifest: dict) -> Optional[dict]:
-    """Extract precision audit data from manifest."""
-    return manifest.get("precision_audit")
-
-
-def _manifest_benchmark_summary(manifest: dict) -> Optional[dict]:
-    """Extract repeated benchmark summary from manifest."""
-    return manifest.get("benchmark_summary")
-
-
-def _categorize_kernel(name: str) -> str:
-    """Map torch.profiler kernel name to a human-readable category."""
-    if "GemmDefault" in name and "Sm100" in name:
-        return "Wgrad GEMM"
-    if "GemmGated" in name and "ZeroMat" not in name:
-        return "GemmGated (fwd)"
-    if "GemmDGated" in name and "ZeroMat" not in name:
-        return "GemmDGated (bwd)"
-    if "GemmGated" in name and "ZeroMat" in name:
-        return "GemmGated ZeroMat (fwd)"
-    if "GemmDGated" in name and "ZeroMat" in name:
-        return "GemmDGated ZeroMat (bwd)"
-    if "_quantize_and_pack" in name:
-        return "FP8 Blockscaled Quant"
-    if "_quantize_flat_blockscaled" in name:
-        return "FP8 Flat Quant"
-    if "_gather_isa_packed_scales" in name:
-        return "ISA Scale Gather"
-    if "token_gather_sum" in name:
-        return "Token Scatter/Gather"
-    if "elementwise_kernel" in name and "BFloat16" in name:
-        return "SwiGLU / Elementwise"
-    if "nvjet" in name:
-        return "Router NVJet GEMM"
-    if "Memcpy" in name:
-        return "Memcpy D2D"
-    if "softmax" in name:
-        return "Router Softmax"
-    if "_compute_col_partial_sum" in name:
-        return "ColVec Reduce"
-    if "_bitmatrix" in name:
-        return "Routing Bitmatrix"
-    if "index_elementwise" in name:
-        return "Index Gather"
-    if "reduce_kernel" in name:
-        return "Reduction Ops"
-    if "vectorized_elementwise" in name:
-        return "Vectorized Add"
-    if "unrolled_elementwise" in name:
-        return "Elementwise Ops"
-    return "Other"
-
-
-def _aggregate_kernels(kernel_list: list[dict]) -> dict[str, dict]:
-    """Aggregate raw kernel events into categories -> {us, count}."""
-    cats: dict[str, dict] = defaultdict(lambda: {"us": 0.0, "count": 0.0})
-    for k in kernel_list:
-        cat = _categorize_kernel(k["name"])
-        cats[cat]["us"] += k["avg_cuda_us"]
-        cats[cat]["count"] += k["avg_count"]
-    return dict(cats)
-
-
-# ── Ernie shape ───────────────────────────────────────────────────────────
-
-@dataclass(frozen=True)
-class MoEShape:
-    T: int = 8192; H: int = 3072; I: int = 1536; E: int = 8; K: int = 8
-
-    @property
-    def TK(self) -> int:
-        return self.T * self.K
-
-    @property
-    def label(self) -> str:
-        return f"T={self.T}, H={self.H}, I={self.I}, E={self.E}, K={self.K}"
-
-SHAPE = MoEShape()
-_SUB = (f"Ernie MoE  ($T$={SHAPE.T}, $H$={SHAPE.H}, $I$={SHAPE.I}, "
-        f"$E$={SHAPE.E}, $K$={SHAPE.K})")
-_HW = "Blackwell B200, shared-cluster low-util rerun"
-
-# ── Publication colour palette ────────────────────────────────────────────
-
-C_BF16    = "#2563EB"   # blue
-C_FP8     = "#EA580C"   # warm orange
-C_SAVE    = "#059669"   # emerald — savings / pass
-C_COST    = "#DC2626"   # red — overhead / fail
-C_NEUTRAL = "#6B7280"   # gray
-C_ACCENT  = "#7C3AED"   # violet — highlights
-C_LIGHT   = "#F3F4F6"   # background gray
-C_AMBER   = "#F59E0B"   # amber — FP8 dtype / warning
-C_SCALE   = "#10B981"   # teal  — SCALE dtype
-
-# Font for Unicode glyphs (DejaVu Sans has full Unicode coverage)
-_GLYPH_FP = FontProperties(family="DejaVu Sans", weight="bold")
-
-# ── Phase system (for precision flow) ─────────────────────────────────────
-
-PHASES = ["Router\n& Meta", "UpProj\nFwd", "DnProj\nFwd",
-          "DnProj\nBwd", "UpBwd\n(wgrad)", "UpBwd\n(actgrad)"]
-N_PH = len(PHASES)
-
-# ── Shared style ──────────────────────────────────────────────────────────
-
-def _apply_style() -> None:
-    """Set publication-quality matplotlib defaults (STIX mathtext, serif)."""
-    sns.set_style("whitegrid", {
-        "grid.linestyle": "--",
-        "grid.alpha": 0.25,
-        "axes.edgecolor": "#D1D5DB",
-    })
+def _style() -> None:
     plt.rcParams.update({
-        "font.family":          "serif",
-        "font.serif":           ["STIXGeneral", "DejaVu Serif"],
-        "mathtext.fontset":     "stix",
-        "font.size":            10,
-        "axes.titlesize":       13,
-        "axes.labelsize":       11,
-        "xtick.labelsize":      9,
-        "ytick.labelsize":      9,
-        "legend.fontsize":      9,
-        "figure.dpi":           200,
-        "savefig.dpi":          250,
-        "savefig.bbox":         "tight",
-        "savefig.facecolor":    "white",
-        "savefig.pad_inches":   0.18,
-        "axes.spines.top":      False,
-        "axes.spines.right":    False,
+        "font.family":  "DejaVu Sans",
+        "axes.facecolor":  "#FCFCFD",
+        "axes.edgecolor":  "#CBD5E1",
+        "axes.linewidth":  0.8,
+        "grid.color":      C_GRID,
+        "grid.linewidth":  0.6,
+        "xtick.color":     C_TEXT,
+        "ytick.color":     C_TEXT,
+        "text.color":      C_TEXT,
+        "axes.labelcolor": C_TEXT,
     })
-
 
 def _save(fig: plt.Figure, name: str) -> None:
-    out = ASSETS / name
-    fig.savefig(str(out))
+    ASSETS.mkdir(exist_ok=True)
+    p = ASSETS / name
+    fig.savefig(p, dpi=150, bbox_inches="tight", facecolor="white")
     plt.close(fig)
-    print(f"  -> {out}")
-
-
-def _pct(base: float, new: float) -> str:
-    d = (new - base) / base * 100
-    return f"{d:+.1f}%"
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Figure 1 — Executive Summary (3-panel)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def fig1_executive_summary() -> None:
-    """Three-panel hero figure: GPU-projection, memory, precision."""
-    mem_data, kern_data = _load_profiling_data()
-    manifest = _load_manifest()
-    pa = _manifest_precision_audit(manifest) if manifest else None
-    bench = _manifest_benchmark_summary(manifest) if manifest else None
-
-    fig, axes = plt.subplots(1, 3, figsize=(15.5, 5.5),
-                              gridspec_kw={"wspace": 0.42})
-    fig.subplots_adjust(top=0.80, bottom=0.10)
-
-    # ── (a) GPU-Projection — CUDA kernel time (the true metric) ──────────
-    ax = axes[0]
-    if kern_data:
-        bf_cuda = kern_data["bf16"].get("total_cuda_us", 4050.5)
-        fp_cuda = kern_data["fp8"].get("total_cuda_us", 3644.6)
-        bf_wc = kern_data["bf16"]["median_total_ms"] * 1000
-        fp_wc = kern_data["fp8"]["median_total_ms"] * 1000
-    else:
-        bf_cuda, fp_cuda = 4050.5, 3644.6
-        bf_wc, fp_wc = 5368.0, 5582.0
-
-    x_pos = np.arange(2)
-    bars = ax.bar(x_pos, [bf_cuda, fp_cuda], 0.52,
-                  color=[C_BF16, C_FP8],
-                  edgecolor="white", linewidth=1.2, zorder=3, alpha=0.90)
-    for i, (cuda_v, wc_v) in enumerate(
-            [(bf_cuda, bf_wc), (fp_cuda, fp_wc)]):
-        ax.text(i, cuda_v + bf_cuda * 0.03,
-                f"{cuda_v:.0f} $\\mu$s",
-                ha="center", va="bottom", fontsize=10, fontweight="bold")
-        gpu_util = cuda_v / wc_v * 100
-        ax.text(i, cuda_v * 0.5,
-                f"wall: {wc_v:.0f}\n({gpu_util:.0f}% util)",
-                ha="center", va="center", fontsize=7.5,
-                color="white", fontweight="bold")
-
-    speedup = bf_cuda / fp_cuda
-    ax.annotate("", xy=(1.18, fp_cuda), xytext=(1.18, bf_cuda),
-                arrowprops=dict(arrowstyle="<->", color=C_SAVE, lw=2),
-                annotation_clip=False)
-    ax.text(1.35, (bf_cuda + fp_cuda) / 2,
-            f"$\\mathbf{{{speedup:.2f}\\times}}$",
-            fontsize=12, color=C_SAVE, va="center", ha="left", clip_on=False)
-    ax.set_xticks(x_pos)
-    ax.set_xticklabels(["BF16", "FP8"])
-    ax.set_ylabel("GPU-Projection ($\\mu$s / iter)")
-    ax.set_title("(a) CUDA Kernel Time", fontweight="bold", pad=8)
-    ax.set_ylim(0, bf_cuda * 1.22)
-    ax.set_xlim(-0.5, 1.85)
-
-    # ── (b) Peak Memory (deltas above pre-fwd base) ──────────────────────
-    ax = axes[1]
-    if mem_data:
-        bf_c = mem_data["bf16"]["checkpoints"]
-        fp_c = mem_data["fp8"]["checkpoints"]
-        bf16_mem = [bf_c["peak_fwd"] - bf_c["pre_fwd"],
-                    bf_c["peak_bwd"] - bf_c["pre_bwd"]]
-        fp8_mem = [fp_c["peak_fwd"] - fp_c["pre_fwd"],
-                   fp_c["peak_bwd"] - fp_c["pre_bwd"]]
-    else:
-        bf16_mem = [1009, 770]
-        fp8_mem = [850, 765]
-
-    x = np.arange(2)
-    w = 0.28
-    b1 = ax.bar(x - w / 2, bf16_mem, w, label="BF16", color=C_BF16,
-                edgecolor="white", linewidth=1.2, zorder=3)
-    b2 = ax.bar(x + w / 2, fp8_mem, w, label="FP8", color=C_FP8,
-                edgecolor="white", linewidth=1.2, zorder=3)
-    ymax_mem = max(max(bf16_mem), max(fp8_mem))
-    for b in b1:
-        ax.text(b.get_x() + b.get_width() / 2, b.get_height() + ymax_mem * 0.015,
-                f"{b.get_height():.0f}", ha="center", va="bottom",
-                fontsize=8.5, fontweight="bold", color=C_BF16)
-    for b in b2:
-        ax.text(b.get_x() + b.get_width() / 2, b.get_height() + ymax_mem * 0.015,
-                f"{b.get_height():.0f}", ha="center", va="bottom",
-                fontsize=8.5, fontweight="bold", color=C_FP8)
-    for i, (bf, fp) in enumerate(zip(bf16_mem, fp8_mem)):
-        color = C_SAVE if fp < bf else C_COST
-        ax.text(i, ymax_mem * 1.18, f"{fp - bf:+.0f} MiB ({_pct(bf, fp)})",
-                ha="center", fontsize=8.5, fontweight="bold", color=color)
-    ax.set_xticks(x)
-    ax.set_xticklabels(["Forward\n$\\Delta$Peak", "Backward\n$\\Delta$Peak"])
-    ax.set_ylabel("Peak $\\Delta$ Memory (MiB above pre-fwd)")
-    ax.set_title("(b) Memory", fontweight="bold", pad=8)
-    ax.set_ylim(0, ymax_mem * 1.35)
-    ax.legend(loc="upper right", framealpha=0.9)
-
-    # ── (c) Precision ────────────────────────────────────────────────────
-    ax = axes[2]
-    metrics = ["output\nRRMSE", "$\\partial x$\nRRMSE",
-               "$\\partial w_1$\nRRMSE", "$\\partial w_2$\nRRMSE"]
-    rr = pa.get("rrmse_pct", {}) if pa else {}
-    fp8_precision = (((bench or {}).get("modes", {}).get("fp8", {})
-                      .get("precision", {})))
-    values = [
-        fp8_precision.get("output_rrmse_pct", {}).get("mean", rr.get("output", 6.60)),
-        fp8_precision.get("dx_rrmse_pct", {}).get("mean", rr.get("dx", 7.48)),
-        rr.get("dw1", 4.27),
-        rr.get("dw2", 4.72),
-    ]
-    threshold = 10.0
-    x_pos = np.arange(len(metrics))
-    bars = ax.bar(x_pos, values, width=0.52, color=C_FP8, edgecolor="white",
-                  linewidth=1.2, zorder=3, alpha=0.85)
-    ax.axhline(threshold, color=C_COST, ls="--", lw=1.5, zorder=2,
-               label=f"Threshold ({threshold}%)")
-    for b, v in zip(bars, values):
-        ax.text(b.get_x() + b.get_width() / 2, v + 0.25,
-                f"{v:.2f}%", ha="center", va="bottom", fontsize=9,
-                fontweight="bold", color=C_SAVE)
-    ax.set_xticks(x_pos)
-    ax.set_xticklabels(metrics)
-    ax.set_ylabel("Relative Error (%)")
-    ax.set_title("(c) Precision", fontweight="bold", pad=8)
-    ax.set_ylim(0, 14)
-    ax.legend(loc="upper left", framealpha=0.9, fontsize=8)
-    badge = "All tracked tensors PASS" if all(v < threshold for v in values) else "Precision gate failed"
-    ax.text(3, 12.5, badge, fontsize=10, fontweight="bold",
-            color=C_SAVE, ha="center",
-            bbox=dict(boxstyle="round,pad=0.3", fc="#ECFDF5", ec=C_SAVE,
-                      lw=1.2, alpha=0.95))
-
-    fig.suptitle(f"SonicMoE FP8 Blockscaled  —  Executive Summary\n"
-                 f"{_SUB}  |  {_HW}",
-                 fontsize=12.5, fontweight="bold", y=0.97)
-    _save(fig, "fig1_executive_summary.png")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Figure 2 — Performance Waterfall
-# ═══════════════════════════════════════════════════════════════════════════
-
-def fig2_performance_waterfall() -> None:
-    """Waterfall: BF16 CUDA total → GEMM savings → quant overhead → FP8 total.
-    Loads real per-kernel profiling from kernel_breakdown.json."""
-    _, kern_data = _load_profiling_data()
-
-    if kern_data:
-        bf_cats = _aggregate_kernels(kern_data["bf16"]["kernels"])
-        fp_cats = _aggregate_kernels(kern_data["fp8"]["kernels"])
-        bf_total_us = sum(v["us"] for v in bf_cats.values())
-        fp_total_us = sum(v["us"] for v in fp_cats.values())
-
-        # GEMM categories
-        gemm_cats = {"Wgrad GEMM", "GemmGated (fwd)", "GemmDGated (bwd)",
-                     "GemmGated ZeroMat (fwd)", "GemmDGated ZeroMat (bwd)"}
-        bf_gemm = sum(v["us"] for c, v in bf_cats.items() if c in gemm_cats)
-        fp_gemm = sum(v["us"] for c, v in fp_cats.items() if c in gemm_cats)
-        gemm_savings = fp_gemm - bf_gemm  # negative = savings
-
-        # FP8 overhead categories
-        overhead_cats = {"FP8 Blockscaled Quant", "FP8 Flat Quant",
-                         "ISA Scale Gather"}
-        fp_overhead = sum(v["us"] for c, v in fp_cats.items()
-                          if c in overhead_cats)
-        bf_overhead = sum(v["us"] for c, v in bf_cats.items()
-                          if c in overhead_cats)
-        quant_delta = fp_overhead - bf_overhead
-
-        other_delta = fp_total_us - bf_total_us - gemm_savings - quant_delta
-    else:
-        bf_total_us, fp_total_us = 6471, 6124
-        gemm_savings, quant_delta, other_delta = -803, 458, -2
-
-    bf_total_r = round(bf_total_us)
-    fp_total_r = round(fp_total_us)
-    gemm_r = round(gemm_savings)
-    quant_r = round(quant_delta)
-    other_r = fp_total_r - bf_total_r - gemm_r - quant_r
-
-    steps = [
-        ("BF16\nBaseline",      bf_total_r,  C_NEUTRAL, True),
-        ("GEMM\nSavings",       gemm_r,      C_SAVE,    False),
-        ("FP8 Quant\nOverhead", quant_r,     C_COST,    False),
-        ("Other\n$\\Delta$",    other_r,     C_NEUTRAL, False),
-        ("FP8\nFrontier",       fp_total_r,  C_FP8,     True),
-    ]
-
-    fig, ax = plt.subplots(figsize=(13, 5.8))
-    fig.subplots_adjust(top=0.82, bottom=0.15)
-
-    running = 0
-    bar_w = 0.55
-
-    for i, (_, val, color, is_abs) in enumerate(steps):
-        if is_abs:
-            bottom, height = 0, val
-            if i == 0:
-                running = val
-        else:
-            if val < 0:
-                bottom = running + val
-                height = -val
-            else:
-                bottom = running
-                height = val
-            running += val
-
-        ax.bar(i, height, bar_w, bottom=bottom, color=color,
-               edgecolor="white", linewidth=1.5, zorder=3, alpha=0.9)
-
-        val_str = f"{val:+d}" if not is_abs else str(val)
-        ax.text(i, bottom + height + bf_total_r * 0.015,
-                f"{val_str} $\\mu$s",
-                ha="center", va="bottom", fontsize=10, fontweight="bold",
-                color=color if not is_abs else "#1F2937")
-
-    # connector lines
-    levels = [bf_total_r]
-    r = bf_total_r
-    for _, val, _, is_abs in steps[1:-1]:
-        r += val
-        levels.append(r)
-    levels.append(fp_total_r)
-    for i in range(len(steps) - 2):
-        y = levels[i + 1]
-        ax.plot([i + bar_w / 2 + 0.04, i + 1 - bar_w / 2 - 0.04],
-                [y, y], color="#9CA3AF", lw=1.0, ls=":", zorder=2)
-
-    net_us = fp_total_r - bf_total_r
-    speedup = bf_total_r / fp_total_r
-    ax.annotate(
-        f"$\\mathbf{{{speedup:.2f}\\times}}$ CUDA\n"
-        f"${net_us:+d}\\;\\mu$s ({net_us/bf_total_r*100:+.1f}%)",
-        xy=(4, fp_total_r), xytext=(3.0, bf_total_r * 0.25),
-        fontsize=11, color=C_SAVE, fontweight="bold", ha="center",
-        arrowprops=dict(arrowstyle="-|>", color=C_SAVE, lw=1.5),
-        bbox=dict(boxstyle="round,pad=0.4", fc="#ECFDF5", ec=C_SAVE,
-                  lw=1.0, alpha=0.95))
-
-    ax.set_xticks(range(len(steps)))
-    ax.set_xticklabels([s[0] for s in steps], fontsize=10)
-    ax.set_ylabel("CUDA Kernel Time ($\\mu$s / iter)")
-    ax.set_ylim(0, bf_total_r * 1.15)
-    ax.set_xlim(-0.5, 4.8)
-    ax.set_title(f"Performance Waterfall  —  torch.profiler CUDA Kernels\n{_SUB}",
-                 fontsize=12.5, fontweight="bold", pad=10)
-    _save(fig, "fig2_performance_waterfall.png")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Figure 3 — Memory Lifecycle
-# ═══════════════════════════════════════════════════════════════════════════
-
-def fig3_memory_lifecycle() -> None:
-    """Memory trajectory across 6 checkpoints: BF16 vs FP8 (from JSON)."""
-    mem_data, _ = _load_profiling_data()
-
-    ckpts = ["Base", "Model\nLoaded", "Input\nAlloc",
-             "Pre-Fwd\n(warmup)", "Fwd\nPeak", "Bwd\nPeak", "Cleanup"]
-
-    if mem_data:
-        bf_c = mem_data["bf16"]["checkpoints"]
-        fp_c = mem_data["fp8"]["checkpoints"]
-        bf16 = np.array([bf_c["base"], bf_c["after_model"], bf_c["after_input"],
-                         bf_c["pre_fwd"], bf_c["peak_fwd"],
-                         bf_c["peak_bwd"], bf_c["post_cleanup"]])
-        fp8 = np.array([fp_c["base"], fp_c["after_model"], fp_c["after_input"],
-                        fp_c["pre_fwd"], fp_c["peak_fwd"],
-                        fp_c["peak_bwd"], fp_c["post_cleanup"]])
-    else:
-        bf16 = np.array([0, 216, 360, 1816, 2826, 3212, 2488])
-        fp8 = np.array([0, 216, 360, 776, 1626, 1751, 872])
-
-    x = np.arange(len(ckpts))
-
-    fig, ax = plt.subplots(figsize=(14, 6.5))
-    fig.subplots_adjust(top=0.83, bottom=0.14)
-
-    # filled area between curves
-    ax.fill_between(x, fp8, bf16, where=(bf16 > fp8),
-                    alpha=0.12, color=C_SAVE, interpolate=True, zorder=1)
-    ax.fill_between(x, fp8, bf16, where=(fp8 > bf16),
-                    alpha=0.12, color=C_COST, interpolate=True, zorder=1)
-
-    ax.plot(x, bf16, "o-", color=C_BF16, lw=2.5, ms=8, zorder=4,
-            label="BF16 Baseline", markeredgecolor="white", markeredgewidth=1.5)
-    ax.plot(x, fp8, "s-", color=C_FP8, lw=2.5, ms=8, zorder=4,
-            label="FP8 Frontier", markeredgecolor="white", markeredgewidth=1.5)
-
-    # point labels — smarter placement
-    for i in range(len(ckpts)):
-        b, f = bf16[i], fp8[i]
-        gap = abs(b - f)
-        offset = max(gap * 0.12, 50) if gap > 0 else 50
-        if b >= f:
-            ax.text(i, b + offset, f"{b:.0f}", ha="center", va="bottom",
-                    fontsize=7.5, color=C_BF16, fontweight="bold")
-            ax.text(i, f - offset, f"{f:.0f}", ha="center", va="top",
-                    fontsize=7.5, color=C_FP8, fontweight="bold")
-        else:
-            ax.text(i, f + offset, f"{f:.0f}", ha="center", va="bottom",
-                    fontsize=7.5, color=C_FP8, fontweight="bold")
-            ax.text(i, b - offset, f"{b:.0f}", ha="center", va="top",
-                    fontsize=7.5, color=C_BF16, fontweight="bold")
-
-    # delta annotations at key divergence points
-    for i in [3, 4, 5, 6]:  # pre-fwd, fwd-peak, bwd-peak, cleanup
-        d = fp8[i] - bf16[i]
-        if abs(d) < 5:
-            continue
-        color = C_SAVE if d < 0 else C_COST
-        mid_y = (bf16[i] + fp8[i]) / 2
-        ax.text(i + 0.28, mid_y, f"{d:+.0f}\nMiB",
-                fontsize=7.5, fontweight="bold", color=color,
-                ha="left", va="center",
-                bbox=dict(boxstyle="round,pad=0.12", fc="white", ec=color,
-                          lw=0.6, alpha=0.9))
-
-    # phase shading
-    ax.axvspan(2.5, 4.5, alpha=0.04, color=C_BF16, zorder=0)
-    ax.axvspan(4.5, 5.5, alpha=0.04, color=C_COST, zorder=0)
-    ax.text(3.5, ax.get_ylim()[1] * 0.97, "FORWARD", fontsize=8, ha="center",
-            color=C_BF16, fontweight="bold", alpha=0.6)
-    ax.text(5.0, ax.get_ylim()[1] * 0.97, "BACKWARD", fontsize=8, ha="center",
-            color=C_COST, fontweight="bold", alpha=0.6)
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(ckpts, fontsize=9)
-    ax.set_ylabel("GPU Memory Allocated (MiB)")
-    ymax = max(bf16.max(), fp8.max())
-    ax.set_ylim(-50, ymax * 1.15)
-    ax.set_xlim(-0.4, len(ckpts) - 0.4)
-    ax.legend(loc="upper left", framealpha=0.95, fontsize=10)
-    ax.set_title(
-        f"Memory Lifecycle  —  7-Checkpoint BF16 vs FP8\n{_SUB}",
-        fontsize=12.5, fontweight="bold", pad=10)
-    _save(fig, "fig3_memory_lifecycle.png")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Figure 4 — Backward Peak Breakdown (100% audit)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def fig4_backward_breakdown() -> None:
-    """Horizontal bar: 100% backward peak tensor audit from mem_breakdown.json."""
-    mem_data, _ = _load_profiling_data()
-
-    if mem_data:
-        th = mem_data["fp8"]["theoretical_sizes_mib"]
-        caches = mem_data["fp8"].get("fp8_caches_after_bwd", {})
-        cache_total = sum(caches.values()) if caches else 111.375
-        measured_delta = mem_data["fp8"]["deltas"]["bwd_peak_above_pre"]
-    else:
-        th = {}
-        cache_total = 111.375
-        measured_delta = 765
-
-    categories = [
-        ("dz (TK,2I) bf16",        th.get("dz_bf16_TK_2I", 384),  "fixed",
-         "CUTLASS d_dtype=bf16"),
-        ("y1s (TK,I) bf16",        th.get("y1_bf16_TK_I", 192),   "fixed",
-         "CUTLASS constraint"),
-        ("z_fp8 (TK,2I) ctx",      th.get("z_fp8_TK_2I", 192),    "shipped",
-         "Already FP8 (was 384)"),
-        ("w1 bf16 params",         th.get("dw1_E_2I_H", 144),      "limited",
-         "4-layout ceiling"),
-        ("w1T+w2 fp8 caches",      round(cache_total, 1),          "limited",
-         "Can defer w1T"),
-        ("dw2 bf16 pre-alloc",     th.get("dw2_E_I_H", 72),       "limited",
-         "Can defer"),
-        ("w2 bf16 params",         th.get("w2_fp8_E_I_H", 36) * 2, "limited",
-         "4-layout ceiling"),
-        ("dout_fp8+w2_fp8 input",  round(th.get("dout_fp8_T_H", 24)
-                                         + th.get("w2_fp8_E_I_H", 36)
-                                         + th.get("dout_scales_TK", 6), 1),
-         "fixed", "Needed by GEMM"),
-        ("x+dout+meta",            round(th.get("x_input_bf16", 48)
-                                         + th.get("routing_metadata_total", 1.75), 1),
-         "fixed", "Interface contract"),
-        ("scales+colvec+autograd",  round(th.get("z_scales", 6)
-                                          + th.get("y1_scales", 3)
-                                          + th.get("colvec_reduce_partial_fp32", 12)
-                                          + th.get("x_scales_TK", 6)
-                                          + th.get("dz_scales", 6), 1),
-         "fixed", "Overhead"),
-    ]
-
-    labels = [c[0] for c in categories]
-    sizes  = [c[1] for c in categories]
-    kinds  = [c[2] for c in categories]
-    notes  = [c[3] for c in categories]
-    total_theory = sum(sizes)
-    pcts = [s / total_theory * 100 for s in sizes]
-
-    kind_color = {"fixed": C_NEUTRAL, "shipped": C_SAVE, "limited": C_AMBER}
-    kind_label = {
-        "fixed":   "Fixed (CUTLASS / interface)",
-        "shipped": "Already optimized",
-        "limited": "Limited headroom",
-    }
-    colors = [kind_color[k] for k in kinds]
-
-    fig, ax = plt.subplots(figsize=(12, 7))
-    fig.subplots_adjust(left=0.22, right=0.92, top=0.85, bottom=0.08)
-
-    y_pos = np.arange(len(labels))[::-1]
-    ax.barh(y_pos, sizes, height=0.65, color=colors,
-            edgecolor="white", linewidth=1.2, zorder=3, alpha=0.88)
-
-    # annotations
-    ann_x = max(sizes) * 1.08
-    for i, (sz, pct, note) in enumerate(zip(sizes, pcts, notes)):
-        y = y_pos[i]
-        if sz >= 60:
-            ax.text(sz - 4, y, f"{sz:.0f}", ha="right", va="center",
-                    fontsize=8.5, fontweight="bold", color="white")
-        else:
-            ax.text(sz + 4, y, f"{sz:.0f}", ha="left", va="center",
-                    fontsize=8.5, fontweight="bold", color="#1F2937")
-        ax.text(ann_x, y, f"{pct:.0f}%  {note}", va="center", ha="left",
-                fontsize=8, color="#4B5563", style="italic")
-
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(labels, fontsize=9)
-    ax.set_xlabel("Memory (MiB)")
-    ax.set_xlim(0, max(sizes) * 1.55)
-
-    handles = [Patch(facecolor=kind_color[k], edgecolor="white", label=kind_label[k])
-               for k in ("shipped", "limited", "fixed")]
-    ax.legend(handles=handles, loc="lower right", fontsize=8.5, framealpha=0.95)
-
-    gap_pct = abs(total_theory - measured_delta) / measured_delta * 100
-    ax.text(0.97, 0.97,
-            f"Theoretical: {total_theory:.0f} MiB\n"
-            f"Measured $\\Delta$peak: {measured_delta:.0f} MiB  |  "
-            f"Gap: {gap_pct:.1f}%",
-            transform=ax.transAxes, fontsize=8.5, va="top", ha="right",
-            fontweight="bold", color=C_ACCENT,
-            bbox=dict(boxstyle="round,pad=0.35", fc="#F5F3FF", ec=C_ACCENT,
-                      lw=1.0, alpha=0.95))
-
-    ax.set_title(
-        f"Backward Peak Breakdown  —  Tensor-Level Audit\n{_SUB}",
-        fontsize=12.5, fontweight="bold", pad=10)
-    _save(fig, "fig4_backward_breakdown.png")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Figure 5 — Kernel-Level Comparison
-# ═══════════════════════════════════════════════════════════════════════════
-
-def fig5_kernel_comparison() -> None:
-    """Grouped bar: per-kernel BF16 vs FP8 timing from torch.profiler."""
-    _, kern_data = _load_profiling_data()
-
-    if kern_data:
-        bf_cats = _aggregate_kernels(kern_data["bf16"]["kernels"])
-        fp_cats = _aggregate_kernels(kern_data["fp8"]["kernels"])
-
-        # Collect named categories, fwd group first then bwd
-        _excl_bf = {"Wgrad GEMM", "GemmGated (fwd)", "GemmDGated (bwd)",
-                    "SwiGLU / Elementwise", "Token Scatter/Gather",
-                    "FP8 Blockscaled Quant", "FP8 Flat Quant",
-                    "ISA Scale Gather", "Router NVJet GEMM",
-                    "Router Softmax", "Routing Bitmatrix"}
-        _excl_fp = {"Wgrad GEMM", "GemmGated ZeroMat (fwd)",
-                    "GemmDGated ZeroMat (bwd)", "SwiGLU / Elementwise",
-                    "Token Scatter/Gather", "FP8 Blockscaled Quant",
-                    "FP8 Flat Quant", "ISA Scale Gather",
-                    "Router NVJet GEMM", "Router Softmax",
-                    "Routing Bitmatrix"}
-        display_rows = [
-            # ── Forward ──
-            ("GemmGated (up-proj)",
-             bf_cats.get("GemmGated (fwd)", {}).get("us", 0),
-             fp_cats.get("GemmGated ZeroMat (fwd)", {}).get("us", 0), "fwd"),
-            ("Routing (NVJet+softmax)",
-             (bf_cats.get("Router NVJet GEMM", {}).get("us", 0)
-              + bf_cats.get("Router Softmax", {}).get("us", 0)
-              + bf_cats.get("Routing Bitmatrix", {}).get("us", 0)),
-             (fp_cats.get("Router NVJet GEMM", {}).get("us", 0)
-              + fp_cats.get("Router Softmax", {}).get("us", 0)
-              + fp_cats.get("Routing Bitmatrix", {}).get("us", 0)), "fwd"),
-            ("Token Scatter/Gather",
-             bf_cats.get("Token Scatter/Gather", {}).get("us", 0),
-             fp_cats.get("Token Scatter/Gather", {}).get("us", 0), "fwd"),
-            ("SwiGLU / Elementwise",
-             bf_cats.get("SwiGLU / Elementwise", {}).get("us", 0),
-             fp_cats.get("SwiGLU / Elementwise", {}).get("us", 0), "fwd"),
-            ("FP8 Blockscaled Quant",
-             bf_cats.get("FP8 Blockscaled Quant", {}).get("us", 0),
-             fp_cats.get("FP8 Blockscaled Quant", {}).get("us", 0), "fwd"),
-            ("FP8 Flat Quant",
-             bf_cats.get("FP8 Flat Quant", {}).get("us", 0),
-             fp_cats.get("FP8 Flat Quant", {}).get("us", 0), "fwd"),
-            ("ISA Scale Gather",
-             bf_cats.get("ISA Scale Gather", {}).get("us", 0),
-             fp_cats.get("ISA Scale Gather", {}).get("us", 0), "fwd"),
-            # ── Backward ──
-            ("GemmDGated (bwd)",
-             bf_cats.get("GemmDGated (bwd)", {}).get("us", 0),
-             fp_cats.get("GemmDGated ZeroMat (bwd)", {}).get("us", 0), "bwd"),
-            ("Wgrad GEMM (×4)",
-             bf_cats.get("Wgrad GEMM", {}).get("us", 0),
-             fp_cats.get("Wgrad GEMM", {}).get("us", 0), "bwd"),
-            ("Other (reduce, copy, …)",
-             sum(v["us"] for c, v in bf_cats.items() if c not in _excl_bf),
-             sum(v["us"] for c, v in fp_cats.items() if c not in _excl_fp),
-             "bwd"),
-        ]
-    else:
-        display_rows = [
-            ("GemmGated (up-proj)",  754, 465, "fwd"),
-            ("Routing",              59,   59, "fwd"),
-            ("Token Scatter/Gather", 140, 145, "fwd"),
-            ("SwiGLU / Elementwise", 210, 209, "fwd"),
-            ("FP8 Blockscaled Quant", 0, 280, "fwd"),
-            ("FP8 Flat Quant",        0, 124, "fwd"),
-            ("ISA Scale Gather",      0,  55, "fwd"),
-            ("GemmDGated (bwd)",    474,  410, "bwd"),
-            ("Wgrad GEMM (×4)",    4674, 4223, "bwd"),
-            ("Other",               160,  155, "bwd"),
-        ]
-
-    names = [r[0] for r in display_rows]
-    bf16 = np.array([r[1] for r in display_rows], dtype=float)
-    fp8 = np.array([r[2] for r in display_rows], dtype=float)
-    phases = [r[3] for r in display_rows]
-
-    # Find fwd/bwd boundary
-    fwd_idx = [i for i, p in enumerate(phases) if p == "fwd"]
-    bwd_idx = [i for i, p in enumerate(phases) if p == "bwd"]
-
-    fig, ax = plt.subplots(figsize=(14, 8))
-    fig.subplots_adjust(left=0.22, right=0.85, top=0.85, bottom=0.10)
-
-    y_pos = np.arange(len(names))[::-1]
-    h = 0.34
-
-    ax.barh(y_pos + h / 2, bf16, h, label="BF16", color=C_BF16,
-            edgecolor="white", linewidth=1.0, zorder=3, alpha=0.88)
-    ax.barh(y_pos - h / 2, fp8, h, label="FP8", color=C_FP8,
-            edgecolor="white", linewidth=1.0, zorder=3, alpha=0.88)
-
-    # speedup labels
-    ann_x = max(bf16.max(), fp8.max()) * 1.04
-    for i, (b16, f8) in enumerate(zip(bf16, fp8)):
-        y = y_pos[i]
-        if b16 > 10 and f8 > 10:
-            ratio = b16 / f8
-            color = C_SAVE if ratio >= 1.05 else (
-                C_COST if ratio < 0.95 else C_NEUTRAL)
-            ax.text(ann_x, y, f"{ratio:.2f}×",
-                    va="center", fontsize=9, fontweight="bold", color=color)
-        elif b16 < 1 and f8 > 0:
-            ax.text(ann_x, y, "FP8 only", va="center", fontsize=8,
-                    color=C_COST, style="italic")
-
-    # phase separator with shading
-    if bwd_idx and fwd_idx:
-        sep_y = (y_pos[fwd_idx[-1]] + y_pos[bwd_idx[0]]) / 2
-        ax.axhline(sep_y, color="#9CA3AF", lw=0.8, ls="--", zorder=1)
-        # Light background shading for fwd/bwd regions
-        ax.axhspan(sep_y, y_pos[0] + 0.8, alpha=0.04, color=C_BF16, zorder=0)
-        ax.axhspan(y_pos[-1] - 0.8, sep_y, alpha=0.04, color=C_COST, zorder=0)
-        # Inline labels on the separator line
-        from matplotlib.transforms import blended_transform_factory
-        trans = blended_transform_factory(ax.transAxes, ax.transData)
-        ax.text(0.50, sep_y, "  FORWARD          BACKWARD  ",
-                fontsize=7, color="#9CA3AF", fontweight="bold",
-                ha="center", va="center", transform=trans,
-                bbox=dict(boxstyle="round,pad=0.2", fc="white",
-                          ec="#D1D5DB", lw=0.6, alpha=0.95))
-
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(names, fontsize=9)
-    ax.set_xlabel("CUDA Kernel Time ($\\mu$s)")
-    ax.set_xlim(0, max(bf16.max(), fp8.max()) * 1.20)
-    ax.legend(loc="lower right", fontsize=10, framealpha=0.95)
-
-    # Total summary box
-    bf_total = bf16.sum()
-    fp_total = fp8.sum()
-    ax.text(0.98, 0.06,
-            f"BF16: {bf_total:.0f} µs | FP8: {fp_total:.0f} µs | "
-            f"CUDA {bf_total/fp_total:.2f}×",
-            transform=ax.transAxes, fontsize=8.5, va="bottom", ha="right",
-            fontweight="bold", color=C_ACCENT,
-            bbox=dict(boxstyle="round,pad=0.35", fc="#F5F3FF", ec=C_ACCENT,
-                      lw=1.0, alpha=0.95))
-
-    ax.set_title(
-        f"Kernel-Level Performance  —  BF16 vs FP8\n"
-        f"{_SUB}  |  torch.profiler CUDA time",
-        fontsize=12.5, fontweight="bold", pad=10)
-    _save(fig, "fig5_kernel_comparison.png")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Figure 6 — Precision State Matrix (heatmap)
-# ═══════════════════════════════════════════════════════════════════════════
-
-_DTYPE_ENC = {0: "", 1: "BF16", 2: "FP8", 3: "FP32", 4: "SCALE"}
-_TENSOR_NAMES = [
-    "x", "router_w", "w1", "w2", "topk_scores", "gather_idx",
-    "z / z_fp8", "y1 / y1_fp8", "y2",
-    "dout / dout_fp8", "dz / dz_fp8", "y1s (recomp)", "dx",
-]
-
-
-def _precision_matrices():
-    """Build (bf16, fp8) numeric matrices + annotation dicts."""
-    N = len(_TENSOR_NAMES)
-    #                        Rtr  UpF  DnF  DnB  UpW  UpA
-    bf16 = np.zeros((N, N_PH))
-    bf16[0]  = [1, 1, 1, 1, 1, 1]  # x
-    bf16[1]  = [1, 0, 0, 0, 0, 0]  # router_w
-    bf16[2]  = [0, 1, 1, 1, 1, 1]  # w1
-    bf16[3]  = [0, 0, 1, 1, 0, 0]  # w2
-    bf16[4]  = [3, 3, 3, 3, 0, 0]  # topk_scores  FP32
-    bf16[5]  = [0, 1, 1, 1, 1, 1]  # gather_idx   (INT32, vis as BF16)
-    bf16[6]  = [0, 1, 1, 1, 0, 0]  # z
-    bf16[7]  = [0, 1, 1, 1, 0, 0]  # y1
-    bf16[8]  = [0, 0, 1, 0, 0, 0]  # y2
-    bf16[9]  = [0, 0, 0, 1, 1, 1]  # dout
-    bf16[10] = [0, 0, 0, 1, 1, 1]  # dz
-    bf16[11] = [0, 0, 0, 1, 0, 0]  # y1s
-    bf16[12] = [0, 0, 0, 0, 0, 1]  # dx
-
-    fp8 = np.zeros((N, N_PH))
-    fp8[0]  = [1, 1, 1, 1, 1, 1]   # x            BF16
-    fp8[1]  = [1, 0, 0, 0, 0, 0]   # router_w     BF16
-    fp8[2]  = [0, 1, 1, 1, 1, 1]   # w1           BF16
-    fp8[3]  = [0, 0, 1, 1, 0, 0]   # w2           BF16
-    fp8[4]  = [3, 3, 3, 3, 0, 0]   # topk_scores  FP32
-    fp8[5]  = [0, 1, 1, 1, 1, 1]   # gather_idx
-    fp8[6]  = [0, 2, 2, 2, 0, 0]   # z_fp8
-    fp8[7]  = [0, 2, 2, 0, 0, 0]   # y1_fp8
-    fp8[8]  = [0, 0, 1, 0, 0, 0]   # y2           BF16
-    fp8[9]  = [0, 0, 0, 1, 1, 1]   # dout         BF16
-    fp8[10] = [0, 0, 0, 2, 1, 2]   # dz: FP8->BF16->FP8
-    fp8[11] = [0, 0, 0, 1, 0, 0]   # y1s          BF16
-    fp8[12] = [0, 0, 0, 0, 0, 1]   # dx           BF16
-
-    # Annotations: position carefully. We compute an offset direction
-    # to avoid overlaps — if the cell above or to the right has a note, shift.
-    bf16_ann = {
-        (0, 1): ("gather\nvia A_idx",   0.42, -0.35),
-        (6, 1): ("384 MiB\n(TK,2I)",    0.42, -0.35),
-        (7, 1): ("192 MiB\n(TK,I)",     0.42,  0.35),
-        (6, 3): ("used by\ndgated",      0.42, -0.35),
-        (10, 3): ("384 MiB",            0.42, -0.30),
-        (11, 3): ("recomp",             0.42,  0.35),
-    }
-    fp8_ann = {
-        (0, 1):  ("quant->FP8\nT-sized",    0.42, -0.35),
-        (6, 1):  ("192M z_fp8\n(bf16 freed)", 0.42, -0.35),
-        (7, 1):  ("96M y1_fp8",             0.42,  0.35),
-        (7, 2):  ("prequant\ncache",        0.42,  0.35),
-        (9, 3):  ("quant T-sized",          0.42, -0.35),
-        (10, 3): ("dz FP8 192M",           0.42, -0.35),
-        (10, 4): ("resize_(0)\ndz bf16",    0.42, -0.35),
-        (10, 5): ("dz_fp8\nprequant",      -0.42, -0.35),
-        (11, 3): ("from\nz_fp8+e8m0",       0.42,  0.35),
-    }
-    return bf16, fp8, bf16_ann, fp8_ann
-
-
-def fig6_precision_flow() -> None:
-    """Heatmap of tensor precision state across execution phases."""
-    colors_map = ["#F9FAFB", C_BF16, C_AMBER, C_COST, C_SCALE]
-    cmap = ListedColormap(colors_map)
-    norm = BoundaryNorm([-0.5, 0.5, 1.5, 2.5, 3.5, 4.5], cmap.N)
-
-    bf16, fp8, bf16_ann, fp8_ann = _precision_matrices()
-
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(17, 8.5),
-                                    gridspec_kw={"wspace": 0.28})
-    fig.subplots_adjust(top=0.87, bottom=0.10)
-
-    for ax, mat, ann, title in [
-        (ax1, bf16, bf16_ann, "BF16 Baseline"),
-        (ax2, fp8,  fp8_ann,  "FP8 Frontier"),
-    ]:
-        # re-enable spines for grid heatmap
-        ax.spines["top"].set_visible(True)
-        ax.spines["right"].set_visible(True)
-
-        ax.imshow(mat, cmap=cmap, norm=norm, aspect="auto",
-                  interpolation="nearest")
-        ax.set_xticks(np.arange(-0.5, N_PH, 1), minor=True)
-        ax.set_yticks(np.arange(-0.5, len(_TENSOR_NAMES), 1), minor=True)
-        ax.grid(which="minor", color="white", linewidth=2)
-        ax.tick_params(which="minor", size=0)
-        ax.set_xticks(range(N_PH))
-        ax.set_xticklabels(PHASES, fontsize=8)
-        ax.set_yticks(range(len(_TENSOR_NAMES)))
-        ax.set_yticklabels(_TENSOR_NAMES, fontsize=8.5)
-
-        # dtype text in cells
-        for r in range(len(_TENSOR_NAMES)):
-            for c in range(N_PH):
-                v = int(mat[r, c])
-                if v == 0:
-                    continue
-                fc = "white" if v in (1, 2, 3) else "#1F2937"
-                ax.text(c, r, _DTYPE_ENC[v], ha="center", va="center",
-                        fontsize=6.5, fontweight="bold", color=fc)
-
-        # annotations — with per-item offset
-        for (r, c_), (note, dx, dy) in ann.items():
-            ax.annotate(
-                note, xy=(c_, r), xytext=(c_ + dx, r + dy),
-                fontsize=5.5, color="#374151", ha="left" if dx > 0 else "right",
-                va="top" if dy < 0 else "bottom",
-                arrowprops=dict(arrowstyle="-", lw=0.4, color="#9CA3AF"),
-                bbox=dict(boxstyle="round,pad=0.12", fc="#FFFBEB",
-                          ec="#FCD34D", lw=0.5, alpha=0.9),
-            )
-
-        # fwd/bwd divider
-        ax.axvline(2.5, color=C_COST, lw=1.5, ls="--", alpha=0.6)
-        ax.text(2.5, -0.85, "fwd | bwd", ha="center", fontsize=7.5,
-                color=C_COST, fontweight="bold")
-        ax.set_title(title, fontsize=11, fontweight="bold", pad=8,
-                     bbox=dict(boxstyle="round,pad=0.3",
-                               fc=C_LIGHT, ec="#D1D5DB", lw=0.8))
-
-    handles = [
-        mpatches.Patch(color=C_BF16,  label="BF16"),
-        mpatches.Patch(color=C_AMBER, label="FP8 (e4m3fn)"),
-        mpatches.Patch(color=C_COST,  label="FP32"),
-        mpatches.Patch(color="#F9FAFB", ec="#D1D5DB", lw=0.8,
-                       label="Not present"),
-    ]
-    fig.legend(handles=handles, loc="lower center", ncol=4, fontsize=9,
-               frameon=True, edgecolor="#D1D5DB",
-               bbox_to_anchor=(0.5, 0.01))
-    fig.suptitle(
-        f"Tensor Precision State per Execution Phase  --  {_SUB}",
-        fontsize=12.5, fontweight="bold", y=0.96)
-    _save(fig, "fig6_precision_flow.png")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Figure 7 — Precision Profile
-# ═══════════════════════════════════════════════════════════════════════════
-
-def fig7_precision_profile() -> None:
-    """Dual-panel precision: RRMSE + cosine similarity."""
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5.2),
-                                    gridspec_kw={"wspace": 0.38,
-                                                 "width_ratios": [2, 1]})
-    fig.subplots_adjust(top=0.82, bottom=0.16)
-
-    # Try manifest precision data, fall back to hardcoded
-    manifest = _load_manifest()
-    pa = _manifest_precision_audit(manifest) if manifest else None
-    bench = _manifest_benchmark_summary(manifest) if manifest else None
-    if pa and "rrmse_pct" in pa:
-        rr = pa["rrmse_pct"]
-        fp8_precision = (((bench or {}).get("modes", {}).get("fp8", {})
-                          .get("precision", {})))
-        vals_a = [
-            fp8_precision.get("output_rrmse_pct", {}).get("mean", rr.get("output", 6.60)),
-            fp8_precision.get("dx_rrmse_pct", {}).get("mean", rr.get("dx", 7.48)),
-            rr.get("dw1", 4.27),
-            rr.get("dw2", 4.72),
-        ]
-        cs = pa.get("cosine_sim", {})
-        vals_b = [
-            fp8_precision.get("output_corr", {}).get("mean", cs.get("output", 0.998)),
-            fp8_precision.get("dx_corr", {}).get("mean", cs.get("dx", 0.997)),
-        ]
-    else:
-        vals_a = [6.60, 7.48, 4.27, 4.72]
-        vals_b = [0.998, 0.997]
-
-    # ── (a) Relative Error ───────────────────────────────────────────────
-    metrics_a = ["output\nRRMSE", "$\\partial x$\nRRMSE",
-                 "$\\partial w_1$\nnorm rel err", "$\\partial w_2$\nnorm rel err"]
-    x = np.arange(len(metrics_a))
-    bars = ax1.bar(x, vals_a, 0.52, color=C_FP8, edgecolor="white",
-                   linewidth=1.2, zorder=3, alpha=0.85)
-    ax1.axhspan(10.0, 14.0, color=C_COST, alpha=0.06, zorder=0)
-    ax1.axhline(10.0, color=C_COST, ls="--", lw=1.5, zorder=2,
-                label="RRMSE threshold (10%)")
-
-    # value labels above bars
-    for b, v in zip(bars, vals_a):
-        ax1.text(b.get_x() + b.get_width() / 2, v + 0.3,
-                 f"{v:.2f}%", ha="center", va="bottom", fontsize=9,
-                 fontweight="bold", color=C_SAVE)
-
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(metrics_a)
-    ax1.set_ylabel("Relative Error (%)")
-    ax1.set_ylim(0, 14)
-    ax1.set_title("(a) Error Metrics", fontweight="bold", pad=8)
-    ax1.legend(loc="upper right", fontsize=8, framealpha=0.9)
-
-    # ── (b) Cosine Similarity ────────────────────────────────────────────
-    metrics_b = ["output", "$\\partial x$"]
-    x2 = np.arange(len(metrics_b))
-    bars2 = ax2.bar(x2, vals_b, 0.42, color=C_ACCENT, edgecolor="white",
-                    linewidth=1.2, zorder=3, alpha=0.85)
-    ax2.axhline(0.99, color=C_COST, ls="--", lw=1.5, zorder=2,
-                label="Threshold (0.99)")
-    ax2.axhspan(0.985, 0.99, color=C_COST, alpha=0.06, zorder=0)
-
-    for b, v in zip(bars2, vals_b):
-        ax2.text(b.get_x() + b.get_width() / 2, v + 0.0004,
-                 f"{v:.3f}", ha="center", va="bottom", fontsize=10,
-                 fontweight="bold", color=C_SAVE)
-
-    ax2.set_xticks(x2)
-    ax2.set_xticklabels(metrics_b)
-    ax2.set_ylabel("Cosine Similarity")
-    ax2.set_ylim(0.985, 1.004)
-    ax2.set_title("(b) Cosine Similarity", fontweight="bold", pad=8)
-    ax2.legend(loc="lower left", fontsize=8, framealpha=0.9)
-
-    # pass badge — placed below the figure via fig.text
-    fig.text(0.5, 0.02,
-             "Contract suite PASS  |  3 seeds, subprocess-isolated  |  "
-             "Shadow weights BIT-IDENTICAL",
-             ha="center", fontsize=9, fontweight="bold", color=C_SAVE,
-             bbox=dict(boxstyle="round,pad=0.3", fc="#ECFDF5", ec=C_SAVE,
-                       lw=1.0, alpha=0.9))
-
-    fig.suptitle(f"Precision Profile  --  FP8 vs BF16 Ground Truth\n{_SUB}",
-                 fontsize=12.5, fontweight="bold", y=0.97)
-    _save(fig, "fig7_precision_profile.png")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Figure 8 — Optimization Design Space
-# ═══════════════════════════════════════════════════════════════════════════
-
-def fig8_design_space() -> None:
-    """Horizontal bar: shipped optimizations vs dead ends."""
-    entries = [
-        # (label, delta_mib, status, note)
-        ("z_fp8 ctx save\n(was 384M bf16)",           -192, "shipped"),
-        ("y1 prequant cache\n(fwd->bwd transfer)",     -96, "shipped"),
-        ("z_fp8 early release\n(freed after dgated)",  -198, "shipped"),
-        ("Eager cache eviction\n(w1 fused+w2 varlen)", -111, "shipped"),
-        ("Deferred bwd cache fill\n(anti-spike)",      -148, "shipped"),
-        ("FP8 weight caches\n(4 layouts structural)",  +222, "cost"),
-        ("stash_bf16_to_cpu\n(CPU offload+proxy)",       +6, "dead"),
-        ("FP8 wgrad\n(dual_quantize path)",               0, "dead"),
-        ("bf16 dtype change\n(w.data = fp8)",              0, "dead"),
-        ("resize_(0)+proxy\n(storage bounds)",             0, "dead"),
-    ]
-
-    labels   = [e[0] for e in entries]
-    deltas   = [e[1] for e in entries]
-    statuses = [e[2] for e in entries]
-
-    status_color = {"shipped": C_SAVE, "cost": C_COST, "dead": "#9CA3AF"}
-    colors = [status_color[s] for s in statuses]
-
-    fig, ax = plt.subplots(figsize=(12, 7.5))
-    fig.subplots_adjust(left=0.26, right=0.90, top=0.85, bottom=0.08)
-
-    y_pos = np.arange(len(labels))[::-1]
-    ax.barh(y_pos, deltas, height=0.62, color=colors,
-            edgecolor="white", linewidth=1.2, zorder=3, alpha=0.88)
-
-    # value labels — right of positive bars, left of negative bars
-    for i, d in enumerate(deltas):
-        y = y_pos[i]
-        if d != 0:
-            x_t = d + (8 if d > 0 else -8)
-            ha = "left" if d > 0 else "right"
-            ax.text(x_t, y, f"{d:+d} MiB", fontsize=9,
-                    fontweight="bold", va="center", ha=ha, color="#1F2937")
-        else:
-            ax.text(8, y, "N/A (overhead > gain)", fontsize=8,
-                    va="center", ha="left", color=C_NEUTRAL, style="italic")
-
-    ax.axvline(0, color="#1F2937", lw=1.0, zorder=2)
-
-    # section separators
-    sep1_y = (y_pos[4] + y_pos[5]) / 2
-    sep2_y = (y_pos[5] + y_pos[6]) / 2
-    ax.axhline(sep1_y, color="#E5E7EB", lw=1.0, zorder=1)
-    ax.axhline(sep2_y, color="#E5E7EB", lw=1.0, zorder=1)
-
-    # section labels — use axes transform to avoid clipping
-    ax.text(-0.01, 0.72, "SHIPPED", fontsize=8, fontweight="bold",
-            color=C_SAVE, va="center", transform=ax.transAxes,
-            rotation=90, ha="right")
-    ax.text(-0.01, 0.44, "COST", fontsize=8, fontweight="bold",
-            color=C_COST, va="center", transform=ax.transAxes,
-            rotation=90, ha="right")
-    ax.text(-0.01, 0.18, "DEAD ENDS", fontsize=8, fontweight="bold",
-            color=C_NEUTRAL, va="center", transform=ax.transAxes,
-            rotation=90, ha="right")
-
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(labels, fontsize=9)
-    ax.set_xlabel("Memory Impact (MiB)")
-    ax.set_xlim(-230, 270)
-
-    handles = [
-        Patch(facecolor=C_SAVE,    edgecolor="white", label="Shipped optimization"),
-        Patch(facecolor=C_COST,    edgecolor="white", label="Structural cost"),
-        Patch(facecolor="#9CA3AF", edgecolor="white", label="Dead end (verified)"),
-    ]
-    ax.legend(handles=handles, loc="lower right", fontsize=9, framealpha=0.95)
-
-    shipped_total = sum(d for d, s in zip(deltas, statuses) if s == "shipped")
-    cost_total = sum(d for d, s in zip(deltas, statuses) if s == "cost")
-    ax.text(0.97, 0.97,
-            f"Shipped: {shipped_total:+d} MiB  |  "
-            f"Structural cost: {cost_total:+d} MiB\n"
-            f"Session 41: Fwd -122 MiB, Bwd -45 MiB",
-            transform=ax.transAxes, fontsize=8.5, va="top", ha="right",
-            fontweight="bold", color="#1F2937",
-            bbox=dict(boxstyle="round,pad=0.3", fc=C_LIGHT, ec="#D1D5DB",
-                      lw=1.0))
-
-    ax.set_title(f"Optimization Design Space  --  Shipped vs Dead Ends\n{_SUB}",
-                 fontsize=12.5, fontweight="bold", pad=10)
-    _save(fig, "fig8_design_space.png")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Figure 9 — Buffer Lifecycle Gantt
-# ═══════════════════════════════════════════════════════════════════════════
-
-@dataclass
-class _Buf:
-    """GPU buffer descriptor: dtype, shape, size, lifetime span, events."""
-    name: str
-    dtype: str          # BF16 | FP8 | FP32 | INT32 | SCALE
-    shape: str
-    mib: float
-    alive: tuple[int, int]  # (start_phase, end_phase) inclusive 0-based
-    events: list            # [(phase_idx, glyph_str), ...]
-
-
-_DTYPE_CLR = {
-    "BF16": C_BF16, "FP8": C_AMBER, "FP32": C_COST,
-    "INT32": C_NEUTRAL, "SCALE": C_SCALE,
-}
-
-
-def _bf16_bufs() -> list[_Buf]:
-    """BF16 baseline buffer inventory (Ernie shape, 12 tracked tensors)."""
-    B = _Buf
-    return [
-        B("x",           "BF16",  "T*H",    48,   (0, 5), []),
-        B("w1",          "BF16",  "E*2I*H", 144,  (1, 5), []),
-        B("w2",          "BF16",  "E*H*I",  72,   (2, 3), []),
-        B("topk_scores", "FP32",  "T*K",    0.25, (0, 3), []),
-        B("gather_idx",  "INT32", "TK",     0.25, (1, 5), []),
-        B("z",           "BF16",  "TK*2I",  384,  (1, 3), [(3, "\u2298")]),
-        B("y1",          "BF16",  "TK*I",   192,  (1, 3), []),
-        B("y2",          "BF16",  "TK*I",   192,  (2, 2), []),
-        B("dout",        "BF16",  "T*H",    48,   (3, 5), []),
-        B("dz",          "BF16",  "TK*2I",  384,  (3, 5), []),
-        B("y1s recomp",  "BF16",  "TK*I",   192,  (3, 3), [(3, "\u21bb")]),
-        B("dx",          "BF16",  "T*H",    48,   (5, 5), []),
-    ]
-
-
-def _fp8_bufs() -> list[_Buf]:
-    """FP8 frontier buffer inventory (Ernie shape, 20 tracked tensors)."""
-    B = _Buf
-    return [
-        B("x",           "BF16",  "T*H",    48,   (0, 5), []),
-        B("x_fp8",       "FP8",   "T*H",    24,   (1, 5), [(1, "\u26a1")]),
-        B("x_scales",    "SCALE", "T/128",  0.5,  (1, 5), []),
-        B("w1",          "BF16",  "E*2I*H", 144,  (1, 5), []),
-        B("w1_fp8",      "FP8",   "E*H*2I", 72,   (1, 5), [(1, "\u2192")]),
-        B("w2",          "BF16",  "E*H*I",  72,   (2, 3), []),
-        B("w2_fp8",      "FP8",   "E*I*H",  36,   (2, 5), [(2, "\u2192")]),
-        B("topk_scores", "FP32",  "T*K",    0.25, (0, 3), []),
-        B("gather_idx",  "INT32", "TK",     0.25, (1, 5), []),
-        B("z_fp8",       "FP8",   "TK*2I",  192,  (1, 3), [(3, "\u2298")]),
-        B("z_scales",    "SCALE", "blk",    4,    (1, 3), []),
-        B("y1_fp8",      "FP8",   "TK*I",   96,   (1, 2), [(1, "\u26a1")]),
-        B("y1_scales",   "SCALE", "blk",    6,    (1, 2), []),
-        B("y2",          "BF16",  "TK*I",   192,  (2, 2), []),
-        B("dout",        "BF16",  "T*H",    48,   (3, 5), []),
-        B("dout_fp8",    "FP8",   "T*H",    24,   (3, 5), [(3, "\u26a1")]),
-        B("dz",          "BF16",  "TK*2I",  384,  (3, 4), [(4, "\u2298")]),
-        B("dz_fp8",      "FP8",   "TK*2I",  192,  (3, 5), [(3, "\u26a1")]),
-        B("y1s recomp",  "BF16",  "TK*I",   192,  (3, 3), [(3, "\u21bb")]),
-        B("dx",          "BF16",  "T*H",    48,   (5, 5), []),
-    ]
-
-
-def _draw_mem_strip(ax: plt.Axes, bufs: list[_Buf], title: str, *,
-                    mode_color: str = C_BF16,
-                    measured_peak: float = 0) -> float:
-    """Narrow cumulative-memory area strip (sits above its Gantt panel).
-
-    Returns tracked peak MiB for cross-panel delta annotation.
-    """
-    phase_mem = np.array([
-        sum(b.mib for b in bufs if b.alive[0] <= p <= b.alive[1])
-        for p in range(N_PH)])
-    peak_ph = int(np.argmax(phase_mem))
-    peak_v = float(phase_mem[peak_ph])
-    xs = np.arange(N_PH)
-
-    ax.fill_between(xs, phase_mem, alpha=0.15, color=mode_color, step="mid")
-    ax.step(xs, phase_mem, where="mid", color=mode_color, lw=2.0, alpha=0.75)
-    ax.plot(xs, phase_mem, "o", color=mode_color, ms=5, alpha=0.65,
-            markeredgecolor="white", markeredgewidth=0.8)
-
-    for xi, mi in zip(xs, phase_mem):
-        ax.text(xi, mi + peak_v * 0.06, f"{mi:.0f}",
-                ha="center", va="bottom", fontsize=7,
-                color=mode_color, alpha=0.65,
-                fontweight="bold" if xi == peak_ph else "normal")
-
-    ax.plot(peak_ph, peak_v, "D", color=mode_color, ms=9,
-            markeredgecolor="white", markeredgewidth=2, zorder=5)
-
-    if measured_peak > 0:
-        ax.axhline(measured_peak, color=mode_color, lw=1.0, ls=":",
-                   alpha=0.40)
-        ax.text(N_PH + 0.3, measured_peak, f"measured: {measured_peak:.0f}",
-                fontsize=7.5, color=mode_color, alpha=0.55,
-                fontweight="bold", va="center")
-
-    ymax = max(peak_v, measured_peak if measured_peak else 0) * 1.45
-    ax.set_ylim(0, ymax)
-    ax.set_ylabel("MiB", fontsize=8.5, color=mode_color, alpha=0.7,
-                  rotation=0, labelpad=15, va="center")
-    ax.tick_params(axis="y", colors=mode_color, labelsize=7, length=3)
-
-    ax.axvline(2.5, color=C_COST, lw=1.0, ls="--", alpha=0.30)
-    ax.text(1.0, ymax * 0.92, "FWD", fontsize=7, fontweight="bold",
-            color=C_BF16, ha="center", va="top", alpha=0.50)
-    ax.text(4.0, ymax * 0.92, "BWD", fontsize=7, fontweight="bold",
-            color=C_COST, ha="center", va="top", alpha=0.50)
-
-    ax.set_xlim(-0.6, N_PH + 2.0)
-    ax.set_xticks(range(N_PH))
-    ax.tick_params(axis="x", labelbottom=False, length=0)
-
-    ax.set_title(title, fontsize=10.5, fontweight="bold", pad=8,
-                 bbox=dict(boxstyle="round,pad=0.3", fc=C_LIGHT,
-                           ec="#D1D5DB", lw=0.8))
-    return peak_v
-
-
-def _draw_gantt(ax: plt.Axes, bufs: list[_Buf], *,
-                mode_color: str = C_BF16) -> None:
-    """Render per-buffer Gantt bars with subtle phase-pressure shading."""
-    bufs = sorted(bufs, key=lambda b: (b.alive[0], -b.mib))
-    n = len(bufs)
-    _GL = {"\u26a1": "Q", "\u2298": "F", "\u2192": "C", "\u21bb": "R"}
-
-    # Subtle per-phase background tint (intensity ~ cumulative MiB)
-    phase_mem = np.array([
-        sum(b.mib for b in bufs if b.alive[0] <= p <= b.alive[1])
-        for p in range(N_PH)])
-    peak_v = phase_mem.max()
-    if peak_v > 0:
-        for p in range(N_PH):
-            ax.axvspan(p - 0.5, p + 0.5, color=mode_color,
-                       alpha=0.015 + (phase_mem[p] / peak_v) * 0.045,
-                       zorder=0)
-
-    for i, buf in enumerate(bufs):
-        s, e = buf.alive
-        ax.barh(i, e - s + 0.85, left=s - 0.425, height=0.72,
-                color=_DTYPE_CLR[buf.dtype], alpha=0.88,
-                edgecolor="white", linewidth=0.9, zorder=4)
-        lbl = f"{buf.mib:.0f}" if buf.mib >= 1 else f"{buf.mib:.1f}"
-        ax.text(e + 0.45, i, f"{lbl} M ({buf.shape})", va="center",
-                fontsize=6.5, color="#374151", fontweight="bold")
-        for ph, sym in buf.events:
-            code = _GL.get(sym, sym)
-            ax.plot(ph, i, "o", color="white", ms=13, mew=0, zorder=6)
-            ax.text(ph, i, code, ha="center", va="center",
-                    fontsize=7.5, color=_DTYPE_CLR[buf.dtype],
-                    fontweight="bold", zorder=7)
-
-    ax.set_yticks(range(n))
-    ax.set_yticklabels([b.name for b in bufs], fontsize=8)
-    ax.set_xticks(range(N_PH))
-    ax.set_xticklabels(PHASES, fontsize=7.5)
-    ax.set_xlim(-0.6, N_PH + 2.0)
-    ax.set_ylim(n - 0.5, -0.5)
-    ax.axvline(2.5, color=C_COST, lw=1.0, ls="--", alpha=0.30, zorder=1)
-
-
-def fig9_buffer_lifecycle() -> None:
-    """Per-buffer lifecycle Gantt with cumulative memory strip above each panel."""
-    mem_data, _ = _load_profiling_data()
-
-    # Try manifest-derived buffers first, fall back to hardcoded
-    manifest = _load_manifest()
-    bf16_m = _manifest_bufs(manifest, "bf16") if manifest else None
-    fp8_m = _manifest_bufs(manifest, "fp8") if manifest else None
-    bf16 = bf16_m if bf16_m else _bf16_bufs()
-    fp8 = fp8_m if fp8_m else _fp8_bufs()
-    data_source = "manifest" if bf16_m else "hardcoded"
-
-    n_b, n_f = len(bf16), len(fp8)
-
-    # Use profiled peak deltas (above pre-fwd) as measured reference
-    bf_meas = fp_meas = 0
-    if mem_data:
-        bf_d = mem_data["bf16"]["deltas"]
-        fp_d = mem_data["fp8"]["deltas"]
-        bf_meas = max(bf_d.get("fwd_peak_above_pre", 0),
-                      bf_d.get("bwd_peak_above_pre", 0))
-        fp_meas = max(fp_d.get("fwd_peak_above_pre", 0),
-                      fp_d.get("bwd_peak_above_pre", 0))
-
-    fig = plt.figure(figsize=(16, 15))
-    fig.subplots_adjust(top=0.90, bottom=0.06, left=0.11, right=0.93)
-
-    outer = fig.add_gridspec(2, 1, hspace=0.28,
-                             height_ratios=[n_b + 3, n_f + 3])
-    gs_b = outer[0].subgridspec(2, 1, height_ratios=[1.5, n_b * 0.6],
-                                hspace=0.06)
-    gs_f = outer[1].subgridspec(2, 1, height_ratios=[1.5, n_f * 0.6],
-                                hspace=0.06)
-
-    ax_mem_b = fig.add_subplot(gs_b[0])
-    ax_gantt_b = fig.add_subplot(gs_b[1])
-    ax_mem_f = fig.add_subplot(gs_f[0])
-    ax_gantt_f = fig.add_subplot(gs_f[1])
-
-    pk_b = _draw_mem_strip(ax_mem_b, bf16,
-                           f"BF16 Baseline  ({n_b} buffers)",
-                           mode_color=C_BF16, measured_peak=bf_meas)
-    _draw_gantt(ax_gantt_b, bf16, mode_color=C_BF16)
-
-    pk_f = _draw_mem_strip(ax_mem_f, fp8,
-                           f"FP8 Frontier  ({n_f} buffers)",
-                           mode_color=C_FP8, measured_peak=fp_meas)
-    _draw_gantt(ax_gantt_f, fp8, mode_color=C_FP8)
-
-    # Delta summary — placed in the gap between groups
-    pos_gb = ax_gantt_b.get_position()
-    pos_mf = ax_mem_f.get_position()
-    gap_y = (pos_gb.y0 + pos_mf.y1) / 2
-    delta = pk_f - pk_b
-    pct = delta / pk_b * 100
-    fig.text(0.50, gap_y,
-             f"FP8 tracked peak {pk_f:.0f} vs BF16 {pk_b:.0f} MiB  "
-             f"({delta:+.0f} MiB, {pct:+.1f}%)",
-             ha="center", fontsize=9.5, fontweight="bold",
-             color=C_SAVE if delta < 0 else C_COST,
-             bbox=dict(boxstyle="round,pad=0.3", fc="white",
-                       ec=C_SAVE if delta < 0 else C_COST,
-                       lw=0.8, alpha=0.9))
-
-    # ── Shared legend ───────────────────────────────────────────────────
-    from matplotlib.lines import Line2D
-    handles: list = [Patch(facecolor=_DTYPE_CLR[d], edgecolor="white", label=d)
-                     for d in ["BF16", "FP8", "FP32", "INT32", "SCALE"]]
-    handles.append(Line2D([0], [0], color=C_NEUTRAL, lw=2, alpha=0.5,
-                          marker="D", ms=5, markeredgecolor="white",
-                          label="$\\Sigma$ tracked"))
-    handles.append(Line2D([0], [0], color=C_NEUTRAL, lw=1, ls=":",
-                          alpha=0.5, label="profiled $\\Delta$peak"))
-    fig.legend(handles=handles, loc="lower center", ncol=7, fontsize=8.5,
-               frameon=True, edgecolor="#D1D5DB",
-               bbox_to_anchor=(0.50, 0.015))
-
-    fig.text(0.50, 0.001,
-             "Events:  Q = quantize   F = free / resize_(0)   "
-             "C = cache (transposed FP8)   R = recompute from ctx",
-             ha="center", fontsize=8, color="#4B5563", style="italic")
-
-    fig.suptitle(
-        "Buffer Lifecycle  \u2014  Per-Tensor Lifetime, Dtype "
-        "& Cumulative Memory\n" f"{_SUB}",
-        fontsize=13, fontweight="bold", y=0.955)
-    _save(fig, "fig9_buffer_lifecycle.png")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Figure 10 — Dtype Transformation Flow
-# ═══════════════════════════════════════════════════════════════════════════
-
-def fig10_dtype_flow() -> None:
-    """Operator-level pipeline showing FP8 quantization / dequantisation points."""
-
-    stages = [
-        ("Router\n& Meta",
-         {"x": "BF16", "router_w": "BF16"},
-         {"topk_scores": "FP32", "gather_idx": "INT32"},
-         "standard routing"),
-        ("Quant\n(fwd)",
-         {"x": "BF16"},
-         {"x_fp8": "FP8", "x_scales": "SCALE"},
-         "T-sized, 128-group\nblockscaled quant"),
-        ("GemmGated\n(up-proj)",
-         {"x_fp8": "FP8", "w1_fp8": "FP8", "A_idx": "INT32"},
-         {"z_fp8": "FP8", "z_scales": "SCALE"},
-         "zero-mat kernel\nno TK-sized FP8 copy"),
-        ("SwiGLU\n+ cache",
-         {"z_fp8": "FP8"},
-         {"y1_fp8": "FP8", "y1_scales": "SCALE"},
-         "prequant cache\nfor bwd transfer"),
-        ("GemmDefault\n(down-proj)",
-         {"y1_fp8": "FP8", "w2_fp8": "FP8"},
-         {"y2": "BF16"},
-         "FP8 fwd GEMM\nBF16 accumulator"),
-        ("DGated\n(bwd)",
-         {"dout": "BF16", "w2_fp8": "FP8"},
-         {"dz": "BF16"},
-         "quant dout inside\nDGated kernel"),
-        ("Quant\n(bwd: dz)",
-         {"dz": "BF16"},
-         {"dz_fp8": "FP8"},
-         "for actgrad GEMM\nthen dz.resize_(0)"),
-        ("Wgrad\nGEMMs",
-         {"dz": "BF16", "x_fp8": "FP8", "y1_fp8": "FP8"},
-         {"dw1": "BF16", "dw2": "BF16"},
-         "BF16 wgrad\n(FP8 wgrad = dead end)"),
-        ("Actgrad\nGEMM",
-         {"dz_fp8": "FP8", "w1": "BF16"},
-         {"dx": "BF16"},
-         "FP8 x BF16 matmul\nscatter to (T,H)"),
-    ]
-
-    n = len(stages)
-    fig, ax = plt.subplots(figsize=(18, 10))
-    fig.subplots_adjust(top=0.88, bottom=0.06, left=0.02, right=0.98)
-
-    col_op = 0.08
-    col_in_start = 0.18
-    col_out_start = 0.55
-    col_note = 0.85
-    row_h = 1.0 / (n + 1)
-
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
+    print(f"    -> {p}")
+
+def _panel_label(ax: plt.Axes, label: str) -> None:
+    ax.text(-0.06, 1.04, label, transform=ax.transAxes,
+            fontsize=11, fontweight="bold", color=C_TEXT, va="bottom")
+
+# ── data loaders ─────────────────────────────────────────────────────────────
+def _load_pa() -> dict[str, Any]:
+    return json.loads(_PATH_ANALYSIS.read_text())
+
+def _load_qb() -> list[dict[str, Any]]:
+    return json.loads(_QUANT_BENCH.read_text())
+
+def _load_grid() -> dict[str, Any]:
+    return json.loads(_GRID_FULL.read_text())
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# fig1 — System Architecture Conceptual
+# ═════════════════════════════════════════════════════════════════════════════
+def fig1_system_overview() -> None:
+    """Conceptual diagram: MoE block + FP8 blockscaling innovation."""
+    _style()
+    fig, ax = plt.subplots(figsize=(15, 8.5))
+    ax.set_xlim(0, 10)
+    ax.set_ylim(0, 6)
     ax.axis("off")
 
-    # Column headers
-    for cx, label in [(col_op, "Operator"), (col_in_start + 0.05, "Inputs"),
-                      (col_out_start + 0.05, "Outputs"), (col_note, "Notes")]:
-        ax.text(cx, 1 - 0.3 * row_h, label, fontsize=10, fontweight="bold",
-                color="#1F2937", ha="center", va="center",
-                transform=ax.transAxes)
+    from matplotlib.patches import FancyBboxPatch, FancyArrowPatch
 
-    # Header underline (use plot instead of axhline to allow transform)
-    hdr_y = 1 - 0.55 * row_h
-    ax.plot([0.02, 0.98], [hdr_y, hdr_y], color="#D1D5DB", lw=1.2,
-            transform=ax.transAxes, clip_on=False)
+    def _box(x, y, w, h, label, sublabel="", fill="#DBEAFE", edge="#3B82F6",
+             tc=C_TEXT, fs=9.5, lw=1.4, style="round,pad=0.06"):
+        ax.add_patch(FancyBboxPatch((x, y), w, h, boxstyle=style,
+                                   facecolor=fill, edgecolor=edge, linewidth=lw, zorder=3))
+        cy = y + h/2 + (0.10 if sublabel else 0)
+        ax.text(x + w/2, cy, label, ha="center", va="center",
+                fontsize=fs, fontweight="bold", color=tc, zorder=4)
+        if sublabel:
+            ax.text(x + w/2, y + h/2 - 0.18, sublabel, ha="center", va="center",
+                    fontsize=7.2, color=C_NEUTRAL, zorder=4)
 
-    # Forward / backward separator
-    fwd_bwd_boundary = 4.5
-    sep_y = 1 - (fwd_bwd_boundary + 1) * row_h
-    ax.plot([0.02, 0.98], [sep_y, sep_y], color=C_COST, lw=1.5, ls="--",
-            alpha=0.6, transform=ax.transAxes, clip_on=False)
-    ax.text(0.005, sep_y, "bwd", fontsize=8, fontweight="bold",
-            color=C_COST, va="center", transform=ax.transAxes)
+    def _arr(x0, y0, x1, y1, color=C_TEXT, lw=1.5, label=""):
+        ax.annotate("", xy=(x1, y1), xytext=(x0, y0),
+                    arrowprops=dict(arrowstyle="-|>", color=color, lw=lw,
+                                   mutation_scale=12), zorder=2)
+        if label:
+            mx, my = (x0+x1)/2, (y0+y1)/2
+            ax.text(mx+0.07, my, label, fontsize=7.5, color=color,
+                    va="center", style="italic")
 
-    def _tensor_box(x_c: float, y_c: float, name: str, dtype: str) -> None:
-        color = _DTYPE_CLR.get(dtype, C_NEUTRAL)
-        w, h = 0.09, row_h * 0.6
-        rect = mpatches.FancyBboxPatch(
-            (x_c - w / 2, y_c - h / 2), w, h,
-            boxstyle="round,pad=0.005", facecolor=color, edgecolor="white",
-            linewidth=0.8, alpha=0.85, transform=ax.transAxes, zorder=3)
-        ax.add_patch(rect)
-        ax.text(x_c, y_c + h * 0.12, name, fontsize=7, fontweight="bold",
-                color="white", ha="center", va="center",
-                transform=ax.transAxes, zorder=4)
-        ax.text(x_c, y_c - h * 0.25, dtype, fontsize=5.5, color="white",
-                ha="center", va="center", alpha=0.85,
-                transform=ax.transAxes, zorder=4)
+    # Token input
+    _box(0.15, 2.4, 1.1, 1.2, "Input tokens\n$x$",
+         f"T×H  BF16", fill="#F0FDF4", edge=C_SAVE, fs=9)
 
-    for idx, (op_label, inputs, outputs, note) in enumerate(stages):
-        y_c = 1 - (idx + 1) * row_h
+    # TopK Router
+    _box(1.7, 2.4, 1.5, 1.2, "TopK Router",
+         "Softmax + gather\nindices + dispatch", fill="#EDE9FE", edge="#7C3AED")
+    _arr(1.25, 3.0, 1.70, 3.0)
 
-        ax.text(col_op, y_c, op_label, fontsize=8, fontweight="bold",
-                color="#1F2937", ha="center", va="center",
-                transform=ax.transAxes,
-                bbox=dict(boxstyle="round,pad=0.25", fc=C_LIGHT,
-                          ec="#D1D5DB", lw=0.7))
+    # Expert pool
+    exp_y = [4.2, 3.0, 1.6]  # top, mid, bot
+    for i, ey in enumerate(exp_y):
+        _box(3.7, ey, 2.5, 0.85,
+             f"Expert FFN",
+             "UpProj + SwiGLU + DnProj",
+             fill="#FFF7ED", edge=C_FP8)
+        _arr(3.2, ey + 0.42, 3.7, ey + 0.42, color=C_FP8)
+        _arr(6.2, ey + 0.42, 6.7, ey + 0.42, color=C_FP8)
+    ax.text(3.45, 3.0, "⋮", ha="center", va="center",
+            fontsize=18, color=C_FP8, fontweight="bold")
+    ax.text(6.45, 3.0, "⋮", ha="center", va="center",
+            fontsize=18, color=C_FP8, fontweight="bold")
 
-        in_names = list(inputs.keys())
-        in_span = 0.30
-        for j, tname in enumerate(in_names):
-            x = col_in_start + (j + 0.5) * in_span / max(len(in_names), 1)
-            _tensor_box(x, y_c, tname, inputs[tname])
+    # Bracket "E experts"
+    ax.annotate("", xy=(3.70, 4.85), xytext=(3.70, 1.60),
+                arrowprops=dict(arrowstyle="-", color=C_NEUTRAL,
+                                connectionstyle="bar,fraction=0.15"), zorder=1)
+    ax.text(3.42, 3.22, f"E\nexpert\nFFNs", ha="right", va="center",
+            fontsize=8, color=C_NEUTRAL, style="italic")
 
-        ax.annotate("", xy=(col_out_start - 0.02, y_c),
-                    xytext=(col_in_start + in_span + 0.01, y_c),
-                    xycoords="axes fraction", textcoords="axes fraction",
-                    arrowprops=dict(arrowstyle="-|>", color="#9CA3AF",
-                                    lw=1.2, connectionstyle="arc3,rad=0"))
+    # Scatter gather
+    _box(6.7, 2.4, 1.3, 1.2, "Scatter-\nGather", "un-dispatch +\nscatter output",
+         fill="#EDE9FE", edge="#7C3AED")
+    _box(8.4, 2.4, 1.4, 1.2, "Output\n$y$",
+         "T×H  BF16", fill="#F0FDF4", edge=C_SAVE)
+    _arr(8.0, 3.0, 8.4, 3.0)
 
-        out_names = list(outputs.keys())
-        out_span = 0.24
-        for j, tname in enumerate(out_names):
-            x = col_out_start + (j + 0.5) * out_span / max(len(out_names), 1)
-            _tensor_box(x, y_c, tname, outputs[tname])
+    # Router dispatch arrows from router to experts
+    rx, ry = 3.2, 3.0
+    for ey in exp_y:
+        ax.annotate("", xy=(3.7, ey+0.42), xytext=(rx, ry),
+                    arrowprops=dict(arrowstyle="-|>", color=C_NEUTRAL,
+                                   lw=0.9, connectionstyle="arc3,rad=0.0"))
+    ax.text(rx + 0.3, 3.18, "dispatch", fontsize=7, color=C_NEUTRAL, style="italic")
 
-        ax.text(col_note, y_c, note, fontsize=6.5, color="#6B7280",
-                ha="center", va="center", style="italic",
-                transform=ax.transAxes)
+    # Gather back to scatter-gather
+    for ey in exp_y:
+        ax.annotate("", xy=(6.7, 3.0), xytext=(6.2, ey+0.42),
+                    arrowprops=dict(arrowstyle="-|>", color=C_NEUTRAL,
+                                   lw=0.9, connectionstyle="arc3,rad=0.0"))
 
-    patches = [Patch(facecolor=_DTYPE_CLR[d], edgecolor="white", label=d)
-               for d in ["BF16", "FP8", "FP32", "INT32", "SCALE"]]
-    ax.legend(handles=patches, loc="lower center", ncol=5, fontsize=8,
-              frameon=True, edgecolor="#D1D5DB",
-              bbox_to_anchor=(0.5, -0.02), bbox_transform=ax.transAxes)
+    # FP8 innovation callout box
+    innov_x, innov_y = 3.7, 0.12
+    ax.add_patch(FancyBboxPatch((innov_x, innov_y), 2.5, 1.1,
+                                boxstyle="round,pad=0.06",
+                                facecolor="#FFF7ED", edgecolor=C_FP8,
+                                linewidth=1.8, linestyle="--", zorder=3))
+    ax.text(5.0, innov_y + 0.82, "FP8 Blockscaling Frontier",
+            ha="center", va="center", fontsize=9.5, fontweight="bold",
+            color=C_FP8, zorder=4)
+    ax.text(5.0, innov_y + 0.50,
+            "T-size FP8 activation  ×  TK-size ISA-packed scale",
+            ha="center", va="center", fontsize=8.2, color=C_TEXT, zorder=4)
+    ax.text(5.0, innov_y + 0.24,
+            "ZeroMat GEMM: no TK-size HBM gather  →  −21% activation memory",
+            ha="center", va="center", fontsize=8.0, color=C_NEUTRAL, zorder=4)
+
+    # Tensor type legend
+    items = [
+        mpatches.Patch(facecolor="#DBEAFE", edgecolor=C_BF16, label="BF16 tensor"),
+        mpatches.Patch(facecolor="#FFF7ED", edgecolor=C_FP8, label="FP8 / ZeroMat GEMM path"),
+        mpatches.Patch(facecolor="#EDE9FE", edgecolor="#7C3AED", label="Router / Gather (BF16)"),
+        mpatches.Patch(facecolor="#F0FDF4", edgecolor=C_SAVE, label="Input / Output (BF16)"),
+    ]
+    ax.legend(handles=items, loc="upper right", framealpha=0.92,
+              fontsize=8.5, ncol=2, borderpad=0.6)
 
     fig.suptitle(
-        "FP8 Dtype Transformation Flow  \u2014  Operator-Level Pipeline\n"
-        f"{_SUB}",
-        fontsize=13, fontweight="bold", y=0.96)
-    _save(fig, "fig10_dtype_flow.png")
+        "SonicMoE  —  Mixture-of-Experts Architecture with FP8 Blockscaling Frontier\n"
+        f"E experts (E=8/32/128 evaluated), K activated per token, H=3072  |  {_HW}",
+        fontsize=13, fontweight="bold", y=1.01,
+    )
+    _save(fig, "fig1_system_overview.png")
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
+# fig2 — Executive Summary (session-53 data)
+# ═════════════════════════════════════════════════════════════════════════════
+def fig2_executive_summary() -> None:
+    """Key claims: speedup, memory, precision, global scaling — all session-53 data."""
+    _style()
+    pa = _load_pa()
+    ba = pa["budget_anchor"]
+    pr = pa["precision_anchor"]
+    fs = pa["frontier_summary"]
+
+    fig = plt.figure(figsize=(16, 9.5))
+    gs  = fig.add_gridspec(2, 4, hspace=0.48, wspace=0.42)
+    ax_perf = fig.add_subplot(gs[0, :2])
+    ax_mem  = fig.add_subplot(gs[0, 2:])
+    ax_prec = fig.add_subplot(gs[1, :2])
+    ax_glob = fig.add_subplot(gs[1, 2:])
+
+    for ax, lbl in zip([ax_perf, ax_mem, ax_prec, ax_glob],
+                       ["(a)", "(b)", "(c)", "(d)"]):
+        _panel_label(ax, lbl)
+
+    # (a) Compute time at anchor
+    bf = ba["bf16_us"]
+    fp = ba["fp8_us"]
+    sp = ba["speedup"]
+    bars = ax_perf.bar([0, 1], [bf/1000, fp/1000], width=0.5,
+                       color=[C_BF16, C_FP8], edgecolor="white",
+                       linewidth=0.8, zorder=3, alpha=0.88)
+    for b, v, label in zip(bars, [bf, fp], ["BF16", "FP8"]):
+        ax_perf.text(b.get_x()+b.get_width()/2, b.get_height()+0.04,
+                     f"{v/1000:.2f} ms", ha="center", va="bottom",
+                     fontsize=11, fontweight="bold")
+    ax_perf.annotate("", xy=(1.35, fp/1000), xytext=(1.35, bf/1000),
+                     arrowprops=dict(arrowstyle="<->", color=C_SAVE, lw=2.0),
+                     annotation_clip=False)
+    ax_perf.text(1.55, (bf+fp)/2/1000,
+                 f"$\\mathbf{{{sp:.3f}\\times}}$",
+                 fontsize=14, color=C_SAVE, va="center", clip_on=False)
+    ax_perf.set_xticks([0, 1])
+    ax_perf.set_xticklabels(["BF16", "FP8"])
+    ax_perf.set_ylabel("GPU-projection (ms / iter)")
+    ax_perf.set_title("(a)  Compute time  —  anchor shape\n"
+                      f"T=8192, E=8, I=1536, H=3072", fontweight="bold", fontsize=9.5)
+    ax_perf.set_ylim(0, bf/1000 * 1.28)
+    ax_perf.set_xlim(-0.45, 1.85)
+    ax_perf.grid(True, axis="y", color=C_GRID)
+
+    # (b) Memory comparison at anchor
+    mem_bf = ba["memory_bf16"]
+    mem_fp = ba["memory_fp8"]
+    phases = ["Fwd peak\n(MiB)", "Bwd peak\n(MiB)"]
+    bf_vals = [mem_bf["peak_fwd_mib"], mem_bf["peak_bwd_mib"]]
+    fp_vals = [mem_fp["peak_fwd_mib"], mem_fp["peak_bwd_mib"]]
+    x = np.arange(2)
+    w = 0.30
+    ax_mem.bar(x - w/2, bf_vals, w, color=C_BF16, edgecolor="white",
+               linewidth=0.8, label="BF16", zorder=3, alpha=0.88)
+    ax_mem.bar(x + w/2, fp_vals, w, color=C_FP8, edgecolor="white",
+               linewidth=0.8, label="FP8", zorder=3, alpha=0.88)
+    for i, (bf_v, fp_v) in enumerate(zip(bf_vals, fp_vals)):
+        delta = fp_v - bf_v
+        color = C_SAVE if delta < 0 else C_COST
+        ax_mem.text(i, max(bf_v, fp_v) + 35,
+                    f"{delta:+.0f} MiB ({100*delta/bf_v:+.1f}%)",
+                    ha="center", fontsize=8.5, color=color, fontweight="bold")
+        ax_mem.text(i - w/2, bf_v - 60, f"{bf_v:.0f}", ha="center",
+                    fontsize=8, color="white", fontweight="bold")
+        ax_mem.text(i + w/2, fp_v - 60, f"{fp_v:.0f}", ha="center",
+                    fontsize=8, color="white", fontweight="bold")
+    ax_mem.set_xticks(x)
+    ax_mem.set_xticklabels(phases)
+    ax_mem.set_ylabel("Peak HBM (MiB)")
+    ax_mem.set_title("(b)  Memory profile  —  anchor shape", fontweight="bold", fontsize=9.5)
+    ax_mem.legend(loc="upper right", framealpha=0.9)
+    ax_mem.set_ylim(0, max(max(bf_vals), max(fp_vals)) * 1.22)
+    ax_mem.grid(True, axis="y", color=C_GRID)
+
+    # (c) Precision — RRMSE and cosine
+    tensor_names = ["output", "dx", "dw1", "dw2"]
+    rrmse = [pr["rrmse_pct"]["output"], pr["rrmse_pct"]["dx"],
+             pr["rrmse_pct"]["dw1"],    pr["rrmse_pct"]["dw2"]]
+    cosine= [pr["cosine_sim"]["output"], pr["cosine_sim"]["dx"],
+             pr["cosine_sim"]["dw1"],    pr["cosine_sim"]["dw2"]]
+    x4 = np.arange(4)
+    ax_prec.bar(x4, rrmse, width=0.5, color=C_FP8, edgecolor="white",
+                linewidth=0.8, alpha=0.82, zorder=3, label="RRMSE (%)")
+    ax_prec.axhline(10.0, color=C_COST, ls="--", lw=1.5, label="Threshold 10%", zorder=4)
+    for xi, (r, c) in enumerate(zip(rrmse, cosine)):
+        ax_prec.text(xi, r + 0.25, f"{r:.2f}%", ha="center", va="bottom",
+                     fontsize=9, fontweight="bold", color=C_SAVE)
+        ax_prec.text(xi, -1.4, f"cos={c:.4f}", ha="center", va="top",
+                     fontsize=7.5, color=C_NEUTRAL)
+    ax_prec.set_xticks(x4)
+    ax_prec.set_xticklabels(tensor_names)
+    ax_prec.set_ylabel("RRMSE (%)")
+    ax_prec.set_title("(c)  Precision audit  —  largest shape tested\n"
+                      f"T=32768, E=8, I=1536  |  all seeds PASS", fontweight="bold", fontsize=9.5)
+    ax_prec.set_ylim(-2, 14)
+    ax_prec.legend(loc="upper right", framealpha=0.9)
+    badge_all_pass = all(r < 10.0 for r in rrmse)
+    badge_text = "✓  All tensors PASS" if badge_all_pass else "✗  FAIL"
+    badge_color = C_SAVE if badge_all_pass else C_COST
+    ax_prec.text(3.5, 12.5, badge_text, fontsize=10, fontweight="bold",
+                 color=badge_color, ha="right",
+                 bbox=dict(boxstyle="round,pad=0.3", fc="#ECFDF5", ec=badge_color,
+                           lw=1.2, alpha=0.95))
+
+    # (d) Global scaling summary
+    dims   = ["T=8k", "T=16k", "T=32k", "I=1536", "I=2048", "I=3072", "E=8", "E=32", "E=128"]
+    speeds = [
+        fs["avg_speedup_by_T"]["8192"],
+        fs["avg_speedup_by_T"]["16384"],
+        fs["avg_speedup_by_T"]["32768"],
+        fs["avg_speedup_by_I"]["1536"],
+        fs["avg_speedup_by_I"]["2048"],
+        fs["avg_speedup_by_I"]["3072"],
+        fs["avg_speedup_by_E"]["8"],
+        fs["avg_speedup_by_E"]["32"],
+        fs["avg_speedup_by_E"]["128"],
+    ]
+    bg_colors = ["#EFF6FF"]*3 + ["#FFF7ED"]*3 + ["#F0FDF4"]*3
+    bars2 = ax_glob.bar(range(9), speeds, width=0.6,
+                        color=bg_colors, edgecolor=[C_BF16]*3+[C_FP8]*3+[C_SAVE]*3,
+                        linewidth=1.2, zorder=3)
+    ax_glob.axhline(fs["speedup_range"]["mean"], color=C_TEXT, ls="--",
+                    lw=1.0, label=f"Global mean {fs['speedup_range']['mean']:.2f}×", zorder=4)
+    ax_glob.axhspan(fs["speedup_range"]["min"], fs["speedup_range"]["max"],
+                    color=C_SAVE, alpha=0.07, zorder=0)
+    for xi, v in enumerate(speeds):
+        ax_glob.text(xi, v + 0.012, f"{v:.2f}×", ha="center", va="bottom",
+                     fontsize=8, fontweight="bold", color=C_TEXT)
+    # Group labels
+    for mid, label, color in [(1, "by T", C_BF16), (4, "by I", C_FP8), (7, "by E", C_SAVE)]:
+        ax_glob.text(mid, ax_glob.get_ylim()[0] - 0.065,
+                     label, ha="center", va="top", fontsize=8.5,
+                     fontweight="bold", color=color,
+                     transform=ax_glob.get_xaxis_transform())
+    ax_glob.set_xticks(range(9))
+    ax_glob.set_xticklabels(dims, fontsize=8.5)
+    ax_glob.set_ylabel("Average speedup (×)")
+    ax_glob.set_title(f"(d)  Average speedup across 27 shapes\n"
+                      f"min={fs['speedup_range']['min']:.3f}× — "
+                      f"max={fs['speedup_range']['max']:.3f}×", fontweight="bold", fontsize=9.5)
+    ax_glob.legend(loc="upper left", framealpha=0.9)
+    ax_glob.set_ylim(1.20, max(speeds) + 0.18)
+    ax_glob.grid(True, axis="y", color=C_GRID)
+    ax_glob.axvspan(2.45, 2.55, color="#CBD5E1", lw=0)
+    ax_glob.axvspan(5.45, 5.55, color="#CBD5E1", lw=0)
+
+    fig.suptitle(
+        "SonicMoE Session 53  —  FP8 Frontier: Executive Summary\n"
+        f"27 shapes (3T × 3E × 3I)  |  nsys GPU-projection  |  {_HW}",
+        fontsize=13, fontweight="bold", y=1.01,
+    )
+    _save(fig, "fig2_executive_summary.png")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# fig3 — Quantization Kernel Selection
+# ═════════════════════════════════════════════════════════════════════════════
+def fig3_quant_kernel_comparison() -> None:
+    """Latency comparison of quant kernel implementations (quant_bench_final.json)."""
+    _style()
+    qb = _load_qb()
+
+    dims_order = ["I=1536", "H=3072", "2I=3072"]
+    kernels = ["triton_col_nogather", "triton_col_gather", "cute_col_nogather",
+               "row_quant", "dual_varlen"]
+    k_labels = ["Triton col\n(no-gather)", "Triton col\n(gather)", "CuTe col\n(no-gather)",
+                 "Row quant", "Dual varlen\n(BF16 fused)"]
+    k_colors = ["#60A5FA", "#2563EB", "#8B5CF6", "#10B981", "#F59E0B"]
+    # selected kernel for hot path
+    k_selected = {"triton_col_nogather", "row_quant"}
+
+    # Lookup median by (kernel, dim)
+    data: dict[tuple[str,str], float] = {}
+    for rec in qb:
+        data[(rec["kernel"], rec["dim"])] = rec["median"]
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 6.0),
+                              gridspec_kw={"wspace": 0.35})
+    fig.subplots_adjust(bottom=0.22, top=0.82)
+
+    for ci, dim in enumerate(dims_order):
+        ax = axes[ci]
+        vals = [data.get((k, dim), float("nan")) for k in kernels]
+        bars = ax.bar(range(len(kernels)), vals, width=0.6, color=k_colors,
+                      edgecolor="white", linewidth=0.6, zorder=3, alpha=0.88)
+        # highlight selected kernel with heavier border
+        for bi, (b, k) in enumerate(zip(bars, kernels)):
+            if k in k_selected:
+                b.set_edgecolor("#1E3A5F")
+                b.set_linewidth(2.2)
+                ax.text(bi, vals[bi] + 2.5, "★ selected",
+                        ha="center", va="bottom", fontsize=7.0,
+                        color="#1E3A5F", fontweight="bold")
+        for bi, v in enumerate(vals):
+            if not np.isnan(v):
+                ax.text(bi, v/2, f"{v:.0f} µs",
+                        ha="center", va="center", fontsize=8.2,
+                        fontweight="bold", color="white",
+                        bbox=dict(boxstyle="round,pad=0.15",
+                                  facecolor="none", edgecolor="none"))
+
+        ax.set_xticks(range(len(kernels)))
+        ax.set_xticklabels(k_labels, fontsize=8.0, rotation=10, ha="right")
+        ax.set_ylabel("Median latency (µs)")
+        ax.set_title(f"dim = {dim}", fontweight="bold", fontsize=11)
+        ax.set_ylim(0, max(v for v in vals if not np.isnan(v)) * 1.28)
+        ax.grid(True, axis="y", color=C_GRID)
+        _panel_label(ax, f"({'abc'[ci]})")
+
+    # Speedup annotation for nw=1 vs nw=4
+    axes[1].text(0.5, -0.28,
+                 "Triton col (nw=1): 2.3× faster than nw=4 (measured via NCU: 63% idle warp at nw=4)\n"
+                 "Row quant already at 97% occupancy — nw=1 gives no improvement\n"
+                 "CuTe col: 33% slower than Triton col → excluded from hot path",
+                 transform=axes[1].transAxes, ha="center", va="top",
+                 fontsize=8.5, color=C_NEUTRAL, style="italic", linespacing=1.5)
+
+    fig.suptitle(
+        "SonicMoE  —  Quantization Kernel Latency Comparison\n"
+        f"FP8 E4M3 blockscaled  |  Triton JIT  |  {_HW}",
+        fontsize=13, fontweight="bold", y=0.95,
+    )
+    _save(fig, "fig3_quant_kernel_comparison.png")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# fig4 — Performance Waterfall (anchor shape)
+# ═════════════════════════════════════════════════════════════════════════════
+def fig4_performance_waterfall() -> None:
+    """Horizontal waterfall: BF16 total → savings → overheads → FP8 total."""
+    _style()
+    pa = _load_pa()
+    ba = pa["budget_anchor"]
+    bb = ba["budget_breakdown"]   # list of dicts
+
+    savings  = [e for e in bb if e["kind"] == "saving" and abs(e["delta_us"]) > 1]
+    overhead = [e for e in bb if e["kind"] == "overhead" and e["delta_us"] > 1]
+    savings.sort(key=lambda x: x["delta_us"])          # most negative first
+    overhead.sort(key=lambda x: x["delta_us"], reverse=True)  # largest first
+
+    fig, ax = plt.subplots(figsize=(14, 8.5))
+    fig.subplots_adjust(left=0.30, right=0.96)
+
+    entries = []
+    entries.append(("BF16 total", ba["bf16_us"], "base"))
+    for e in savings:
+        entries.append((e["category"], e["delta_us"], "saving"))
+    for e in overhead:
+        entries.append((e["category"], e["delta_us"], "overhead"))
+    entries.append(("FP8 total", ba["fp8_us"], "result"))
+
+    running = ba["bf16_us"]
+    y_labels, y_pos, bar_starts, bar_widths, bar_colors, bar_texts = \
+        [], [], [], [], [], []
+
+    for yi, (label, value, kind) in enumerate(entries):
+        y_labels.append(label)
+        y_pos.append(yi)
+        if kind == "base":
+            bar_starts.append(0)
+            bar_widths.append(value)
+            bar_colors.append(C_BF16)
+            bar_texts.append(f"{value/1000:.2f} ms")
+        elif kind == "result":
+            bar_starts.append(0)
+            bar_widths.append(value)
+            bar_colors.append(C_FP8)
+            bar_texts.append(f"{value/1000:.2f} ms  ({ba['speedup']:.3f}×)")
+        elif kind == "saving":
+            bar_starts.append(running + value)
+            bar_widths.append(-value)
+            bar_colors.append(C_SAVE)
+            running += value
+            bar_texts.append(f"−{abs(value)/1000:.2f} ms")
+        else:  # overhead
+            bar_starts.append(running)
+            bar_widths.append(value)
+            bar_colors.append(C_COST)
+            running += value
+            bar_texts.append(f"+{value/1000:.2f} ms")
+
+    # Draw bars
+    ax.barh(y_pos, bar_widths, left=bar_starts,
+            color=bar_colors, alpha=0.85, edgecolor="white", linewidth=0.8, zorder=3)
+
+    # Value labels at bar right/left edge
+    for yi, (start, width, kind, text) in enumerate(
+            zip(bar_starts, bar_widths, [e[2] for e in entries], bar_texts)):
+        end = start + width
+        ha = "left" if end >= 0 else "right"
+        offset = 20 if end >= 0 else -20
+        ax.text(end + offset, yi, text, va="center", ha=ha,
+                fontsize=8.0, fontweight="bold" if kind in ("base","result") else "normal",
+                color=C_TEXT)
+
+    # Reference lines
+    ax.axvline(ba["bf16_us"], color=C_BF16, ls=":", lw=1.2, alpha=0.6, zorder=0)
+    ax.axvline(ba["fp8_us"],  color=C_FP8,  ls=":", lw=1.2, alpha=0.6, zorder=0)
+    ax.axvline(0, color=C_TEXT, lw=0.8, alpha=0.3)
+
+    # Separator between savings and overhead
+    n_savings = len(savings)
+    ax.axhline(n_savings + 0.5, color="#CBD5E1", lw=1.0, ls="--")
+    ax.text(ba["bf16_us"]*0.50, n_savings + 0.55, "← savings  |  overhead →",
+            ha="center", va="bottom", fontsize=8, color=C_NEUTRAL)
+
+    ax.set_yticks(y_pos)
+    ax.set_yticklabels(y_labels, fontsize=9)
+    ax.set_xlabel("Cumulative GPU-projection time (µs)")
+    ax.invert_yaxis()
+    ax.grid(True, axis="x", color=C_GRID)
+    ax.set_title(
+        "Performance Waterfall: BF16 → FP8 Kernel Time Decomposition\n"
+        f"Anchor: T=8192, E=8, I=1536  |  Total savings: "
+        f"{ba['budget_breakdown'][0]['delta_us']:.0f}… net {pa['budget_anchor']['budget_totals']['net_us']:.0f} µs",
+        fontweight="bold",
+    )
+
+    # Legend
+    legend_items = [
+        mpatches.Patch(color=C_BF16, label="BF16 total"),
+        mpatches.Patch(color=C_SAVE, label="GEMM / elementwise savings"),
+        mpatches.Patch(color=C_COST, label="FP8 quant + bridge overhead"),
+        mpatches.Patch(color=C_FP8, label="FP8 total"),
+    ]
+    ax.legend(handles=legend_items, loc="lower right", framealpha=0.92, fontsize=9)
+
+    fig.suptitle(
+        f"SonicMoE Session 53  —  Kernel Budget Waterfall  |  {_HW}",
+        fontsize=13, fontweight="bold", y=1.01,
+    )
+    _save(fig, "fig4_performance_waterfall.png")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# fig5 — Stage-Level Memory Profile
+# ═════════════════════════════════════════════════════════════════════════════
+def fig5_stage_memory_profile() -> None:
+    """Allocated + peak HBM per phase (6 stages × BF16 / FP8)."""
+    _style()
+    pa = _load_pa()
+    pm = pa["path_analysis"]["phase_memory"]
+
+    phases  = [p["phase_name"] for p in pm["bf16"]]
+    bf_alloc = [p["allocated_mib"] for p in pm["bf16"]]
+    bf_peak  = [p["peak_mib"]      for p in pm["bf16"]]
+    fp_alloc = [p["allocated_mib"] for p in pm["fp8"]]
+    fp_peak  = [p["peak_mib"]      for p in pm["fp8"]]
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6.0),
+                              gridspec_kw={"wspace": 0.32})
+    fig.subplots_adjust(top=0.82, bottom=0.12)
+    _panel_label(axes[0], "(a)")
+    _panel_label(axes[1], "(b)")
+
+    x = np.arange(len(phases))
+    w = 0.28
+
+    for ax, alloc, peak, mode, color in [
+        (axes[0], bf_alloc, bf_peak, "BF16", C_BF16),
+        (axes[1], fp_alloc, fp_peak, "FP8",  C_FP8),
+    ]:
+        ax.bar(x - w/2, alloc, w, color=color, alpha=0.55,
+               label="Allocated", edgecolor="white", linewidth=0.6, zorder=3)
+        ax.bar(x + w/2, peak, w, color=color, alpha=0.90,
+               label="Peak", edgecolor="white", linewidth=0.6, zorder=3)
+        for xi, (a, p) in enumerate(zip(alloc, peak)):
+            ax.text(xi - w/2, a + 18, f"{a:.0f}", ha="center", va="bottom",
+                    fontsize=7.5, color=color)
+            ax.text(xi + w/2, p + 18, f"{p:.0f}", ha="center", va="bottom",
+                    fontsize=7.5, color=color, fontweight="bold")
+        ax.set_xticks(x)
+        ax.set_xticklabels([ph.replace(" (", "\n(") for ph in phases],
+                           fontsize=8.5)
+        ax.set_ylabel("HBM (MiB)")
+        ax.set_title(f"({('a' if mode=='BF16' else 'b')})  {mode} — memory per stage",
+                     fontweight="bold")
+        ax.legend(loc="upper left", framealpha=0.9)
+        ax.set_ylim(0, max(max(alloc), max(peak)) * 1.22)
+        ax.grid(True, axis="y", color=C_GRID)
+        # Fwd/Bwd divider
+        ax.axvline(2.5, color="#CBD5E1", ls="--", lw=1.0)
+        ax.text(1.0, ax.get_ylim()[1]*0.96, "← Forward →",
+                ha="center", fontsize=8, color=C_BF16 if mode=="BF16" else C_FP8,
+                alpha=0.7, fontweight="bold")
+        ax.text(3.5, ax.get_ylim()[1]*0.96, "← Backward →",
+                ha="center", fontsize=8, color=C_BF16 if mode=="BF16" else C_FP8,
+                alpha=0.7, fontweight="bold")
+
+    # Delta overlay — right axis on ax[1]
+    ax2 = axes[1].twinx()
+    delta_peak = [fp - bf for fp, bf in zip(fp_peak, bf_peak)]
+    ax2.plot(x, delta_peak, "o--", color="#6B7280", lw=1.4, ms=5, zorder=5, label="Δ peak (FP8−BF16)")
+    ax2.axhline(0, color="#9CA3AF", lw=0.8, ls=":")
+    ax2.set_ylabel("Δ peak HBM (MiB)", color=C_NEUTRAL)
+    ax2.tick_params(axis="y", colors=C_NEUTRAL)
+    ax2.legend(loc="upper right", framealpha=0.9, fontsize=8)
+
+    fig.suptitle(
+        "SonicMoE Session 53  —  Stage-Level HBM Memory Profile (BF16 vs FP8)\n"
+        f"Anchor shape T=8192, E=8, I=1536, H=3072  |  {_HW}",
+        fontsize=13, fontweight="bold", y=1.01,
+    )
+    _save(fig, "fig5_stage_memory_profile.png")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# fig6 — Precision Audit
+# ═════════════════════════════════════════════════════════════════════════════
+def fig6_precision_audit() -> None:
+    """RRMSE and cosine similarity per tensor from precision_anchor."""
+    _style()
+    pa = _load_pa()
+    pr = pa["precision_anchor"]
+
+    tensors = ["output", "dx (actgrad)", "dw1 (upproj)", "dw2 (dnproj)"]
+    rrmse  = [pr["rrmse_pct"]["output"], pr["rrmse_pct"]["dx"],
+              pr["rrmse_pct"]["dw1"],    pr["rrmse_pct"]["dw2"]]
+    cosine = [pr["cosine_sim"]["output"], pr["cosine_sim"]["dx"],
+              pr["cosine_sim"]["dw1"],    pr["cosine_sim"]["dw2"]]
+
+    fig, (ax_r, ax_c) = plt.subplots(1, 2, figsize=(12, 5.5),
+                                      gridspec_kw={"wspace": 0.36})
+    fig.subplots_adjust(top=0.82, bottom=0.14)
+    _panel_label(ax_r, "(a)")
+    _panel_label(ax_c, "(b)")
+
+    x = np.arange(len(tensors))
+
+    # (a) RRMSE
+    bars = ax_r.bar(x, rrmse, width=0.5, color=C_FP8, edgecolor="white",
+                    linewidth=0.8, alpha=0.85, zorder=3)
+    ax_r.axhline(10.0, color=C_COST, ls="--", lw=1.8, label="Threshold 10%", zorder=4)
+    ax_r.fill_between([-0.5, 3.5], [10, 10], [14, 14], color=C_COST, alpha=0.06)
+    for b, v in zip(bars, rrmse):
+        ax_r.text(b.get_x()+b.get_width()/2, v + 0.18, f"{v:.3f}%",
+                  ha="center", va="bottom", fontsize=10, fontweight="bold",
+                  color=C_SAVE if v < 10 else C_COST)
+    ax_r.set_xticks(x)
+    ax_r.set_xticklabels(tensors)
+    ax_r.set_ylabel("Relative RMSE (%)")
+    ax_r.set_title("(a)  RRMSE — FP8 vs BF16 reference", fontweight="bold")
+    ax_r.set_ylim(0, 14)
+    ax_r.legend(loc="upper right", framealpha=0.9)
+    ax_r.grid(True, axis="y", color=C_GRID)
+    badge = "✓  All PASS  (< 10%)" if all(r < 10 for r in rrmse) else "✗  FAIL"
+    ax_r.text(0.5, 0.96, badge, transform=ax_r.transAxes, ha="center", va="top",
+              fontsize=11, fontweight="bold", color=C_SAVE,
+              bbox=dict(boxstyle="round,pad=0.3", fc="#ECFDF5", ec=C_SAVE, lw=1.2))
+
+    # (b) Cosine similarity
+    cos_deviance = [1.0 - c for c in cosine]
+    bars2 = ax_c.bar(x, cos_deviance, width=0.5, color=C_BF16, edgecolor="white",
+                     linewidth=0.8, alpha=0.85, zorder=3)
+    ax_c.axhline(0.01, color=C_COST, ls="--", lw=1.8, label="Threshold 1−0.99=0.01", zorder=4)
+    ax_c.fill_between([-0.5, 3.5], [0.01, 0.01], [0.025, 0.025], color=C_COST, alpha=0.06)
+    for b, c_dev, c_val in zip(bars2, cos_deviance, cosine):
+        ax_c.text(b.get_x()+b.get_width()/2, c_dev + 0.0004,
+                  f"1−{c_val:.4f}\n= {c_dev:.4f}",
+                  ha="center", va="bottom", fontsize=8.5, fontweight="bold",
+                  color=C_SAVE if c_dev < 0.01 else C_COST)
+    ax_c.set_xticks(x)
+    ax_c.set_xticklabels(tensors)
+    ax_c.set_ylabel("1 − cosine similarity")
+    ax_c.set_title("(b)  Cosine similarity deviance (lower = better)", fontweight="bold")
+    ax_c.legend(loc="upper right", framealpha=0.9)
+    ax_c.set_ylim(0, 0.025)
+    ax_c.grid(True, axis="y", color=C_GRID)
+    badge2 = "✓  All PASS  (cos > 0.99)" if all(c > 0.99 for c in cosine) else "✗  FAIL"
+    ax_c.text(0.5, 0.96, badge2, transform=ax_c.transAxes, ha="center", va="top",
+              fontsize=11, fontweight="bold", color=C_SAVE,
+              bbox=dict(boxstyle="round,pad=0.3", fc="#ECFDF5", ec=C_SAVE, lw=1.2))
+
+    fig.suptitle(
+        "SonicMoE Session 53  —  FP8 Precision Audit\n"
+        f"Reference: BF16 baseline  |  Shape: {pr['shape_key']}  |  {_HW}",
+        fontsize=13, fontweight="bold", y=1.01,
+    )
+    _save(fig, "fig6_precision_audit.png")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# fig7 — Speedup vs Memory-Delta Scatter (27 shapes)
+# ═════════════════════════════════════════════════════════════════════════════
+def fig7_speedup_memory_scatter() -> None:
+    """2D scatter: speedup vs peak-bwd memory-delta for all 27 shapes."""
+    _style()
+    pa = _load_pa()
+    gr = pa["grid_records"]
+
+    T_map = {8192: ("o", 50), 16384: ("s", 90), 32768: ("D", 130)}
+    I_map = {1536: "#60A5FA", 2048: "#10B981", 3072: "#F59E0B"}
+
+    fig, ax = plt.subplots(figsize=(10, 7.5))
+    fig.subplots_adjust(right=0.82)
+
+    for rec in gr:
+        T, I = int(rec["T"]), int(rec["I"])
+        marker, size = T_map.get(T, ("o", 60))
+        color = I_map.get(I, "#888888")
+        ax.scatter(rec["speedup"], rec["peak_bwd_delta_pct"],
+                   s=size, c=color, marker=marker,
+                   edgecolors="white", linewidth=0.8, alpha=0.87, zorder=3)
+        # Annotate outlier shapes
+        if rec["speedup"] > 1.65 or rec["speedup"] < 1.31 or \
+           rec["peak_bwd_delta_pct"] > 9.8:
+            ax.annotate(
+                rec["shape_key"].replace("_", " "),
+                (rec["speedup"], rec["peak_bwd_delta_pct"]),
+                xytext=(8, 8), textcoords="offset points",
+                fontsize=6.5, color=C_NEUTRAL,
+                arrowprops=dict(arrowstyle="-", color=C_NEUTRAL, lw=0.6),
+            )
+
+    # Average lines
+    mean_sp = float(np.mean([r["speedup"] for r in gr]))
+    mean_mem= float(np.mean([r["peak_bwd_delta_pct"] for r in gr]))
+    ax.axvline(mean_sp,  color=C_TEXT, ls="--", lw=0.9, alpha=0.5)
+    ax.axhline(mean_mem, color=C_TEXT, ls="--", lw=0.9, alpha=0.5)
+    ax.text(mean_sp + 0.004, ax.get_ylim()[0] + 0.10,
+            f"mean speedup\n{mean_sp:.3f}×", fontsize=7.5, color=C_NEUTRAL)
+    ax.text(ax.get_xlim()[0] + 0.005, mean_mem + 0.10,
+            f"mean Δmem {mean_mem:.1f}%", fontsize=7.5, color=C_NEUTRAL)
+
+    ax.set_xlabel("FP8 Speedup (×)", fontsize=11)
+    ax.set_ylabel("Peak Backward HBM Δ  (%  over BF16)", fontsize=11)
+    ax.set_title(
+        "Speed–Memory Tradeoff: FP8 speedup vs backward-peak HBM increase\n"
+        "(faster FP8 tends to come with modest memory overhead from quant temporaries)",
+        fontweight="bold",
+    )
+    ax.grid(True, color=C_GRID)
+
+    # Legend — T markers
+    T_handles = [
+        plt.scatter([], [], s=sz, marker=mk, c="#888888", edgecolors="white",
+                    linewidth=0.8, label=f"T={T//1024}k")
+        for T, (mk, sz) in sorted(T_map.items())
+    ]
+    I_handles = [
+        mpatches.Patch(color=c, label=f"I={I}")
+        for I, c in sorted(I_map.items())
+    ]
+    leg1 = ax.legend(handles=T_handles, title="Token count", loc="upper left",
+                     framealpha=0.9, fontsize=9)
+    ax.add_artist(leg1)
+    ax.legend(handles=I_handles, title="Intermediate size", loc="upper center",
+              framealpha=0.9, fontsize=9)
+
+    fig.suptitle(
+        f"SonicMoE Session 53  —  27-Shape Speed vs Memory Scatter  |  {_HW}",
+        fontsize=13, fontweight="bold", y=1.01,
+    )
+    _save(fig, "fig7_speedup_memory_scatter.png")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# fig8 — Kernel Budget Composition (donut pair)
+# ═════════════════════════════════════════════════════════════════════════════
+def fig8_budget_composition() -> None:
+    """Donut charts: BF16 vs FP8 kernel-type composition at anchor shape."""
+    _style()
+    pa = _load_pa()
+    ba = pa["budget_anchor"]
+    bb = ba["budget_breakdown"]
+
+    # Aggregate into semantic groups
+    def _group(cats: list[str]) -> float:
+        return sum(e["bf16_us"] for e in bb if e["category"] in cats), \
+               sum(e["fp8_us"]  for e in bb if e["category"] in cats)
+
+    groups = {
+        "BF16 GEMM\n(wgrad)":       ["Wgrad GEMM"],
+        "BF16 GEMM\n(fwd/bwd)":     ["GemmGated (fwd)", "GemmDGated (bwd)", "cuBLAS GEMM"],
+        "ZeroMat GEMM\n(FP8 fwd)":  ["GemmGated ZeroMat (fwd)"],
+        "ZeroMat GEMM\n(FP8 bwd)":  ["GemmDGated ZeroMat (bwd)"],
+        "FP8 Quant\n(col)":         ["Blockscaled Quant"],
+        "FP8 Quant\n(dual)":        ["Dual Quant"],
+        "FP8 Quant\n(row)":         ["Row Quant"],
+        "ISA Scale\nGather":        ["ISA Scale Gather"],
+        "Token\nGather":            ["Token Gather"],
+        "Router +\nMisc":           ["Router Metadata", "TopK Router", "Softmax",
+                                     "Elementwise Ops", "Reduce"],
+    }
+    bf_vals, fp_vals, labels = [], [], []
+    for label, cats in groups.items():
+        bfv = sum(e["bf16_us"] for e in bb if e["category"] in cats)
+        fpv = sum(e["fp8_us"]  for e in bb if e["category"] in cats)
+        bf_vals.append(bfv)
+        fp_vals.append(fpv)
+        labels.append(label)
+
+    palette = [
+        "#3B82F6", "#60A5FA", "#F97316", "#FDBA74",
+        "#8B5CF6", "#A78BFA", "#C4B5FD",
+        "#10B981", "#6EE7B7", "#94A3B8",
+    ]
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 7.5))
+    fig.subplots_adjust(wspace=0.05, top=0.85, bottom=0.05)
+
+    def _donut(ax, vals, title, mode_color):
+        total = sum(vals)
+        # Filter out zeros
+        fv = [(v, l, p) for v, l, p in zip(vals, labels, palette) if v > 1]
+        vs, ls, ps = zip(*fv) if fv else ([], [], [])
+        wedges, texts, autotexts = ax.pie(
+            vs, labels=None, colors=ps,
+            autopct=lambda p: f"{p:.0f}%" if p > 3 else "",
+            startangle=90, pctdistance=0.75,
+            wedgeprops=dict(width=0.52, edgecolor="white", linewidth=1.5),
+        )
+        for at in autotexts:
+            at.set_fontsize(8.0)
+            at.set_fontweight("bold")
+            at.set_color("white")
+        # Center text
+        ax.text(0, 0, f"{total/1000:.2f}\nms", ha="center", va="center",
+                fontsize=14, fontweight="bold", color=mode_color)
+        ax.set_title(title, fontsize=12, fontweight="bold", pad=14,
+                     color=mode_color)
+
+    _donut(axes[0],
+           bf_vals,
+           f"BF16  ({ba['bf16_us']/1000:.2f} ms)",
+           C_BF16)
+    _donut(axes[1],
+           fp_vals,
+           f"FP8   ({ba['fp8_us']/1000:.2f} ms)   {ba['speedup']:.3f}×",
+           C_FP8)
+
+    # Shared legend
+    legend_patches = [mpatches.Patch(color=p, label=l)
+                      for l, p in zip(labels, palette)]
+    fig.legend(handles=legend_patches, loc="lower center",
+               ncol=5, fontsize=8.5, framealpha=0.92,
+               borderpad=0.6, columnspacing=1.0)
+
+    fig.suptitle(
+        "SonicMoE Session 53  —  Kernel-Type Budget Composition\n"
+        f"Anchor: T=8192, E=8, I=1536  |  {_HW}",
+        fontsize=13, fontweight="bold", y=0.97,
+    )
+    _save(fig, "fig8_budget_composition.png")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# fig9 — Tensor Inventory per Stage (stage_deltas)
+# ═════════════════════════════════════════════════════════════════════════════
+def fig9_tensor_inventory() -> None:
+    """Per-stage tensor R/W counts and FP8-only / BF16-only tensor deltas."""
+    _style()
+    pa    = _load_pa()
+    stage_d = pa["path_analysis"]["stage_deltas"]
+
+    bf_reads  = [len(s["bf16_reads"])  for s in stage_d]
+    bf_writes = [len(s["bf16_writes"]) for s in stage_d]
+    fp_reads  = [len(s["fp8_reads"])   for s in stage_d]
+    fp_writes = [len(s["fp8_writes"])  for s in stage_d]
+    fp8_only  = [len(s.get("fp8_only_tensors", [])) for s in stage_d]
+    bf16_only = [len(s.get("bf16_only_tensors", [])) for s in stage_d]
+    extra_w   = [len(s.get("extra_writes", [])) for s in stage_d]
+    retired_w = [len(s.get("retired_writes", [])) for s in stage_d]
+
+    fig, axes = plt.subplots(2, 1, figsize=(13, 9.5),
+                              gridspec_kw={"hspace": 0.42})
+    _panel_label(axes[0], "(a)")
+    _panel_label(axes[1], "(b)")
+
+    x = np.arange(6)
+    w = 0.20
+
+    # (a) Read/Write count comparison
+    axes[0].bar(x - 1.5*w, bf_reads,  w, color=C_BF16, alpha=0.75,
+                label="BF16 reads", edgecolor="white", linewidth=0.5)
+    axes[0].bar(x - 0.5*w, fp_reads,  w, color=C_FP8,  alpha=0.75,
+                label="FP8 reads",  edgecolor="white", linewidth=0.5)
+    axes[0].bar(x + 0.5*w, bf_writes, w, color=C_BF16, alpha=0.45,
+                label="BF16 writes",edgecolor="white", linewidth=0.5, hatch="//")
+    axes[0].bar(x + 1.5*w, fp_writes, w, color=C_FP8,  alpha=0.45,
+                label="FP8 writes", edgecolor="white", linewidth=0.5, hatch="//")
+    axes[0].set_xticks(x)
+    axes[0].set_xticklabels([s["name"] for s in stage_d], fontsize=9)
+    axes[0].set_ylabel("Tensor count")
+    axes[0].set_title("(a)  Tensor reads and writes per stage — BF16 vs FP8", fontweight="bold")
+    axes[0].legend(ncol=4, loc="upper right", framealpha=0.9, fontsize=8.5)
+    axes[0].grid(True, axis="y", color=C_GRID)
+    axes[0].axvline(2.5, color="#CBD5E1", ls="--", lw=1.0)
+    axes[0].text(1.0, axes[0].get_ylim()[1]*0.92, "Forward",
+                 ha="center", fontsize=8.5, color=C_NEUTRAL, fontweight="bold")
+    axes[0].text(4.0, axes[0].get_ylim()[1]*0.92, "Backward",
+                 ha="center", fontsize=8.5, color=C_NEUTRAL, fontweight="bold")
+
+    # (b) FP8-only tensors, retired tensors, extra tensors
+    axes[1].bar(x - w, fp8_only,  w*1.5, color=C_FP8,  alpha=0.85,
+                label="FP8-only tensors (new in FP8)", edgecolor="white")
+    axes[1].bar(x,     bf16_only, w*1.5, color=C_BF16, alpha=0.55,
+                label="BF16-only tensors (absent in FP8)", edgecolor="white", hatch="//")
+    axes[1].bar(x + w, extra_w,   w*1.5, color=C_COST, alpha=0.65,
+                label="Extra writes added by FP8", edgecolor="white")
+
+    for xi, (fp, bf, ex) in enumerate(zip(fp8_only, bf16_only, extra_w)):
+        if fp > 0:
+            axes[1].text(xi - w, fp + 0.05, str(fp), ha="center", fontsize=9,
+                         color=C_FP8, fontweight="bold")
+        if bf > 0:
+            axes[1].text(xi, bf + 0.05, str(bf), ha="center", fontsize=9,
+                         color=C_BF16, fontweight="bold")
+
+    axes[1].set_xticks(x)
+    axes[1].set_xticklabels([s["name"] for s in stage_d], fontsize=9)
+    axes[1].set_ylabel("Tensor count")
+    axes[1].set_title("(b)  FP8 tensor inventory delta — new vs retired tensors", fontweight="bold")
+    axes[1].legend(ncol=3, loc="upper right", framealpha=0.9, fontsize=8.5)
+    axes[1].grid(True, axis="y", color=C_GRID)
+    axes[1].axvline(2.5, color="#CBD5E1", ls="--", lw=1.0)
+    axes[1].set_ylim(0, max(max(fp8_only), max(bf16_only), max(extra_w)) + 1.2)
+
+    fig.suptitle(
+        "SonicMoE Session 53  —  Stage-Level Tensor Inventory: BF16 vs FP8 Frontier\n"
+        f"Source: path_analysis.stage_deltas  |  {_HW}",
+        fontsize=13, fontweight="bold", y=1.01,
+    )
+    _save(fig, "fig9_tensor_inventory.png")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# fig10 — Speedup Scaling Line Plots (parametric sweeps)
+# ═════════════════════════════════════════════════════════════════════════════
+def fig10_scaling_line_plots() -> None:
+    """Line plots of speedup along each dimension with explicit fixed params."""
+    _style()
+    pa = _load_pa()
+    gr = pa["grid_records"]
+
+    lookup: dict[tuple[int, int, int], float] = {
+        (int(r["T"]), int(r["E"]), int(r["I"])): r["speedup"]
+        for r in gr
+    }
+    T_vals = sorted({int(r["T"]) for r in gr})
+    I_vals = sorted({int(r["I"]) for r in gr})
+    E_vals = sorted({int(r["E"]) for r in gr})
+
+    def sp(T, E, I): return lookup.get((T, E, I), float("nan"))
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 6.0),
+                              gridspec_kw={"wspace": 0.32})
+    fig.subplots_adjust(top=0.80, bottom=0.14)
+
+    # (a) T-sweep at (E=8, I=1536), (E=8, I=3072), (E=128, I=1536)
+    ax = axes[0]
+    sweeps_T = [
+        ("E=8,  I=1536", C_BF16, "o-",  [(T, 8,   1536) for T in T_vals]),
+        ("E=8,  I=3072", C_FP8,  "s--", [(T, 8,   3072) for T in T_vals]),
+        ("E=128,I=1536", C_SAVE, "D:",  [(T, 128, 1536) for T in T_vals]),
+    ]
+    for label, color, style, pts in sweeps_T:
+        ys = [sp(T, E, I) for T, E, I in pts]
+        ax.plot([t//1024 for t, _, _ in pts], ys, style, color=color,
+                lw=2.0, ms=7, label=label, zorder=3)
+        for xi, y in zip([t//1024 for t, _, _ in pts], ys):
+            if not np.isnan(y):
+                ax.text(xi, y + 0.012, f"{y:.3f}×",
+                        ha="center", fontsize=7.0, color=color)
+    ax.set_xlabel("Token count T (×1k)")
+    ax.set_ylabel("FP8 speedup (×)")
+    ax.set_title("(a)  T sweep\n(3 fixed (E, I) configs)", fontweight="bold")
+    ax.legend(fontsize=8.5, framealpha=0.9)
+    ax.set_ylim(1.0, max(sp(T,E,I) for T in T_vals for E in [8,128] for I in [1536,3072]) + 0.18)
+    ax.axhline(1.0, color=C_NEUTRAL, lw=0.8, ls=":")
+    ax.grid(True, color=C_GRID)
+    _panel_label(ax, "(a)")
+
+    # (b) I-sweep at (T=8k, E=8), (T=32k, E=8), (T=32k, E=128)
+    ax = axes[1]
+    sweeps_I = [
+        ("T=8k,  E=8",   C_BF16, "o-",  [(8192,  8,   I) for I in I_vals]),
+        ("T=32k, E=8",   C_FP8,  "s--", [(32768, 8,   I) for I in I_vals]),
+        ("T=32k, E=128", C_SAVE, "D:",  [(32768, 128, I) for I in I_vals]),
+    ]
+    for label, color, style, pts in sweeps_I:
+        ys = [sp(T, E, I) for T, E, I in pts]
+        ax.plot(I_vals, ys, style, color=color,
+                lw=2.0, ms=7, label=label, zorder=3)
+        for xi, y in zip(I_vals, ys):
+            if not np.isnan(y):
+                ax.text(xi, y + 0.012, f"{y:.3f}×",
+                        ha="center", fontsize=7.0, color=color)
+    ax.set_xlabel("Intermediate size I")
+    ax.set_ylabel("FP8 speedup (×)")
+    ax.set_title("(b)  I sweep\n(3 fixed (T, E) configs)", fontweight="bold")
+    ax.legend(fontsize=8.5, framealpha=0.9)
+    ax.set_ylim(1.0, max(sp(T,E,I) for T in [8192,32768] for E in [8,128] for I in I_vals) + 0.18)
+    ax.axhline(1.0, color=C_NEUTRAL, lw=0.8, ls=":")
+    ax.grid(True, color=C_GRID)
+    _panel_label(ax, "(b)")
+
+    # (c) E-sweep at (T=8k, I=1536), (T=32k, I=1536), (T=32k, I=3072)
+    ax = axes[2]
+    sweeps_E = [
+        ("T=8k,  I=1536", C_BF16, "o-",  [(8192,  E, 1536) for E in E_vals]),
+        ("T=32k, I=1536", C_FP8,  "s--", [(32768, E, 1536) for E in E_vals]),
+        ("T=32k, I=3072", C_SAVE, "D:",  [(32768, E, 3072) for E in E_vals]),
+    ]
+    for label, color, style, pts in sweeps_E:
+        ys = [sp(T, E, I) for T, E, I in pts]
+        ax.plot([e for _, e, _ in pts], ys, style, color=color,
+                lw=2.0, ms=7, label=label, zorder=3)
+        for xi, y in zip([e for _, e, _ in pts], ys):
+            if not np.isnan(y):
+                ax.text(xi, y + 0.012, f"{y:.3f}×",
+                        ha="center", fontsize=7.0, color=color)
+    ax.set_xlabel("Expert count E")
+    ax.set_ylabel("FP8 speedup (×)")
+    ax.set_title("(c)  E sweep\n(3 fixed (T, I) configs)", fontweight="bold")
+    ax.legend(fontsize=8.5, framealpha=0.9)
+    ax.set_xscale("log")
+    ax.set_xticks(E_vals)
+    ax.set_xticklabels([str(e) for e in E_vals])
+    ax.set_ylim(1.0, max(sp(T,E,I) for T in [8192,32768] for E in E_vals for I in [1536,3072]) + 0.18)
+    ax.axhline(1.0, color=C_NEUTRAL, lw=0.8, ls=":")
+    ax.grid(True, color=C_GRID)
+    _panel_label(ax, "(c)")
+
+    fig.suptitle(
+        "SonicMoE Session 53  —  Speedup Scaling Line Plots  (explicit fixed-parameter sweeps)\n"
+        f"27 shapes (3T × 3E × 3I)  |  nsys GPU-projection  |  {_HW}",
+        fontsize=13, fontweight="bold", y=1.01,
+    )
+    _save(fig, "fig10_scaling_line_plots.png")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Entry point
-# ═══════════════════════════════════════════════════════════════════════════
+# ═════════════════════════════════════════════════════════════════════════════
+def generate_all() -> None:
+    print("\nSonicMoE FP8 Visualization Suite  —  fig1–10  (session-53 data)")
+    print("=" * 65)
+    figs = [
+        ("System Overview",          fig1_system_overview),
+        ("Executive Summary",         fig2_executive_summary),
+        ("Quant Kernel Comparison",   fig3_quant_kernel_comparison),
+        ("Performance Waterfall",     fig4_performance_waterfall),
+        ("Stage Memory Profile",      fig5_stage_memory_profile),
+        ("Precision Audit",           fig6_precision_audit),
+        ("Speedup–Memory Scatter",    fig7_speedup_memory_scatter),
+        ("Budget Composition",        fig8_budget_composition),
+        ("Tensor Inventory",          fig9_tensor_inventory),
+        ("Scaling Line Plots",        fig10_scaling_line_plots),
+    ]
+    for name, fn in figs:
+        print(f"\n  Generating: {name}")
+        fn()
 
-FIGURES = [
-    ("Executive Summary",         fig1_executive_summary),
-    ("Performance Waterfall",     fig2_performance_waterfall),
-    ("Memory Lifecycle",          fig3_memory_lifecycle),
-    ("Backward Peak Breakdown",   fig4_backward_breakdown),
-    ("Kernel-Level Comparison",   fig5_kernel_comparison),
-    ("Precision State Matrix",    fig6_precision_flow),
-    ("Precision Profile",         fig7_precision_profile),
-    ("Optimization Design Space", fig8_design_space),
-    ("Buffer Lifecycle Gantt",    fig9_buffer_lifecycle),
-    ("Dtype Transformation Flow", fig10_dtype_flow),
-]
-
-
-def generate_all(out_dir: Optional[str] = None) -> None:
-    """Generate all publication-quality figures."""
-    global ASSETS
-    if out_dir:
-        ASSETS = pathlib.Path(out_dir)
-    ASSETS.mkdir(parents=True, exist_ok=True)
-    _apply_style()
-
-    print("SonicMoE FP8 Visualization Suite (artifact-driven refresh)")
-    print("=" * 55)
-    for name, func in FIGURES:
-        print(f"  Generating: {name}")
-        func()
-    print("=" * 55)
-    print(f"All {len(FIGURES)} figures saved to: {ASSETS}/")
+    print(f"\n  All figures saved to {ASSETS}/\n")
 
 
 if __name__ == "__main__":

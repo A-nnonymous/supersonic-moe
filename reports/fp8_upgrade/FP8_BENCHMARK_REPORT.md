@@ -191,4 +191,4 @@ python tools/cluster_idle_launch.py scan
 ---
 
 > 报告基于 B200 (SM 10.0) idle 节点实测数据。所有 nsys 数据存于 `benchmarks/nsys_clean/`。
-> 复现方式详见 `reports/fp8_upgrade/HANDOFF.md` §10.4。
+> 复现方式请以 `docs/HANDOFF.md` 中的当前复现说明为准；本目录下 handoff 仅作历史参考。

@@ -29,3 +29,15 @@ except Exception as e:
     import traceback
     print(f"\n  [skip] Frontier: {e}")
     traceback.print_exc()
+
+# BF16 vs FP8 path-comparison visualization (requires compare-viz report)
+try:
+    from visualization.path_compare_viz import generate_compare_viz
+    print("\n  Generating: BF16 vs FP8 Path Comparison")
+    generate_compare_viz()
+except FileNotFoundError:
+    print("\n  [skip] Path comparison: run `python tools/introspect.py --mode compare-viz` first")
+except Exception as e:
+    import traceback
+    print(f"\n  [skip] Path comparison: {e}")
+    traceback.print_exc()

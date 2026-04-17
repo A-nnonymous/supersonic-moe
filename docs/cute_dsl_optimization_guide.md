@@ -267,7 +267,7 @@ To replicate in CuTe DSL: need larger tile (128×128), 2D-like thread mapping vi
 | `tests/test_cute_blockscaled.py` | Colwise quant correctness+perf |
 | `tests/test_rcp_precision.py` | rcp.approx precision verification |
 | `docs/FP8_ARCH_SPEC.md` | Full architecture spec |
-| `reports/fp8_upgrade/HANDOFF.md` | Project status + next steps |
+| `docs/HANDOFF.md` | Project status + next steps |
 | `reports/fp8_upgrade/engineering_log.md` | 31 lessons learned |
 
 ## 8. QuACK Library Reference

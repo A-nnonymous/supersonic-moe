@@ -73,22 +73,35 @@ y1s[pad] = SwiGLU(z[pad]) * score[pad] = 非零 × 0 = 0
 → ds[pad] → scatter 到 virtual index ≥ T*K → 被 ds[:T*K] 截断  ✓
 ```
 
-对于 `dz`（影响 dw1 和 dx 的梯度），CUTLASS dgated 内核的行为是：
-```
-dz[i] = (dout_gathered[i] @ w2^T) ⊙ d_SwiGLU(z[i])
-```
-这里 `dout_gathered[pad]` 通过 `A_idx=x_gather_idx` 从 dout 中 gather，
-而 `x_gather_idx[pad]=0` 所以 gather 了 dout 的第 0 行（非零）。
-但 `dz[pad]` 随后参与的 wgrad 和 actgrad：
-```
-dw1 += dz^T @ x_gathered  (per expert, 包含 padding 行)
-dx[0] += dz[pad] @ w1^T   (padding 行的 actgrad 累加到 x[0])
-```
+对于 `dz`（影响 dw1 和 dx 的梯度），**score-gating 保证了 padding 行的精确零贡献**。
 
-这里 padding 行对 dw1 和 dx[0] **有数值贡献**！但实测 RRMSE delta = 0，
-原因是这个贡献与 BF16 raw 路径完全一致——BF16 和 FP8+padding 使用相同的 routing，
-所以相同的 token（包括 padding 行指向的 x[0]）参与了相同 expert 的计算。
-**两个路径在 routing 层面是 bit-identical 的**，精度差异纯粹来自 FP8 量化。
+在全部 6 条 backward 路径中，router score `s` 在 `d_SwiGLU` **之前**被乘入梯度，
+使得 `dz[pad] = 0`（精确零，非近似）：
+
+**CUTLASS fused 路径**（`gemm_dgated.py:152-176`）：
+```
+tRS_rD_scaled = tRS_rD * colvec_scale   // colvec_scale = score
+(dXY, y1) = dswiglu(z, tRS_rD_scaled)   // dXY 写回为 dz
+```
+当 `score[pad]=0` 时，`tRS_rD_scaled[pad]=0`，`dswiglu` 的每一项都线性依赖此输入，
+因此 `dz[pad]=0`。注意：epilogue 中的第二次 `tRS_rOut *= colvec_scale`（line 688-698）
+作用于 `y1`（产出 `y1s = y1 * score` 用于 dw2），并**不**影响 `dz`。
+
+**5 个 Triton 内核**（`swiglu_triton.py:522,641,763,970,1178`）：
+```
+dy1_s = dy1 * s_val
+d_gate = dy1_s * up * sig * (1 + gate * (1 - sig))
+d_up = dy1_s * silu_gate
+```
+当 `s_val=0` 时，`dy1_s=0`，因此 `d_gate=d_up=0`，即 `dz[pad]=0`。
+
+由于 `dz[pad]=0`（IEEE 754 保证 `finite * 0.0 = 0.0`）：
+```
+dw1 += dz^T @ x_gathered  → dz[pad]=0 → 该行对 dw1 零贡献  ✓
+dx[0] += dz[pad] @ w1^T = 0 @ w1^T = 0  → 零污染            ✓
+```
+Padding 行在 backward 中的数学地位与 forward 完全对称：**精确不可见**。
+FP8+padding 与 BF16 raw 的精度差异纯粹来自 FP8 量化，与 padding 无关。
 
 ### 2.3 五个 Routing Tensor 的变换
 
