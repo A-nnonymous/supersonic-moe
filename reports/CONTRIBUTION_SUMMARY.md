@@ -3,6 +3,7 @@
 > **Branch:** `paddle_compat` (vs `main`)
 > **Hardware:** NVIDIA B30Z (SM100a, Blackwell)
 > **Measurement:** nsys GPU-projection, 27-shape grid, 12 iterations after 3 warmup
+> **Authoritative Data Source:** `python tools/introspect.py --mode benchmark` produces unified JSON covering performance × precision × memory.  All tables below should be re-generated from this JSON.
 
 ---
 
@@ -100,6 +101,7 @@ Anchor shape (T=32768, I=1536, E=8), FP8 vs BF16 gold (identical routing):
 
 All RRMSE < 7% — this is pure FP8 E4M3 quantization noise.
 Multi-seed (5 seeds × 3 GPUs) measurements confirm output std < 0.05%.
+RRMSE convention: **ratio** in JSON (0.065 = 6.5%), displayed as percentage in tables.
 
 ![Precision Audit](assets/fig6_precision_audit.png)
 
@@ -253,6 +255,14 @@ CUDA_VISIBLE_DEVICES=0 python -m pytest tests/ops/test_pad_gradient_integrity.py
 
 # Full 27-shape grid benchmark (8 GPUs, ~15 min)
 python tools/introspect.py --mode grid --gpu 8
+
+# Unified 3-phase benchmark (precision × memory × perf, single JSON)
+# Default: 6 shapes (E=8/32/128), 3 seeds, nsys 5w+20m
+python tools/introspect.py --mode benchmark
+# Custom shapes:
+python tools/introspect.py --mode benchmark \
+    --benchmark-shapes 8192,3072,1536,8,8 32768,3072,1536,8,8 \
+    --benchmark-seeds 42,123,777
 
 # Generate all figures
 python -m visualization
