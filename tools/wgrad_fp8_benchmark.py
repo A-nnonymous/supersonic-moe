@@ -302,7 +302,9 @@ def main():
             print()
 
     # Save results
-    out_path = os.path.join(os.path.dirname(__file__), "..", "wgrad_fp8_benchmark.json")
+    out_path = os.path.join(
+        os.path.dirname(__file__), "..", "reports", "wgrad_fp8_benchmark_legacy.json"
+    )
     with open(out_path, "w") as f:
         json.dump(all_results, f, indent=2)
     print(f"Results saved to {out_path}")

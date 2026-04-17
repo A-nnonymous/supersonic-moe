@@ -1,2 +1,6 @@
 """SonicMoE dataflow & memory visualization suite."""
-from visualization.sonicmoe_dataflow import generate_all  # noqa: F401
+
+try:
+    from visualization.sonicmoe_dataflow import generate_all  # noqa: F401
+except ModuleNotFoundError:
+    generate_all = None  # type: ignore[assignment]
