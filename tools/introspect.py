@@ -3445,7 +3445,8 @@ def run(
 
     print(f"  Device: {gpu_name}")
     if nsys_shapes:
-        print(f"  Shapes: {len(nsys_shapes)} — {[f'T{s['T']}_E{s['E']}' for s in nsys_shapes]}")
+        labels = ["T%d_E%d" % (s["T"], s["E"]) for s in nsys_shapes]
+        print(f"  Shapes: {len(nsys_shapes)} — {labels}")
     else:
         print(f"  Shape: T={SHAPE['T']}, H={SHAPE['H']}, I={SHAPE['I']}, "
               f"E={SHAPE['E']}, K={SHAPE['K']}")

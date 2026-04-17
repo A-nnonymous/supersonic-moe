@@ -181,7 +181,7 @@ def fig1_system_overview() -> None:
             "T-size FP8 activation  ×  TK-size ISA-packed scale",
             ha="center", va="center", fontsize=8.2, color=C_TEXT, zorder=4)
     ax.text(5.0, innov_y + 0.24,
-            "ZeroMat GEMM: no TK-size HBM gather  →  −21% activation memory",
+            "ZeroMat GEMM: no TK-size HBM gather  →  reduced activation memory",
             ha="center", va="center", fontsize=8.0, color=C_NEUTRAL, zorder=4)
 
     # Tensor type legend
@@ -415,11 +415,27 @@ def fig3_quant_kernel_comparison() -> None:
         ax.grid(True, axis="y", color=C_GRID)
         _panel_label(ax, f"({'abc'[ci]})")
 
-    # Speedup annotation for nw=1 vs nw=4
+    # Speedup annotation for nw=1 vs nw=4 — derive ratios from quant_bench data
+    qb = _load_qb()
+    kernels = qb.get("kernels", {})
+    def _med(k):
+        v = kernels.get(k, {})
+        return v.get("median_us", v.get("time_us", 0))
+    col_nw1 = _med("triton_col_nogather")
+    col_nw4 = _med("triton_col_nogather_nw4") or _med("triton_col_nw4")
+    cute_col = _med("cute_col_nogather") or _med("cute_col")
+    row_nw1 = _med("triton_row")
+    lines = []
+    if col_nw4 > 0 and col_nw1 > 0:
+        lines.append(f"Triton col (nw=1): {col_nw4/col_nw1:.1f}× faster than nw=4")
+    else:
+        lines.append("Triton col (nw=1): faster than nw=4 (see NCU profile)")
+    lines.append("Row quant: high occupancy — nw=1 gives no improvement")
+    if cute_col > 0 and col_nw1 > 0:
+        pct = (cute_col / col_nw1 - 1) * 100
+        lines.append(f"CuTe col: {pct:.0f}% slower than Triton col → excluded from hot path")
     axes[1].text(0.5, -0.28,
-                 "Triton col (nw=1): 2.3× faster than nw=4 (measured via NCU: 63% idle warp at nw=4)\n"
-                 "Row quant already at 97% occupancy — nw=1 gives no improvement\n"
-                 "CuTe col: 33% slower than Triton col → excluded from hot path",
+                 "\n".join(lines),
                  transform=axes[1].transAxes, ha="center", va="top",
                  fontsize=8.5, color=C_NEUTRAL, style="italic", linespacing=1.5)
 
