@@ -508,6 +508,179 @@ _ALL_TESTS = [
     test_no_token_misrouting,
 ]
 
+
+# ===================================================================
+# Production-scale parametrized tests (E=32, E=128)
+# Uses vectorized torch ops (no Python per-row loops) for speed.
+# ===================================================================
+
+def _backward_gold_vectorized(x, w1, w2, grad_out, efo_list, xg, ss, scores, E, total):
+    """Vectorized gold backward — per-expert sliced matmul, no Python row loops.
+
+    Args are GPU tensors (float64). xg/ss are LongTensor. scores is DoubleTensor.
+    Returns (dw1, dw2, dx, dz).
+    """
+    I2, H = w1.shape[0], w1.shape[1]
+    I = I2 // 2
+    device = x.device
+
+    x_gathered = x[xg]
+    dout_gathered = grad_out[xg]
+    z = torch.zeros(total, I2, device=device, dtype=torch.float64)
+    y1 = torch.zeros(total, I, device=device, dtype=torch.float64)
+    dy1 = torch.zeros(total, I, device=device, dtype=torch.float64)
+
+    for e in range(E):
+        s, end = efo_list[e], efo_list[e + 1]
+        if s >= end:
+            continue
+        z[s:end] = x_gathered[s:end] @ w1[:, :, e].T
+        y1[s:end] = _interleaved_swiglu(z[s:end])
+        dy1[s:end] = dout_gathered[s:end] @ w2[:, :, e]
+
+    s_scores = scores[ss]
+    dy1_s = dy1 * s_scores.unsqueeze(1)
+    dz = _d_interleaved_swiglu(z, dy1_s)
+    y1s = y1 * s_scores.unsqueeze(1)
+
+    dw1 = torch.zeros_like(w1)
+    dw2 = torch.zeros_like(w2)
+    dx = torch.zeros_like(x)
+    for e in range(E):
+        s, end = efo_list[e], efo_list[e + 1]
+        if s >= end:
+            continue
+        dw1[:, :, e] = dz[s:end].T @ x_gathered[s:end]
+        dw2[:, :, e] = dout_gathered[s:end].T @ y1s[s:end]
+        dx.index_add_(0, xg[s:end], dz[s:end] @ w1[:, :, e])
+    return dw1, dw2, dx, dz
+
+
+_PRODUCTION_SHAPES = [
+    # (T, H, I, E, K, label)
+    (512, 256, 128, 32, 8, "E32_medium"),
+    (1024, 256, 128, 32, 8, "E32_large"),
+    (256, 128, 64, 128, 8, "E128_extreme"),
+]
+
+
+def _run_all_axioms_production(T, H, I, E, K, label):
+    """Run all axioms on a single production shape. Returns summary string."""
+    from sonicmoe.functional.triton_kernels import TC_topk_router_metadata_triton
+    from sonicmoe.functional import _pad_routing_metadata
+    from sonicmoe.quack_utils.blockscaled_fp8_gemm import _get_padding_plan
+
+    TK = T * K
+    device = "cuda"
+    torch.manual_seed(42)
+    F64_ATOL = 1e-11
+
+    x = torch.randn(T, H, device=device, dtype=torch.float64)
+    w1 = torch.randn(2 * I, H, E, device=device, dtype=torch.float64) * 0.1
+    w2 = torch.randn(H, I, E, device=device, dtype=torch.float64) * 0.1
+    grad_out = torch.randn(T, H, device=device, dtype=torch.float64)
+
+    # Realistic softmax top-K routing
+    logits = torch.randn(T, E, device=device, dtype=torch.float64)
+    topk_vals, topk_indices = logits.topk(K, dim=-1)
+    topk_indices = topk_indices.int()
+    topk_scores = F.softmax(topk_vals, dim=-1).float()
+
+    # Routing metadata
+    _ss = torch.empty(TK, dtype=torch.int32, device=device)
+    _sr = torch.empty(TK, dtype=torch.int32, device=device)
+    _ef = torch.empty(E, dtype=torch.int32, device=device)
+    efo = torch.empty(E + 1, dtype=torch.int32, device=device)
+    xg = torch.empty(TK, dtype=torch.int32, device=device)
+    TC_topk_router_metadata_triton(topk_indices, E, _ef, efo, xg, _ss, _sr)
+
+    efo_l = efo.cpu().tolist()
+    seg_lens = [efo_l[e + 1] - efo_l[e] for e in range(E)]
+    non_aligned = sum(1 for s in seg_lens if s % 128 != 0 and s > 0)
+
+    # Pad
+    (pefo, pxg, pss, _psr, pscores, pt, padded) = _pad_routing_metadata(
+        efo, xg, _ss, _sr, topk_scores.flatten().to(device), TK, T, E, K)
+    assert padded, f"{label}: expected padding to be triggered"
+    pefo_l = pefo.cpu().tolist()
+    padded_total = pt
+    n_pad = padded_total - TK
+
+    _, _, _, dst_idx = _get_padding_plan(efo, TK)
+
+    # Axiom 1: Token conservation
+    dst = dst_idx.cpu().tolist()
+    assert len(set(dst)) == TK
+    assert all(0 <= d < padded_total for d in dst)
+
+    # Axiom 2: Score invariant
+    scores_flat_d = topk_scores.flatten().double().to(device)
+    pscores_d = pscores.double().to(device)
+    assert (pscores_d[:TK] - scores_flat_d).abs().max().item() == 0.0
+    if n_pad > 0:
+        assert pscores_d[TK:].abs().max().item() == 0.0
+
+    # Backward gold: padded vs unpadded
+    dw1_o, dw2_o, dx_o, _ = _backward_gold_vectorized(
+        x, w1, w2, grad_out, efo_l, xg.long(), _ss.long(),
+        scores_flat_d, E, TK)
+    dw1_p, dw2_p, dx_p, dz_p = _backward_gold_vectorized(
+        x, w1, w2, grad_out, pefo_l, pxg.long(), pss.long(),
+        pscores_d, E, padded_total)
+
+    # Axiom 4: dz[pad]==0
+    is_real = torch.zeros(padded_total, dtype=torch.bool, device=device)
+    is_real[dst_idx] = True
+    pad_mask = ~is_real
+    dz_at_pad = dz_p[pad_mask]
+    max_dz = dz_at_pad.abs().max().item() if dz_at_pad.numel() > 0 else 0.0
+    assert max_dz == 0.0, f"{label}: dz[pad] max={max_dz}"
+
+    # Axiom 5,6,7: dw1, dw2, dx
+    d1 = (dw1_o - dw1_p).abs().max().item()
+    d2 = (dw2_o - dw2_p).abs().max().item()
+    dd = (dx_o - dx_p).abs().max().item()
+    d0 = (dx_o[0] - dx_p[0]).abs().max().item()
+    assert d1 < F64_ATOL, f"{label}: dw1 diff={d1}"
+    assert d2 < F64_ATOL, f"{label}: dw2 diff={d2}"
+    assert dd < F64_ATOL, f"{label}: dx diff={dd}"
+
+    # Axiom 8: No misrouting (vectorized)
+    xg_l = xg.cpu().tolist()
+    pxg_l = pxg.cpu().tolist()
+    for orig_pos in range(TK):
+        assert pxg_l[dst[orig_pos]] == xg_l[orig_pos]
+    efo_t = torch.tensor(efo_l[1:])
+    pefo_t = torch.tensor(pefo_l[1:])
+    orig_experts = torch.searchsorted(efo_t, torch.arange(TK))
+    padded_experts = torch.searchsorted(pefo_t, torch.tensor(dst))
+    assert (orig_experts == padded_experts).all()
+
+    msg = (f"PASS {label}: T={T} E={E} K={K} TK={TK} "
+           f"non-aligned={non_aligned}/{E} pad={n_pad} "
+           f"dz_pad=0.0 dw1={d1:.1e} dw2={d2:.1e} dx={dd:.1e}")
+    print(msg)
+    return msg
+
+
+def test_production_E32_medium():
+    _run_all_axioms_production(512, 256, 128, 32, 8, "E32_medium")
+
+
+def test_production_E32_large():
+    _run_all_axioms_production(1024, 256, 128, 32, 8, "E32_large")
+
+
+def test_production_E128_extreme():
+    _run_all_axioms_production(256, 128, 64, 128, 8, "E128_extreme")
+
+
+_ALL_TESTS = _ALL_TESTS + [
+    test_production_E32_medium,
+    test_production_E32_large,
+    test_production_E128_extreme,
+]
+
 if __name__ == "__main__":
     for fn in _ALL_TESTS:
         fn()

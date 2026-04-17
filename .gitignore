@@ -221,3 +221,8 @@ tools/_archive/
 *.ncu-rep
 *.nsys-rep
 *.qdrep
+
+# Large binary data (npy, pt checkpoints, quack cache)
+*.npy
+*.pt
+my_quack_cache/
