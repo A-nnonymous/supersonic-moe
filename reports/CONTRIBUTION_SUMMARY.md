@@ -68,11 +68,20 @@ count E. The sweet spot is large I × large T.
 
 ### 2.3 Kernel-Level Budget
 
-At the Ernie production shape (T=8192, H=3072, I=1536, E=8, K=8):
+At the anchor shape (T=8192, H=3072, I=1536, E=8, K=8), BF16 total = 3644µs,
+FP8 total = 2715µs → **1.34× end-to-end**.
 
-- **Forward:** FP8 1178µs vs BF16 1388µs → **1.18×** (GemmGated 1.69×, DownProj 1.65×)
-- **Backward:** FP8 2476µs vs BF16 2648µs → **1.07×** (wgrad still BF16-dominated)
-- **Quant overhead:** 593µs total (quantize_and_pack, colwise, weight quant, ISA pack)
+| Category | BF16 (µs) | FP8 (µs) | Delta |
+|:---------|:---------:|:--------:|:-----:|
+| Wgrad GEMM | 2161.5 | 1078.1 | −1083 (2.00×) |
+| GemmGated (fwd) | 718.3 | 0 → ZeroMat 459.0 | −259 (1.56×) |
+| GemmDGated (bwd) | 452.6 | 0 → ZeroMat 384.0 | −69 (1.18×) |
+| Token Gather | 139.8 | 145.9 | +6 |
+| **FP8 quant overhead** | — | **480.6** | +481 (new) |
+
+Quant overhead breakdown: Blockscaled Quant 235µs + Dual Quant 152µs + Row Quant 77µs
+\+ ISA Scale Gather 16µs = 481µs. This is the cost of blockscaled FP8 quantization,
+partially offset by GEMM savings of −1411µs → net savings 929µs.
 
 ![Performance Waterfall](assets/fig4_performance_waterfall.png)
 
@@ -80,17 +89,17 @@ At the Ernie production shape (T=8192, H=3072, I=1536, E=8, K=8):
 
 ## 3. Precision
 
-All RRMSE computed against BF16 gold (identical routing, 3+ seeds):
+Anchor shape (T=32768, I=1536, E=8), FP8 vs BF16 gold (identical routing):
 
 | Tensor | RRMSE (%) | Cosine Similarity | Threshold | Status |
 |:-------|:---------:|:-----------------:|:---------:|:------:|
-| output | 6.52 | 0.9979 | <10%, >0.99 | PASS |
-| dx | 6.53 | 0.9979 | <10%, >0.99 | PASS |
-| dw1 | 4.27 | 0.9991 | <10%, >0.99 | PASS |
-| dw2 | 4.72 | 0.9989 | <10%, >0.99 | PASS |
+| output | 6.55 | 0.9979 | <10%, >0.99 | PASS |
+| dx | 6.56 | 0.9979 | <10%, >0.99 | PASS |
+| dw1 | 4.12 | 0.9992 | <10%, >0.99 | PASS |
+| dw2 | 4.19 | 0.9991 | <10%, >0.99 | PASS |
 
-Precision is uniform across 6 shape×E combinations (T∈{8192,32768}, E∈{8,32,128}).
 All RRMSE < 7% — this is pure FP8 E4M3 quantization noise.
+Multi-seed (5 seeds × 3 GPUs) measurements confirm output std < 0.05%.
 
 ![Precision Audit](assets/fig6_precision_audit.png)
 
