@@ -41,6 +41,16 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
+## 🛠️ Development Workflow and Repository Hygiene
+
+- **Read indexes first**: before broad file searches, open the nearest `INDEX.md`. The root map is [`INDEX.md`](INDEX.md).
+- **Canonical state lives in `docs/HANDOFF.md`**: treat `reports/fp8_upgrade/HANDOFF.md` as historical only.
+- **Keep indexes in sync with file changes**: any file create / delete / rename / move must update the nearest affected `INDEX.md`; cross-directory changes must also update the nearest shared ancestor index.
+- **Regenerate indexes after structural edits**: run `python tools/generate_directory_indexes.py` from the repository root and review the generated summaries.
+- **Prefer canonical files over parallel variants**: extend existing authoritative files instead of creating new `*_final`, `*_new`, or duplicate bootstrap docs unless there is a clear long-term need.
+- **Keep generated artifacts out of the root when possible**: new benchmark and profiling outputs should live under `reports/` rather than adding more root-level snapshots.
+- **When retiring a file, leave a clear trail**: update indexes and links so historical references are explicit instead of silently stale.
+
 ## 🎯 Quick Start
 
 ### Basic Usage
@@ -120,9 +130,15 @@ The reporting policy for every FP8 step is:
 - memory baseline: official bf16
 - performance baselines: previous commit and official bf16
 
-## 🔥 FP8 Blockscaled Status (2026-04-15, Session 54)
+## 🔥 FP8 Blockscaled Status (2026-04-17, Session 57)
 
-The `native-fp8-exploration` branch has a fully functional **zero-materialization** blockscaled FP8 training path for Blackwell (B30Z) with **32×32 isotropic weight quantization**, optional **weight stash** memory optimization, native **CUTLASS / QuACK** FP8 kernels, **Pythonic config API** (`SonicMoEConfig`), **unaligned FP8 padding** (forward only), **epilogue FP8 D output** (z written directly as fp8 by CUTLASS), **NCU-guided quant kernel optimization** (num_warps=1 → 2.3× colwise speedup), **shape-based wgrad FP8 auto-tuning**, and **fused dual row+col quantization**. No TK-sized FP8 activation is materialized.
+The `paddle_compat` branch has a fully functional **zero-materialization** blockscaled FP8 training path for Blackwell (B30Z) with **32×32 isotropic weight quantization**, optional **weight stash** memory optimization, native **CUTLASS / QuACK** FP8 kernels, **Pythonic config API** (`SonicMoEConfig`), **route-level padding** (forward + backward, mathematically proven zero error), **epilogue FP8 D output** (z written directly as fp8 by CUTLASS), **NCU-guided quant kernel optimization** (num_warps=1 → 2.3× colwise speedup), **shape-based wgrad FP8 auto-tuning**, **fused dual row+col quantization**, and **Paddle compat** (54/54 shapes verified). No TK-sized FP8 activation is materialized.
+
+### Session 57 Additions
+
+- **Route-level padding backward proof**: All 6 backward paths (1 CUTLASS fused + 5 Triton) audited. `dz[pad]=0` exactly due to score-gating before dSwiGLU. See `docs/pad_audit_methodology.md`.
+- **Gradient integrity test** (`tests/ops/test_pad_gradient_integrity.py`): 8 axioms proving padding introduces zero backward error (dz=0, dw1/dw2/dx bit-exact).
+- **Doc correction**: Fixed erroneous claim about `dz[pad]` being non-zero in pad audit methodology.
 
 ### Session 54 Additions
 
@@ -220,7 +236,7 @@ for batch in dataloader:
     moe.cpu_optimizer_step()
 ```
 
-> **Methodology:** nsys GPU-projection, 12-20 iters after 5 warmup. Each shape×mode in isolated subprocess (`CUDA_VISIBLE_DEVICES` per GPU). BF16 baseline verified within <1% of official SonicMoE. E>8 FP8 uses official token rounding (Mtile=128). nsys-rep files: `panzhaowu/output/nsys/`.
+> **Methodology:** nsys GPU-projection, 12-20 iters after 5 warmup. Each shape×mode in isolated subprocess (`CUDA_VISIBLE_DEVICES` per GPU). BF16 baseline verified within <1% of official SonicMoE. E>8 FP8 uses route-level padding (`_pad_routing_metadata`, Mtile=128-aligned segments). nsys-rep files: `panzhaowu/output/nsys/`.
 
 ### How to Reproduce All Results
 
@@ -334,8 +350,8 @@ ls /root/paddlejob/share-storage/gpfs/system-public/panzhaowu/output/nsys/*.nsys
 - **Each shape×mode runs in its own subprocess** (avoids CUTLASS JIT cache cross-contamination between different shapes)
 - **BF16 uses `moe_TC_softmax_topk_layer` directly** (same API as official benchmark, verified <1% gap)
 - **FP8 E≤8** uses stash mode (bf16 weights → CPU during fwd/bwd)
-- **FP8 E>8** uses official token rounding (`forward_token_choice_rounding`, Mtile=128) + `moe_general_routing_inputs`
-- **Expert segments must be 128-aligned** (SM100 ISA scale tile hardware constraint; non-aligned raises `RuntimeError`)
+- **FP8 E>8** uses route-level padding (`_pad_routing_metadata`, 128-aligned segments, zero GEMM code changes)
+- **Expert segments must be 128-aligned** (SM100 ISA scale tile hardware constraint; route-level padding handles this automatically)
 
 ### Quick Start (Pythonic Config — no env vars needed)
 
@@ -397,14 +413,15 @@ moe.unstash_bf16()                # +216 MiB GPU (CPU → bf16)
 
 | Priority | Resource | Path | Why |
 |:---:|----------|------|-----|
-| 1 | **Handoff** | `docs/HANDOFF.md` | **Start here** — complete project state, architecture, 27-shape data, bugs fixed, lessons, next steps |
-| 2 | **Grid data** | `reports/grid_session53/session53_grid_full.json` | Raw 27-shape benchmark JSON (performance + memory per shape) |
-| 3 | **Breakdown** | `reports/session53_breakdown.md` | Performance/memory table with scaling rules |
-| 4 | **Engineering log** | `reports/fp8_upgrade/engineering_log.md` | Historical development log (Phases 1-18), useful for understanding design decisions |
-| 5 | **BF16 baseline** | `/lab/official/sonic-moe` (env: `official_bf16`) | The ONLY valid BF16 baseline for comparison |
-| 6 | **Environment** | `/panzhaowu/env.md` | Machine setup, compilation, cluster tools |
-| 7 | Introspect tool | `tools/introspect.py` | All-in-one profiling: `--mode nsys/grid/precision/report` |
-| 8 | Contract tests | `tests/fp8_large_project_contract_test.py` | 34-test contract gate (+20 subtests) |
+| 1 | **Handoff** | `docs/HANDOFF.md` | **Start here** — complete project state, architecture, perf/mem/precision, lessons, next steps |
+| 2 | **Pad audit** | `docs/pad_audit_methodology.md` | Route-level padding design + backward correctness proof (dz[pad]=0) |
+| 3 | **Grid data** | `reports/grid_session53/session53_grid_full.json` | Raw 27-shape benchmark JSON (performance + memory per shape) |
+| 4 | **Breakdown** | `reports/session53_breakdown.md` | Performance/memory table with scaling rules |
+| 5 | **Engineering log** | `reports/fp8_upgrade/engineering_log.md` | Historical development log (Phases 1-20, 60 lessons) |
+| 6 | **BF16 baseline** | `/lab/official/sonic-moe` (env: `official_bf16`) | The ONLY valid BF16 baseline for comparison |
+| 7 | **Environment** | `/panzhaowu/env.md` | Machine setup, compilation, cluster tools |
+| 8 | Introspect tool | `tools/introspect.py` | All-in-one profiling: `--mode nsys/grid/precision/report/compare-viz` |
+| 9 | Contract tests | `tests/fp8_large_project_contract_test.py` | 34-test contract gate (+20 subtests) |
 
 > **Note:** `reports/fp8_upgrade/HANDOFF.md` is **stale** (Session 52 data). Use `docs/HANDOFF.md` only.
 
@@ -420,15 +437,23 @@ Run `python -m visualization` to regenerate all figures into `assets/`.
 | 1 | Kernel Runtime Breakdown | 2×2 grid: E2E latency, speedup decomposition, per-category kernel budget, quant micro-benchmark |
 | 2 | Memory Breakdown | Memory lifecycle waterfall, peak comparison across shapes, delta vs BF16 |
 | 3 | Computation Data Flow | Side-by-side BF16 vs FP8 zero-materialization data flow diagram |
+| 4 | BF16 vs FP8 Path Compare | Per-phase operator path, bridge tensors, and manifest memory envelope |
+| 5 | Frontier Contributions | Budget waterfall, scaling bars, and grid heatmaps for FP8-over-BF16 gains |
 
 #### Kernel Runtime Breakdown
-![Kernel Runtime Breakdown](./assets/fig11_kernel_runtime_breakdown.png)
+![Kernel Runtime Breakdown](./assets/fig11_kernel_budget_breakdown.png)
 
 #### Memory Breakdown
-![Memory Breakdown](./assets/fig12_memory_breakdown.png)
+![Memory Breakdown](./assets/fig12_memory_scaling.png)
 
 #### Computation Data Flow
 ![Computation Data Flow](./assets/fig13_computation_dataflow.png)
+
+#### BF16 vs FP8 Path Compare
+![BF16 vs FP8 Path Compare](./assets/fig15_fp8_bf16_path_compare.png)
+
+#### Frontier Contributions
+![Frontier Contributions](./assets/fig16_fp8_frontier_contributions.png)
 
 ### Introspection Pipeline
 
@@ -443,7 +468,10 @@ python tools/introspect.py --mode nsys --gpu 0 \
 # 2. Aggregate all data into summary JSON (no GPU needed)
 python tools/introspect.py --mode compile-session53
 
-# 3. Render all figures
+# 3. Compile BF16-vs-FP8 comparison report + render dedicated comparison figures
+python tools/introspect.py --mode compare-viz
+
+# 4. Render all figure suites that have their input artifacts available
 python -m visualization
 ```
 

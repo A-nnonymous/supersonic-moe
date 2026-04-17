@@ -255,12 +255,13 @@ def fig11_kernel_runtime_breakdown(data: GridData) -> None:
             bars = ax.barh(y_pos, values, color=colors, alpha=0.8,
                            edgecolor="white", linewidth=0.5, height=0.7)
 
-            # Value labels
+            # Value labels — anchored at Delta=0 axis to avoid y-axis label overlap
             for bar, v in zip(bars, values):
-                w = bar.get_width()
-                ha = "right" if w < 0 else "left"
-                offset = -30 if w < 0 else 10
-                ax.annotate(f"{v:+.0f}", xy=(w, bar.get_y() + bar.get_height()/2),
+                bw = bar.get_width()
+                ha = "right" if bw < 0 else "left"
+                offset = -5 if bw < 0 else 5
+                ax.annotate(f"{v:+.0f}",
+                            xy=(0, bar.get_y() + bar.get_height() / 2),
                             xytext=(offset, 0), textcoords="offset points",
                             va="center", ha=ha, fontsize=6.5, fontweight="bold",
                             color="#374151")
@@ -418,8 +419,7 @@ def _draw_box(ax, xy, w, h, text, color, fontsize=8, alpha=0.15,
     tc = textcolor or "#1F2937"
     ax.text(x0 + w/2, y0 + h/2, text,
             ha="center", va="center", fontsize=fontsize,
-            fontweight=weight, color=tc, zorder=10,
-            path_effects=[pe.withStroke(linewidth=2, foreground="white")])
+            fontweight=weight, color=tc, zorder=10)
 
 
 def _draw_arrow(ax, xy_from, xy_to, color="#374151", lw=1.2,
@@ -463,7 +463,47 @@ def fig13_computation_dataflow(data: GridData) -> None:
     Y_TOP = 12.5
     DY = -1.15
 
-    for panel_idx, (ax, mode, title_color) in enumerate([
+    # Pastel fill palette: (fill, edge, textcolor) per node type
+    _P = {
+        "input_bf16": ("#DBEAFE", "#2563EB", "#1E3A8A"),
+        "input_fp8":  ("#FFF7ED", "#EA580C", "#7C2D12"),
+        "router":     ("#FEF3C7", "#D97706", "#78350F"),
+        "quant":      ("#FEE2E2", "#DC2626", "#7F1D1D"),
+        "gemm_bf16":  ("#BFDBFE", "#1D4ED8", "#1E3A8A"),
+        "gemm_fp8":   ("#BFDBFE", "#EA580C", "#1E3A8A"),
+        "tensor_fp8": ("#FFF7ED", "#EA580C", "#7C2D12"),
+        "tensor_bf16":("#DBEAFE", "#2563EB", "#1E3A8A"),
+        "gather":     ("#FEE2E2", "#B91C1C", "#7F1D1D"),
+        "scatter":    ("#F1F5F9", "#475569", "#1E293B"),
+        "swiglu":     ("#EDE9FE", "#7C3AED", "#4C1D95"),
+        "bwd_bf16":   ("#E0F2FE", "#0369A1", "#0C4A6E"),
+        "bwd_fp8":    ("#ECFDF5", "#059669", "#064E3B"),
+        "save_note":  ("#DCFCE7", "#16A34A", "#14532D"),
+    }
+
+    def _box(ax, xy, w, h, text, key, fontsize=8, bold=False):
+        fill, edge, tc = _P[key]
+        patch = FancyBboxPatch(
+            (xy[0], xy[1]), w, h,
+            boxstyle="round,pad=0.025",
+            facecolor=fill, alpha=1.0,
+            edgecolor=edge, linewidth=1.4, zorder=2,
+        )
+        ax.add_patch(patch)
+        ax.text(xy[0] + w / 2, xy[1] + h / 2, text,
+                ha="center", va="center", fontsize=fontsize,
+                fontweight="bold" if bold else "normal",
+                color=tc, zorder=10, multialignment="center")
+
+    def _note(ax, xy, text, key, fontsize=7):
+        fill, edge, tc = _P[key]
+        ax.text(xy[0], xy[1], text,
+                fontsize=fontsize, color=tc, ha="center", va="center",
+                style="italic", zorder=11, multialignment="center",
+                bbox=dict(boxstyle="round,pad=0.18", facecolor=fill,
+                          edgecolor=edge, linewidth=0.8, alpha=0.95))
+
+    for panel_idx, (ax, mode, main_color) in enumerate([
         (axes[0], "bf16", C_BF16),
         (axes[1], "fp8",  C_FP8),
     ]):
@@ -473,100 +513,109 @@ def fig13_computation_dataflow(data: GridData) -> None:
         ax.set_aspect("equal")
 
         is_fp8 = (mode == "fp8")
-        main_color = C_FP8 if is_fp8 else C_BF16
+        input_key = "input_fp8" if is_fp8 else "input_bf16"
+
+        # Section background bands (approximate fwd/bwd split)
+        bwd_band = 3.6 if is_fp8 else 2.6
+        ax.axhspan(-1.5, bwd_band, color="#F0FFF4", alpha=0.35, zorder=0)
+        ax.axhspan(bwd_band, 14.0, color="#EFF6FF" if not is_fp8 else "#FFF7ED",
+                   alpha=0.20, zorder=0)
 
         title = "FP8 Frontier (Zero-Materialization)" if is_fp8 else "BF16 Baseline"
-        ax.text(COL_X + BOX_W/2, Y_TOP + 1.2, title,
+        ax.text(COL_X + BOX_W / 2, Y_TOP + 1.2, title,
                 fontsize=14, fontweight="bold", ha="center", color=main_color)
-        ax.text(COL_X + BOX_W/2, Y_TOP + 0.75,
+        ax.text(COL_X + BOX_W / 2, Y_TOP + 0.72,
                 f"T={T}, H={H}, I={I}, E={E}, K={K}",
                 fontsize=8, ha="center", color="#6B7280", style="italic")
 
-        # ── FORWARD PASS ──
+        # Section labels on left margin
+        ax.text(-0.16, 9.5, "FWD", fontsize=10, fontweight="bold",
+                color=main_color, rotation=90, va="center", ha="center", alpha=0.70)
+        ax.text(-0.16, 1.0, "BWD", fontsize=10, fontweight="bold",
+                color=main_color, rotation=90, va="center", ha="center", alpha=0.70)
+
+        # ── FORWARD PASS ──────────────────────────────────────────────────
         y = Y_TOP
-        ax.text(-0.1, y - 2.5, "FORWARD", fontsize=10, fontweight="bold",
-                color=main_color, rotation=90, va="center", ha="center")
 
         # Input
-        _draw_box(ax, (COL_X, y), BOX_W, BOX_H,
-                  f"x  [T x H]  BF16\n{T} x {H} = {T*H*2/1048576:.0f} MiB",
-                  main_color, fontsize=8, alpha=0.12, bold=True)
+        _box(ax, (COL_X, y), BOX_W, BOX_H,
+             f"x  [T \u00d7 H]  BF16\n{T} \u00d7 {H} = {T*H*2/1048576:.0f} MiB",
+             input_key, fontsize=8, bold=True)
 
         # Routing
         y += DY
         _draw_arrow(ax, (COL_X + BOX_W/2, y + BOX_H + 0.02),
                     (COL_X + BOX_W/2, y + BOX_H + DY + BOX_H - 0.02),
                     color=main_color)
-        _draw_box(ax, (COL_X, y), BOX_W, BOX_H,
-                  f"TopK Routing\nA_idx [T -> TK]  ({T} -> {TK})",
-                  "#F59E0B", fontsize=7.5, alpha=0.12)
+        _box(ax, (COL_X, y), BOX_W, BOX_H,
+             f"TopK Router  \u2192  A_idx [T\u2192TK]\n({T} \u2192 {TK})",
+             "router", fontsize=7.5)
 
         if is_fp8:
-            # Quantize (T-sized, not TK!)
+            # Quantize (T-sized only)
             y += DY
             _draw_arrow(ax, (COL_X + BOX_W/2, y + BOX_H + 0.02),
                         (COL_X + BOX_W/2, y + BOX_H + DY + BOX_H - 0.02),
                         color=main_color)
-            _draw_box(ax, (COL_X, y), BOX_W, BOX_H,
-                      "quantize_and_pack(x)\nx_fp8 [T x H] FP8 + scales",
-                      C_QUANT, fontsize=7.5, alpha=0.15, bold=True)
-            _draw_annotation(ax, (COL_X + BOX_W + 0.6, y + BOX_H/2),
-                             "T-sized!\nNot TK-sized", fontsize=7, color=C_QUANT)
+            _box(ax, (COL_X, y), BOX_W, BOX_H,
+                 "quantize_and_pack(x)\nx_fp8 [T \u00d7 H]  FP8 + scales",
+                 "quant", fontsize=7.5, bold=True)
+            _note(ax, (COL_X + BOX_W + 0.85, y + BOX_H / 2),
+                  "T-sized!\nNot TK-sized", "quant", fontsize=7)
 
             # GemmGated ZeroMat
             y += DY
             _draw_arrow(ax, (COL_X + BOX_W/2, y + BOX_H + 0.02),
                         (COL_X + BOX_W/2, y + BOX_H + DY + BOX_H * 1.2 - 0.02),
                         color=main_color)
-            _draw_box(ax, (COL_X, y), BOX_W, BOX_H * 1.2,
-                      "GemmGated ZeroMat\nx_fp8[T x H] + A_idx -> z_fp8[T x 2I]\n"
-                      "Gathers on-the-fly via A_idx",
-                      C_GEMM, fontsize=7.5, alpha=0.15, bold=True, edgecolor=C_FP8)
-            _draw_annotation(ax, (COL_X + BOX_W + 0.8, y + BOX_H * 0.6),
-                             "No TK x H FP8\nmaterialized!", fontsize=7.5, color=C_SAVE)
+            _box(ax, (COL_X, y), BOX_W, BOX_H * 1.2,
+                 "GemmGated ZeroMat\nx_fp8[T\u00d7H] + A_idx \u2192 z_fp8[T\u00d72I]\n"
+                 "Gathers rows on-the-fly via A_idx",
+                 "gemm_fp8", fontsize=7.5, bold=True)
+            _note(ax, (COL_X + BOX_W + 0.95, y + BOX_H * 0.65),
+                  "No TK\u00d7H FP8\nmaterialized!", "save_note", fontsize=7.5)
 
-            # Epilogue quant output
+            # Epilogue FP8 output tensor
             y += DY * 1.1
             _draw_arrow(ax, (COL_X + BOX_W/2, y + BOX_H * 1.2 + 0.02),
                         (COL_X + BOX_W/2, y + BOX_H * 1.2 + DY + BOX_H - 0.02),
                         color=main_color)
-            _draw_box(ax, (COL_X, y), BOX_W, BOX_H,
-                      "z_fp8  [T x 2I]  FP8\nEpilogue quant -- zero alloc",
-                      C_FP8, fontsize=7.5, alpha=0.15, bold=True)
-            _draw_annotation(ax, (COL_X + BOX_W + 0.6, y + BOX_H/2),
-                             "CUTLASS epilogue\nwrites FP8 directly",
-                             fontsize=6.5, color=C_SAVE)
+            _box(ax, (COL_X, y), BOX_W, BOX_H,
+                 "z_fp8  [T \u00d7 2I]  FP8\nCUTLASS epilogue quant \u2014 zero alloc",
+                 "tensor_fp8", fontsize=7.5, bold=True)
+            _note(ax, (COL_X + BOX_W + 0.85, y + BOX_H / 2),
+                  "CUTLASS epilogue\nwrites FP8 directly", "save_note", fontsize=6.5)
         else:
-            # BF16: Gather + GemmGated
+            # BF16: explicit Gather
             y += DY
             _draw_arrow(ax, (COL_X + BOX_W/2, y + BOX_H + 0.02),
                         (COL_X + BOX_W/2, y + BOX_H + DY + BOX_H - 0.02),
                         color=main_color)
-            _draw_box(ax, (COL_X, y), BOX_W, BOX_H,
-                      f"Gather x -> x_TK [TK x H] BF16\n{TK} x {H} = {TK*H*2/1048576:.0f} MiB",
-                      C_COST, fontsize=7.5, alpha=0.12)
+            _box(ax, (COL_X, y), BOX_W, BOX_H,
+                 f"Gather x \u2192 x_TK [TK\u00d7H]  BF16\n{TK}\u00d7{H} = {TK*H*2/1048576:.0f} MiB",
+                 "gather", fontsize=7.5)
 
             y += DY
             _draw_arrow(ax, (COL_X + BOX_W/2, y + BOX_H + 0.02),
                         (COL_X + BOX_W/2, y + BOX_H + DY + BOX_H - 0.02),
                         color=main_color)
-            _draw_box(ax, (COL_X, y), BOX_W, BOX_H,
-                      "GemmGated (CUTLASS)\nx_TK[TK x H] x W1[H x 2I] -> z[TK x 2I]",
-                      C_GEMM, fontsize=7.5, alpha=0.12)
+            _box(ax, (COL_X, y), BOX_W, BOX_H,
+                 "GemmGated (CUTLASS)\nx_TK[TK\u00d7H] \u00d7 W1[H\u00d72I] \u2192 z[TK\u00d72I]",
+                 "gemm_bf16", fontsize=7.5)
 
             y += DY
-            _draw_box(ax, (COL_X, y), BOX_W, BOX_H,
-                      f"z  [TK x 2I]  BF16\n{TK} x {2*I} = {TK*2*I*2/1048576:.0f} MiB",
-                      C_BF16, fontsize=7.5, alpha=0.12)
+            _box(ax, (COL_X, y), BOX_W, BOX_H,
+                 f"z  [TK\u00d72I]  BF16\n{TK}\u00d7{2*I} = {TK*2*I*2/1048576:.0f} MiB",
+                 "tensor_bf16", fontsize=7.5)
 
         # SwiGLU
         _draw_arrow(ax, (COL_X + BOX_W/2, y + 0.02),
                     (COL_X + BOX_W/2, y + DY + BOX_H - 0.02),
                     color=main_color)
         y += DY
-        _draw_box(ax, (COL_X, y), BOX_W, BOX_H,
-                  "SwiGLU Activation\ny1 = swish(z[:,:I]) * z[:,I:]",
-                  "#8B5CF6", fontsize=7.5, alpha=0.12)
+        _box(ax, (COL_X, y), BOX_W, BOX_H,
+             "SwiGLU Activation\ny1 = swish(z[:,:I]) \u2299 z[:,I:]",
+             "swiglu", fontsize=7.5)
 
         # DownProj
         _draw_arrow(ax, (COL_X + BOX_W/2, y + 0.02),
@@ -574,14 +623,14 @@ def fig13_computation_dataflow(data: GridData) -> None:
                     color=main_color)
         y += DY
         if is_fp8:
-            _draw_box(ax, (COL_X, y), BOX_W, BOX_H * 1.1,
-                      "GemmDGated ZeroMat\ny1_fp8[T x I] + A_idx -> o[T x H]\n"
-                      "Scatter-reduce in kernel",
-                      C_GEMM, fontsize=7.5, alpha=0.15, bold=True, edgecolor=C_FP8)
+            _box(ax, (COL_X, y), BOX_W, BOX_H * 1.1,
+                 "GemmDGated ZeroMat\ny_fp8[T\u00d7I] + A_idx \u2192 o[T\u00d7H]\n"
+                 "Scatter-reduce in kernel",
+                 "gemm_fp8", fontsize=7.5, bold=True)
         else:
-            _draw_box(ax, (COL_X, y), BOX_W, BOX_H,
-                      "GemmDGated (CUTLASS)\ny1[TK x I] x W2[I x H] -> y2[TK x H]",
-                      C_GEMM, fontsize=7.5, alpha=0.12)
+            _box(ax, (COL_X, y), BOX_W, BOX_H,
+                 "GemmDGated (CUTLASS)\ny1[TK\u00d7I] \u00d7 W2[I\u00d7H] \u2192 y2[TK\u00d7H]",
+                 "gemm_bf16", fontsize=7.5)
 
         # Scatter + Output
         _draw_arrow(ax, (COL_X + BOX_W/2, y + 0.02),
@@ -589,73 +638,94 @@ def fig13_computation_dataflow(data: GridData) -> None:
                     color=main_color)
         y += DY
         if not is_fp8:
-            _draw_box(ax, (COL_X, y), BOX_W, BOX_H,
-                      "Scatter-Reduce y2[TK x H] -> o[T x H]",
-                      C_NEUTRAL, fontsize=7.5, alpha=0.12)
+            _box(ax, (COL_X, y), BOX_W, BOX_H,
+                 "Scatter-Reduce  y2[TK\u00d7H] \u2192 o[T\u00d7H]",
+                 "scatter", fontsize=7.5)
             _draw_arrow(ax, (COL_X + BOX_W/2, y + 0.02),
                         (COL_X + BOX_W/2, y + DY + BOX_H - 0.02),
                         color=main_color)
             y += DY
 
-        _draw_box(ax, (COL_X, y), BOX_W, BOX_H,
-                  f"output  [T x H]  BF16\n{T} x {H} = {T*H*2/1048576:.0f} MiB",
-                  main_color, fontsize=8, alpha=0.12, bold=True)
+        _box(ax, (COL_X, y), BOX_W, BOX_H,
+             f"output  [T\u00d7H]  BF16\n{T}\u00d7{H} = {T*H*2/1048576:.0f} MiB",
+             input_key, fontsize=8, bold=True)
 
-        # ── BACKWARD divider ──
+        # ── BACKWARD divider ──────────────────────────────────────────────
         bwd_y = y + DY * 0.8
-        ax.plot([0.3, 6.8], [bwd_y + 0.25, bwd_y + 0.25],
-                ls="--", lw=0.8, color="#D1D5DB", zorder=0)
-        ax.text(COL_X + BOX_W/2, bwd_y + 0.4, "BACKWARD",
-                fontsize=9, fontweight="bold", ha="center", color=main_color, alpha=0.7)
+        ax.plot([0.2, 6.8], [bwd_y + 0.25, bwd_y + 0.25],
+                ls="--", lw=1.0, color="#94A3B8", zorder=3)
+        ax.add_patch(FancyBboxPatch(
+            (COL_X + BOX_W / 2 - 0.95, bwd_y + 0.08), 1.90, 0.34,
+            boxstyle="round,pad=0.04", facecolor="white",
+            edgecolor="#94A3B8", linewidth=0.8, zorder=4,
+        ))
+        ax.text(COL_X + BOX_W / 2, bwd_y + 0.25,
+                "\u2193  BACKWARD",
+                fontsize=8.5, fontweight="bold", ha="center", va="center",
+                color=main_color, alpha=0.90, zorder=5)
 
+        # Backward GEMMs
         y = bwd_y - 0.2
+        bwd_key = "bwd_fp8" if is_fp8 else "bwd_bf16"
         if is_fp8:
-            _draw_box(ax, (COL_X, y), BOX_W, BOX_H,
-                      "dGemmDGated ZeroMat -> dy1_fp8\n"
-                      "Wgrad auto-tune: OFF at I=1536",
-                      C_FP8, fontsize=7, alpha=0.12)
+            _box(ax, (COL_X, y), BOX_W, BOX_H,
+                 "dGemmDGated ZeroMat \u2192 dy_fp8\n"
+                 "Wgrad auto-tune: OFF at I=1536",
+                 bwd_key, fontsize=7)
         else:
-            _draw_box(ax, (COL_X, y), BOX_W, BOX_H,
-                      "dGemmDGated -> dy1 [TK x I] BF16\n"
-                      "dW2 via Wgrad GEMM",
-                      C_BF16, fontsize=7, alpha=0.12)
+            _box(ax, (COL_X, y), BOX_W, BOX_H,
+                 "dGemmDGated \u2192 dy [TK\u00d7I]  BF16\n"
+                 "dW2 via Wgrad GEMM",
+                 bwd_key, fontsize=7)
 
         _draw_arrow(ax, (COL_X + BOX_W/2, y + 0.02),
                     (COL_X + BOX_W/2, y + DY + BOX_H - 0.02),
                     color=main_color)
         y += DY
         if is_fp8:
-            _draw_box(ax, (COL_X, y), BOX_W, BOX_H,
-                      "dGemmGated ZeroMat -> dx_fp8\n"
-                      "dW1 via Wgrad GEMM",
-                      C_FP8, fontsize=7, alpha=0.12)
+            _box(ax, (COL_X, y), BOX_W, BOX_H,
+                 "dGemmGated ZeroMat \u2192 dx_fp8\ndW1 via Wgrad GEMM",
+                 bwd_key, fontsize=7)
         else:
-            _draw_box(ax, (COL_X, y), BOX_W, BOX_H,
-                      "dGemmGated -> dx [TK x H] BF16\n"
-                      "dW1 via Wgrad GEMM",
-                      C_BF16, fontsize=7, alpha=0.12)
+            _box(ax, (COL_X, y), BOX_W, BOX_H,
+                 "dGemmGated \u2192 dx [TK\u00d7H]  BF16\ndW1 via Wgrad GEMM",
+                 bwd_key, fontsize=7)
 
         _draw_arrow(ax, (COL_X + BOX_W/2, y + 0.02),
                     (COL_X + BOX_W/2, y + DY + BOX_H - 0.02),
                     color=main_color)
         y += DY
-        _draw_box(ax, (COL_X, y), BOX_W, BOX_H,
-                  f"dx  [T x H]  BF16\n{T} x {H} = {T*H*2/1048576:.0f} MiB",
-                  main_color, fontsize=8, alpha=0.12, bold=True)
+        _box(ax, (COL_X, y), BOX_W, BOX_H,
+             f"dx  [T\u00d7H]  BF16\n{T}\u00d7{H} = {T*H*2/1048576:.0f} MiB",
+             input_key, fontsize=8, bold=True)
 
-        # Peak memory badge
+        # Memory / timing badge
         if is_fp8:
-            mem_text = f"Peak Bwd: {fp8_bwd:.0f} MiB   |   {fp8_:.0f} us/iter"
+            mem_text = f"Peak Bwd: {fp8_bwd:.0f} MiB   |   {fp8_:.0f} \u03bcs/iter"
         else:
-            mem_text = f"Peak Bwd: {bf16_bwd:.0f} MiB   |   {bf16:.0f} us/iter"
-        ax.text(COL_X + BOX_W/2, -1.1, mem_text,
+            mem_text = f"Peak Bwd: {bf16_bwd:.0f} MiB   |   {bf16:.0f} \u03bcs/iter"
+        ax.text(COL_X + BOX_W / 2, -1.1, mem_text,
                 fontsize=9, fontweight="bold", ha="center", color=main_color,
                 bbox=dict(boxstyle="round,pad=0.3", facecolor=main_color,
-                          alpha=0.08, edgecolor=main_color, linewidth=1.0))
+                          alpha=0.10, edgecolor=main_color, linewidth=1.0))
+
+    # Legend
+    legend_items = [
+        mpatches.Patch(facecolor="#DBEAFE", edgecolor="#2563EB", label="BF16 tensor / BF16 GEMM"),
+        mpatches.Patch(facecolor="#FFF7ED", edgecolor="#EA580C", label="FP8 tensor / FP8 ZeroMat"),
+        mpatches.Patch(facecolor="#FEE2E2", edgecolor="#DC2626", label="Quantization kernel"),
+        mpatches.Patch(facecolor="#FEF3C7", edgecolor="#D97706", label="Top-k Router"),
+        mpatches.Patch(facecolor="#EDE9FE", edgecolor="#7C3AED", label="SwiGLU Activation"),
+        mpatches.Patch(facecolor="#F1F5F9", edgecolor="#475569", label="Scatter / Reduce"),
+        mpatches.Patch(facecolor="#DCFCE7", edgecolor="#16A34A", label="FP8 savings annotation"),
+    ]
+    fig.legend(handles=legend_items, loc="lower center", ncol=4, fontsize=8.5,
+               framealpha=0.94, bbox_to_anchor=(0.5, -0.005),
+               edgecolor="#CBD5E1")
 
     fig.suptitle(
-        "SonicMoE Session 53 — Computation Data Flow\n"
-        f"BF16 Baseline vs FP8 Zero-Materialization  |  Speedup: {sp:.3f}x",
+        "SonicMoE Session 53 \u2014 Computation Data Flow\n"
+        f"BF16 Baseline vs FP8 Zero-Materialization  |  Speedup: {sp:.3f}\u00d7",
         fontsize=14, fontweight="bold", y=0.99,
     )
     _save(fig, "fig13_computation_dataflow.png")
@@ -666,144 +736,123 @@ def fig13_computation_dataflow(data: GridData) -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def fig14_speedup_scaling(data: GridData) -> None:
-    """4-panel multi-dimensional speedup analysis:
-    (a) T×I heatmap at E=8
-    (b) T×E heatmap at I=1536
-    (c) Speedup vs token count (line plot, one line per I, E=8)
-    (d) Savings-vs-Overhead scatter (all 27 shapes)
+    """Redesigned 2-row layout:
+    Row 0 — Three speedup heatmaps: T×I (E=8 fixed), T×E (I=1536 fixed), E×I (avg over T).
+    Row 1 — Grouped budget bars: BF16 vs FP8 absolute kernel time per category
+             at the representative anchor shape (T=8k, E=8, I=1536).
     """
     _apply_style()
-    fig, axes = plt.subplots(2, 2, figsize=(14, 11),
-                             gridspec_kw={"hspace": 0.35, "wspace": 0.30})
+    fig = plt.figure(figsize=(16, 11))
+    gs = fig.add_gridspec(
+        2, 3,
+        height_ratios=[2.0, 1.7],
+        hspace=0.42, wspace=0.32,
+    )
 
-    # ── (a) T × I heatmap at E=8 ─────────────────────────────────────────
-    ax = axes[0, 0]
+    def _heat(ax, matrix, row_labels, col_labels, title, xlabel, ylabel, subtitle=""):
+        im = ax.imshow(matrix, cmap=CMAP_SPEEDUP, aspect="auto", vmin=1.0, vmax=1.72)
+        nrows, ncols = matrix.shape
+        for ri in range(nrows):
+            for ci in range(ncols):
+                v = matrix[ri, ci]
+                ax.text(ci, ri, f"{v:.3f}\u00d7",
+                        ha="center", va="center", fontsize=10.5, fontweight="bold",
+                        color="white" if v > 1.42 else "#374151")
+        ax.set_xticks(range(ncols))
+        ax.set_xticklabels(col_labels)
+        ax.set_yticks(range(nrows))
+        ax.set_yticklabels(row_labels)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title, fontweight="bold", pad=8)
+        if subtitle:
+            ax.text(0.5, 1.01, subtitle, transform=ax.transAxes,
+                    ha="center", va="bottom", fontsize=7.5, color="#6B7280",
+                    style="italic")
+        fig.colorbar(im, ax=ax, label="Speedup (\u00d7)", shrink=0.82)
+
+    # ── (a) T × I at E=8 ─────────────────────────────────────────────────
     E_fixed = 8
-    matrix_a = np.zeros((len(T_VALS), len(I_VALS)))
+    mat_a = np.zeros((len(T_VALS), len(I_VALS)))
     for ti, T in enumerate(T_VALS):
         for ii, I in enumerate(I_VALS):
-            matrix_a[ti, ii] = data.speedup(T, E_fixed, I)
+            mat_a[ti, ii] = data.speedup(T, E_fixed, I)
+    _heat(fig.add_subplot(gs[0, 0]), mat_a,
+          [f"T={t//1024}k" for t in T_VALS], [f"I={i}" for i in I_VALS],
+          f"(a)  T \u00d7 I  speedup", "Intermediate size I", "Tokens T",
+          subtitle=f"E={E_fixed} fixed")
 
-    im_a = ax.imshow(matrix_a, cmap=CMAP_SPEEDUP, aspect="auto",
-                     vmin=1.0, vmax=1.7)
-    for ti in range(len(T_VALS)):
-        for ii in range(len(I_VALS)):
-            v = matrix_a[ti, ii]
-            ax.text(ii, ti, f"{v:.3f}x",
-                    ha="center", va="center", fontsize=10, fontweight="bold",
-                    color="white" if v > 1.4 else "#374151")
-
-    ax.set_xticks(range(len(I_VALS)))
-    ax.set_xticklabels([f"I={i}" for i in I_VALS])
-    ax.set_yticks(range(len(T_VALS)))
-    ax.set_yticklabels([f"T={t//1024}k" for t in T_VALS])
-    ax.set_title(f"(a) Speedup: T x I (E={E_fixed})", fontweight="bold")
-    fig.colorbar(im_a, ax=ax, label="Speedup (x)", shrink=0.8)
-
-    # ── (b) T × E heatmap at I=1536 ──────────────────────────────────────
-    ax = axes[0, 1]
+    # ── (b) T × E at I=1536 ──────────────────────────────────────────────
     I_fixed = 1536
-    matrix_b = np.zeros((len(T_VALS), len(E_VALS)))
+    mat_b = np.zeros((len(T_VALS), len(E_VALS)))
     for ti, T in enumerate(T_VALS):
         for ei, E in enumerate(E_VALS):
-            matrix_b[ti, ei] = data.speedup(T, E, I_fixed)
+            mat_b[ti, ei] = data.speedup(T, E, I_fixed)
+    _heat(fig.add_subplot(gs[0, 1]), mat_b,
+          [f"T={t//1024}k" for t in T_VALS], [f"E={e}" for e in E_VALS],
+          f"(b)  T \u00d7 E  speedup", "Expert count E", "Tokens T",
+          subtitle=f"I={I_fixed} fixed")
 
-    im_b = ax.imshow(matrix_b, cmap=CMAP_SPEEDUP, aspect="auto",
-                     vmin=1.0, vmax=1.7)
-    for ti in range(len(T_VALS)):
-        for ei in range(len(E_VALS)):
-            v = matrix_b[ti, ei]
-            ax.text(ei, ti, f"{v:.3f}x",
-                    ha="center", va="center", fontsize=10, fontweight="bold",
-                    color="white" if v > 1.4 else "#374151")
+    # ── (c) E × I averaged over T ─────────────────────────────────────────
+    mat_c = np.zeros((len(E_VALS), len(I_VALS)))
+    for ei, E in enumerate(E_VALS):
+        for ii, I in enumerate(I_VALS):
+            vals = [data.speedup(T, E, I) for T in T_VALS if data.get(T, E, I)]
+            mat_c[ei, ii] = float(np.mean(vals)) if vals else 0.0
+    _heat(fig.add_subplot(gs[0, 2]), mat_c,
+          [f"E={e}" for e in E_VALS], [f"I={i}" for i in I_VALS],
+          "(c)  E \u00d7 I  speedup", "Intermediate size I", "Expert count E",
+          subtitle="averaged over T in {8k, 16k, 32k}")
 
-    ax.set_xticks(range(len(E_VALS)))
-    ax.set_xticklabels([f"E={e}" for e in E_VALS])
-    ax.set_yticks(range(len(T_VALS)))
-    ax.set_yticklabels([f"T={t//1024}k" for t in T_VALS])
-    ax.set_title(f"(b) Speedup: T x E (I={I_fixed})", fontweight="bold")
-    fig.colorbar(im_b, ax=ax, label="Speedup (x)", shrink=0.8)
+    # ── (d) Grouped budget bars — BF16 vs FP8 per category ───────────────
+    ax_d = fig.add_subplot(gs[1, :])
+    T_rep, E_rep, I_rep = 8192, 8, 1536
+    bb = data.budget(T_rep, E_rep, I_rep)
+    bf16_total = data.bf16_us(T_rep, E_rep, I_rep)
+    fp8_total = data.fp8_us(T_rep, E_rep, I_rep)
+    sp_rep = data.speedup(T_rep, E_rep, I_rep)
 
-    # ── (c) Speedup vs T (line plot, one line per I, E=8) ────────────────
-    ax = axes[1, 0]
-    i_colors = {1536: "#3B82F6", 2048: "#10B981", 3072: "#F59E0B"}
-    for I_val, color in i_colors.items():
-        speeds = [data.speedup(T, E_fixed, I_val) for T in T_VALS]
-        ax.plot(T_VALS, speeds, "o-", color=color, lw=2, ms=7,
-                label=f"I={I_val}", zorder=3)
-        for ti, (t, s) in enumerate(zip(T_VALS, speeds)):
-            ax.annotate(f"{s:.3f}x", xy=(t, s),
-                        xytext=(0, 10), textcoords="offset points",
-                        fontsize=7.5, fontweight="bold", ha="center", color=color)
+    # Keep categories significant in either mode (>80 µs)
+    sig = [(cat, v) for cat, v in bb.items()
+           if v["bf16_us"] > 80 or v["fp8_us"] > 80]
+    sig.sort(key=lambda x: x[1]["bf16_us"], reverse=True)
 
-    ax.axhline(1.0, color="#9CA3AF", ls="--", lw=0.8, zorder=0)
-    ax.set_xscale("log", base=2)
-    ax.set_xticks(T_VALS)
-    ax.set_xticklabels([f"{t//1024}k" for t in T_VALS])
-    ax.set_xlabel("Token Count (T)")
-    ax.set_ylabel("FP8 Speedup (x)")
-    ax.set_title(f"(c) Speedup Scaling with T (E={E_fixed})", fontweight="bold")
-    ax.legend(loc="upper left", framealpha=0.9)
-    ax.set_ylim(0.95, max(data.speedup(T, E_fixed, I) for T in T_VALS for I in I_VALS) * 1.08)
+    n = len(sig)
+    x = np.arange(n)
+    w = 0.36
+    bf16_ms = np.array([v["bf16_us"] for _, v in sig]) / 1000.0
+    fp8_ms  = np.array([v["fp8_us"]  for _, v in sig]) / 1000.0
 
-    # ── (d) Savings vs Overhead scatter (all 27 shapes) ──────────────────
-    ax = axes[1, 1]
-    t_markers = {8192: "o", 16384: "s", 32768: "D"}
-    for T, marker in t_markers.items():
-        for I_val, color in i_colors.items():
-            savings_vals = []
-            overhead_vals = []
-            for E in E_VALS:
-                s = data.budget_savings(T, E, I_val)
-                o = data.budget_overhead(T, E, I_val)
-                if s > 0 or o > 0:
-                    savings_vals.append(s)
-                    overhead_vals.append(o)
-            if savings_vals:
-                lab = f"T={T//1024}k, I={I_val}" if T == 8192 else None
-                ax.scatter(savings_vals, overhead_vals, c=color, marker=marker,
-                           s=50, alpha=0.8, edgecolors="white", linewidth=0.5,
-                           label=lab, zorder=3)
+    ax_d.bar(x - w/2, bf16_ms, w, color=C_BF16, alpha=0.82,
+             label=f"BF16  ({bf16_total/1000:.1f} ms total)",
+             edgecolor="white", linewidth=0.5)
+    ax_d.bar(x + w/2, fp8_ms, w, color=C_FP8, alpha=0.82,
+             label=f"FP8   ({fp8_total/1000:.1f} ms total, {sp_rep:.3f}\u00d7 speedup)",
+             edgecolor="white", linewidth=0.5)
 
-    # y=x line (break-even)
-    lim = max(
-        max((data.budget_savings(T, E, I) for T in T_VALS for E in E_VALS for I in I_VALS
-             if data.get(T, E, I)), default=1),
-        max((data.budget_overhead(T, E, I) for T in T_VALS for E in E_VALS for I in I_VALS
-             if data.get(T, E, I)), default=1),
-    ) * 1.1
-    ax.plot([0, lim], [0, lim], "k--", lw=0.8, alpha=0.5, label="break-even")
-    ax.fill_between([0, lim], [0, 0], [0, lim], alpha=0.04, color=C_SAVE, zorder=0)
-    ax.fill_between([0, lim], [0, lim], [lim, lim], alpha=0.04, color=C_COST, zorder=0)
-    ax.text(lim * 0.7, lim * 0.3, "FP8 wins", fontsize=10, color=C_SAVE,
-            fontweight="bold", alpha=0.5)
-    ax.text(lim * 0.3, lim * 0.7, "BF16 wins", fontsize=10, color=C_COST,
-            fontweight="bold", alpha=0.5)
+    # Delta annotation above each group
+    for xi, (bv, fv) in enumerate(zip(bf16_ms, fp8_ms)):
+        d_pct = (fv - bv) / bv * 100 if bv > 0 else 0
+        color = C_SAVE if d_pct < 0 else (C_COST if d_pct > 5 else C_NEUTRAL)
+        ax_d.text(xi, max(bv, fv) + 0.04, f"{d_pct:+.0f}%",
+                  ha="center", fontsize=7.2, fontweight="bold", color=color)
 
-    ax.set_xlabel("GEMM Savings (us)")
-    ax.set_ylabel("FP8 Overhead (us)")
-    ax.set_title("(d) Budget: Savings vs Overhead (all 27 shapes)", fontweight="bold")
-
-    # Custom legend with markers
-    from matplotlib.lines import Line2D
-    legend_elements = [
-        Line2D([0], [0], marker="o", color="w", markerfacecolor="#6B7280",
-               markersize=7, label="T=8k"),
-        Line2D([0], [0], marker="s", color="w", markerfacecolor="#6B7280",
-               markersize=7, label="T=16k"),
-        Line2D([0], [0], marker="D", color="w", markerfacecolor="#6B7280",
-               markersize=7, label="T=32k"),
-        mpatches.Patch(color="#3B82F6", label="I=1536"),
-        mpatches.Patch(color="#10B981", label="I=2048"),
-        mpatches.Patch(color="#F59E0B", label="I=3072"),
-        Line2D([0], [0], ls="--", color="k", lw=0.8, label="break-even"),
-    ]
-    ax.legend(handles=legend_elements, loc="upper left", framealpha=0.9,
-              fontsize=7, ncol=2)
+    cat_labels = [c.replace(" (fwd)", "\n(fwd)").replace(" (bwd)", "\n(bwd)")
+                  for c, _ in sig]
+    ax_d.set_xticks(x)
+    ax_d.set_xticklabels(cat_labels, fontsize=8.5)
+    ax_d.set_ylabel("Time (ms / iter)")
+    ax_d.set_title(
+        f"(d)  Per-category kernel time: BF16 vs FP8"
+        f"  \u2014  T={T_rep//1024}k, E={E_rep}, I={I_rep}",
+        fontweight="bold",
+    )
+    ax_d.legend(loc="upper right", framealpha=0.92)
+    ax_d.axhline(0, color="#9CA3AF", lw=0.5)
 
     fig.suptitle(
-        "SonicMoE Session 53 — Multi-Dimensional FP8 Speedup Scaling\n"
-        f"27 shapes (3T x 3E x 3I)  |  nsys GPU-projection  |  {_HW}",
+        "SonicMoE Session 53 \u2014 Multi-Dimensional FP8 Speedup Scaling\n"
+        f"27 shapes (3T \u00d7 3E \u00d7 3I)  |  nsys GPU-projection  |  {_HW}",
         fontsize=13, fontweight="bold", y=1.01,
     )
     _save(fig, "fig14_speedup_scaling.png")

@@ -270,6 +270,27 @@
 57. **Module-level precision is tighter than op-level.** Op-level RRMSE was ≤7%; module-level (chained permute+GEMM+SwiGLU+GEMM+scatter) is only 6.5% FP8. Error doesn't compound as much as expected because the scatter (weighted sum) acts as a low-pass filter.
 58. **ERNIE-core applies prob scaling BETWEEN SwiGLU and down-proj** (`o2 = swiglu(o1) * probs` then `o3 = o2 @ W2`). SonicMoE applies it AFTER down-proj in `_router_forward`. Mathematically equivalent for linear down-proj but produces different intermediate tensors — matters for numerical precision analysis.
 
+## Phase 20: Doc Correction + Backward Gradient Integrity Test (Session 57)
+
+- **dz[pad]=0 proof completed**: Audited all 6 backward paths (1 CUTLASS fused in `gemm_dgated.py`, 5 Triton in `swiglu_triton.py`). In every path, router score multiplies gradient BEFORE dSwiGLU. Since `score[pad]=0` (IEEE 754 exact zero), `dz[pad]=0` exactly. This means padding rows contribute zero to dw1 and dx.
+- **Doc correction**: `docs/pad_audit_methodology.md` Section 2.2 previously claimed dz[pad] was non-zero but "consistent between BF16 and FP8 paths". This was wrong. Replaced with correct analysis citing exact code locations in both CUTLASS and Triton paths.
+- **`test_pad_gradient_integrity.py`**: 8 axiomatic tests covering full backward chain:
+  1. Token conservation (dst_idx injective)
+  2. Score invariant (original preserved, padding == exact 0.0)
+  3. Forward near-exact (< 1e-13 threshold for GPU matmul tiling differences)
+  4. **dz[pad] == exact 0.0** (364 padding rows, all precisely zero)
+  5. dw1 near-exact (< 1e-13, measured exact 0.0)
+  6. dw2 near-exact (< 1e-13, measured exact 0.0)
+  7. dx near-exact with dx[0] (gather target) verified
+  8. No token misrouting
+- **test_pad_routing.py fix**: Pre-existing failure (diff=2.78e-17) from GPU matmul tiling difference in float64. Changed from bit-exact to 1e-13 epsilon threshold. Root cause: different expert segment lengths (7 vs 128 rows) produce different matmul reduction order on GPU.
+- **Coverage audit**: Mapped all FP8 frontier strategies against test files. 48 testable techniques identified, all covered except isolated FP8 dgated kernel test (pre-existing gap, end-to-end coverage exists).
+
+### Lessons (Session 57)
+
+59. **Score-gating guarantees dz[pad]=0 exactly across ALL 6 backward paths.** IEEE 754: `finite * 0.0 = 0.0`. Route-level padding is backward-safe by construction, not by coincidence.
+60. **GPU matmul tiling depends on problem shape.** Different row counts produce ULP-level float64 differences. Assertions for matmul-derived values need epsilon tolerance; score-gating zeros are truly bit-exact because they depend only on multiplication by zero.
+
 ---
 
 > **Canonical handoff for next agent: `docs/HANDOFF.md`**
