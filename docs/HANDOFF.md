@@ -1,9 +1,9 @@
 # SonicMoE FP8 Frontier — Handoff
 
 > **Branch:** `paddle_compat`
-> **Date:** 2026-04-17 (Session 57)
+> **Date:** 2026-04-20 (Session 58)
 > **Upstream:** `native-fp8-exploration` + PR #1 "adapt paddle" merged
-> **Status:** Clean frontier. All tests pass. Ready for next agent.
+> **Status:** Clean frontier. All tests pass. Multi-stream sync eliminated.
 
 ---
 
@@ -198,6 +198,16 @@ python tools/introspect.py --mode grid --gpu 8
 
 ## 7. Lessons Learned (Selected High-Value)
 
+### From Session 58 (stream sync elimination)
+
+61. **Multi-stream design has no perf benefit in sonic-moe.** `_WGRAD_STREAM` (dead code, never
+    called) and `_DEQUANT_STREAM` (used in 2 backward paths) added explicit `cudaStreamSynchronize`
+    (via `wait_stream()`) without measurable overlap gains. Removing them eliminates all type=3
+    STREAM_SYNCHRONIZE events from nsys. Backward path now has zero sync calls.
+
+62. **nsys `--capture-range=nvtx` + Paddle's `nvprof_nvtx_push` don't interoperate.** Use
+    `--capture-range=none` when profiling Paddle-based tests with nsys.
+
 ### From Session 57 (doc audit + gradient test)
 
 59. **Score-gating guarantees dz[pad]=0 exactly across ALL 6 backward paths.** The CUTLASS
@@ -257,8 +267,17 @@ python tools/introspect.py --mode grid --gpu 8
 4. **Memory audit**: Investigate backward memory gap (PD vs PT). Use `torch.cuda.memory_snapshot()`
    to identify exact tensors. The gap is likely router autograd tensors.
 
-5. **ERNIE-core integration**: Run full ERNIE MoE layer under Paddle compat. The
-   `tests/ernie_core_moe_single_gpu.py` is a starting point but uses Paddle-native, not compat.
+5. **ERNIE-core MlpNode integration**: Replace ERNIE-core's `ExpertsGroupGemmContiguousNode`
+   GEMM backend with sonic-moe's FP8 frontier (`_UpProjection` + `_DownProjection`) to get
+   CUTLASS DSL performance. Integration approach:
+   - **Adapter class** wrapping sonic-moe's `moe_general_routing_inputs()` to match MlpNode's
+     `(hs_2d_dispatched, dispatched_indices, dispatched_probs)` interface
+   - MlpNode.forward calls unzip → sonic-moe FP8 GEMM (up+gated+down) → zip
+   - Key mappings: MlpNode.unzip = sonic-moe's `x_gather_idx` scatter, MlpNode.zip = `token_gather_sum`
+   - FP8_ALIGN (128) matches sonic-moe's 128-alignment padding
+   - MlpNode's subbatch support maps to sonic-moe's expert-level GEMM splitting
+   - Weight format: ERNIE uses `fp8_weight_stacked`/`fp8_scale_stacked` per-layer;
+     sonic-moe uses `_STASHED_FP8_WEIGHTS` cache. Need a shim to bridge weight lifecycle.
 
 ---
 
