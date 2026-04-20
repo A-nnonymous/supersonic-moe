@@ -3,7 +3,7 @@
 > **Branch:** `paddle_compat`
 > **Date:** 2026-04-20 (Session 58)
 > **Upstream:** `native-fp8-exploration` + PR #1 "adapt paddle" merged
-> **Status:** Clean frontier. All tests pass. Multi-stream sync eliminated.
+> **Status:** Clean frontier. All tests pass. Multi-stream sync eliminated. Ready for ERNIE integration.
 
 ---
 
@@ -12,7 +12,8 @@
 ### One-Sentence Summary
 
 Blackwell SM100a blockscaled FP8 (E4M3 + E8M0, 1x32) MoE training is **production-ready**:
-1.29-1.70x speedup, 6.5% RRMSE, route-level padding for non-aligned experts, Paddle compat verified.
+1.29-1.70x speedup, 6.5% RRMSE, route-level padding for non-aligned experts, zero explicit
+cudaStreamSynchronize in backward, Paddle compat verified.
 
 ### What Works
 
@@ -25,6 +26,17 @@ Blackwell SM100a blockscaled FP8 (E4M3 + E8M0, 1x32) MoE training is **productio
 | Real training loop (5 iters, cpu_optimizer_step) | PASS, loss decreasing | pad_audit Section 3.4 |
 | FP8+Stash (bf16 weights → CPU) | PASS, -24.5% peak mem | fp8_frontier_strict_test |
 | 0-size expert handling | PASS, all paths | test_moe_module 7-empty tests |
+| Single-stream backward (no sync overhead) | PASS, 0 STREAM_SYNC | Session 58 nsys sqlite verification |
+
+### Session 58 Changes
+
+1. **Removed multi-stream design** — deleted `_WGRAD_STREAM` (dead code, never used) and
+   `_DEQUANT_STREAM` (used in 2 backward paths for z-dequant and x_col quant overlap).
+   These produced `cudaStreamSynchronize` events via `wait_stream()`. The overlap provided
+   no measurable benefit. All quant/dequant ops now run sequentially on the default stream.
+   - Modified: `sonicmoe/functional/__init__.py` (removed 45 lines, added 9)
+   - Verified: nsys sqlite shows zero type=3 STREAM_SYNCHRONIZE events. Backward path
+     has exactly zero `cudaStreamSynchronize` calls. Test correctness PASSED.
 
 ### What Does NOT Work / Known Issues
 
@@ -109,11 +121,20 @@ Full mathematical proof: `docs/pad_audit_methodology.md`
 
 ### Key Invariant (Session 57 Discovery)
 
-**dz[pad] is exactly zero.** The original Session 56 HANDOFF did not explicitly address this.
-Session 57 audited all 6 backward paths and confirmed that score-gating occurs BEFORE dSwiGLU
-in every path, making `dz[pad]=0` an IEEE 754 guarantee (`finite * 0.0 = 0.0`).
-Corrected the erroneous claim in `pad_audit_methodology.md` Section 2.2 and added
-`test_pad_gradient_integrity.py` with 8 axioms proving this property.
+**dz[pad] is exactly zero.** Session 57 audited all 6 backward paths and confirmed that
+score-gating occurs BEFORE dSwiGLU in every path, making `dz[pad]=0` an IEEE 754 guarantee
+(`finite * 0.0 = 0.0`). Corrected the erroneous claim in `pad_audit_methodology.md`
+Section 2.2 and added `test_pad_gradient_integrity.py` with 8 axioms proving this property.
+
+### Stream Design (Session 58 Cleanup)
+
+**All forward and backward ops run on the default CUDA stream.** Prior sessions (7, 15)
+experimented with side-stream overlap (z-dequant || dout-quant). Session 58 removed all
+side-stream code because: (1) `_WGRAD_STREAM` was dead code — declared but never used;
+(2) `_DEQUANT_STREAM` overlap saved ~47µs theoretical but each `wait_stream()` call produced
+a `cudaStreamSynchronize` that cost more; (3) cross-stream blocks prevent caching allocator
+reuse. The `stream_id` parameter in CuTe DSL kernels (forward.py/backward.py) passes the
+default stream's raw pointer — this is NOT multi-stream and was not changed.
 
 ### Weight Caches
 
@@ -159,11 +180,13 @@ FP8 dgated backward kernel lacks an **isolated** 3-way test (only end-to-end cov
 |:-------|:-----|:---------------|
 | Pad audit design doc | `docs/pad_audit_methodology.md` | Mathematical proof of padding correctness, all backward paths analyzed |
 | Session 53 grid data | `reports/grid_session53/session53_grid_full.json` | Raw 27-shape benchmark (nsys + memory + precision) |
-| Engineering log | `reports/fp8_upgrade/engineering_log.md` | 19 phases, 59 lessons, all dead ends documented |
-| NCU kernel profile | `/tmp/ncu_quant2.ncu-rep` (ephemeral) | 23-kernel metrics (regs, occ%, DRAM%, LD eff) |
-| ERNIE-core FP8 | `ernie_core/models/moe/token_dispatcher/fp8_utils.py` | Paddle's `kitchen_quant` + `deep_gemm` — the comparison point |
+| Engineering log | `reports/fp8_upgrade/engineering_log.md` | 21 phases (Sessions 1-58), 62 lessons, all dead ends documented |
+| ERNIE-core MoE layer | `/root/.../liangshuhao/erniebot_test_speed/third_party/ernie-core/src/ernie_core/models/moe/moe_layer.py` | `MlpNode` (line 1776), `FusionFP8Expert` (line 545), `ExpertsGroupGemmContiguousNode` — integration target |
+| ERNIE-core FP8 utils | `ernie_core/models/moe/token_dispatcher/fp8_utils.py` | Paddle's `kitchen_quant` + `deep_gemm` — the comparison point |
+| nsys sqlite (Session 58) | `/root/.../panzhaowu/output/nsys_stream_sync/moe_fp8_routing.sqlite` | Verified zero STREAM_SYNCHRONIZE events after fix |
 | Official BF16 baseline | `/lab/official/sonic-moe` (env: `official_bf16`) | ONLY valid BF16 reference |
 | Paddle quack fork | `/root/.../zhangyichen/sonicmoe_for_ernie/quack` | eb_venv quack with Paddle compat patches |
+| pd_run.sh reference | `/root/.../zhangyichen/sonicmoe_for_ernie/supersonic-moe/tests/pd_run.sh` | Reference env config for Paddle tests (eb_venv, SONIC_MOE_FP8_MODE=perf, USE_QUACK_GEMM=1) |
 
 ---
 
@@ -186,6 +209,16 @@ export SONIC_MOE_FP8_MODE=perf USE_QUACK_GEMM=1 QUACK_CACHE_DIR=./my_quack_cache
 CUDA_VISIBLE_DEVICES=1 python tests/ops/test_pad_gradient_integrity.py
 CUDA_VISIBLE_DEVICES=1 python tests/ops/test_pad_routing.py
 
+# FP8 routing test (eb_venv, ~30s — the test used for Session 58 stream sync validation)
+CUDA_VISIBLE_DEVICES=1 python tests/ops/test_moe_general_routing_fp8.py
+
+# nsys profiling (eb_venv — do NOT use --capture-range=nvtx with Paddle)
+nsys profile --trace=cuda,nvtx --output=/tmp/profile \
+  python tests/ops/test_moe_general_routing_fp8.py --bench
+nsys export --type=sqlite --output=/tmp/profile.sqlite /tmp/profile.nsys-rep
+# Query: SELECT syncType, COUNT(*) FROM CUPTI_ACTIVITY_KIND_SYNCHRONIZATION GROUP BY syncType
+# syncType=3 (STREAM_SYNCHRONIZE) should be 0
+
 # PyTorch native nsys benchmark (xfer)
 source /root/.../panzhaowu/envs/xfer/bin/activate
 CUDA_VISIBLE_DEVICES=0 python tools/introspect.py --mode nsys --nsys-shapes 8192,3072,1536,8,8
@@ -200,13 +233,21 @@ python tools/introspect.py --mode grid --gpu 8
 
 ### From Session 58 (stream sync elimination)
 
-61. **Multi-stream design has no perf benefit in sonic-moe.** `_WGRAD_STREAM` (dead code, never
-    called) and `_DEQUANT_STREAM` (used in 2 backward paths) added explicit `cudaStreamSynchronize`
-    (via `wait_stream()`) without measurable overlap gains. Removing them eliminates all type=3
-    STREAM_SYNCHRONIZE events from nsys. Backward path now has zero sync calls.
+61. **Side-stream overlap in backward provides no net benefit.** `_DEQUANT_STREAM` theoretically
+    saved ~47µs by overlapping z-dequant with dout-quant, but each `wait_stream()` call produced
+    a `cudaStreamSynchronize` (CUPTI type=3), and cross-stream blocks prevent caching allocator
+    reuse. Net effect was negative. Always prefer single-stream unless overlap window is >100µs.
+    (Note: engineering_log Phase 15 recorded "removed cross-stream overlap" for wgrad, but
+    `_DEQUANT_STREAM` survived until Session 58 in two backward paths. Now fully removed.)
 
-62. **nsys `--capture-range=nvtx` + Paddle's `nvprof_nvtx_push` don't interoperate.** Use
-    `--capture-range=none` when profiling Paddle-based tests with nsys.
+62. **nsys `--capture-range=nvtx` does NOT work with Paddle's `nvprof_nvtx_push`.** Paddle's NVTX
+    markers use a different domain/API than nsys expects. Use `--capture-range=none` (or omit
+    the flag entirely) when profiling Paddle-based tests. Export to sqlite and query
+    `CUPTI_ACTIVITY_KIND_SYNCHRONIZATION` with `syncType=3` to find stream syncs.
+
+63. **`_WGRAD_STREAM` was dead code.** Declared in Session 32, but `_get_wgrad_stream()` was
+    never called anywhere — all wgrad paths used the default stream. A reminder to grep for
+    callers before assuming infra is live.
 
 ### From Session 57 (doc audit + gradient test)
 
@@ -251,33 +292,87 @@ python tools/introspect.py --mode grid --gpu 8
    isolated kernel-level test (only end-to-end coverage). Adding a `test_gemm_dgated_fp8` would
    close the last coverage gap.
 
+6. **All backward sync is eliminated.** After Session 58, the backward path has zero explicit
+   `cudaStreamSynchronize`. The forward still has 6 framework-internal `stream_wait_event`
+   calls (CUPTI type=2, from Paddle/PyTorch internals), which are harmless and unavoidable.
+   The remaining D2H syncs in forward are: `_get_cu_seqlens_cpu()` → `.tolist()` (guarded by
+   `ASSUME_ALIGNED`), `_auto_capacity()` → `.max().item()`, and `_unpack_grouped_rows()` /
+   `blockscaled_fp8_gemm()` → `.item()`.
+
+7. **ERNIE-core MlpNode is the integration target.** `MlpNode` (moe_layer.py:1776) orchestrates
+   unzip → expert GEMM → zip. Its GEMM backend (`ExpertsGroupGemmContiguousNode`) uses
+   `deep_gemm.m_grouped_gemm_fp8_fp8_bf16_nt_contiguous`. Replacing this with sonic-moe's
+   CUTLASS DSL GEMM is the next major milestone. Key compatibility: both use FP8_ALIGN=128,
+   both use 1x32 blockscaled quantization, both have subbatch support.
+
 ---
 
 ## 9. Next Steps
 
-1. **Fair E>8 FP8 baseline**: Re-run grid_session53 E>8 FP8 with route-level padding (instead of
-   rounding) on xfer env. Currently E>8 numbers conflate routing strategy with Paddle overhead.
+### 9.1 ERNIE-core MlpNode Integration (Priority 1)
 
-2. **Epilogue forward quantization**: Move `quantize_and_pack_activation(x)` into the GemmGated
-   epilogue (like z epilogue quant). Would eliminate ~130us forward overhead.
+**Goal**: Replace ERNIE-core's `ExpertsGroupGemmContiguousNode` GEMM backend with sonic-moe's
+FP8 frontier (`_UpProjection` + `_DownProjection`) for CUTLASS DSL performance on Blackwell.
 
-3. **FP8 dgated isolated test**: Add `test_gemm_dgated.py::test_fp8_dgated` with 3-way
-   cross-validation (torch gold vs BF16 CUTLASS vs FP8 blockscaled).
+**ERNIE MlpNode Architecture** (moe_layer.py:1776):
+```
+dispatch(hidden_states) → (hs_2d_dispatched, dispatched_indices, dispatched_probs)
+  → UnZipNode.forward (gather per-expert tokens, tilewise_quant → FP8)
+  → ExpertsGroupGemmContiguousNode.forward (FP8 group GEMM: up+gated+SwiGLU+down)
+  → ZipNode.forward (scatter-add weighted by probs)
+→ combine output
+```
 
-4. **Memory audit**: Investigate backward memory gap (PD vs PT). Use `torch.cuda.memory_snapshot()`
-   to identify exact tensors. The gap is likely router autograd tensors.
+**Integration Approach**:
+1. **Adapter class** wrapping sonic-moe's `moe_general_routing_inputs()` to accept MlpNode's
+   `(hs_2d_dispatched, dispatched_indices, dispatched_probs)` input format.
+2. **GEMM substitution**: MlpNode's `ExpertsGroupGemmContiguousNode` → sonic-moe's
+   `_UpProjection` (up+gated+SwiGLU) + `_DownProjection` (down-proj, varlen).
+3. **Key compatibility points**:
+   - Both use FP8_ALIGN=128 for expert segment alignment
+   - Both use 1x32 blockscaled E4M3+E8M0 quantization
+   - MlpNode's `tokens_per_expert` list maps to sonic-moe's `cu_seqlens` (cumsum of padded counts)
+   - MlpNode.unzip (gather) = sonic-moe's `x_gather_idx` scatter
+   - MlpNode.zip (scatter-add) = sonic-moe's `token_gather_sum_kernel`
+4. **SwiGLU convention**: ERNIE uses split-half (`gate=[:I], up=[I:]`), sonic-moe uses
+   interleaved (`gate=even, up=odd`). Use `split_to_interleaved()` / `interleaved_to_split()`
+   (already verified bit-exact round-trip in Session 54).
+5. **Weight lifecycle shim**: ERNIE stores `fp8_weight_stacked`/`fp8_scale_stacked` on the
+   parameter object; sonic-moe uses `_STASHED_FP8_WEIGHTS` dict keyed by `(data_ptr, _version)`.
+   Need a bridge to populate sonic-moe's cache from ERNIE's pre-quantized weights.
+6. **Prob scaling difference**: ERNIE applies `o2 = swiglu(o1) * probs` between SwiGLU and
+   down-proj; sonic-moe applies it after down-proj in `_router_forward`. Mathematically
+   equivalent for linear down-proj, but intermediate tensors differ — test both orders.
 
-5. **ERNIE-core MlpNode integration**: Replace ERNIE-core's `ExpertsGroupGemmContiguousNode`
-   GEMM backend with sonic-moe's FP8 frontier (`_UpProjection` + `_DownProjection`) to get
-   CUTLASS DSL performance. Integration approach:
-   - **Adapter class** wrapping sonic-moe's `moe_general_routing_inputs()` to match MlpNode's
-     `(hs_2d_dispatched, dispatched_indices, dispatched_probs)` interface
-   - MlpNode.forward calls unzip → sonic-moe FP8 GEMM (up+gated+down) → zip
-   - Key mappings: MlpNode.unzip = sonic-moe's `x_gather_idx` scatter, MlpNode.zip = `token_gather_sum`
-   - FP8_ALIGN (128) matches sonic-moe's 128-alignment padding
-   - MlpNode's subbatch support maps to sonic-moe's expert-level GEMM splitting
-   - Weight format: ERNIE uses `fp8_weight_stacked`/`fp8_scale_stacked` per-layer;
-     sonic-moe uses `_STASHED_FP8_WEIGHTS` cache. Need a shim to bridge weight lifecycle.
+**MlpNode subbatch support**: MlpNode has `moe_subbatch_token_num_after_dispatch` (fixed-size
+subbatch) and `use_auto_subbatch` (memory-aware dynamic subbatch). These map naturally to
+sonic-moe's expert-level GEMM splitting in `_UpProjection`/`_DownProjection`.
+
+### 9.2 Fair E>8 FP8 Baseline
+
+Re-run grid_session53 E>8 FP8 with route-level padding (instead of rounding) on xfer env.
+Currently E>8 numbers conflate routing strategy with Paddle overhead.
+
+### 9.3 Epilogue Forward Quantization
+
+Move `quantize_and_pack_activation(x)` into the GemmGated epilogue (like z epilogue quant).
+Would eliminate ~130us forward overhead — the dominant bottleneck at I=1536.
+
+### 9.4 FP8 Dgated Isolated Test
+
+Add `test_gemm_dgated.py::test_fp8_dgated` with 3-way cross-validation
+(torch gold vs BF16 CUTLASS vs FP8 blockscaled). Currently only end-to-end coverage.
+
+### 9.5 Remaining D2H Sync Points in Forward
+
+These `.item()` / `.tolist()` calls cause D2H transfers in the forward path. They are
+acceptable if the ops before them are already synchronizing (GEMM completion), but could
+be eliminated for fully asynchronous pipelines:
+- `_get_cu_seqlens_cpu()` → `.tolist()` (guarded by `SONIC_MOE_FP8_ASSUME_ALIGNED=1`)
+- `_auto_capacity()` → `.max().item()`
+- `_unpack_grouped_rows()` → `cu_seqlens_m[-1].item()`
+- `blockscaled_fp8_gemm()` → `cu_seqlens_m[-1].item()`
+- `prepare_sonic_inputs()` (test only) → `pad_counts.max().item()`
 
 ---
 
