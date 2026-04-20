@@ -2160,6 +2160,159 @@ def _run_cutlass_blockscaled_gemm_varlen_k(
     return out
 
 
+# ── Fused wgrad GEMM + fp32 accumulation (zero extra kernels) ─────────────────
+
+_COMPILE_CACHE_VK_ACCUM: dict = {}
+_GEMM_FAST_PATH_VK_ACCUM: dict = {}
+
+
+def _run_cutlass_blockscaled_gemm_varlen_k_accumulate(
+    a_fp8: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_fp8: torch.Tensor,
+    b_scales: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    M: int,
+    N: int,
+    total_K: int,
+    num_experts: int,
+    device: torch.device,
+    accumulator: torch.Tensor,
+) -> None:
+    """CUTLASS blockscaled FP8 GEMM with fused fp32 accumulation.
+
+    Computes: accumulator += A @ B (per-expert varlen_k GEMM)
+
+    Uses the CUTLASS epilogue `D = 1.0 * (A@B) + 1.0 * C` where C=D=accumulator.
+    This eliminates the separate transpose+cast+add kernels (saving ~170μs/iter).
+
+    accumulator must be a contiguous fp32 tensor of shape (num_experts, M, N).
+    """
+    assert accumulator.dtype == torch.float32
+    assert accumulator.shape == (num_experts, M, N)
+    assert accumulator.is_contiguous()
+
+    a_logical = a_fp8.T
+    b_logical = b_fp8.T
+
+    fast_key = (
+        "vk_accum", M, N, total_K, num_experts,
+        a_fp8.shape[0], a_fp8.shape[1],
+        b_fp8.shape[0], b_fp8.shape[1],
+        a_scales.size(1), b_scales.size(1),
+        device.index if device.index is not None else -1,
+    )
+    cached = _GEMM_FAST_PATH_VK_ACCUM.get(fast_key)
+    if cached is not None:
+        compiled, scheduler_args, epi_args = cached
+        d_permuted = accumulator.permute(1, 2, 0)
+        a_cute = _make_cute_tensor_dynamic(a_logical, leading_dim=0)
+        b_cute = _make_cute_tensor_dynamic(b_logical, leading_dim=0)
+        d_cute = _make_cute_tensor_dynamic(d_permuted, leading_dim=1)
+        c_cute = _make_cute_tensor_dynamic(d_permuted, leading_dim=1)  # C = D (inplace)
+        a_sc_cute = _make_cute_tensor_dynamic(a_scales, leading_dim=1)
+        b_sc_cute = _make_cute_tensor_dynamic(b_scales, leading_dim=1)
+        varlen_args = GemmWrapperBase.create_varlen_args(
+            cu_seqlens_m=None, cu_seqlens_k=cu_seqlens_k, A_idx=None,
+        )
+        stream = cuda.CUstream(torch.cuda.current_stream().stream_base.raw_stream)
+        compiled(
+            a_cute, b_cute, d_cute, c_cute,
+            epi_args, scheduler_args, varlen_args, stream,
+            a_sc_cute, b_sc_cute,
+        )
+        return
+
+    config = default_config(device)
+    if config.swap_ab:
+        raise RuntimeError("blockscaled varlen_k does not support swap_ab")
+
+    # D and C are the same tensor (inplace accumulation)
+    tensor_infos = {
+        "A": GemmTensorInfo(a_logical),
+        "B": GemmTensorInfo(b_logical),
+        "D": GemmTensorInfo(accumulator),
+        "C": GemmTensorInfo(accumulator),  # C = D for D += A@B
+    }
+    GemmWrapperBase.permute_tensors(tensor_infos, varlen_k=True)
+
+    major_configs = {
+        "A": ("m", "k", "l"),
+        "B": ("n", "k", "l"),
+        "D": ("m", "n", "l"),
+        "C": ("m", "n", "l"),
+    }
+    GemmWrapperBase.determine_major_orders(tensor_infos, major_configs)
+
+    for name, info in tensor_infos.items():
+        if info.tensor is not None:
+            info.dtype = _TORCH_TO_CUTLASS_DTYPE[info.tensor.dtype]
+            info.cute_tensor = _make_cute_tensor_dynamic(
+                info.tensor,
+                leading_dim=1 if info.major == major_configs[name][1] else 0,
+            )
+
+    tile_shape_mn = (config.tile_m, config.tile_n)
+    cluster_shape_mnk = (config.cluster_m, config.cluster_n, 1)
+    if not GemmDefaultSm100.is_valid_dtypes(
+        tensor_infos["A"].dtype, tensor_infos["B"].dtype,
+        Float32, tensor_infos["D"].dtype,
+        tensor_infos["A"].major, tensor_infos["B"].major,
+    ):
+        raise TypeError("Unsupported FP8 blockscaled type/major combination for varlen_k accumulate")
+
+    max_active_clusters = get_max_active_clusters(config.cluster_m * config.cluster_n)
+    scheduler_args = GemmWrapperBase.create_scheduler_args(
+        max_active_clusters,
+        tile_count_semaphore=None, batch_idx_permute=None,
+        max_swizzle_size=config.max_swizzle_size,
+    )
+    varlen_args = GemmWrapperBase.create_varlen_args(
+        cu_seqlens_m=None, cu_seqlens_k=cu_seqlens_k, A_idx=None,
+    )
+    # beta=1.0: D = 1.0 * (A@B) + 1.0 * C, where C=D=accumulator
+    epi_args = GemmDefaultSm100.EpilogueArguments(beta=Float32(1.0))
+    current_stream = cuda.CUstream(torch.cuda.current_stream().stream_base.raw_stream)
+    a_scale_cute = _make_cute_tensor_dynamic(a_scales, leading_dim=1)
+    b_scale_cute = _make_cute_tensor_dynamic(b_scales, leading_dim=1)
+
+    compile_key = (
+        "vk_accum",
+        tensor_infos["A"].dtype, tensor_infos["B"].dtype,
+        tensor_infos["D"].dtype,
+        tile_shape_mn, cluster_shape_mnk,
+        M, N, total_K,
+        a_scales.size(1), b_scales.size(1),
+        tensor_infos["A"].major, tensor_infos["B"].major,
+        tensor_infos["D"].major,
+        config.pingpong, _SF_VEC_SIZE,
+    )
+    compiled = _COMPILE_CACHE_VK_ACCUM.get(compile_key)
+    if compiled is None:
+        gemm_obj = GemmDefaultSm100(
+            Float32, tensor_infos["A"].dtype,
+            tile_shape_mn, cluster_shape_mnk,
+            sf_vec_size=_SF_VEC_SIZE, gather_A=False,
+        )
+        compiled = cute.compile(
+            gemm_obj,
+            tensor_infos["A"].cute_tensor, tensor_infos["B"].cute_tensor,
+            tensor_infos["D"].cute_tensor, tensor_infos["C"].cute_tensor,
+            epi_args, scheduler_args, varlen_args, current_stream,
+            a_scale_cute, b_scale_cute,
+        )
+        _COMPILE_CACHE_VK_ACCUM[compile_key] = compiled
+
+    _GEMM_FAST_PATH_VK_ACCUM[fast_key] = (compiled, scheduler_args, epi_args)
+
+    compiled(
+        tensor_infos["A"].cute_tensor, tensor_infos["B"].cute_tensor,
+        tensor_infos["D"].cute_tensor, tensor_infos["C"].cute_tensor,
+        epi_args, scheduler_args, varlen_args, current_stream,
+        a_scale_cute, b_scale_cute,
+    )
+
+
 def blockscaled_fp8_wgrad_varlen_k(
     a_src: torch.Tensor,
     b_src: torch.Tensor,

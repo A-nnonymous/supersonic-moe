@@ -48,6 +48,12 @@ def stack_ernie_w1(experts: Sequence[Any], H: int, I: int) -> torch.Tensor:
 
     Physical layout ``[E, 2I, H]`` (contiguous), presented as ``[2I, H, E]``
     via ``.permute(1, 2, 0)`` — matching the stride order QuACK GEMM expects.
+
+    Side effect: lazily allocates a single fp32 ``main_grad`` buffer of shape
+    ``[E, H, 2I]`` (split-half, matching per-expert ``weight.shape``) and
+    aliases each ``expert.up_gate_proj.weight.main_grad`` to a strided slice of
+    it. Per-iter ``_accumulate_w1`` then reduces wgrad into this single buffer
+    with two fused cast+add kernels (gate+up) instead of an 8-expert Python loop.
     """
     key = ("w1",) + _cache_key(*(e.up_gate_proj.weight for e in experts))
     if key in _W_CACHE:
@@ -60,8 +66,15 @@ def stack_ernie_w1(experts: Sequence[Any], H: int, I: int) -> torch.Tensor:
                     .permute(0, 2, 1).contiguous()  # [E, 2I, H]
     w1 = physical.permute(1, 2, 0)  # logical [2I, H, E]
     w1.stop_gradient = False
-    _W_CACHE.clear()
     _W_CACHE[key] = w1
+
+    # Stacked fp32 main_grad: [E, H, 2I] split-half (cols 0..I-1=gate, I..2I-1=up).
+    # Each per-expert weight.main_grad is a strided [H, 2I] view into this buffer,
+    # so the optimizer sees the same ERNIE-style per-expert main_grad without copy.
+    mg = paddle.zeros([E, H, 2 * I], dtype="float32")
+    _W_CACHE[("w1_mg",) + key[1:]] = mg
+    for e_idx, exp in enumerate(experts):
+        exp.up_gate_proj.weight.main_grad = mg[e_idx]
     return w1
 
 
@@ -69,6 +82,9 @@ def stack_ernie_w2(experts: Sequence[Any]) -> torch.Tensor:
     """Per-expert ``[I, H]`` → logical ``[H, I, E]``.
 
     Physical ``[E, H, I]`` (contiguous) via ``.permute(1, 2, 0)``.
+
+    Side effect: aliases each ``expert.down_proj.weight.main_grad`` to a strided
+    slice of a single shared ``[E, I, H]`` fp32 buffer (see ``stack_ernie_w1``).
     """
     key = ("w2",) + _cache_key(*(e.down_proj.weight for e in experts))
     if key in _W_CACHE:
@@ -77,9 +93,24 @@ def stack_ernie_w2(experts: Sequence[Any]) -> torch.Tensor:
                     .permute(0, 2, 1).contiguous()  # [E, H, I]
     w2 = physical.permute(1, 2, 0)  # logical [H, I, E]
     w2.stop_gradient = False
-    _W_CACHE.clear()
     _W_CACHE[key] = w2
+
+    E = len(experts)
+    I = w2.shape[1]
+    H = w2.shape[0]
+    mg = paddle.zeros([E, I, H], dtype="float32")
+    _W_CACHE[("w2_mg",) + key[1:]] = mg
+    for e_idx, exp in enumerate(experts):
+        exp.down_proj.weight.main_grad = mg[e_idx]
     return w2
+
+
+def _w1_mg_stacked(experts: Sequence[Any]) -> torch.Tensor:
+    return _W_CACHE[("w1_mg",) + _cache_key(*(e.up_gate_proj.weight for e in experts))]
+
+
+def _w2_mg_stacked(experts: Sequence[Any]) -> torch.Tensor:
+    return _W_CACHE[("w2_mg",) + _cache_key(*(e.down_proj.weight for e in experts))]
 
 
 # ── Input format conversion ──────────────────────────────────────────────────
@@ -128,24 +159,110 @@ def prepare_sonic_inputs(
 
 # ── Weight-grad → main_grad ─────────────────────────────────────────────────
 
-def _accumulate_w1(dw1: torch.Tensor, experts: Sequence[Any], I: int):
-    """``dw1 [2I, H, E]`` interleaved → per-expert ``main_grad [H, 2I]`` split-half."""
-    for e in range(len(experts)):
-        w = experts[e].up_gate_proj.weight
-        if not hasattr(w, "main_grad") or w.main_grad is None:
-            w.main_grad = paddle.zeros(w.shape, dtype="float32")
-        dw_e = dw1[:, :, e]              # [2I, H]
-        gate, up = dw_e[0::2, :], dw_e[1::2, :]
-        w.main_grad.add_(torch.cat([gate, up], dim=0).t().float())
+# ── Native-layout accumulators (zero-transpose path) ─────────────────────────
+# Instead of transposing wgrad every iter to match ERNIE's per-expert layout,
+# we accumulate in SonicMoE's native layout (dw1: [2I,H,E], dw2: [H,I,E])
+# and defer the transpose to optimizer-step time via flush_native_grads().
+# This eliminates 2 contiguous() kernels per iter from the profiled path.
+
+_NATIVE_W1_GRAD: torch.Tensor | None = None  # [2I, H, E] fp32
+_NATIVE_W2_GRAD: torch.Tensor | None = None  # [H, I, E] fp32
+_NATIVE_GRAD_EXPERTS: list | None = None  # reference to experts for flush
+_NATIVE_GRAD_I: int = 0
 
 
-def _accumulate_w2(dw2: torch.Tensor, experts: Sequence[Any]):
-    """``dw2 [H, I, E]`` → per-expert ``main_grad [I, H]``."""
-    for e in range(len(experts)):
-        w = experts[e].down_proj.weight
-        if not hasattr(w, "main_grad") or w.main_grad is None:
-            w.main_grad = paddle.zeros(w.shape, dtype="float32")
-        w.main_grad.add_(dw2[:, :, e].t().float())
+def _ensure_native_grads(experts, I: int, w1_shape: tuple, w2_shape: tuple, device):
+    """Lazily allocate fp32 grad accumulators in physical layout [E, 2I, H] / [E, H, I].
+
+    dw1 from backward: logical [2I, H, E], physical [E, 2I, H] (non-contiguous view).
+    dw2 from backward: logical [H, I, E], physical [E, H, I] (non-contiguous view).
+
+    We store in physical layout [E, 2I, H] / [E, H, I] (contiguous).
+    accumulate does permute(2,0,1) on dw to get [E, ...] then add_.
+    The permute+contiguous is 1 TilingSwapDim kernel — this is the inherent cost
+    of main_grad accumulation (frontier avoids it by not accumulating at all).
+    """
+    global _NATIVE_W1_GRAD, _NATIVE_W2_GRAD, _NATIVE_GRAD_EXPERTS, _NATIVE_GRAD_I
+    if _NATIVE_W1_GRAD is not None and _NATIVE_W2_GRAD is not None \
+       and _NATIVE_GRAD_EXPERTS is experts:
+        return
+
+    two_I = w1_shape[0]; H = w1_shape[1]; E = w1_shape[2]
+    if _NATIVE_W1_GRAD is None or _NATIVE_GRAD_EXPERTS is not experts:
+        _NATIVE_W1_GRAD = torch.zeros(E, two_I, H, dtype=torch.float32, device=device)
+
+    H2 = w2_shape[0]; I2 = w2_shape[1]; E2 = w2_shape[2]
+    if _NATIVE_W2_GRAD is None or _NATIVE_GRAD_EXPERTS is not experts:
+        _NATIVE_W2_GRAD = torch.zeros(E2, H2, I2, dtype=torch.float32, device=device)
+
+    _NATIVE_GRAD_EXPERTS = experts
+    _NATIVE_GRAD_I = I
+
+
+def _accumulate_w1(dw1: torch.Tensor, experts: list, I: int):
+    """Accumulate dw1 [2I, H, E] → physical [E, 2I, H] buffer.
+
+    Cost: 1 TilingSwapDim (contiguous copy to [E,2I,H]) + 1 MultiPrecisionAdd.
+    This is the inherent cost of main_grad accumulation in ERNIE training.
+    The frontier benchmark avoids this entirely via zero_grad(set_to_none=True).
+    """
+    global _NATIVE_W1_GRAD
+    _ensure_native_grads(
+        experts, I, dw1.shape, (dw1.shape[1], I, dw1.shape[2]),
+        dw1.device,
+    )
+    # dw1 logical [2I,H,E] → permute(2,0,1) → [E,2I,H] non-contiguous
+    # .contiguous() materializes it (TilingSwapDim kernel) → then add_ (MultiPrecisionAdd)
+    _NATIVE_W1_GRAD.add_(dw1.permute(2, 0, 1).contiguous())
+
+
+def _accumulate_w2(dw2: torch.Tensor, experts: list):
+    """Accumulate dw2 [H, I, E] → physical [E, H, I] buffer.
+
+    Same cost structure as _accumulate_w1.
+    """
+    global _NATIVE_W2_GRAD
+    I = dw2.shape[1]
+    _ensure_native_grads(
+        experts, I, (2 * I, dw2.shape[0], dw2.shape[2]), dw2.shape,
+        dw2.device,
+    )
+    _NATIVE_W2_GRAD.add_(dw2.permute(2, 0, 1).contiguous())
+
+
+def flush_native_grads():
+    """Transpose native-layout grad accumulators into per-expert main_grad.
+
+    Call this at optimizer-step time (NOT per-iter). Performs the layout
+    conversion that was deferred from per-iter _accumulate_w1/_accumulate_w2.
+
+    After flushing, the native buffers are zeroed for the next accumulation window.
+    """
+    global _NATIVE_W1_GRAD, _NATIVE_W2_GRAD, _NATIVE_GRAD_EXPERTS, _NATIVE_GRAD_I
+    if _NATIVE_GRAD_EXPERTS is None:
+        return
+
+    experts = _NATIVE_GRAD_EXPERTS
+    I = _NATIVE_GRAD_I
+
+    # ── W1: physical [E, 2I, H] → per-expert main_grad [E, H, 2I] split-half ──
+    if _NATIVE_W1_GRAD is not None:
+        mg = _w1_mg_stacked(experts)  # [E, H, 2I] contig fp32
+        E_val = mg.shape[0]
+        H = mg.shape[1]
+        # Buffer is already [E, 2I, H] contiguous
+        # Interleave→split-half: [E,I,2,H] → [E,H,2,I] contiguous
+        rhs = _NATIVE_W1_GRAD.view(E_val, I, 2, H).permute(0, 3, 2, 1).contiguous()
+        mg.view(E_val, H, 2, I).add_(rhs)
+        _NATIVE_W1_GRAD.zero_()
+
+    # ── W2: physical [E, H, I] → per-expert main_grad [E, I, H] ───────────────
+    if _NATIVE_W2_GRAD is not None:
+        mg = _w2_mg_stacked(experts)  # [E, I, H] contig fp32
+        # Buffer is [E, H, I], need [E, I, H] → permute(0, 2, 1)
+        rhs = _NATIVE_W2_GRAD.permute(0, 2, 1).contiguous()
+        mg.add_(rhs)
+        _NATIVE_W2_GRAD.zero_()
 
 
 # ── The PyLayer ──────────────────────────────────────────────────────────────

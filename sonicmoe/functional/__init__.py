@@ -1253,14 +1253,32 @@ class _UpProjection(torch.autograd.Function):
                     del dz_bf16
 
                     # CUTLASS wgrad GEMM
-                    dw1_base = _run_cutlass_blockscaled_gemm_varlen_k(
-                        dz_col_fp8, dz_col_scales,
-                        x_col_fp8, x_col_scales,
-                        expert_frequency_offset,
-                        M=w1_shape[0], N=H, total_K=TK,
-                        num_experts=E, out_dtype=w1_dtype, device=x.device,
-                    )
-                    dw1 = dw1_base.permute(1, 2, 0)
+                    # If a fp32 wgrad accumulator is provided (ERNIE main_grad path),
+                    # fuse accumulation into the GEMM epilogue (D = A@B + C, beta=1).
+                    _wgrad_accum = getattr(ctx, '_wgrad_w1_accumulator', None)
+                    if _wgrad_accum is not None:
+                        from ..quack_utils.blockscaled_fp8_gemm import (
+                            _run_cutlass_blockscaled_gemm_varlen_k_accumulate,
+                        )
+                        _run_cutlass_blockscaled_gemm_varlen_k_accumulate(
+                            dz_col_fp8, dz_col_scales,
+                            x_col_fp8, x_col_scales,
+                            expert_frequency_offset,
+                            M=w1_shape[0], N=H, total_K=TK,
+                            num_experts=E, device=x.device,
+                            accumulator=_wgrad_accum,
+                        )
+                        dw1_base = None
+                        dw1 = None
+                    else:
+                        dw1_base = _run_cutlass_blockscaled_gemm_varlen_k(
+                            dz_col_fp8, dz_col_scales,
+                            x_col_fp8, x_col_scales,
+                            expert_frequency_offset,
+                            M=w1_shape[0], N=H, total_K=TK,
+                            num_experts=E, out_dtype=w1_dtype, device=x.device,
+                        )
+                        dw1 = dw1_base.permute(1, 2, 0)
                     del dz_col_fp8, dz_col_scales, x_col_fp8, x_col_scales
                 else:
                     dw1_base = torch.empty((E, w1_shape[0], w1_shape[1]), dtype=w1_dtype, device=w1_device)
@@ -1839,15 +1857,33 @@ class _DownProjection(torch.autograd.Function):
                             gather_idx=x_gather_idx,
                         )
 
-                        dw2_base = _run_cutlass_blockscaled_gemm_varlen_k(
-                            dout_col_fp8, dout_col_sc,
-                            y1s_col_fp8, y1s_col_sc,
-                            expert_frequency_offset,
-                            M=dout.shape[1], N=w2_shape[1],
-                            total_K=TK_wgrad, num_experts=w2_shape[2],
-                            out_dtype=w2_dtype, device=dout.device,
-                        )
-                        dw2 = dw2_base.permute(1, 2, 0)
+                        # Fused wgrad accumulation (same as w1 path)
+                        _wgrad_accum_w2 = getattr(ctx, '_wgrad_w2_accumulator', None)
+                        if _wgrad_accum_w2 is not None:
+                            from ..quack_utils.blockscaled_fp8_gemm import (
+                                _run_cutlass_blockscaled_gemm_varlen_k_accumulate,
+                            )
+                            _run_cutlass_blockscaled_gemm_varlen_k_accumulate(
+                                dout_col_fp8, dout_col_sc,
+                                y1s_col_fp8, y1s_col_sc,
+                                expert_frequency_offset,
+                                M=dout.shape[1], N=w2_shape[1],
+                                total_K=TK_wgrad, num_experts=w2_shape[2],
+                                device=dout.device,
+                                accumulator=_wgrad_accum_w2,
+                            )
+                            dw2_base = None
+                            dw2 = None
+                        else:
+                            dw2_base = _run_cutlass_blockscaled_gemm_varlen_k(
+                                dout_col_fp8, dout_col_sc,
+                                y1s_col_fp8, y1s_col_sc,
+                                expert_frequency_offset,
+                                M=dout.shape[1], N=w2_shape[1],
+                                total_K=TK_wgrad, num_experts=w2_shape[2],
+                                out_dtype=w2_dtype, device=dout.device,
+                            )
+                            dw2 = dw2_base.permute(1, 2, 0)
                         del dout_col_fp8, dout_col_sc, y1s_col_fp8, y1s_col_sc
                     else:
                         dw2_base = torch.empty((w2_shape[2], w2_shape[0], w2_shape[1]), dtype=w2_dtype, device=w2_device)

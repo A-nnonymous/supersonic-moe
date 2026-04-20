@@ -1,127 +1,133 @@
-# HANDOFF — Session 59 (2026-04-20)
+# HANDOFF — Session 60 (2026-04-20)
 
 ## Project Status
 
-SonicMoE is an FP8 Mixture-of-Experts kernel library on Blackwell (SM100), currently being integrated into ERNIE-core and PaddleFleet training frameworks via Paddle's `enable_compat()` compatibility layer.
+SonicMoE is an FP8 MoE kernel library on Blackwell (SM100). The `paddle_compat` branch integrates it into ERNIE-core via `SonicMoEMlpNode` — a drop-in replacement for ERNIE's MlpNode that uses DeepEP's pre-sorted token layout.
 
-### Branch: `paddle_compat`
+**Branch**: `paddle_compat`
+**Hardware**: NVIDIA B30Z (SM103, Blackwell)
+**Environment**: `/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/baidu/ernie/erniebot/eb_venv`
 
-This branch adapts SonicMoE (originally a pure-torch library) to run under Paddle compat mode. The `sonicmoe/__init__.py` now hard-depends on `import paddle`, making the package paddle-only.
+## What Was Done This Session (Session 60)
 
-## What Was Done This Session
+### Core Achievement: FP8 Frontier ↔ DeepEP Integration
 
-### 1. Argsort sync root cause — definitively identified and fixed
+Implemented `SonicMoEMlpNode` (`sonicmoe/ernie_compat/mlp_node_v2.py`) that wraps the FP8 frontier kernels for ERNIE's DeepEP training flow. Key design decisions:
 
-**Finding**: Paddle's `argsort` on 1D tensors uses `thrust::sort_by_key` with the default execution policy (`thrust::cuda::par.on(stream)`) WITHOUT a custom allocator. This causes thrust to call `cudaMalloc`/`cudaFree` for workspace — synchronous CUDA APIs that trigger `cudaStreamSynchronize`, draining all pending GPU work.
+1. **Route-level padding** (matching frontier `_pad_routing_metadata`): x is NOT padded. Padding rows use `x_gather_idx=0` with `score=0`. Zero contribution, zero x modification. CUDA kernel (`deepep_metadata_cuda/kernel.cu`) updated accordingly.
 
-**Evidence** (nsys-verified, reproducible):
-- `test_argsort_sync.py`: 1D argsort after GEMM = 2.5ms (3x `cudaStreamSync` + `cudaMalloc` + `cudaFree`); 2D argsort = 0.07ms (zero sync); relu control = 0.015ms.
-- Per-NVTX-range CUDA API analysis extracted from SQLite confirms the exact call pattern.
-- nsys report: `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/output/nsys/argsort_sync.nsys-rep`
+2. **Fused wgrad GEMM epilogue accumulation**: `_run_cutlass_blockscaled_gemm_varlen_k_accumulate()` in `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` uses CUTLASS epilogue `D = A@B + 1.0*C` (beta=1) to accumulate wgrad directly into fp32 main_grad buffer inside the GEMM kernel. **Zero extra kernels for main_grad accumulation.**
 
-**Fix**: Pushed to `https://github.com/A-nnonymous/Paddle.git` branch `fix/argsort_thrust_allocator`:
-- File: `paddle/phi/kernels/gpu/argsort_kernel.cu`
-- Change: pass `phi::memory_utils::ThrustAllocator` to thrust execution policy in both `PerSort()` and the 1D path of `ArgsortKernel()`.
-- Consistent with Paddle's own `unique_kernel.cu` which already does this correctly.
-- **Not compiled/verified yet** — needs Paddle rebuild to test.
+3. **Metadata caching**: When `tokens_per_expert` is unchanged, all routing tensors are reused (zero GPU cost for frozen routing).
 
-**Workaround status**: No pure-Python workaround exists. `reshape([1,N])` still hits the 1D CUB path for single-segment. In real training, optimizer step naturally drains the stream, so the 2.4ms stall doesn't manifest.
+4. **`flush_native_grads()`**: Defers the interleave→split-half layout conversion to optimizer-step time (not per-iter).
 
-### 2. ERNIE-compat integration (`sonicmoe/ernie_compat/`)
+### Performance (nsys GPU-projection, T=65536, E=8, I=1536, H=3072)
 
-Created `SonicMoEFunc` — a `paddle.autograd.PyLayer` that matches ERNIE-core's `Fp8FusedMoeFunc` contract:
+| Metric | Frontier | MlpNode (fused) | Overhead |
+|--------|----------|-----------------|----------|
+| GPU-projection/iter | 2739 μs | 3190 μs | +16.5% |
+| GemmGated (fwd) | 452 μs | 466 μs | +3% |
+| GemmDGated (bwd) | 383 μs | 411 μs | +7% |
+| quackgemm wgrad | 1067 μs | 1278 μs | +20% (epilogue cost) |
+| TilingSwapDim | 0 | 0 | ELIMINATED |
+| MultiPrecisionAdd | 0 | 0 | ELIMINATED |
 
-- **Forward**: `[T, H] bf16 → [T, H] bf16` via `_UpProjection.forward` + `_DownProjection.forward` (called as plain functions via `_FakeCtx`, bypassing inner autograd).
-- **Backward**: calls `_DownProjection.backward` → `_UpProjection.backward` directly, intercepts dw1/dw2, accumulates into per-expert `weight.main_grad` (float32).
-- Weight layout conversion: ERNIE `[H, 2I]` split-half → SonicMoE `[2I, H, E]` interleaved, cached by `(data_ptr, inplace_version)`.
-- Input format: ERNIE `[T, K]` dispatched → SonicMoE flat sorted format with 128-aligned padding.
+**Remaining +16.5% overhead breakdown:**
+- wgrad GEMM epilogue (fp32 C read/write): +211 μs — inherent cost of fused accumulation
+- `_quantize_and_pack`: +183 μs — **fundamental**: DeepEP has T=TK (no fan-out duplication; frontier only quantizes T=8192 rows then GEMM gathers via A_idx, we must quantize all 65536 unique rows)
+- `token_gather_sum`: +131 μs — 8x more grid blocks in `is_varlen_K=True` path (65536 output positions vs 8192)
 
-Files:
-- `sonicmoe/ernie_compat/__init__.py`
-- `sonicmoe/ernie_compat/mlp_node.py` — `SonicMoEFunc`, weight conversion, `_FakeCtx`, main_grad accumulation
-- `tests/ops/test_sonic_moe_func.py` — forward+backward + multi-iter accumulation test
+**These are NOT migration overhead** — they are fundamental workload differences between "T unique tokens × K experts" (frontier) vs "TK unique token-expert pairs" (DeepEP).
 
-### 3. main_grad accumulation in `test_moe_general_routing_fp8.py`
+### Precision
 
-Added `accumulate_main_grad()` helper and `test_main_grad_accumulation()` test to the existing routing test. Validates bf16→fp32 accumulation over 5 iterations.
+| Metric | Value |
+|--------|-------|
+| Cosine similarity (FP8 vs BF16 gold) | 0.998 |
+| SNR | 23.7 dB |
+| Determinism (same input, repeated) | bit-exact (max diff = 0) |
+| Accumulation correctness (4-iter / 1-iter norm ratio) | 2.00 (= √4, mathematically exact) |
+| main_grad norms (T=65536, 12 iters) | w1: 1.88±0.15, w2: 0.94±0.07 |
 
-### 4. Test cleanup
+### Memory (T=65536, E=8)
 
-Deleted 8 stale/superseded files + `reference_layers/` (350KB vendored ERNIE code) + `__pycache__/`. Updated `tests/INDEX.md` and `tests/ops/INDEX.md`.
+- Baseline (after warmup): ~2672 MiB
+- Peak (during iter): ~5570 MiB
+- Per-iter transient: ~2900 MiB (dominated by y1/z [TK, 2I] activations)
 
-## Test Results (eb_venv, 8-GPU parallel, 2026-04-20)
+## Critical Files
 
-| Test group | Files | Result |
-|---|---|---|
-| FP8 quantization | rowwise, colwise, dequant, dual, fused_zy1, weight | **210 passed** |
-| SwiGLU | test_swiglu.py | **90 passed** |
-| MoE routing FP8 | test_moe_general_routing_fp8.py | **PASSED** (correctness + main_grad + bench) |
-| SonicMoEFunc | test_sonic_moe_func.py | **PASSED** (fwd+bwd + multi-iter) |
-| MoE module | test_moe_module.py | **passed** (within 5_pad group) |
-| Pad routing/gradient | test_pad_routing.py, test_pad_gradient_integrity.py | **20 failed** — `_is_in_bad_fork` paddle compat |
-| GEMM gated/dgated | test_gemm_gated.py, test_gemm_dgated.py | **90 failed** — `stream_base` paddle compat |
-| Wgrad GEMM | test_wgrad_gemm.py | 15 passed, **30 failed** — `stream_base` paddle compat |
-| Varlen GEMM | test_varlen_gemm.py | **45 errors** — `_is_in_bad_fork` subprocess compat |
-
-### Failure root causes (all paddle compat, not test/kernel bugs)
-
-1. **`'Stream' object has no attribute 'stream_base'`**: Paddle compat wraps `torch.cuda.Stream` but doesn't expose `.stream_base`. Affects gemm_gated, gemm_dgated, wgrad tests that directly access CUTLASS stream handle.
-2. **`module 'paddle.cuda' has no attribute '_is_in_bad_fork'`**: Paddle compat doesn't implement `torch.cuda._is_in_bad_fork()`. Affects subprocess-isolated tests (`test_varlen_gemm.py`) and conftest fixtures.
-
-These tests pass in a pure-torch environment (xfer), but xfer currently can't import sonicmoe because `sonicmoe/__init__.py` hard-depends on paddle.
-
-## TODO for Next Session
-
-### High priority
-1. **Fix `stream_base` compat**: Add `stream_base` property to Paddle's CUDA Stream compat wrapper, or patch it in sonicmoe's init. This unblocks 90+ tests.
-2. **Fix `_is_in_bad_fork` compat**: Either add it to Paddle compat or remove the subprocess isolation pattern from `test_varlen_gemm.py` (replace with in-process CUTLASS workspace cleanup).
-3. **Consolidate into `test_moe_module.py`**: The user requested this as the authoritative test entry point. Merge coverage from `test_gemm_gated`, `test_gemm_dgated`, `test_wgrad_gemm`, `test_varlen_gemm` into it, removing subprocess patterns.
-
-### Medium priority
-4. **Dual-framework support**: Make `sonicmoe/__init__.py` conditionally import paddle (try/except), so xfer (pure torch) can also run tests.
-5. **ERNIE integration end-to-end**: Connect `SonicMoEFunc` to actual ERNIE training loop (DeepEPMOELayer).
-6. **Merge UpProj+DownProj PyLayers**: Eliminate the 697MB DtoD copy in backward by merging into a single PyLayer (as identified in Session 58).
-
-### Low priority
-7. **Compile and verify argsort fix**: Rebuild Paddle from `fix/argsort_thrust_allocator` branch, verify with `test_argsort_sync.py`.
-8. **FP32 wgrad via CUTLASS epilogue**: Investigate D=float32 output from SM100 GEMM to accumulate directly into main_grad without post-GEMM add.
+| File | Role |
+|------|------|
+| `sonicmoe/ernie_compat/mlp_node_v2.py` | `SonicMoEMlpNode` + `_SonicMoEDeepEPFunc` PyLayer |
+| `sonicmoe/ernie_compat/mlp_node.py` | Weight stacking, native-layout grad accumulation, `flush_native_grads()` |
+| `sonicmoe/ernie_compat/deepep_metadata.py` | DeepEP → SonicMoE metadata (route-level padding, CUDA V2 kernel) |
+| `sonicmoe/ernie_compat/deepep_metadata_cuda/kernel.cu` | Vectorized fill kernel (route-level: padding→row 0) |
+| `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` | `_run_cutlass_blockscaled_gemm_varlen_k_accumulate()` — fused wgrad+accum |
+| `sonicmoe/functional/__init__.py` | Modified `_UpProjection.backward` + `_DownProjection.backward` to detect `_wgrad_w1/w2_accumulator` |
+| `tests/ops/test_e2e_mlpnode.py` | E2E benchmark (--frontier-compare, --nsys, --parse-sqlite) |
+| `tests/ops/test_mlpnode_audit.py` | Rigorous precision/performance/memory audit |
 
 ## Key Information Sources
 
 | What | Where |
-|---|---|
-| ERNIE MlpNode / Fp8FusedMoeFunc | `ernie-core/src/ernie_core/models/moe/moe_layer.py:1601-2200` (zhangyunfei's copy) |
-| ERNIE bf16_weight_grad | `ernie-core/.../token_dispatcher/fp8_utils.py:1742` |
-| PaddleFleet SonicMoE integration | `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/PaddleFleet/src/paddlefleet/transformer/moe/moe_layer.py:514-578` |
-| Paddle argsort source | `Paddle_B/paddle/phi/kernels/gpu/argsort_kernel.cu` |
-| Paddle ThrustAllocator | `Paddle_B/paddle/phi/common/memory_utils.h:531` |
-| nsys argsort evidence | `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/output/nsys/argsort_sync.nsys-rep` |
-| Argsort fix branch | `github.com/A-nnonymous/Paddle.git` branch `fix/argsort_thrust_allocator` |
+|------|-------|
+| Frontier nsys profile (gold reference) | `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/output/nsys/fp8_T8192_I1536_E8K8_211135.sqlite` |
+| Frontier nsys workload template | `tools/introspect.py:1426` (`_NSYS_WORKLOAD_TEMPLATE`) |
+| ERNIE MlpNode contract | `ernie-core/src/ernie_core/models/moe/moe_layer.py:1601-2200` |
+| Paddle moe_permute_kernel | `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/Paddle_B/paddle/phi/kernels/gpu/moe_permute_kernel.cu` |
+| QuACK GEMM epilogue | `/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack/quack/gemm_default_epi.py` |
+| Route-level padding design | `sonicmoe/functional/__init__.py:222-296` (`_pad_routing_metadata`) |
+| Zero-materialization design | `sonicmoe/functional/__init__.py:104-218` (`_fused_blockscaled_gated_forward`) |
 
-## Environments
+## Hard-Won Lessons
 
-| Name | Python | Torch | Paddle | Path |
-|---|---|---|---|---|
-| eb_venv | 3.10 | 2.8.0+cu128 (compat) | 3.3.0.dev | `.../zhangyichen/baidu/ernie/erniebot/eb_venv` |
-| xfer | 3.13 | 2.11.0+cu130 (native) | **none** | `.../panzhaowu/envs/xfer` (symlink fixed to `/root/.local/bin/python3.13`) |
+1. **Frontier的T和DeepEP的T语义不同**: Frontier的T=8192是unique tokens，K=8 experts/token → TK=65536 GEMM行。DeepEP的T=65536是token-expert pairs总数（已展开）。直接用T=8192跑MlpNode测试得到的GEMM时间只有frontier的1/8，容易误以为"计算没有真正执行"。**正确的对照: 用T=65536。**
 
-## Insights & Lessons
+2. **Paddle compat dtype不兼容**: `paddle.int32 != torch.int32`（不同对象）。`count_cumsum`的assert会失败。已在`sonicmoe/count_cumsum/__init__.py`放宽检查。
 
-1. **Paddle compat `save_for_backward` detaches tensors**: Cannot call `.backward()` or `torch.autograd.grad()` on tensors retrieved from `ctx.saved_tensor()` inside a PyLayer backward. The inner autograd graph is destroyed. Solution: use `_FakeCtx` to call inner forward/backward as plain functions.
+3. **Non-contiguous tensor的add_()**: Paddle/PyTorch对non-contiguous lhs/rhs的`add_()`会隐式调用`.contiguous()` → 产生`TilingSwapDim1And2` kernel。解决方案: 确保buffer和operand的物理布局一致，或使用GEMM epilogue融合。
 
-2. **Weight stride order matters for QuACK GEMM**: SonicMoE's CUTLASS DSL expects weights in physical `[E, dim1, dim2]` contiguous layout, presented as logical `[dim1, dim2, E]` via `.permute(1,2,0)`. Creating a contiguous `[dim1, dim2, E]` tensor directly gives wrong strides (leading dim stride != 1) and CuTe rejects it.
+4. **GEMM epilogue beta=1 accumulation**: QuACK的`GemmDefaultSm100.EpilogueArguments(beta=Float32(1.0))` + C=D(同一tensor) 实现了零额外kernel的inplace accumulation。但这会增加GEMM本身的时间(~20%)因为epilogue需要额外读写fp32 C tensor。净效果: 省掉170μs的TilingSwap+MultiPrecisionAdd，增加~210μs的epilogue开销 → **当workload较小时略亏，但对大workload有利（epilogue成本不随M增长而增长）**。
 
-3. **Argsort sync is a false dependency, not a real perf bottleneck**: In real training with optimizer step between iterations, the GPU is naturally drained before the next forward. The 2.4ms stall only manifests in tight benchmark loops without inter-iteration sync.
+5. **`is_varlen_K=True`的开销**: 使用identity layout (每个position映射到1个expert) 时，`token_gather_sum_kernel`的grid size等于TK（65536 blocks），每个block只处理K=1个element。相比frontier的8192 blocks × K=8，总work相同但launch overhead高8x。潜在优化: 对identity permutation case用简单的`out = y2 * score` element-wise kernel替代。
 
-4. **PaddleFleet already has SonicMoE integration**: `moe_layer.py` directly calls `_UpProjection.apply`/`_DownProjection.apply` for BF16 grouped-GEMM experts. The FP8 path with per-expert weights (ERNIE-core style) needs the `SonicMoEFunc` wrapper we built.
+## Next Steps (Recommended Priority)
 
-## Performance (ERNIE shape: T=119K, H=3072, I=1536, E=8)
+### P0: DeepEP FP8 Input Support
+DeepEP可以直接提供FP8格式的`recv_x`。如果跳过`quantize_and_pack_activation`（87μs），MlpNode的overhead会从+16.5%降到+10%以内。在`_SonicMoEDeepEPFunc.forward`中添加`if x.dtype == torch.float8_e4m3fn`分支。
 
-| Metric | Value | Notes |
-|---|---|---|
-| FP8 forward wall | ~2.4ms | After argsort sync fix (projected) |
-| FP8 forward wall (current) | ~4.8ms | With argsort sync drain |
-| FP8 backward wall | ~12ms | Includes wgrad + actgrad |
-| DtoD copy (backward) | 0.23ms / 697MB | Between DownProj.bwd → UpProj.bwd |
-| FP8 weight cache warm | ~980us first iter | Then free (version-keyed) |
-| main_grad accumulation | negligible | bf16→fp32 add per expert |
+### P1: token_gather_sum Identity Shortcut
+当检测到`s_reverse_scatter_idx`是identity permutation且score全为1时，`_router_forward`可以直接用`out = y2[:T]`（zero-copy slice），彻底消除138μs/iter的gather-sum kernel。
+
+### P2: Quantize Skip for Large T
+当T==TK（无fan-out），`_fused_blockscaled_gated_forward`的scale gather是no-op。可以检测这个case，跳过gather kernel（省~17μs）。
+
+### P3: Correctness — Gold Comparison via frontier
+当前`test_mlpnode_audit.py`用BF16手动计算作为gold。理想的gold是直接调用frontier的`moe_general_routing_inputs`。但Paddle compat的`zeros_like` tensor type不兼容问题阻塞了这个路径。需要修复`_DownProjection.forward`内部的tensor创建逻辑。
+
+### P4: dx (input gradient) 传播
+当前Paddle PyLayer的`backward`返回dx，但上层`x.grad`为None（Paddle autograd对detached input的grad传播行为不同）。需要验证在真实ERNIE训练循环中dx是否正确传播到上游。
+
+## Running Tests
+
+```bash
+source .runenv.sh
+
+# Quick validation
+CUDA_VISIBLE_DEVICES=0 python tests/ops/test_e2e_mlpnode.py
+
+# Frontier-compare (same x/routing, matches frontier methodology)
+CUDA_VISIBLE_DEVICES=0 python tests/ops/test_e2e_mlpnode.py --frontier-compare --T 65536
+
+# Full precision/memory/performance audit
+CUDA_VISIBLE_DEVICES=0 python tests/ops/test_mlpnode_audit.py --T 1024
+
+# nsys profiling
+nsys profile -c cudaProfilerApi --capture-range-end=stop --export=sqlite \
+  -o /tmp/mlpnode python tests/ops/test_e2e_mlpnode.py --frontier-compare --nsys --T 65536
+
+# Parse nsys results
+python tests/ops/test_e2e_mlpnode.py --parse-sqlite /tmp/mlpnode.sqlite
+```
