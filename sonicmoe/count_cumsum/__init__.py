@@ -20,7 +20,7 @@ def count_cumsum_cuda(
 @torch.no_grad()
 def count_cumsum(x: torch.Tensor, E: int, do_cumsum: bool = True) -> torch.Tensor:
     assert x.dim() == 1, "x should be 1-dimensional"
-    assert x.dtype in [torch.int32, torch.long]
+    assert x.dtype in [torch.int32, torch.long] or "int32" in str(x.dtype).lower() or "int64" in str(x.dtype).lower()
 
     count_output = torch.empty(E, dtype=torch.int32, device=x.device)
     cumsum_output = torch.empty(E, dtype=torch.int32, device=x.device) if do_cumsum else None

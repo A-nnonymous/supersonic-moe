@@ -1098,12 +1098,11 @@ def run_trace_isolated(trace_mode: str, gpu: int) -> ModeManifest:
 def _run_collect_worker(mode: str, seed: int, out_path: Path) -> None:
     """Worker entrypoint: materialize outputs and grads for precision audit.
 
-    Must use EXACTLY the same code path as the nsys workload:
-    - E≤8: moe_TC_softmax_topk_layer (same as official benchmark)
-    - E>8: token rounding + moe_general_routing_inputs (both bf16 and fp8)
+    Uses moe_TC_softmax_topk_layer for ALL expert counts — it handles
+    route-level padding internally for E>8.  This matches the production
+    code path and avoids the manual token-rounding branch.
     """
     import torch
-    import torch.nn.functional as F_torch
     import sonicmoe.functional as functional
     from sonicmoe.functional.utils import enable_fp8, enable_quack_gemm
     from sonicmoe.functional import moe_TC_softmax_topk_layer
@@ -1114,7 +1113,6 @@ def _run_collect_worker(mode: str, seed: int, out_path: Path) -> None:
 
     model, _ = _build_model_and_input(device)
     E, T, H, K = SHAPE["E"], SHAPE["T"], SHAPE["H"], SHAPE["K"]
-    use_token_rounding = (E > 8)
 
     functional._ALIGNMENT_ASSUMED = True
 
@@ -1128,47 +1126,22 @@ def _run_collect_worker(mode: str, seed: int, out_path: Path) -> None:
     w1_p = model.c_fc.weight.permute(1, 2, 0)
     w2_p = model.c_proj.weight.permute(1, 2, 0)
 
-    if use_token_rounding:
-        # Both BF16 and FP8 use the same token-rounded routing
-        from sonicmoe.functional import count_cumsum, moe_general_routing_inputs
-        Mtile = 128
-        with torch.no_grad():
-            rl = F_torch.linear(x, model.router.weight)
-            sc = F_torch.softmax(rl, dim=-1, dtype=torch.float32).to(torch.bfloat16)
-            tv, ti = sc.topk(K, dim=-1)
-            tv /= tv.sum(dim=-1, keepdim=True)
-            sc.scatter_(-1, ti, tv)
-            cb = sc.clone() - 1; cb.scatter_(1, ti, tv)
-            si = cb.argsort(dim=0, descending=True).int()
-            ef = count_cumsum(ti.view(-1), E, do_cumsum=True)[0]
-            efr = (torch.ceil(ef / Mtile) * Mtile).int()
-            mk = torch.arange(T, device=device, dtype=torch.int32)[:, None].expand(-1, E) < efr[None, :]
-            tok = si[mk]
-            exp = torch.arange(E, device=device, dtype=torch.int32)[None, :].expand(T, -1)[mk]
-            od = tok.argsort().int(); tok = tok[od]; exp = exp[od]
-            rsc = sc[tok, exp].contiguous()
-        out, _ = moe_general_routing_inputs(
-            x, rsc, tok, exp, w1_p, None, w2_p, None,
-            E, model.stream_id, ActivationType.SWIGLU, False,
-        )
-    else:
-        # E≤8: direct moe_TC_softmax_topk_layer (matches nsys workload exactly)
-        out, _, _ = moe_TC_softmax_topk_layer(
-            x, model.router.weight, w1_p, None, w2_p, None,
-            K, model.stream_id, ActivationType.SWIGLU, False,
-        )
+    # Unified path: moe_TC_softmax_topk_layer handles route-level padding
+    # internally for all E values (including E>8).
+    out, _, _ = moe_TC_softmax_topk_layer(
+        x, model.router.weight, w1_p, None, w2_p, None,
+        K, model.stream_id, ActivationType.SWIGLU, False,
+    )
 
     out.sum().backward()
     torch.cuda.synchronize()
 
-    # Capture grads BEFORE saving
     payload = {
         "output": out.detach().cpu(),
         "dx": x.grad.detach().cpu() if x.grad is not None else None,
         "dw1": model.c_fc.weight.grad.detach().cpu() if model.c_fc.weight.grad is not None else None,
         "dw2": model.c_proj.weight.grad.detach().cpu() if model.c_proj.weight.grad is not None else None,
     }
-    torch.save(payload, out_path)
     torch.save(payload, out_path)
 
 
@@ -4725,6 +4698,306 @@ def run_compile_session53() -> dict:
 # ═══════════════════════════════════════════════════════════════════════════════
 # CLI
 # ═══════════════════════════════════════════════════════════════════════════════
+# Unified Benchmark Mode — performance × precision × memory
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Default 6-shape benchmark list
+BENCHMARK_SHAPES_DEFAULT = [
+    {"T": 8192,  "H": 3072, "I": 1536, "E": 8,   "K": 8},   # Ernie production baseline
+    {"T": 8192,  "H": 3072, "I": 3072, "E": 8,   "K": 8},   # I scaling
+    {"T": 32768, "H": 3072, "I": 1536, "E": 8,   "K": 8},   # T scaling
+    {"T": 8192,  "H": 3072, "I": 1536, "E": 32,  "K": 8},   # E>8, route-level padding
+    {"T": 32768, "H": 3072, "I": 3072, "E": 32,  "K": 8},   # Peak absolute perf
+    {"T": 8192,  "H": 3072, "I": 1536, "E": 128, "K": 8},   # Extreme padding
+]
+
+
+def _benchmark_shape_key(shape: dict) -> str:
+    return f"T{shape['T']}_I{shape['I']}_E{shape['E']}K{shape['K']}"
+
+
+def _benchmark_collect_precision(
+    shape: dict, seeds: list[int], gpu: int,
+) -> dict[str, Any]:
+    """Phase 1: subprocess-isolated precision audit for one shape.
+
+    Returns RRMSE as ratio (0.065 = 6.5%), cosine as float64.
+    Per-seed breakdown included for reproducibility.
+    """
+    import torch
+
+    python_bin = sys.executable
+    shape_arg = ",".join(str(shape[k]) for k in ("T", "H", "I", "E", "K"))
+
+    def _collect(mode: str, seed: int, out_path: Path) -> None:
+        env = _build_subprocess_env(mode, gpu)
+        proc = subprocess.run(
+            [python_bin, str(Path(__file__).resolve()),
+             "--shape", shape_arg,
+             "--_worker-collect", mode,
+             "--_worker-seed", str(seed),
+             "--_worker-output", str(out_path)],
+            capture_output=True, text=True, timeout=600,
+            cwd=str(ROOT), env=env,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"Precision worker [{mode}, seed={seed}] failed:\n"
+                f"{proc.stderr[-2000:] or proc.stdout[-2000:]}")
+
+    def _rrmse_ratio(a, b):
+        """RRMSE as ratio (consistent with conftest.py). 0.065 = 6.5%."""
+        return float(((a.float() - b.float()).norm()
+                      / b.float().norm().clamp(min=1e-8)).item())
+
+    def _cosine(a, b):
+        af = a.flatten().double()
+        bf = b.flatten().double()
+        d = (af.norm() * bf.norm()).clamp(min=1e-12)
+        return max(-1.0, min(1.0, float((af * bf).sum().item() / d.item())))
+
+    rrmse_per_seed: dict[str, dict[str, float]] = {}
+    cosine_per_seed: dict[str, dict[str, float]] = {}
+    rrmse_agg: dict[str, list[float]] = collections.defaultdict(list)
+    cosine_agg: dict[str, list[float]] = collections.defaultdict(list)
+
+    with _persistent_tempdir() as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        for seed in seeds:
+            bf16_path = tmpdir_path / f"bf16_s{seed}.pt"
+            fp8_path = tmpdir_path / f"fp8_s{seed}.pt"
+            _collect("bf16", seed, bf16_path)
+            _collect("fp8", seed, fp8_path)
+            bf16_out = torch.load(bf16_path, weights_only=False)
+            fp8_out = torch.load(fp8_path, weights_only=False)
+
+            seed_rrmse, seed_cos = {}, {}
+            for key in ["output", "dx", "dw1", "dw2"]:
+                ref = bf16_out.get(key)
+                test = fp8_out.get(key)
+                if ref is None or test is None:
+                    continue
+                r = _rrmse_ratio(test, ref)
+                c = _cosine(test, ref)
+                seed_rrmse[key] = round(r, 4)
+                seed_cos[key] = round(c, 6)
+                rrmse_agg[key].append(r)
+                cosine_agg[key].append(c)
+            rrmse_per_seed[str(seed)] = seed_rrmse
+            cosine_per_seed[str(seed)] = seed_cos
+
+    # Aggregate: mean across seeds
+    rrmse_mean = {k: round(_safe_mean(v), 4) for k, v in rrmse_agg.items()}
+    cosine_mean = {k: round(_safe_mean(v), 6) for k, v in cosine_agg.items()}
+
+    return {
+        "rrmse": rrmse_mean,
+        "cosine": cosine_mean,
+        "per_seed": {
+            s: {"rrmse": rrmse_per_seed[s], "cosine": cosine_per_seed[s]}
+            for s in rrmse_per_seed
+        },
+    }
+
+
+def _benchmark_collect_memory(
+    shape: dict, gpu: int, warmup: int = 5,
+) -> dict[str, dict]:
+    """Phase 2: subprocess-isolated memory measurement for one shape."""
+    result = {}
+    for mode in ("bf16", "fp8"):
+        mem = _run_memory_measure(mode, shape, gpu, warmup=warmup)
+        result[mode] = mem
+    # Compute bwd delta
+    bf_bwd = result.get("bf16", {}).get("peak_bwd_mib", 0)
+    fp_bwd = result.get("fp8", {}).get("peak_bwd_mib", 0)
+    if bf_bwd > 0:
+        result["bwd_delta_pct"] = round((fp_bwd - bf_bwd) / bf_bwd * 100, 1)
+    return result
+
+
+def _benchmark_collect_perf(
+    shape: dict, gpu: int,
+    warmup: int = DEFAULT_NSYS_WARMUP, iters: int = DEFAULT_NSYS_ITERS,
+) -> dict[str, Any]:
+    """Phase 3: nsys GPU-projection for one shape, returns per_iter_us."""
+    nsys_data = run_nsys_profile(gpu=gpu, warmup=warmup, iters=iters, shapes=[shape])
+    shape_key = _benchmark_shape_key(shape)
+    shape_res = nsys_data.get("shapes", {}).get(shape_key, {})
+    bf16_us = shape_res.get("bf16", {}).get("per_iter_us")
+    fp8_us = shape_res.get("fp8", {}).get("per_iter_us")
+    result: dict[str, Any] = {}
+    if bf16_us is not None:
+        result["bf16_us"] = round(bf16_us, 1)
+    if fp8_us is not None:
+        result["fp8_us"] = round(fp8_us, 1)
+    if bf16_us and fp8_us and fp8_us > 0:
+        result["speedup"] = round(bf16_us / fp8_us, 3)
+    # Include kernel budget breakdown if available
+    for mode in ("bf16", "fp8"):
+        cats = shape_res.get(mode, {}).get("category_summary")
+        if cats:
+            result[f"{mode}_categories"] = {k: round(v, 1) for k, v in cats.items()}
+    return result
+
+
+def run_benchmark(
+    shapes: list[dict[str, int]],
+    seeds: list[int],
+    num_gpus: int = 1,
+    nsys_warmup: int = DEFAULT_NSYS_WARMUP,
+    nsys_iters: int = DEFAULT_NSYS_ITERS,
+) -> dict[str, Any]:
+    """Rigorous 3-layer benchmark: precision × memory × performance.
+
+    All phases use subprocess isolation. Phases run serially to guarantee
+    GPU is fully idle between them.  Produces a single authoritative JSON.
+
+    RRMSE convention: ratio (0.065 = 6.5%).
+    """
+    import torch
+
+    gpu = 0  # benchmark pins to GPU 0 for reproducibility
+
+    timestamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+    gpu_name = "unknown"
+    try:
+        device = torch.device(f"cuda:{gpu}")
+        gpu_name = torch.cuda.get_device_name(device)
+    except Exception:
+        pass
+
+    commit = "unknown"
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=str(ROOT), text=True, timeout=10,
+        ).strip()
+    except Exception:
+        pass
+
+    branch = "unknown"
+    try:
+        branch = subprocess.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=str(ROOT), text=True, timeout=10,
+        ).strip()
+    except Exception:
+        pass
+
+    metadata = {
+        "timestamp": timestamp,
+        "hardware": gpu_name,
+        "branch": branch,
+        "commit": commit,
+        "python": sys.executable,
+        "seeds": seeds,
+        "nsys_warmup": nsys_warmup,
+        "nsys_iters": nsys_iters,
+        "rrmse_convention": "ratio (0.065 = 6.5%)",
+    }
+
+    results: dict[str, Any] = {"metadata": metadata, "shapes": {}}
+    n = len(shapes)
+
+    print("=" * 80)
+    print(f"  Unified Benchmark — {n} shapes × 3 phases (precision / memory / perf)")
+    print(f"  Seeds: {seeds}  |  nsys: {nsys_warmup}w+{nsys_iters}m  |  GPU: {gpu_name}")
+    print("=" * 80)
+
+    for i, shape in enumerate(shapes):
+        sk = _benchmark_shape_key(shape)
+        print(f"\n  [{i+1}/{n}] Shape: {sk}")
+        shape_result: dict[str, Any] = {"shape": shape}
+
+        # ── Phase 1: Precision ──────────────────────────────────────────
+        print(f"    Phase 1: Precision ({len(seeds)} seeds) ...", flush=True)
+        saved = dict(SHAPE)
+        SHAPE.update(shape)
+        try:
+            prec = _benchmark_collect_precision(shape, seeds, gpu)
+            shape_result["precision"] = prec
+            rr = prec.get("rrmse", {})
+            cs = prec.get("cosine", {})
+            print(f"      RRMSE  output={rr.get('output','?')} dx={rr.get('dx','?')} "
+                  f"dw1={rr.get('dw1','?')} dw2={rr.get('dw2','?')}")
+            print(f"      Cosine output={cs.get('output','?')} dx={cs.get('dx','?')} "
+                  f"dw1={cs.get('dw1','?')} dw2={cs.get('dw2','?')}")
+        except Exception as ex:
+            shape_result["precision"] = {"error": str(ex)}
+            print(f"      ERROR: {ex}")
+        finally:
+            SHAPE.update(saved)
+
+        # ── Phase 2: Memory ─────────────────────────────────────────────
+        print(f"    Phase 2: Memory ...", flush=True)
+        try:
+            mem = _benchmark_collect_memory(shape, gpu)
+            shape_result["memory"] = mem
+            bf_m = mem.get("bf16", {})
+            fp_m = mem.get("fp8", {})
+            print(f"      BF16 base={bf_m.get('base_mib','?')} fwd={bf_m.get('peak_fwd_mib','?')} "
+                  f"bwd={bf_m.get('peak_bwd_mib','?')} MiB")
+            print(f"      FP8  base={fp_m.get('base_mib','?')} fwd={fp_m.get('peak_fwd_mib','?')} "
+                  f"bwd={fp_m.get('peak_bwd_mib','?')} MiB")
+            d = mem.get("bwd_delta_pct")
+            if d is not None:
+                print(f"      bwd delta: {d:+.1f}%")
+        except Exception as ex:
+            shape_result["memory"] = {"error": str(ex)}
+            print(f"      ERROR: {ex}")
+
+        # ── Phase 3: Performance (nsys) ─────────────────────────────────
+        print(f"    Phase 3: Performance (nsys {nsys_warmup}w+{nsys_iters}m) ...", flush=True)
+        try:
+            perf = _benchmark_collect_perf(shape, gpu, nsys_warmup, nsys_iters)
+            shape_result["performance"] = perf
+            print(f"      BF16={perf.get('bf16_us','?')} µs  FP8={perf.get('fp8_us','?')} µs  "
+                  f"speedup={perf.get('speedup','?')}×")
+        except Exception as ex:
+            shape_result["performance"] = {"error": str(ex)}
+            print(f"      ERROR: {ex}")
+
+        results["shapes"][sk] = shape_result
+
+    # ── Write unified JSON ──────────────────────────────────────────────
+    report_dir = ROOT / "reports"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    out_path = report_dir / f"benchmark_{branch}_{time.strftime('%Y%m%d_%H%M%S')}.json"
+    out_path.write_text(json.dumps(results, indent=2, default=str))
+
+    # ── Print summary table ─────────────────────────────────────────────
+    print(f"\n{'='*100}")
+    print(f"  BENCHMARK SUMMARY — {out_path.name}")
+    print(f"{'='*100}")
+    print(f"  {'Shape':<28s} {'BF16µs':>7s} {'FP8µs':>7s} {'Speed':>6s} "
+          f"{'BF16bwd':>8s} {'FP8bwd':>8s} {'MemΔ%':>6s} "
+          f"{'RRMSE(out)':>10s} {'cos(out)':>9s}")
+    print(f"  {'-'*28} {'-'*7} {'-'*7} {'-'*6} {'-'*8} {'-'*8} {'-'*6} {'-'*10} {'-'*9}")
+
+    for sk, sr in results["shapes"].items():
+        perf = sr.get("performance", {})
+        mem = sr.get("memory", {})
+        prec = sr.get("precision", {})
+        bf_us = perf.get("bf16_us", 0)
+        fp_us = perf.get("fp8_us", 0)
+        sp = perf.get("speedup", 0)
+        bf_bwd = mem.get("bf16", {}).get("peak_bwd_mib", 0)
+        fp_bwd = mem.get("fp8", {}).get("peak_bwd_mib", 0)
+        m_pct = mem.get("bwd_delta_pct", 0)
+        rr_out = prec.get("rrmse", {}).get("output", 0)
+        cs_out = prec.get("cosine", {}).get("output", 0)
+        print(f"  {sk:<28s} {bf_us:>7.0f} {fp_us:>7.0f} {sp:>5.3f}× "
+              f"{bf_bwd:>7.0f}M {fp_bwd:>7.0f}M {m_pct:>+5.1f}% "
+              f"{rr_out:>9.4f}  {cs_out:>8.6f}")
+
+    print(f"{'='*100}")
+    print(f"  JSON: {out_path}")
+    print(f"  RRMSE convention: ratio (multiply ×100 for percentage)")
+    return results
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
     parser = argparse.ArgumentParser(
@@ -4732,20 +5005,22 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Modes:
-              trace   — isolated tensor lifecycle + memory manifest
-              profile — trace + lightweight kernel timing
-              full    — trace + repeated benchmark/profiler + precision audit
-              nsys    — nsys GPU-projection profiling (gold standard for perf)
-              grid    — parallel 27-shape nsys grid across multiple GPUs
+              trace     — isolated tensor lifecycle + memory manifest
+              profile   — trace + lightweight kernel timing
+              full      — trace + repeated benchmark/profiler + precision audit
+              nsys      — nsys GPU-projection profiling (gold standard for perf)
+              grid      — parallel 27-shape nsys grid across multiple GPUs
+              benchmark — unified 3-phase (precision × memory × perf) JSON
 
             Example:
               python tools/introspect.py --mode full
               python tools/introspect.py --mode nsys --nsys-shapes 8192,3072,1536,8,8 8192,3072,2048,8,8
               python tools/introspect.py --mode grid --gpu 8
+              python tools/introspect.py --mode benchmark --benchmark-shapes 8192,3072,1536,8,8 32768,3072,1536,8,8
         """),
     )
     parser.add_argument(
-        "--mode", choices=["trace", "profile", "full", "nsys", "grid", "report", "precision", "quant-bench", "wgrad-bench", "ncu-bench", "wgrad-force", "pad-audit", "compile-session53"],
+        "--mode", choices=["trace", "profile", "full", "nsys", "grid", "report", "precision", "quant-bench", "wgrad-bench", "ncu-bench", "wgrad-force", "pad-audit", "compile-session53", "benchmark"],
         default="trace",
         help="Introspection depth (default: trace)",
     )
@@ -4801,6 +5076,15 @@ def main():
         "--wgrad-bench-trials", type=int, default=30,
         help="wgrad-bench mode: timing trials per mode (default: 30)",
     )
+    parser.add_argument(
+        "--benchmark-shapes", nargs="+", type=str, default=None,
+        help="benchmark mode: shapes as T,H,I,E,K (space-separated). "
+             "Default: 6 canonical shapes covering E=8/32/128.",
+    )
+    parser.add_argument(
+        "--benchmark-seeds", type=str, default="42,123,777",
+        help="benchmark mode: comma-separated seeds for precision audit (default: 42,123,777)",
+    )
     parser.add_argument("--_worker-trace", choices=["bf16", "fp8"], help=argparse.SUPPRESS)
     parser.add_argument("--_worker-collect", choices=["bf16", "fp8"], help=argparse.SUPPRESS)
     parser.add_argument("--_worker-seed", type=int, default=42, help=argparse.SUPPRESS)
@@ -4851,6 +5135,25 @@ def main():
             parts = [int(x) for x in s.split(",")]
             assert len(parts) == 5, f"Expected T,H,I,E,K but got {len(parts)} values in '{s}'"
             wgrad_bench_shapes.append(dict(zip(("T", "H", "I", "E", "K"), parts)))
+
+    # ── benchmark mode: unified 3-phase pipeline ──
+    if args.mode == "benchmark":
+        benchmark_shapes = BENCHMARK_SHAPES_DEFAULT
+        if args.benchmark_shapes:
+            benchmark_shapes = []
+            for s in args.benchmark_shapes:
+                parts = [int(x) for x in s.split(",")]
+                assert len(parts) == 5, f"Expected T,H,I,E,K but got {len(parts)} in '{s}'"
+                benchmark_shapes.append(dict(zip(("T", "H", "I", "E", "K"), parts)))
+        benchmark_seeds = [int(x.strip()) for x in args.benchmark_seeds.split(",") if x.strip()]
+        run_benchmark(
+            shapes=benchmark_shapes,
+            seeds=benchmark_seeds,
+            num_gpus=args.gpu or 1,
+            nsys_warmup=args.nsys_warmup,
+            nsys_iters=args.nsys_iters,
+        )
+        return
 
     run(
         mode=args.mode,

@@ -130,9 +130,14 @@ The reporting policy for every FP8 step is:
 - memory baseline: official bf16
 - performance baselines: previous commit and official bf16
 
-## 🔥 FP8 Blockscaled Status (2026-04-17, Session 57)
+## 🔥 FP8 Blockscaled Status (2026-04-18, Session 58)
 
-The `paddle_compat` branch has a fully functional **zero-materialization** blockscaled FP8 training path for Blackwell (B30Z) with **32×32 isotropic weight quantization**, optional **weight stash** memory optimization, native **CUTLASS / QuACK** FP8 kernels, **Pythonic config API** (`SonicMoEConfig`), **route-level padding** (forward + backward, mathematically proven zero error), **epilogue FP8 D output** (z written directly as fp8 by CUTLASS), **NCU-guided quant kernel optimization** (num_warps=1 → 2.3× colwise speedup), **shape-based wgrad FP8 auto-tuning**, **fused dual row+col quantization**, and **Paddle compat** (54/54 shapes verified). No TK-sized FP8 activation is materialized.
+The `paddle_compat` branch has a fully functional **zero-materialization** blockscaled FP8 training path for Blackwell (B30Z) with **32×32 isotropic weight quantization**, optional **weight stash** memory optimization, native **CUTLASS / QuACK** FP8 kernels, **Pythonic config API** (`SonicMoEConfig`), **route-level padding** (forward + backward, mathematically proven zero error), **epilogue FP8 D output** (z written directly as fp8 by CUTLASS), **NCU-guided quant kernel optimization** (num_warps=1 → 2.3× colwise speedup), **shape-based wgrad FP8 auto-tuning**, **fused dual row+col quantization**, **single-stream backward** (zero `cudaStreamSynchronize`), and **Paddle compat** (54/54 shapes verified). No TK-sized FP8 activation is materialized.
+
+### Session 58 Additions
+
+- **Multi-stream elimination**: Removed `_WGRAD_STREAM` (dead code) and `_DEQUANT_STREAM` (2 backward paths) + all `wait_stream()` calls. Backward path now has **zero** `cudaStreamSynchronize` events (verified via nsys sqlite). See `docs/HANDOFF.md` §4, `reports/fp8_upgrade/engineering_log.md` Phase 21.
+- **ERNIE-core MlpNode integration plan**: Detailed mapping of sonic-moe FP8 frontier to ERNIE's `MlpNode` architecture. See `docs/HANDOFF.md` §9.1.
 
 ### Session 57 Additions
 

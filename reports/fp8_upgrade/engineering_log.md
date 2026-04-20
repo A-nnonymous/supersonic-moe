@@ -291,6 +291,42 @@
 59. **Score-gating guarantees dz[pad]=0 exactly across ALL 6 backward paths.** IEEE 754: `finite * 0.0 = 0.0`. Route-level padding is backward-safe by construction, not by coincidence.
 60. **GPU matmul tiling depends on problem shape.** Different row counts produce ULP-level float64 differences. Assertions for matmul-derived values need epsilon tolerance; score-gating zeros are truly bit-exact because they depend only on multiplication by zero.
 
+## Phase 21: Multi-Stream Elimination + ERNIE Integration Plan (Session 58)
+
+- **Removed all side-stream logic from forward/backward.** Deleted `_WGRAD_STREAM` (dead code —
+  declared in Session 32 but `_get_wgrad_stream()` was never called), `_DEQUANT_STREAM` (used in
+  `_UpProjection.backward` for x_col quant and `_DownProjection.backward` for z dequant), and
+  all `wait_stream()` calls that produced `cudaStreamSynchronize` events.
+- **Clarification on Phase 15 inconsistency**: Phase 15 recorded "Single-stream wgrad pipeline:
+  Removed cross-stream overlap." This was accurate for wgrad-specific overlap, but `_DEQUANT_STREAM`
+  survived in two other backward paths (`_UpProjection.backward` x_col quant overlap and
+  `_DownProjection.backward` z-dequant overlap) until Session 58 fully removed it.
+- **nsys verification**: Profiled with `nsys profile --trace=cuda,nvtx --capture-range=none`,
+  exported to sqlite, queried `CUPTI_ACTIVITY_KIND_SYNCHRONIZATION WHERE syncType=3`:
+  zero STREAM_SYNCHRONIZE events. Backward path has zero sync calls; forward has 6 framework-internal
+  `stream_wait_event` (type=2, Paddle/CUDA runtime internals, unavoidable).
+- **Correctness**: `test_moe_general_routing_fp8.py` passes unchanged after the fix.
+- **ERNIE-core MlpNode study**: Read `MlpNode.__init__`, `.forward`, `.forward_auto_subbatch`,
+  `FusionFP8Expert`, `ExpertsGroupGemmContiguousNode`. Documented integration plan in HANDOFF §9.1
+  with 6 key compatibility/incompatibility points.
+
+### Edits Made
+
+| File | Change |
+|:-----|:-------|
+| `sonicmoe/functional/__init__.py` | Deleted lines 506-525 (`_WGRAD_STREAM`, `_DEQUANT_STREAM`, getters). Rewrote `_UpProjection.backward` FP8 wgrad section to run x_col quant on default stream (-15 lines, +4 lines). Rewrote `_DownProjection.backward` z-dequant section to run on default stream (-11 lines, +3 lines). All `wait_stream()` removed. |
+
+### Lessons (Session 58)
+
+61. **Side-stream overlap provides no net benefit when overlap window is small.** `_DEQUANT_STREAM`
+    saved ~47µs theoretical but each `wait_stream()` produced a `cudaStreamSynchronize` costing
+    more, and cross-stream blocks prevent caching allocator reuse. Prefer single-stream unless
+    overlap window is >100µs.
+62. **nsys `--capture-range=nvtx` does NOT interoperate with Paddle's `nvprof_nvtx_push`.** 
+    Different NVTX domain/API. Use `--capture-range=none` when profiling Paddle tests.
+63. **`_WGRAD_STREAM` was dead code.** Declared in Session 32, never called. Always grep for
+    callers before assuming infrastructure is live.
+
 ---
 
 > **Canonical handoff for next agent: `docs/HANDOFF.md`**

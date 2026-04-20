@@ -503,26 +503,6 @@ _STASHED_FP8_WEIGHTS: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 # Counter for pre-quantization hits (testing/diagnostics).
 _PREQUANT_HIT_COUNT: dict[str, int] = collections.defaultdict(int)
 
-# Side stream for overlapping wgrad with actgrad in _UpProjection.backward.
-_WGRAD_STREAM: torch.cuda.Stream | None = None
-
-
-def _get_wgrad_stream() -> torch.cuda.Stream:
-    global _WGRAD_STREAM
-    if _WGRAD_STREAM is None:
-        _WGRAD_STREAM = torch.cuda.Stream()
-    return _WGRAD_STREAM
-
-
-# Side stream for overlapping z-dequant with dout-quant in _DownProjection.backward.
-_DEQUANT_STREAM: torch.cuda.Stream | None = None
-
-
-def _get_dequant_stream() -> torch.cuda.Stream:
-    global _DEQUANT_STREAM
-    if _DEQUANT_STREAM is None:
-        _DEQUANT_STREAM = torch.cuda.Stream()
-    return _DEQUANT_STREAM
 
 
 def _matches_prequant_tensor(lhs: torch.Tensor | None, rhs: torch.Tensor | None) -> bool:
@@ -1254,16 +1234,11 @@ class _UpProjection(torch.autograd.Function):
                     )
                     bwd_col = _PREQUANTIZED_SCALES.pop("bwd_col", None)
 
-                    # Stream-overlapped quant pipeline:
-                    # S0 (main): dz_col (if not pre-computed) -> free dz_bf16 -> wait S1 -> GEMM
-                    # S1 (side): x_col (Triton nw=1, handles gather)
-                    _side_stream = _get_dequant_stream()
-                    _side_stream.wait_stream(torch.cuda.current_stream())
-                    with torch.cuda.stream(_side_stream):
-                        x_col_fp8, x_col_scales = colwise_quantize_and_pack(
-                            x, logical_rows=H, logical_cols=TK,
-                            gather_idx=x_gather_idx,
-                        )
+                    # Sequential quant pipeline (all on default stream):
+                    x_col_fp8, x_col_scales = colwise_quantize_and_pack(
+                        x, logical_rows=H, logical_cols=TK,
+                        gather_idx=x_gather_idx,
+                    )
 
                     if bwd_col is not None:
                         # Use pre-computed col-fp8 from dual quant (zero extra HBM read)
@@ -1277,18 +1252,33 @@ class _UpProjection(torch.autograd.Function):
                     # dz.untyped_storage().resize_(0)
                     del dz_bf16
 
-                    # Sync: GEMM needs both quant outputs
-                    torch.cuda.current_stream().wait_stream(_side_stream)
-
                     # CUTLASS wgrad GEMM
-                    dw1_base = _run_cutlass_blockscaled_gemm_varlen_k(
-                        dz_col_fp8, dz_col_scales,
-                        x_col_fp8, x_col_scales,
-                        expert_frequency_offset,
-                        M=w1_shape[0], N=H, total_K=TK,
-                        num_experts=E, out_dtype=w1_dtype, device=x.device,
-                    )
-                    dw1 = dw1_base.permute(1, 2, 0)
+                    # If a fp32 wgrad accumulator is provided (ERNIE main_grad path),
+                    # fuse accumulation into the GEMM epilogue (D = A@B + C, beta=1).
+                    _wgrad_accum = getattr(ctx, '_wgrad_w1_accumulator', None)
+                    if _wgrad_accum is not None:
+                        from ..quack_utils.blockscaled_fp8_gemm import (
+                            _run_cutlass_blockscaled_gemm_varlen_k_accumulate,
+                        )
+                        _run_cutlass_blockscaled_gemm_varlen_k_accumulate(
+                            dz_col_fp8, dz_col_scales,
+                            x_col_fp8, x_col_scales,
+                            expert_frequency_offset,
+                            M=w1_shape[0], N=H, total_K=TK,
+                            num_experts=E, device=x.device,
+                            accumulator=_wgrad_accum,
+                        )
+                        dw1_base = None
+                        dw1 = None
+                    else:
+                        dw1_base = _run_cutlass_blockscaled_gemm_varlen_k(
+                            dz_col_fp8, dz_col_scales,
+                            x_col_fp8, x_col_scales,
+                            expert_frequency_offset,
+                            M=w1_shape[0], N=H, total_K=TK,
+                            num_experts=E, out_dtype=w1_dtype, device=x.device,
+                        )
+                        dw1 = dw1_base.permute(1, 2, 0)
                     del dz_col_fp8, dz_col_scales, x_col_fp8, x_col_scales
                 else:
                     dw1_base = torch.empty((E, w1_shape[0], w1_shape[1]), dtype=w1_dtype, device=w1_device)
@@ -1749,18 +1739,15 @@ class _DownProjection(torch.autograd.Function):
                     use_fp8_preact = (z is None and z_fp8 is not None)
 
                     if not use_fp8_preact:
-                        # Fallback: standalone dequant (when z is already bf16)
+                        # Standalone dequant (when z is already bf16) — all on default stream.
                         s_float = s.float()
                         if z is None:
-                            _ds = _get_dequant_stream()
-                            _ds.wait_stream(torch.cuda.current_stream())
-                            with torch.cuda.stream(_ds):
-                                z = dequantize_blockscaled_fp8(z_fp8, z_raw_scales_u8)
-                                del z_fp8, z_raw_scales_u8
+                            z = dequantize_blockscaled_fp8(z_fp8, z_raw_scales_u8)
+                            del z_fp8, z_raw_scales_u8
                     else:
                         s_float = s.float()
 
-                    # dout-quant + scale_gather on default stream (parallel with dequant if fallback).
+                    # dout-quant + scale_gather (all on default stream).
                     dout_fp8, dout_scales_t = quantize_and_pack_activation(dout)
                     TK_bwd = x_gather_idx.shape[0]
                     K_bwd = dout.shape[1]
@@ -1779,11 +1766,6 @@ class _DownProjection(torch.autograd.Function):
                     )
                     dout_scales = dout_scales_tk.view(_E8M0_DTYPE)
                     del dout_scales_t, dout_scales_tk
-
-                    # Synchronize: gemm_dgated_kernel needs dout_fp8/dout_scales
-                    # (and z_bf16 if not using fp8 preact).
-                    if not use_fp8_preact:
-                        torch.cuda.current_stream().wait_stream(_get_dequant_stream())
 
                     if ctx._w2_decoupled:
                         w2_fp8_enk = ctx._w2_dgated_fp8
@@ -1875,15 +1857,33 @@ class _DownProjection(torch.autograd.Function):
                             gather_idx=x_gather_idx,
                         )
 
-                        dw2_base = _run_cutlass_blockscaled_gemm_varlen_k(
-                            dout_col_fp8, dout_col_sc,
-                            y1s_col_fp8, y1s_col_sc,
-                            expert_frequency_offset,
-                            M=dout.shape[1], N=w2_shape[1],
-                            total_K=TK_wgrad, num_experts=w2_shape[2],
-                            out_dtype=w2_dtype, device=dout.device,
-                        )
-                        dw2 = dw2_base.permute(1, 2, 0)
+                        # Fused wgrad accumulation (same as w1 path)
+                        _wgrad_accum_w2 = getattr(ctx, '_wgrad_w2_accumulator', None)
+                        if _wgrad_accum_w2 is not None:
+                            from ..quack_utils.blockscaled_fp8_gemm import (
+                                _run_cutlass_blockscaled_gemm_varlen_k_accumulate,
+                            )
+                            _run_cutlass_blockscaled_gemm_varlen_k_accumulate(
+                                dout_col_fp8, dout_col_sc,
+                                y1s_col_fp8, y1s_col_sc,
+                                expert_frequency_offset,
+                                M=dout.shape[1], N=w2_shape[1],
+                                total_K=TK_wgrad, num_experts=w2_shape[2],
+                                device=dout.device,
+                                accumulator=_wgrad_accum_w2,
+                            )
+                            dw2_base = None
+                            dw2 = None
+                        else:
+                            dw2_base = _run_cutlass_blockscaled_gemm_varlen_k(
+                                dout_col_fp8, dout_col_sc,
+                                y1s_col_fp8, y1s_col_sc,
+                                expert_frequency_offset,
+                                M=dout.shape[1], N=w2_shape[1],
+                                total_K=TK_wgrad, num_experts=w2_shape[2],
+                                out_dtype=w2_dtype, device=dout.device,
+                            )
+                            dw2 = dw2_base.permute(1, 2, 0)
                         del dout_col_fp8, dout_col_sc, y1s_col_fp8, y1s_col_sc
                     else:
                         dw2_base = torch.empty((w2_shape[2], w2_shape[0], w2_shape[1]), dtype=w2_dtype, device=w2_device)
