@@ -5,6 +5,12 @@
 import paddle
 import inspect
 
+# ── Paddle compat shims for missing torch.cuda internals ─────────────────────
+# torch.random.manual_seed() calls torch.cuda._is_in_bad_fork() internally.
+# Paddle compat doesn't implement it — safe to stub as always-False (never forked).
+if not hasattr(paddle.cuda, '_is_in_bad_fork'):
+    paddle.cuda._is_in_bad_fork = lambda: False
+
 if not (hasattr(paddle.library.CustomOpDef, "__call__") and inspect.isfunction(paddle.library.CustomOpDef.__call__)):
     def __call__(self, *args, **kwargs):
         return getattr(getattr(paddle.ops, self._namespace), self._name)(*args, **kwargs)
