@@ -15,19 +15,32 @@ Two implementations:
   2. **Python fallback**: pure PyTorch ops, used when CUDA kernel is not compiled.
 
 ``deepep_to_sonic_metadata`` dispatches to CUDA if available.
+
+For the **topk** path (``deepep_topk_to_sonic_metadata``):
+  1. **CUDA kernel** (fused): warp-ballot progressive cumsum (same as moe_permute)
+     + 4 micro-kernels fused via stream ordering. Zero argsort. Stable ordering.
+  2. **Python fallback**: argsort-based, ~1.3ms for typical shapes.
 """
 
 from __future__ import annotations
 
+import math
 from typing import Sequence
 
 import torch
 
-# Try to import the JIT-compiled CUDA kernel
+# Try to import the JIT-compiled CUDA kernels
 _HAS_CUDA_KERNEL = False
 try:
     from sonicmoe.ernie_compat.deepep_metadata_cuda import deepep_metadata_cuda
     _HAS_CUDA_KERNEL = True
+except Exception:
+    pass
+
+_HAS_TOPK_CUDA_KERNEL = False
+try:
+    from sonicmoe.ernie_compat.deepep_topk_metadata_cuda import deepep_topk_metadata_cuda
+    _HAS_TOPK_CUDA_KERNEL = True
 except Exception:
     pass
 
@@ -37,6 +50,54 @@ except Exception:
 # are pure identity sequences. They depend only on (TK_padded, device, dtype)
 # and never on routing — caching them eliminates 3 arange allocations per iter.
 _ARANGE_CACHE: dict[tuple, torch.Tensor] = {}
+
+
+class _TopkOutputCache:
+    """High-watermark tensor cache for the topk CUDA metadata path.
+
+    Eliminates per-call allocations of ~10 output tensors + workspace.
+    Each entry grows by 1.25x when re-allocated to amortize cost.
+    """
+
+    def __init__(self):
+        self._bufs: dict[str, torch.Tensor] = {}
+
+    def get_or_alloc(
+        self,
+        name: str,
+        shape: tuple[int, ...],
+        dtype: torch.dtype,
+        device,
+        zero: bool = False,
+    ) -> torch.Tensor:
+        """Return a tensor of *exact* ``shape``.  Reuses cached buffer if large enough."""
+        needed = math.prod(shape) if shape else 1
+        t = self._bufs.get(name)
+
+        if t is not None and t.dtype == dtype and str(t.device) == str(device) and t.numel() >= needed:
+            view = t.view(-1)[:needed].view(shape)
+            if zero:
+                view.zero_()
+            return view
+
+        alloc = max(needed, int(t.numel() * 1.25) if t is not None else needed)
+        t = torch.empty(alloc, dtype=dtype, device=device)
+        if zero:
+            t.zero_()
+        self._bufs[name] = t
+        return t[:needed].view(shape)
+
+    def clear(self):
+        self._bufs.clear()
+
+
+# Global cache instance — cleared by invalidate_topk_cache().
+_TOPK_CACHE = _TopkOutputCache()
+
+
+def invalidate_topk_cache() -> None:
+    """Clear the topk output tensor cache.  Called on optimizer step / shape change."""
+    _TOPK_CACHE.clear()
 
 
 def _cached_arange(n: int, dtype: torch.dtype, device) -> torch.Tensor:
@@ -52,6 +113,284 @@ def _cached_arange(n: int, dtype: torch.dtype, device) -> torch.Tensor:
     if t.shape[0] == n:
         return t
     return t[:n]
+
+
+def deepep_topk_to_sonic_metadata(
+    dispatched_indices: torch.Tensor,   # [N_recv, topk] int32, -1 = masked
+    dispatched_probs: torch.Tensor,     # [N_recv, topk] float32
+    tokens_per_expert: Sequence[int] | torch.Tensor,  # [E]
+    E: int,
+    device: str | torch.device = "cuda",
+    block: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]:
+    """Convert real DeepEP topk dispatch results to SonicMoE routing metadata.
+
+    Unlike ``deepep_to_sonic_metadata`` which assumes tokens are already sorted
+    by expert (identity layout, K=1), this function handles the real DeepEP
+    dispatch where each received token can be routed to multiple local experts.
+
+    Parameters
+    ----------
+    dispatched_indices : Tensor [N_recv, topk] int32
+        Local expert indices from DeepEP dispatch. -1 means masked (not routed
+        to any local expert in that slot).
+    dispatched_probs : Tensor [N_recv, topk] float32
+        Routing probabilities from DeepEP dispatch.
+    tokens_per_expert : list[int] or Tensor [E]
+        Per-expert token counts from DeepEP ``buffer.dispatch()``.
+    E : int
+        Number of local experts.
+    device : str or torch.device
+        Target device for output tensors.
+    block : int
+        Alignment block size (128 for FP8 GEMM).
+
+    Returns
+    -------
+    expert_frequency_offset : Tensor [E+1] int32
+    x_gather_idx : Tensor [TK_padded] int32
+    s_scatter_idx : Tensor [TK_padded] int32
+    s_reverse_scatter_idx : Tensor [TK] int32
+    num_activated_expert_per_token_offset : Tensor [N_recv+1] int32
+    topk_scores : Tensor [TK_padded] float32 (token-major scores in [0,TK); padding zeros in [TK,TK_padded))
+    TK_padded : int
+    total_pad_rows : int
+    N_recv : int
+        Number of original received tokens (T for _DownProjection).
+    """
+    N_recv = dispatched_indices.shape[0]
+    topk = dispatched_indices.shape[1]
+
+    # Dispatch to CUDA kernel if available
+    if _HAS_TOPK_CUDA_KERNEL:
+        return _deepep_topk_to_sonic_metadata_cuda(
+            dispatched_indices, dispatched_probs, tokens_per_expert,
+            E, device, block,
+        )
+
+    # ── Phase 1: Flatten and filter valid entries ───────────────────────
+    tok_ids = torch.arange(N_recv, dtype=torch.int32, device=device) \
+                   .unsqueeze(1).expand(N_recv, topk)
+    valid = dispatched_indices >= 0
+
+    tok_flat = tok_ids[valid]           # original token row for each valid entry
+    exp_flat = dispatched_indices[valid].int()  # expert id for each valid entry
+    scr_flat = dispatched_probs[valid].float()  # score for each valid entry
+    TK = tok_flat.shape[0]              # total valid token-expert assignments
+
+    if TK == 0:
+        # Edge case: no tokens routed to any local expert
+        efo = torch.zeros(E + 1, dtype=torch.int32, device=device)
+        empty_i = torch.empty(0, dtype=torch.int32, device=device)
+        empty_f = torch.empty(0, dtype=torch.float32, device=device)
+        naept = torch.zeros(N_recv + 1, dtype=torch.int32, device=device)
+        return efo, empty_i, empty_i, empty_i, naept, empty_f, 0, 0, N_recv
+
+    # ── Phase 2: Sort by expert (argsort) ──────────────────────────────
+    # sort_perm: expert-sorted position → token-major position
+    sort_perm = exp_flat.long().argsort(stable=True)
+
+    # x_gather_idx (unpadded): original token row at each expert-sorted position
+    x_gather_unpadded = tok_flat[sort_perm].int()
+
+    # s_reverse_scatter_idx (unpadded): token-major position → expert-sorted position
+    s_reverse_unpadded = torch.empty(TK, dtype=torch.int32, device=device)
+    s_reverse_unpadded[sort_perm] = torch.arange(TK, dtype=torch.int32, device=device)
+
+    # ── Phase 3: Host prefix-sum for padded offsets ────────────────────
+    (offsets, seg_starts, seg_lens, real_counts, real_bases, pad_bases,
+     TK_padded, total_pad_rows) = _host_prefix_sum(tokens_per_expert, E, TK, block)
+
+    expert_frequency_offset = torch.tensor(offsets, dtype=torch.int32, device=device)
+
+    # ── Phase 4: Apply route-level padding ─────────────────────────────
+    if total_pad_rows == 0:
+        # Already aligned — no padding needed
+        x_gather_idx = x_gather_unpadded
+        # s_scatter_idx: expert-sorted position → token-major position
+        s_scatter_idx = sort_perm.int()
+        s_reverse_scatter_idx = s_reverse_unpadded
+        # topk_scores: token-major order
+        topk_scores = scr_flat
+    else:
+        # Compute dst_idx: maps unpadded expert-sorted position → padded position
+        # For each sorted position, determine which expert it belongs to and
+        # its local offset within that expert's segment.
+        real_bases_d = torch.tensor(real_bases, dtype=torch.long, device=device)
+        seg_starts_d = torch.tensor(seg_starts, dtype=torch.long, device=device)
+
+        sorted_experts = exp_flat[sort_perm].long()  # expert for each sorted pos
+        local_pos = torch.arange(TK, dtype=torch.long, device=device) - real_bases_d[sorted_experts]
+        dst_idx = (seg_starts_d[sorted_experts] + local_pos).long()
+
+        # x_gather_idx: padded, padding rows gather from row 0 (score=0 nullifies)
+        x_gather_idx = torch.zeros(TK_padded, dtype=torch.int32, device=device)
+        x_gather_idx[dst_idx] = x_gather_unpadded
+
+        # s_scatter_idx: maps padded expert-sorted position → token-major position
+        # Real positions: point to their token-major index (via sort_perm)
+        # Pad positions: point to virtual indices beyond TK (score=0, safe)
+        N_pad = total_pad_rows
+        s_scatter_idx = torch.empty(TK_padded, dtype=torch.int32, device=device)
+        s_scatter_idx[dst_idx] = sort_perm.int()
+        # Fill padding positions with virtual indices [TK, TK + N_pad)
+        is_real = torch.zeros(TK_padded, dtype=torch.bool, device=device)
+        is_real[dst_idx] = True
+        pad_positions = torch.where(~is_real)[0]
+        s_scatter_idx[pad_positions] = torch.arange(
+            TK, TK + N_pad, dtype=torch.int32, device=device
+        )
+
+        # s_reverse_scatter_idx: token-major → padded expert-sorted position
+        # Length TK (only real entries need reverse mapping)
+        s_reverse_scatter_idx = dst_idx[s_reverse_unpadded.long()].int()
+
+        # topk_scores: TK_padded-sized. Real entries at token-major positions [0, TK),
+        # padding entries at [TK, TK_padded) = 0. The backward does
+        # s = topk_scores[s_scatter_idx] where pad positions map to >= TK.
+        topk_scores = torch.zeros(TK_padded, dtype=torch.float32, device=device)
+        topk_scores[:TK] = scr_flat
+
+    # ── Phase 5: Build num_activated_expert_per_token_offset ───────────
+    # naept[i] = cumulative count of expert assignments for tokens 0..i-1
+    per_token_counts = torch.bincount(tok_flat.long(), minlength=N_recv).int()
+    naept = torch.zeros(N_recv + 1, dtype=torch.int32, device=device)
+    naept[1:] = per_token_counts.cumsum(0).int()
+
+    return (
+        expert_frequency_offset,
+        x_gather_idx,
+        s_scatter_idx,
+        s_reverse_scatter_idx,
+        naept,
+        topk_scores,
+        TK_padded,
+        total_pad_rows,
+        N_recv,
+    )
+
+
+# ── CUDA topk implementation ─────────────────────────────────────────────────
+
+def _deepep_topk_to_sonic_metadata_cuda(
+    dispatched_indices: torch.Tensor,
+    dispatched_probs: torch.Tensor,
+    tokens_per_expert: Sequence[int] | torch.Tensor,
+    E: int,
+    device: str | torch.device = "cuda",
+    block: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, int]:
+    """CUDA fused topk metadata conversion (warp-ballot, zero argsort).
+
+    Uses Paddle moe_permute-style progressive cumsum for stable ordering.
+    4 fused kernels via stream ordering, ~50us for N=16K, topk=8, E=8.
+    """
+    N_recv = dispatched_indices.shape[0]
+    topk = dispatched_indices.shape[1]
+
+    # Compute TK and TK_padded on host (need tokens_per_expert list)
+    if isinstance(tokens_per_expert, torch.Tensor):
+        tpe_list = tokens_per_expert.tolist()
+        tpe_dev = _TOPK_CACHE.get_or_alloc(
+            "tpe_dev", (E,), torch.int32, device, zero=False,
+        )
+        tpe_dev.copy_(tokens_per_expert.to(device=device, dtype=torch.int32))
+    else:
+        tpe_list = list(tokens_per_expert)
+        tpe_dev = _TOPK_CACHE.get_or_alloc(
+            "tpe_dev", (E,), torch.int32, device, zero=False,
+        )
+        tpe_dev.copy_(torch.tensor(tpe_list, dtype=torch.int32, device=device))
+
+    TK = sum(tpe_list)
+    # Compute TK_padded (padded sum)
+    TK_padded = 0
+    for count in tpe_list:
+        if count > 0:
+            TK_padded += ((count + block - 1) // block) * block
+    total_pad_rows = TK_padded - TK
+
+    if TK == 0:
+        efo = torch.zeros(E + 1, dtype=torch.int32, device=device)
+        empty_i = torch.empty(0, dtype=torch.int32, device=device)
+        empty_f = torch.empty(0, dtype=torch.float32, device=device)
+        naept = torch.zeros(N_recv + 1, dtype=torch.int32, device=device)
+        return efo, empty_i, empty_i, empty_i, naept, empty_f, 0, 0, N_recv
+
+    # Cached allocations — only re-alloc when shape grows
+    expert_offsets = _TOPK_CACHE.get_or_alloc(
+        "expert_offsets", (E + 1,), torch.int32, device, zero=False,
+    )
+    seg_starts = _TOPK_CACHE.get_or_alloc(
+        "seg_starts", (E,), torch.int32, device, zero=False,
+    )
+    real_bases = _TOPK_CACHE.get_or_alloc(
+        "real_bases", (E,), torch.int32, device, zero=False,
+    )
+    x_gather_idx = _TOPK_CACHE.get_or_alloc(
+        "x_gather_idx", (TK_padded,), torch.int32, device, zero=True,
+    )
+    s_scatter_idx = _TOPK_CACHE.get_or_alloc(
+        "s_scatter_idx", (TK_padded,), torch.int32, device, zero=False,
+    )
+    s_reverse_scatter_idx = _TOPK_CACHE.get_or_alloc(
+        "s_reverse_scatter", (TK,), torch.int32, device, zero=False,
+    )
+    topk_scores = _TOPK_CACHE.get_or_alloc(
+        "topk_scores", (TK_padded,), torch.float32, device, zero=True,
+    )
+    naept = _TOPK_CACHE.get_or_alloc(
+        "naept", (N_recv + 1,), torch.int32, device, zero=False,
+    )
+
+    # Workspace: block_hist[B*E] + block_offset[B*E] + completion_flag[1]
+    num_blocks = (N_recv + 31) // 32  # ROWS_PER_BLOCK = 32
+    cumsum_workspace = _TOPK_CACHE.get_or_alloc(
+        "cumsum_workspace", (2 * num_blocks * E + 1,), torch.int32, device, zero=False,
+    )
+
+    _stream_obj = torch.cuda.current_stream(device)
+    stream = _stream_obj.stream_base.raw_stream if hasattr(_stream_obj, "stream_base") else _stream_obj.cuda_stream
+
+    deepep_topk_metadata_cuda(
+        dispatched_indices=dispatched_indices.contiguous(),
+        dispatched_probs=dispatched_probs.contiguous(),
+        tokens_per_expert=tpe_dev,
+        expert_offsets=expert_offsets,
+        seg_starts=seg_starts,
+        real_bases=real_bases,
+        x_gather_idx=x_gather_idx,
+        s_scatter_idx=s_scatter_idx,
+        s_reverse_scatter_idx=s_reverse_scatter_idx,
+        topk_scores=topk_scores,
+        naept=naept,
+        global_block_cumsum=cumsum_workspace,
+        N_recv=N_recv,
+        E=E,
+        topk=topk,
+        TK=TK,
+        TK_padded=TK_padded,
+        alignment=block,
+        stream=stream,
+    )
+
+    # topk_scores is TK_padded-sized with zeros at pad positions.
+    # For the topk path, _DownProjection uses T=N_recv and _router_forward
+    # indexes scores via naept (token-major order within the first TK elements).
+    # The backward indexes via s_scatter_idx which maps to token-major positions
+    # for real entries and to >= TK for pad entries (where scores = 0).
+    # Return topk_scores as full TK_padded buffer (compatible with backward).
+    return (
+        expert_offsets,
+        x_gather_idx,
+        s_scatter_idx,
+        s_reverse_scatter_idx,
+        naept,
+        topk_scores,
+        TK_padded,
+        total_pad_rows,
+        N_recv,
+    )
 
 
 def deepep_to_sonic_metadata(
@@ -182,7 +521,8 @@ def _deepep_to_sonic_metadata_cuda(
 
     # Launch fill kernel: E blocks × 256 threads
     if TK_padded > 0:
-        stream = torch.cuda.current_stream(device).stream_base.raw_stream
+        _stream_obj = torch.cuda.current_stream(device)
+        stream = _stream_obj.stream_base.raw_stream if hasattr(_stream_obj, "stream_base") else _stream_obj.cuda_stream
         deepep_metadata_cuda(
             expert_freq_offset=expert_freq_offset,
             x_gather_idx=x_gather_idx,
