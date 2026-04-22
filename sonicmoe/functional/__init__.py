@@ -1536,8 +1536,13 @@ class _DownProjection(torch.autograd.Function):
         # Track which optional tensor inputs were actually provided (for Paddle backward return count)
         ctx._has_b2 = b2 is not None
         ctx._has_num_activated = num_activated_expert_per_token_offset is not None
-        # Track stop_gradient for topk_scores (Paddle requires None for stop_gradient inputs)
-        ctx._topk_scores_needs_grad = not topk_scores.stop_gradient
+        # Always compute ds (topk_scores gradient) — needed for router training.
+        # NOTE: topk_scores.stop_gradient is unreliable inside .apply() because
+        # Paddle's torch-proxy resets stop_gradient=True on inputs (mirroring
+        # PyTorch Function.apply() detach behavior) without providing
+        # ctx.needs_input_grad.  Defaulting to True is safe: if the caller truly
+        # doesn't need ds, the autograd engine simply discards it.
+        ctx._topk_scores_needs_grad = True
 
         # Memory optimization: store z in FP8 to save ~50% of z's memory.
         # At Ernie shape (TK=65536, 2I=3072), z is 384MB BF16 -> ~213MB FP8 = ~171MB saved.

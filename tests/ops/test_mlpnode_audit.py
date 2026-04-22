@@ -40,7 +40,7 @@ from sonicmoe.ernie_compat import (
     flush_native_grads,
     invalidate_weight_caches,
 )
-from sonicmoe.ernie_compat.mlp_node import (
+from sonicmoe.ernie_compat.mlp_node_v2 import (
     _NATIVE_W1_GRAD,
     _NATIVE_W2_GRAD,
     stack_ernie_w1,

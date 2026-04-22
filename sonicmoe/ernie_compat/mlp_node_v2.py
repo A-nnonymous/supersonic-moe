@@ -401,17 +401,9 @@ class SonicMoEFunc(paddle.autograd.PyLayer):
         dz = down_grads[1]    # [TK, 2I] bf16
         dw2 = down_grads[2]   # [H, I, E] w2_dtype
 
-        # ds: at index 4 (after db2=None at index 3)
-        has_b2 = getattr(down_ctx, '_has_b2', False)
-        ds_idx = 4 if has_b2 else 3
-        # Actually, backward always returns in fixed order:
-        # [None(y1), dz, dw2, db2_or_skip, ds, None, None, None, None, None, None?, ...]
-        # Find ds by checking which is float32
-        ds = None
-        for g in down_grads[3:]:
-            if g is not None and g.dtype == torch.float32:
-                ds = g
-                break
+        # ds: at index 3 (b2=None → no db2) or 4 (b2 present → db2 at 3)
+        ds_idx = 4 if getattr(down_ctx, '_has_b2', False) else 3
+        ds = down_grads[ds_idx]
 
         # ── UpProjection backward ────────────────────────────────────────
         # Input to backward: (dy1=None, dz)
@@ -688,11 +680,10 @@ class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
         dz = down_grads[1]
         dw2 = down_grads[2]
 
-        ds = None
-        for g in down_grads[3:]:
-            if g is not None and g.dtype == torch.float32:
-                ds = g
-                break
+        # ds: deterministic index based on _has_b2 (b2 is always None in this path,
+        # so ds is always at index 3.  Previous code used a fragile float32 heuristic.)
+        ds_idx = 4 if getattr(down_ctx, '_has_b2', False) else 3
+        ds = down_grads[ds_idx]
 
         # ── UpProjection backward ────────────────────────────────────────
         up_ctx._wgrad_w1_accumulator = _NATIVE_W1_GRAD
