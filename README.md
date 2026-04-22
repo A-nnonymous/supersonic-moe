@@ -44,12 +44,27 @@ pip install -e .
 ## 🛠️ Development Workflow and Repository Hygiene
 
 - **Read indexes first**: before broad file searches, open the nearest `INDEX.md`. The root map is [`INDEX.md`](INDEX.md).
-- **Canonical state lives in `docs/HANDOFF.md`**: treat `reports/fp8_upgrade/HANDOFF.md` as historical only.
+- **Canonical state lives in `HANDOFF.md`** (root): bugs found, architecture constraints, what works/doesn't. `docs/session60_lessons.md` has detailed engineering lessons.
 - **Keep indexes in sync with file changes**: any file create / delete / rename / move must update the nearest affected `INDEX.md`; cross-directory changes must also update the nearest shared ancestor index.
 - **Regenerate indexes after structural edits**: run `python tools/generate_directory_indexes.py` from the repository root and review the generated summaries.
 - **Prefer canonical files over parallel variants**: extend existing authoritative files instead of creating new `*_final`, `*_new`, or duplicate bootstrap docs unless there is a clear long-term need.
 - **Keep generated artifacts out of the root when possible**: new benchmark and profiling outputs should live under `reports/` rather than adding more root-level snapshots.
 - **When retiring a file, leave a clear trail**: update indexes and links so historical references are explicit instead of silently stale.
+
+## 🔌 Paddle Integration (ERNIE / PaddleFleet)
+
+The `paddle_compat` / `session60-ds-fix` branch integrates SonicMoE into PaddleFleet via Paddle's torch-proxy (`paddle.compat.enable_torch_proxy`).
+
+**Quick test** (single-card, FP8, gate gradient verified):
+```bash
+source .runenv.sh
+CUDA_VISIBLE_DEVICES=0 python tests/test_moe_layer.py
+```
+
+**Key files**:
+- `sonicmoe/ernie_compat/mlp_node_v2.py` — `SonicMoEMlpNode` (production MlpNode replacement)
+- `tests/test_moe_layer.py` — Path A (direct .apply, gate→ds verified) + Path B (MlpNode E2E)
+- `HANDOFF.md` — full project status, bugs found, architecture constraints for next agent
 
 ## 🎯 Quick Start
 

@@ -1,133 +1,140 @@
-# HANDOFF — Session 60 (2026-04-20)
+# HANDOFF — Session 60→61 (2026-04-22)
 
-## Project Status
+## Project Status: What Works, What Doesn't
 
-SonicMoE is an FP8 MoE kernel library on Blackwell (SM100). The `paddle_compat` branch integrates it into ERNIE-core via `SonicMoEMlpNode` — a drop-in replacement for ERNIE's MlpNode that uses DeepEP's pre-sorted token layout.
+SonicMoE is an FP8 MoE kernel library (Blackwell SM100/SM103). The `paddle_compat` branch integrates it into PaddleFleet/ERNIE via Paddle's torch-proxy.
 
-**Branch**: `paddle_compat`
-**Hardware**: NVIDIA B30Z (SM103, Blackwell)
-**Environment**: `/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/baidu/ernie/erniebot/eb_venv`
+**Branch**: `session60-ds-fix` (on `myrepo`, based on `fork/paddle`)
+**Hardware**: NVIDIA B30Z (SM103, CUDA 13.0)
+**Python**: 3.12 (system), QuACK at `/root/.../zhangyichen/sonicmoe_for_ernie/quack`
 
-## What Was Done This Session (Session 60)
+### What Works (Verified)
 
-### Core Achievement: FP8 Frontier ↔ DeepEP Integration
+| Capability | Status | Evidence |
+|---|---|---|
+| FP8 forward (UpProj + DownProj) | **PASS** | `test_moe_layer.py` Path A & B |
+| FP8 backward (dx) | **PASS** | x.grad.norm = 0.022 |
+| FP8 backward (ds → gate) | **PASS** (after fix) | gate_w.grad.norm = 0.056 (was 0.0) |
+| FP8 backward (dw1, dw2 via main_grad) | **PASS** | 16/16 expert weights non-zero |
+| Gate without no_grad() | **PASS** (after rewire) | No segfault, ds flows back |
+| Path A vs B precision | **PASS** | output RRMSE=0.0004%, cosine>0.999 |
+| SonicMoEMlpNode E2E (production path) | **PASS** | Path B in test_moe_layer.py |
 
-Implemented `SonicMoEMlpNode` (`sonicmoe/ernie_compat/mlp_node_v2.py`) that wraps the FP8 frontier kernels for ERNIE's DeepEP training flow. Key design decisions:
+### What Doesn't Work / Not Yet Done
 
-1. **Route-level padding** (matching frontier `_pad_routing_metadata`): x is NOT padded. Padding rows use `x_gather_idx=0` with `score=0`. Zero contribution, zero x modification. CUDA kernel (`deepep_metadata_cuda/kernel.cu`) updated accordingly.
+| Item | Status | Detail |
+|---|---|---|
+| nsys GPU-projection profiling | **BLOCKED** | nsys 2025.1.1 doesn't capture CUDA kernels on this B30Z setup. nsys 2026.2.1 binary exists at `/opt/nvidia/nsight-systems-cli/2026.2.1/target-linux-x64/nsys` but hasn't been validated. Need `--trace=cuda` and the 2026 binary. |
+| Memory waterfall breakdown | **PARTIAL** | Rough numbers only: pre=1478 MiB, peak=3833 MiB (T=8192, ernie shape). No per-phase breakdown yet. |
+| Multi-card (EP>1) E2E test | **NOT DONE** | Requires DeepEP buffer setup; single-card only. |
+| ERNIE training loop integration | **NOT DONE** | MlpNode interface verified, but not plugged into actual ERNIE training. |
 
-2. **Fused wgrad GEMM epilogue accumulation**: `_run_cutlass_blockscaled_gemm_varlen_k_accumulate()` in `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` uses CUTLASS epilogue `D = A@B + 1.0*C` (beta=1) to accumulate wgrad directly into fp32 main_grad buffer inside the GEMM kernel. **Zero extra kernels for main_grad accumulation.**
+## Three Bugs Fixed This Session
 
-3. **Metadata caching**: When `tokens_per_expert` is unchanged, all routing tensors are reused (zero GPU cost for frozen routing).
+### Bug 1 (P0): ds silently dropped — router could never train
 
-4. **`flush_native_grads()`**: Defers the interleave→split-half layout conversion to optimizer-step time (not per-iter).
+**File**: `sonicmoe/functional/__init__.py:1540`
+**Root cause**: `_DownProjection.forward` checked `topk_scores.stop_gradient` to decide whether to compute ds. But Paddle torch-proxy's `.apply()` resets `stop_gradient=True` on all tensor inputs inside forward (mimicking PyTorch `Function.apply()` detach behavior), and doesn't provide `ctx.needs_input_grad`.
+**Effect**: `ctx._topk_scores_needs_grad = False` → ds=None → gate_w.grad=0 → router frozen.
+**Fix**: `ctx._topk_scores_needs_grad = True` (always compute ds).
+**Verification**: gate_w.grad.norm went from 0.0 to 0.056.
 
-### Performance (nsys GPU-projection, T=65536, E=8, I=1536, H=3072)
+### Bug 2 (P0): segfault when gate runs without no_grad()
 
-| Metric | Frontier | MlpNode (fused) | Overhead |
-|--------|----------|-----------------|----------|
-| GPU-projection/iter | 2739 μs | 3190 μs | +16.5% |
-| GemmGated (fwd) | 452 μs | 466 μs | +3% |
-| GemmDGated (bwd) | 383 μs | 411 μs | +7% |
-| quackgemm wgrad | 1067 μs | 1278 μs | +20% (epilogue cost) |
-| TilingSwapDim | 0 | 0 | ELIMINATED |
-| MultiPrecisionAdd | 0 | 0 | ELIMINATED |
+**File**: `tests/test_moe_layer.py` (architecture issue)
+**Root cause**: The old test used `_convert_routing_map_and_probs` (which calls `paddle.topk`) and `_prepare_sonic_inputs` (which calls `.cast()`) between gate output and `_DownProjection.apply()`. These native Paddle ops create autograd nodes (TopkGradNode, CastGradNode). When the torch-proxy backward returns ds, it flows through these native Paddle nodes, which try to access the gradient tensor's metadata via `paddle::Tensor::type()` — but torch-proxy gradient tensors have incompatible metadata → segfault.
+**Fix**: Rewired to match PaddleFleet's pattern — pass gate's `topk_weights`/`topk_indices` directly to `_UpProjection.apply()` + `_DownProjection.apply()` with `is_varlen_K=False`. Routing metadata via `general_routing_router_metadata` (integer-only, no autograd nodes).
+**Rule**: Between gate output and `_DownProjection.apply()`, NO native Paddle ops that create autograd nodes on the score tensor path.
 
-**Remaining +16.5% overhead breakdown:**
-- wgrad GEMM epilogue (fp32 C read/write): +211 μs — inherent cost of fused accumulation
-- `_quantize_and_pack`: +183 μs — **fundamental**: DeepEP has T=TK (no fan-out duplication; frontier only quantizes T=8192 rows then GEMM gathers via A_idx, we must quantize all 65536 unique rows)
-- `token_gather_sum`: +131 μs — 8x more grid blocks in `is_varlen_K=True` path (65536 output positions vs 8192)
+### Bug 3 (P1): ds extraction used fragile float32 heuristic
 
-**These are NOT migration overhead** — they are fundamental workload differences between "T unique tokens × K experts" (frontier) vs "TK unique token-expert pairs" (DeepEP).
+**File**: `sonicmoe/ernie_compat/mlp_node_v2.py` (two locations)
+**Old code**: `for g in down_grads[3:]: if g is not None and g.dtype == float32: ds = g; break`
+**Fix**: Deterministic `ds_idx = 4 if ctx._has_b2 else 3; ds = down_grads[ds_idx]`
 
-### Precision
+## Critical Architecture Constraint (torch-proxy)
 
-| Metric | Value |
-|--------|-------|
-| Cosine similarity (FP8 vs BF16 gold) | 0.998 |
-| SNR | 23.7 dB |
-| Determinism (same input, repeated) | bit-exact (max diff = 0) |
-| Accumulation correctness (4-iter / 1-iter norm ratio) | 2.00 (= √4, mathematically exact) |
-| main_grad norms (T=65536, 12 iters) | w1: 1.88±0.15, w2: 0.94±0.07 |
+**Golden rule**: On the ds gradient return path (from `_DownProjection.backward` back to gate), there must be **zero** native Paddle autograd nodes. The gate's own TopkGradNode (created during gate's forward) is fine — it operates on normal Paddle tensors. But any Paddle op (topk, cast, boolean indexing, etc.) inserted *between* gate output and `_DownProjection.apply()` will create autograd nodes that receive torch-proxy gradient tensors → segfault.
 
-### Memory (T=65536, E=8)
+This is why PaddleFleet passes `topk_scores` [T,K] directly to `_DownProjection.apply()` — no intermediate ops.
 
-- Baseline (after warmup): ~2672 MiB
-- Peak (during iter): ~5570 MiB
-- Per-iter transient: ~2900 MiB (dominated by y1/z [TK, 2I] activations)
+## Precision (Path A vs Path B, same weights, T=4096)
 
-## Critical Files
+| Metric | RRMSE (%) | Cosine |
+|---|---|---|
+| output | 0.0004 | 1.000000 |
+| dx | 0.0027 | 1.000000 |
+| dw1 | 0.1656 | 0.999896 |
+| dw2 | 0.1656 | 0.999928 |
 
-| File | Role |
-|------|------|
-| `sonicmoe/ernie_compat/mlp_node_v2.py` | `SonicMoEMlpNode` + `_SonicMoEDeepEPFunc` PyLayer |
-| `sonicmoe/ernie_compat/mlp_node.py` | Weight stacking, native-layout grad accumulation, `flush_native_grads()` |
-| `sonicmoe/ernie_compat/deepep_metadata.py` | DeepEP → SonicMoE metadata (route-level padding, CUDA V2 kernel) |
-| `sonicmoe/ernie_compat/deepep_metadata_cuda/kernel.cu` | Vectorized fill kernel (route-level: padding→row 0) |
-| `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` | `_run_cutlass_blockscaled_gemm_varlen_k_accumulate()` — fused wgrad+accum |
-| `sonicmoe/functional/__init__.py` | Modified `_UpProjection.backward` + `_DownProjection.backward` to detect `_wgrad_w1/w2_accumulator` |
-| `tests/ops/test_e2e_mlpnode.py` | E2E benchmark (--frontier-compare, --nsys, --parse-sqlite) |
-| `tests/ops/test_mlpnode_audit.py` | Rigorous precision/performance/memory audit |
+dw1/dw2 ~0.17% RRMSE comes from `is_varlen_K=False` (Path A) vs `is_varlen_K=True` + route-level padding (Path B). Different wgrad GEMM tile paths in BF16.
+
+## Performance (NOT yet validated by nsys GPU-projection)
+
+The Session 59 numbers in the old HANDOFF (2739 µs frontier vs 3190 µs MlpNode) were measured with a working nsys setup. Current environment's nsys 2025.1.1 can't capture CUDA kernels on B30Z. Use nsys 2026.2.1 at `/opt/nvidia/nsight-systems-cli/2026.2.1/target-linux-x64/nsys`.
+
+CUDA-event rough timing (not gold standard, includes CPU overhead):
+- Forward: ~2.7 ms (T=8192, H=3072, I=1536, E=8, K=8)
+- Backward: ~3.4 ms
+- Total: ~6.1 ms/iter
+
+## Memory (T=8192, ernie shape, rough)
+
+- Pre-forward: 1478 MiB
+- Peak (fwd+bwd): 3833 MiB
+- Δ transient: ~2355 MiB (dominated by y1/z activations + wgrad intermediates)
 
 ## Key Information Sources
 
 | What | Where |
-|------|-------|
-| Frontier nsys profile (gold reference) | `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/output/nsys/fp8_T8192_I1536_E8K8_211135.sqlite` |
-| Frontier nsys workload template | `tools/introspect.py:1426` (`_NSYS_WORKLOAD_TEMPLATE`) |
-| ERNIE MlpNode contract | `ernie-core/src/ernie_core/models/moe/moe_layer.py:1601-2200` |
-| Paddle moe_permute_kernel | `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/Paddle_B/paddle/phi/kernels/gpu/moe_permute_kernel.cu` |
-| QuACK GEMM epilogue | `/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack/quack/gemm_default_epi.py` |
+|---|---|
+| PaddleFleet MoE single-card sonic path | `PaddleFleet/src/paddlefleet/transformer/moe/moe_layer.py:887-950` |
+| PaddleFleet _UpProj/_DownProj signatures | `PaddleFleet/src/paddlefleet/ops/sonicmoe/functional/__init__.py` (NOTE: different from local — no `selected_experts` param) |
+| Local _DownProjection signature | `sonicmoe/functional/__init__.py:1387` (has extra `selected_experts` + `fp8_protocol` params vs PaddleFleet) |
+| Frontier nsys methodology | `tools/introspect.py:1426` (`_NSYS_WORKLOAD_TEMPLATE`) — uses tempfile + subprocess, nsys 2026 |
 | Route-level padding design | `sonicmoe/functional/__init__.py:222-296` (`_pad_routing_metadata`) |
-| Zero-materialization design | `sonicmoe/functional/__init__.py:104-218` (`_fused_blockscaled_gated_forward`) |
+| QuACK GEMM path | `/root/.../zhangyichen/sonicmoe_for_ernie/quack/quack/gemm_default_epi.py` |
+| Env setup | `.runenv.sh` (PYTHONPATH for quack + sonic-moe + ernie-core) |
 
-## Hard-Won Lessons
+## Critical Files
 
-1. **Frontier的T和DeepEP的T语义不同**: Frontier的T=8192是unique tokens，K=8 experts/token → TK=65536 GEMM行。DeepEP的T=65536是token-expert pairs总数（已展开）。直接用T=8192跑MlpNode测试得到的GEMM时间只有frontier的1/8，容易误以为"计算没有真正执行"。**正确的对照: 用T=65536。**
-
-2. **Paddle compat dtype不兼容**: `paddle.int32 != torch.int32`（不同对象）。`count_cumsum`的assert会失败。已在`sonicmoe/count_cumsum/__init__.py`放宽检查。
-
-3. **Non-contiguous tensor的add_()**: Paddle/PyTorch对non-contiguous lhs/rhs的`add_()`会隐式调用`.contiguous()` → 产生`TilingSwapDim1And2` kernel。解决方案: 确保buffer和operand的物理布局一致，或使用GEMM epilogue融合。
-
-4. **GEMM epilogue beta=1 accumulation**: QuACK的`GemmDefaultSm100.EpilogueArguments(beta=Float32(1.0))` + C=D(同一tensor) 实现了零额外kernel的inplace accumulation。但这会增加GEMM本身的时间(~20%)因为epilogue需要额外读写fp32 C tensor。净效果: 省掉170μs的TilingSwap+MultiPrecisionAdd，增加~210μs的epilogue开销 → **当workload较小时略亏，但对大workload有利（epilogue成本不随M增长而增长）**。
-
-5. **`is_varlen_K=True`的开销**: 使用identity layout (每个position映射到1个expert) 时，`token_gather_sum_kernel`的grid size等于TK（65536 blocks），每个block只处理K=1个element。相比frontier的8192 blocks × K=8，总work相同但launch overhead高8x。潜在优化: 对identity permutation case用简单的`out = y2 * score` element-wise kernel替代。
-
-## Next Steps (Recommended Priority)
-
-### P0: DeepEP FP8 Input Support
-DeepEP可以直接提供FP8格式的`recv_x`。如果跳过`quantize_and_pack_activation`（87μs），MlpNode的overhead会从+16.5%降到+10%以内。在`_SonicMoEDeepEPFunc.forward`中添加`if x.dtype == torch.float8_e4m3fn`分支。
-
-### P1: token_gather_sum Identity Shortcut
-当检测到`s_reverse_scatter_idx`是identity permutation且score全为1时，`_router_forward`可以直接用`out = y2[:T]`（zero-copy slice），彻底消除138μs/iter的gather-sum kernel。
-
-### P2: Quantize Skip for Large T
-当T==TK（无fan-out），`_fused_blockscaled_gated_forward`的scale gather是no-op。可以检测这个case，跳过gather kernel（省~17μs）。
-
-### P3: Correctness — Gold Comparison via frontier
-当前`test_mlpnode_audit.py`用BF16手动计算作为gold。理想的gold是直接调用frontier的`moe_general_routing_inputs`。但Paddle compat的`zeros_like` tensor type不兼容问题阻塞了这个路径。需要修复`_DownProjection.forward`内部的tensor创建逻辑。
-
-### P4: dx (input gradient) 传播
-当前Paddle PyLayer的`backward`返回dx，但上层`x.grad`为None（Paddle autograd对detached input的grad传播行为不同）。需要验证在真实ERNIE训练循环中dx是否正确传播到上游。
+| File | Role | Modified this session? |
+|---|---|---|
+| `sonicmoe/functional/__init__.py` | `_UpProjection`, `_DownProjection` — **ds fix here** | **YES** |
+| `sonicmoe/ernie_compat/mlp_node_v2.py` | `SonicMoEMlpNode` + `_SonicMoEDeepEPFunc` — **ds index fix here** | **YES** |
+| `tests/test_moe_layer.py` | Path A (direct .apply) + Path B (MlpNode E2E) | **YES (rewired)** |
+| `sonicmoe/ernie_compat/deepep_metadata.py` | DeepEP → SonicMoE metadata (topk CUDA kernel) | No |
+| `tests/ops/bench_deepep_topk_nsys.py` | nsys benchmark (needs nsys 2026.2.1) | **YES** |
+| `tests/precision_compare_paths.py` | Path A vs B precision comparison | **NEW** |
+| `docs/session60_lessons.md` | Engineering lessons #67-#72 | **NEW** |
 
 ## Running Tests
 
 ```bash
 source .runenv.sh
 
-# Quick validation
-CUDA_VISIBLE_DEVICES=0 python tests/ops/test_e2e_mlpnode.py
+# Path A (gate→MLP, ds verified) + Path B (MlpNode E2E, main_grad verified)
+CUDA_VISIBLE_DEVICES=0 python tests/test_moe_layer.py
 
-# Frontier-compare (same x/routing, matches frontier methodology)
-CUDA_VISIBLE_DEVICES=0 python tests/ops/test_e2e_mlpnode.py --frontier-compare --T 65536
+# Precision comparison (same weights, Path A vs B)
+CUDA_VISIBLE_DEVICES=0 python tests/precision_compare_paths.py
 
-# Full precision/memory/performance audit
-CUDA_VISIBLE_DEVICES=0 python tests/ops/test_mlpnode_audit.py --T 1024
-
-# nsys profiling
-nsys profile -c cudaProfilerApi --capture-range-end=stop --export=sqlite \
-  -o /tmp/mlpnode python tests/ops/test_e2e_mlpnode.py --frontier-compare --nsys --T 65536
-
-# Parse nsys results
-python tests/ops/test_e2e_mlpnode.py --parse-sqlite /tmp/mlpnode.sqlite
+# nsys profiling (MUST use nsys 2026.2.1 on B30Z)
+/opt/nvidia/nsight-systems-cli/2026.2.1/target-linux-x64/nsys profile \
+  --trace=cuda,nvtx -o /tmp/mlpnode_e2e --force-overwrite=true \
+  python tests/ops/mlpnode_nsys_worker.py
 ```
+
+## Next Steps (Recommended)
+
+### P0: nsys GPU-projection with nsys 2026.2.1
+The benchmark script (`bench_deepep_topk_nsys.py`) and worker (`mlpnode_nsys_worker.py`) are ready. Just need to validate that nsys 2026.2.1 captures CUDA kernel data on B30Z. Update the `nsys_bin` path in the bench script.
+
+### P1: Memory waterfall breakdown
+Add per-phase memory tracking (post-metadata, post-UpProj, post-DownProj, post-backward) to the worker script. Use `paddle.device.cuda.memory_allocated()` at each checkpoint (outside the timed region).
+
+### P2: Multi-card E2E with DeepEP
+Test with actual `deep_ep.Buffer.dispatch()` / `.combine()` instead of simulated single-card routing. This is the real production path.
+
+### P3: ERNIE training loop plug-in
+`SonicMoEMlpNode` interface matches ERNIE's MlpNode. Need to verify end-to-end in the ERNIE training loop (optimizer step, lr schedule, gradient accumulation).
