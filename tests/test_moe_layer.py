@@ -2,9 +2,9 @@
 Unit test for MoELayer single-card implementation,
 adapted from PaddleFleet's moe_layer.py.
 
-When both `fp8` and `using_sonic_moe` are enabled in config,
-uses supersonic-moe's _UpProjection / _DownProjection with FP8 context
-for forward and backward computation.
+Two test paths:
+  Path A — MoELayer using moe_general_routing_inputs (Paddle autograd, reliable baseline).
+  Path B — SonicMoEMlpNode E2E (production DeepEP topk path, main_grad accumulation).
 """
 import sys
 from dataclasses import dataclass
@@ -24,10 +24,19 @@ paddle.compat.enable_torch_proxy(
 from sonicmoe.enums import ActivationType
 from sonicmoe.functional import (
     moe_general_routing_inputs,
+    general_routing_router_metadata,
+    _UpProjection,
+    _DownProjection,
     clear_all_fp8_weight_caches,
     _refresh_fp8_config,
 )
 from sonicmoe.functional.utils import enable_fp8
+from sonicmoe.count_cumsum import count_cumsum
+from sonicmoe.ernie_compat.mlp_node_v2 import (
+    SonicMoEMlpNode,
+    invalidate_weight_caches,
+    flush_native_grads,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +139,22 @@ class Gate(paddle.nn.Layer):
             aux_loss,
             None,          # z_loss
         )
+
+
+# ---------------------------------------------------------------------------
+# Lightweight expert stubs for SonicMoEMlpNode (Path B)
+# ---------------------------------------------------------------------------
+class _FakeLinear:
+    """Minimal weight holder matching ERNIE per-expert interface."""
+    def __init__(self, weight):
+        self.weight = weight
+
+
+class _FakeExpert:
+    """Stub matching SonicMoEMlpNode's per-expert ``up_gate_proj`` / ``down_proj``."""
+    def __init__(self, up_gate_weight, down_weight):
+        self.up_gate_proj = _FakeLinear(up_gate_weight)   # [H, 2I]
+        self.down_proj = _FakeLinear(down_weight)          # [I, H]
 
 
 # ---------------------------------------------------------------------------
@@ -314,23 +339,22 @@ class MoELayer(paddle.nn.Layer):
         if hidden_states.ndim == 3:
             hidden_states = hidden_states.reshape([-1, hidden_states.shape[-1]])
 
-        # --- Gate (no_grad: SonicMoE handles grad internally) ---
-        with paddle.no_grad():
-            (
-                capacity,
-                topk_weights,
-                topk_indices,
-                gates_masked,
-                mask,
-                priorities,
-                aux_loss,
-                z_loss,
-            ) = self.gate(hidden_states)
+        # --- Gate (no no_grad: gate has its own autograd for router training) ---
+        (
+            capacity,
+            topk_weights,
+            topk_indices,
+            gates_masked,
+            mask,
+            priorities,
+            aux_loss,
+            z_loss,
+        ) = self.gate(hidden_states)
 
         # --- Expert computation (single-card) ---
         if self.moe_grouped_gemm:
             output = self._forward_single_card_grouped_gemm_moe(
-                hidden_states, mask, gates_masked
+                hidden_states, topk_indices, topk_weights
             )
         else:
             raise NotImplementedError
@@ -346,59 +370,72 @@ class MoELayer(paddle.nn.Layer):
     def _forward_single_card_grouped_gemm_moe(
         self,
         hidden_states: paddle.Tensor,
-        routing_map: paddle.Tensor,
-        probs: paddle.Tensor,
+        topk_indices: paddle.Tensor,
+        topk_scores: paddle.Tensor,
     ) -> paddle.Tensor:
         """
-        Single-card MoE forward with grouped GEMM.
+        Single-card MoE forward — PaddleFleet style direct .apply().
 
-        When using_sonic_moe is True, uses supersonic-moe's _UpProjection/_DownProjection.
-        FP8 is handled externally via the enable_fp8 context manager — the kernels
-        automatically use FP8 paths when FP8 is active.
+        topk_indices [T, K] int64 — expert indices from gate (no autograd)
+        topk_scores  [T, K] float32 — routing probs from gate (ON autograd graph,
+                     ds flows back to gate via _DownProjection.backward)
         """
-
-        def _convert_routing_map_and_probs(routing_map, probs, topk):
-            routing_map = routing_map.astype("bool")
-            masked_probs = probs * routing_map.astype("float32")
-            weights, indices = paddle.topk(masked_probs, k=topk, axis=-1)
-            return indices, weights
 
         if self.using_sonic_moe:
             T = hidden_states.shape[0]
             K = self.num_experts_per_tok
             E = self.num_experts_per_device
+            stream_id = 0
 
-            selected_indices, topk_scores = _convert_routing_map_and_probs(
-                routing_map, probs, self.num_experts_per_tok
+            # --- Routing metadata: only integer ops, no Paddle autograd nodes ---
+            tok_ids = paddle.arange(T, dtype="int32").unsqueeze(1).expand(
+                [T, K]).reshape([-1])
+            exp_ids = topk_indices.reshape([-1]).cast("int32")
+            scores_flat = topk_scores.reshape([-1])
+
+            (
+                _expert_frequency,
+                expert_frequency_offset,
+                x_gather_idx,
+                s_scatter_idx,
+                s_reverse_scatter_idx,
+                num_activated_expert_per_token_offset,
+            ) = general_routing_router_metadata(
+                scores_flat, tok_ids, exp_ids, T, E,
             )
+            s_scatter_idx.stop_gradient = True
 
-            # --- Pad inputs for 128-alignment (required by FP8 kernels) ---
-            x_padded, token_indices, expert_indices, router_scores = \
-                _prepare_sonic_inputs(
-                    hidden_states, selected_indices, topk_scores, E
-                )
-
-            # --- SonicMoE FP8 forward via moe_general_routing_inputs ---
+            # --- Direct .apply() (matching PaddleFleet single-card path) ---
             w1 = self.grouped_gemm_experts.weight1  # [2I, H, E]
             w2 = self.grouped_gemm_experts.weight2  # [H, I, E]
 
-            # moe_general_routing_inputs expects w1 as [2I, H, E], w2 as [H, I, E]
-            out, expert_freq = moe_general_routing_inputs(
-                x_padded,
-                router_scores,
-                token_indices,
-                expert_indices,
-                w1,
-                None,  # b1
-                w2,
-                None,  # b2
-                E,
-                0,     # stream_id
+            y1, z = _UpProjection.apply(
+                hidden_states, w1, None,           # x, w1, b1
+                expert_frequency_offset,
+                T * K, K, stream_id,
+                x_gather_idx, s_scatter_idx,
+                s_reverse_scatter_idx,
+                num_activated_expert_per_token_offset,
+                False,                             # is_varlen_K
                 ActivationType.SWIGLU,
+                False,                             # is_inference_mode_enabled
+                False,                             # use_low_precision_postact_buffer
             )
 
-            # Trim padding rows back to original T
-            return out[:T]
+            output = _DownProjection.apply(
+                y1, z, w2, None,                   # y1, z, w2, b2
+                topk_scores,                       # [T, K] — ds flows back to gate
+                s_scatter_idx,                     # selected_experts (positional)
+                expert_frequency_offset,
+                T, K, stream_id,
+                x_gather_idx, s_scatter_idx,
+                s_reverse_scatter_idx,
+                num_activated_expert_per_token_offset,
+                False,                             # is_varlen_K
+                ActivationType.SWIGLU,
+                None,                              # fp8_protocol
+            )
+            return output
         else:
             # Standard grouped GEMM path (non-SonicMoE)
             tokens_per_expert = routing_map.sum(axis=0)
@@ -434,19 +471,18 @@ class AddAuxiliaryLoss(paddle.autograd.PyLayer):
 
 
 # ---------------------------------------------------------------------------
-# Test entry point
+# Test entry point — Path A (MoELayer + moe_general_routing_inputs)
 # ---------------------------------------------------------------------------
 def test_moe_layer():
     config = MoETestConfig()
-    print(f"[TEST] Config: fp8={config.fp8}, using_sonic_moe={config.using_sonic_moe}")
+    print(f"[Path A] Config: fp8={config.fp8}, using_sonic_moe={config.using_sonic_moe}")
 
     moe_layer = MoELayer(config)
 
-    paddle.amp.decorate(moe_layer, level="O2", dtype="bfloat16", master_weight=True, master_grad=True)
-
-    # Note: Skip paddle.amp.decorate for SonicMoE FP8 path —
-    # FP8 kernels handle precision internally. AMP O2 cast nodes in
-    # the autograd graph can cause segfaults during backward.
+    # No paddle.amp.decorate — FP8 kernels handle precision internally.
+    # AMP O2 inserts CastGradNode that segfaults when FP8 backward frees
+    # tensor storage via resize_(0). Production PaddleFleet also does not
+    # apply AMP decorate to the MoE layer itself.
 
     batch_size = 2
     x = paddle.randn(
@@ -458,22 +494,130 @@ def test_moe_layer():
     clear_all_fp8_weight_caches()
     with enable_fp8(config.fp8):
         _refresh_fp8_config()
-        print("[TEST] pass 1 (cold cache, forward-only)...", flush=True)
+        print("[Path A] pass 1 (cold cache, forward-only)...", flush=True)
         out = moe_layer(x)
-        print(f"[TEST] pass 1 done, out.shape={out.shape}", flush=True)
+        print(f"[Path A] pass 1 done, out.shape={out.shape}", flush=True)
     out_grad = paddle.randn_like(out)
 
     # --- Pass 2: forward + backward (warm cache) ---
     with enable_fp8(config.fp8):
-        print("[TEST] pass 2 (warm cache, forward)...", flush=True)
+        print("[Path A] pass 2 (warm cache, forward)...", flush=True)
         out = moe_layer(x)
-        print(f"[TEST] pass 2 forward done, out.shape={out.shape}", flush=True)
-    print("[TEST] backward...", flush=True)
+        print(f"[Path A] pass 2 forward done, out.shape={out.shape}", flush=True)
+    print("[Path A] backward...", flush=True)
     out.backward(out_grad)
-    print("[TEST] backward done", flush=True)
+    print("[Path A] backward done", flush=True)
+
+    # --- Gradient verification ---
+    if x.grad is not None:
+        print(f"[Path A] x.grad norm = {x.grad.norm().item():.6f}", flush=True)
+    else:
+        print("[Path A] WARNING: x.grad is None!", flush=True)
+
     clear_all_fp8_weight_caches()
-    print("==== PASSED ====", flush=True)
+    print("==== Path A PASSED ====", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Test entry point — Path B (SonicMoEMlpNode E2E, production MlpNode)
+# ---------------------------------------------------------------------------
+def test_mlpnode_e2e():
+    config = MoETestConfig()
+    E = config.n_routed_experts
+    H = config.hidden_size
+    I = config.moe_intermediate_size
+    T = 2 * config.seq_len  # batch_size * seq_len
+    print(f"[Path B] E={E}, H={H}, I={I}, T={T}", flush=True)
+
+    # 1. Create per-expert parameters (ERNIE layout: w1 [H, 2I], w2 [I, H])
+    init = paddle.nn.initializer.Uniform(-0.001, 0.001)
+    experts = []
+    expert_params = []          # keep references for AMP decorate
+    for e_idx in range(E):
+        w1 = paddle.create_parameter(
+            shape=[H, 2 * I], dtype="bfloat16", default_initializer=init,
+        )
+        w2 = paddle.create_parameter(
+            shape=[I, H], dtype="bfloat16", default_initializer=init,
+        )
+        expert_params.extend([w1, w2])
+        experts.append(_FakeExpert(w1, w2))
+
+    mlp_node = SonicMoEMlpNode(
+        experts=experts,
+        n_experts=E,
+        hidden_size=H,
+        intermediate_size=I,
+        activation_type=ActivationType.SWIGLU,
+    )
+
+    # 2. Create input
+    x = paddle.randn([T, H], dtype="bfloat16")
+    x.stop_gradient = False
+
+    # 3. Generate routing (gate under no_grad — we only test the MLP here)
+    gate = Gate(config)
+    with paddle.no_grad():
+        _, topk_weights, topk_indices, _, _, _, _, _ = gate(x)
+
+    dispatched_indices = topk_indices.cast("int32")
+    dispatched_probs = topk_weights.cast("float32")
+    flat_idx = dispatched_indices.reshape([-1])
+    tokens_per_expert = paddle.bincount(
+        flat_idx.cast("int64"), minlength=E,
+    ).tolist()
+
+    # 4. Warm-up pass (cold FP8 cache)
+    invalidate_weight_caches()
+    clear_all_fp8_weight_caches()
+    with enable_fp8(config.fp8):
+        _refresh_fp8_config()
+        print("[Path B] warm-up (cold cache, forward-only)...", flush=True)
+        out = mlp_node(x, tokens_per_expert, dispatched_indices, dispatched_probs)
+        print(f"[Path B] warm-up done, out.shape={out.shape}", flush=True)
+
+    # 5. Forward + backward (warm cache)
+    # Clear x.grad from warm-up (if any)
+    x.clear_gradient()
+
+    with enable_fp8(config.fp8):
+        _refresh_fp8_config()
+        print("[Path B] forward (warm cache)...", flush=True)
+        out = mlp_node(x, tokens_per_expert, dispatched_indices, dispatched_probs)
+        print(f"[Path B] forward done, out.shape={out.shape}", flush=True)
+
+    out_grad = paddle.randn_like(out)
+    print("[Path B] backward...", flush=True)
+    out.backward(out_grad)
+    print("[Path B] backward done", flush=True)
+
+    # 6. Flush native-layout grad accumulators → per-expert main_grad
+    flush_native_grads()
+
+    # 7. Verify gradients
+    # dx — must be non-None and non-zero (autograd chain intact, no detach)
+    assert x.grad is not None, "[Path B] FAIL: x.grad is None — autograd chain broken!"
+    dx_norm = x.grad.norm().item()
+    assert dx_norm > 0, "[Path B] FAIL: x.grad is zero — gradient vanished!"
+    print(f"[Path B] dx norm = {dx_norm:.6f}", flush=True)
+
+    # dw — per-expert main_grad via native accumulators
+    n_nonzero = 0
+    for e_idx, exp in enumerate(experts):
+        mg1 = getattr(exp.up_gate_proj.weight, 'main_grad', None)
+        mg2 = getattr(exp.down_proj.weight, 'main_grad', None)
+        if mg1 is not None and mg1.norm().item() > 0:
+            n_nonzero += 1
+        if mg2 is not None and mg2.norm().item() > 0:
+            n_nonzero += 1
+    print(f"[Path B] {n_nonzero}/{2*E} expert weight grads non-zero via main_grad", flush=True)
+    assert n_nonzero > 0, "[Path B] FAIL: no main_grad accumulated!"
+
+    invalidate_weight_caches()
+    clear_all_fp8_weight_caches()
+    print("==== Path B (SonicMoEMlpNode E2E) PASSED ====", flush=True)
 
 
 if __name__ == "__main__":
-    test_moe_layer()
+    test_moe_layer()          # Path A: MoELayer + moe_general_routing_inputs
+    test_mlpnode_e2e()         # Path B: SonicMoEMlpNode (production MlpNode)
