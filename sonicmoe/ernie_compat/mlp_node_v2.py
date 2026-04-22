@@ -5,23 +5,23 @@ Contains:
     ``invalidate_weight_caches``
   - Native-layout grad accumulation: ``_accumulate_w1``, ``_accumulate_w2``,
     ``flush_native_grads``
-  - ``SonicMoEFunc``: ERNIE-core style PyLayer (argsort-based, legacy path)
-  - ``SonicMoEMlpNode``: drop-in MlpNode replacement using DeepEP zero-sync
+  - ``SonicMoEFunc``: ERNIE-core style PyLayer (argsort-based, legacy test path)
+  - ``SonicMoEMlpNode``: drop-in MlpNode replacement using DeepEP topk
     metadata (the production path)
 
 ``SonicMoEMlpNode`` packages unzip + FP8 FFN + zip into a single callable,
-using the DeepEP zero-sync metadata path to eliminate argsort overhead.
+using the DeepEP topk metadata path to eliminate argsort overhead.
 
 Drop-in replacement for ERNIE's MlpNode:
-    ``forward(dispatched_hidden_states, tokens_per_expert) → expert_output``
+    ``forward(dispatched_hidden_states, tokens_per_expert,
+              dispatched_indices, dispatched_probs) → expert_output``
 
-Performance notes (zero migration overhead via route-level padding):
-  - x is NOT padded — padding is handled at the routing metadata level
-    (gather indices for pad rows point to row 0, score=0 nullifies contribution).
-    This matches the frontier's ``_pad_routing_metadata`` design exactly.
-  - No grad padding needed in backward (output is T-sized, not T+pad).
-  - Metadata caching: when tokens_per_expert hasn't changed, metadata is reused.
-  - Native-layout grad accumulation: single add_() per weight, no transpose.
+Gradient contract (matching ERNIE FusionMoePyLayer):
+  - dx flows back to the caller via Paddle autograd (required by
+    FusedDispatch.backward for the reverse A2A communication).
+  - dw1/dw2 are accumulated into per-expert ``main_grad`` buffers via
+    native-layout accumulators; they do NOT flow through autograd.
+  - ds (d/d(score)) flows back to the caller via autograd.
 """
 
 from __future__ import annotations
@@ -33,7 +33,6 @@ import torch
 
 from sonicmoe.enums import ActivationType
 from sonicmoe.ernie_compat.deepep_metadata import (
-    deepep_to_sonic_metadata,
     deepep_topk_to_sonic_metadata,
     invalidate_topk_cache,
 )
@@ -438,14 +437,18 @@ class SonicMoEFunc(paddle.autograd.PyLayer):
 # ── SonicMoEMlpNode (production path using DeepEP metadata) ──────────────────
 
 class SonicMoEMlpNode:
-    """Drop-in replacement for ERNIE's MlpNode.
+    """Drop-in replacement for ERNIE's MlpNode (topk DeepEP dispatch path).
 
     Packages unzip + FP8 FFN + zip into a single callable.
-    Uses DeepEP's pre-sorted token layout for zero-sync metadata conversion.
+    Uses DeepEP's topk dispatch metadata for zero-sync metadata conversion.
+
+    Gradient contract:
+      - dx flows back through Paddle autograd to the caller (no detach).
+      - dw1/dw2 accumulate into per-expert main_grad via native-layout buffers.
+      - ds (d/d(score)) flows back through Paddle autograd.
 
     Performance optimizations (zero migration overhead):
       - Route-level padding: x is passed directly (no padding, no cat, no copy).
-      - Metadata caching: reuses metadata when tokens_per_expert is unchanged.
       - Native-layout grad accumulation (1 add_ kernel per weight, no transpose).
 
     Parameters
@@ -481,10 +484,6 @@ class SonicMoEMlpNode:
         self._activation_type = activation_type
         self._stream_id = stream_id
 
-        # ── Metadata cache (reuse when tokens_per_expert unchanged) ────────
-        self._cached_tpe: list[int] | None = None
-        self._cached_metadata: tuple | None = None
-
     def forward(
         self,
         dispatched_hidden_states: torch.Tensor,
@@ -496,21 +495,19 @@ class SonicMoEMlpNode:
 
         Parameters
         ----------
-        dispatched_hidden_states : Tensor [T, H] bf16
-            Already sorted by expert from DeepEP dispatch (identity layout),
-            OR raw received tokens (topk layout when dispatched_indices given).
+        dispatched_hidden_states : Tensor [N_recv, H] bf16
+            Received tokens from DeepEP dispatch (topk layout).
         tokens_per_expert : list[int] or Tensor [E]
             Per-expert token counts from DeepEP ``buffer.dispatch()``.
-        dispatched_indices : Tensor [N_recv, topk] int32, optional
+        dispatched_indices : Tensor [N_recv, topk] int32
             Local expert indices from DeepEP dispatch. -1 = masked.
-            When provided, uses topk metadata conversion path.
-        dispatched_probs : Tensor [N_recv, topk] float32, optional
-            Routing probabilities. Required when dispatched_indices is given.
+        dispatched_probs : Tensor [N_recv, topk] float32
+            Routing probabilities from DeepEP dispatch.
 
         Returns
         -------
-        Tensor [T, H] bf16
-            Expert output, same ordering as input.
+        Tensor [N_recv, H] bf16
+            Expert output, same token ordering as input.
         """
         x = dispatched_hidden_states
         T = x.shape[0]
@@ -518,73 +515,32 @@ class SonicMoEMlpNode:
         H = self._H
         I = self._I
 
-        # Determine path: topk (real dispatch) vs identity (pre-sorted)
-        use_topk = dispatched_indices is not None
-
-        if use_topk:
-            assert dispatched_probs is not None, (
-                "dispatched_probs required when dispatched_indices is given"
-            )
-            # Topk path: real DeepEP dispatch with multi-expert routing
-            (
-                expert_frequency_offset,
-                x_gather_idx,
-                s_scatter_idx,
-                s_reverse_scatter_idx,
-                num_activated_expert_per_token_offset,
-                router_scores,
-                TK_padded,
-                total_pad_rows,
-                N_recv,
-            ) = deepep_topk_to_sonic_metadata(
-                dispatched_indices, dispatched_probs,
-                tokens_per_expert, E, device=x.device,
-            )
-            # T_down = N_recv for the topk path: _router_forward outputs [N_recv, H]
-            T_down = N_recv
-        else:
-            # Identity layout path: tokens already sorted by expert (K=1)
-            tpe_list = (
-                tokens_per_expert.tolist()
-                if isinstance(tokens_per_expert, torch.Tensor)
-                else list(tokens_per_expert)
-            )
-            if tpe_list == self._cached_tpe and self._cached_metadata is not None:
-                (
-                    expert_frequency_offset,
-                    x_gather_idx,
-                    s_scatter_idx,
-                    s_reverse_scatter_idx,
-                    num_activated_expert_per_token_offset,
-                    router_scores,
-                    TK_padded,
-                    total_pad_rows,
-                ) = self._cached_metadata
-            else:
-                (
-                    expert_frequency_offset,
-                    x_gather_idx,
-                    s_scatter_idx,
-                    s_reverse_scatter_idx,
-                    num_activated_expert_per_token_offset,
-                    router_scores,
-                    TK_padded,
-                    total_pad_rows,
-                ) = deepep_to_sonic_metadata(tpe_list, T, E, device=x.device)
-                self._cached_tpe = tpe_list
-                self._cached_metadata = (
-                    expert_frequency_offset,
-                    x_gather_idx,
-                    s_scatter_idx,
-                    s_reverse_scatter_idx,
-                    num_activated_expert_per_token_offset,
-                    router_scores,
-                    TK_padded,
-                    total_pad_rows,
-                )
-            # Identity layout: T_down = TK_padded, output sliced to [T_orig, H]
-            T_down = TK_padded
-            N_recv = T
+        # Topk path: real DeepEP dispatch with multi-expert routing.
+        # Identity layout (K=1, pre-sorted) was removed — it had an
+        # unfixable dx bug due to expert-sorted ↔ token-order mismatch
+        # when total_pad_rows > 0.  All production callers use topk.
+        assert dispatched_indices is not None, (
+            "dispatched_indices is required (identity layout path removed)"
+        )
+        assert dispatched_probs is not None, (
+            "dispatched_probs required when dispatched_indices is given"
+        )
+        (
+            expert_frequency_offset,
+            x_gather_idx,
+            s_scatter_idx,
+            s_reverse_scatter_idx,
+            num_activated_expert_per_token_offset,
+            router_scores,
+            TK_padded,
+            total_pad_rows,
+            N_recv,
+        ) = deepep_topk_to_sonic_metadata(
+            dispatched_indices, dispatched_probs,
+            tokens_per_expert, E, device=x.device,
+        )
+        # T_down = N_recv for the topk path: _router_forward outputs [N_recv, H]
+        T_down = N_recv
 
         # 2. NO x-padding needed — route-level padding handles alignment.
         #    Padding rows in x_gather_idx point to row 0 with score=0.
@@ -593,13 +549,16 @@ class SonicMoEMlpNode:
         w1 = stack_ernie_w1(self._experts, H, I)
         w2 = stack_ernie_w2(self._experts)
 
-        # 4. Prepare tensor inputs for PyLayer
-        x = x.detach()
+        # 4. Prepare tensor inputs for PyLayer.
+        #    x passes through WITHOUT detach — dx must flow back to the caller
+        #    so that FusedDispatch.backward can do the reverse A2A with it.
+        #    router_scores is freshly constructed by deepep_topk_to_sonic_metadata
+        #    (not on any external autograd graph), so detach is unnecessary.
         x.stop_gradient = False
-        router_scores = router_scores.detach()
         router_scores.stop_gradient = False
 
-        # Non-differentiable inputs
+        # Non-differentiable inputs (integer metadata + stacked weights whose
+        # grads go through main_grad, not autograd)
         x_gather_idx.stop_gradient = True
         s_scatter_idx.stop_gradient = True
         w1.stop_gradient = True
@@ -619,7 +578,6 @@ class SonicMoEMlpNode:
             E, N_recv, T_down, TK_padded,
             self._activation_type,
             self._stream_id,
-            use_topk,
         )
 
         return output
@@ -637,48 +595,37 @@ class SonicMoEMlpNode:
         )
 
 
-# ── Internal PyLayer using pre-computed DeepEP metadata ─────────────────────
-
-# ── Grad-padding buffer (module-level, reused across iters) ────────────────
-# In the DeepEP identity layout, _DownProjection uses T=TK_padded so its output
-# is [TK_padded, H]. We slice to [T_orig, H] in forward, which means backward
-# receives [T_orig, H] grad that must be re-padded to [TK_padded, H].
-# Pre-allocated buffer eliminates per-iter torch.cat.
-_GRAD_PAD_BUF: torch.Tensor | None = None
-_GRAD_PAD_BUF_ROWS: int = 0
+# ── Internal PyLayer (topk DeepEP metadata, production path) ─────────────────
 
 
 class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
-    """PyLayer that takes pre-computed DeepEP metadata (skips argsort entirely).
+    """PyLayer for the topk DeepEP dispatch path (production path).
 
     Uses route-level padding (frontier design): x is NOT padded. Padding rows
     gather from row 0 with score=0, contributing nothing to output or grads.
 
-    In the DeepEP identity layout, TK_padded positions map 1:1 to "virtual tokens"
-    (each assigned to 1 expert), so _DownProjection uses T=TK_padded to allocate
-    its output, then we slice out[:T_orig] to return only real tokens.
+    T_down = N_recv: _DownProjection outputs [N_recv, H] directly, no slicing.
     """
 
     @staticmethod
     def forward(
         ctx,
         hidden_states: torch.Tensor,       # [T, H] bf16  (grad)
-        router_scores: torch.Tensor,        # [TK] float32 (topk) or [TK_padded] (identity)
+        router_scores: torch.Tensor,        # [TK_padded] float32
         expert_frequency_offset: torch.Tensor,  # [E+1] int32
         x_gather_idx: torch.Tensor,         # [TK_padded] int32
         s_scatter_idx: torch.Tensor,        # [TK_padded] int32
-        s_reverse_scatter_idx: torch.Tensor, # [TK] int32 (topk) or [TK_padded] (identity)
-        num_activated_expert_per_token_offset: torch.Tensor,  # [N_recv+1] or [TK_padded+1]
+        s_reverse_scatter_idx: torch.Tensor, # [TK] int32
+        num_activated_expert_per_token_offset: torch.Tensor,  # [N_recv+1]
         w1: torch.Tensor,                   # [2I, H, E] bf16
         w2: torch.Tensor,                   # [H, I, E] bf16
         experts: Sequence[Any] = None,
         n_experts: int = 0,
-        T_orig: int = 0,
+        N_recv: int = 0,
         T_down: int = 0,
         TK_padded: int = 0,
         activation_type: ActivationType = ActivationType.SWIGLU,
         stream_id: int = 0,
-        use_topk: bool = False,
     ) -> torch.Tensor:
         _refresh_fp8_config()
 
@@ -698,9 +645,7 @@ class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
             )
 
         # ── DownProjection forward (via FakeCtx) ─────────────────────────
-        # For topk path: T_down = N_recv, output is [N_recv, H] directly.
-        # For identity path: T_down = TK_padded, output is [TK_padded, H],
-        #   sliced to [T_orig, H].
+        # Topk path: T_down = N_recv, output is [N_recv, H] directly.
         down_ctx = _FakeCtx()
         with enable_fp8(True):
             out = _DownProjection.forward(
@@ -720,44 +665,13 @@ class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
         ctx._down_ctx = down_ctx
         ctx._experts = experts
         ctx._I = w1.shape[0] // 2
-        ctx._T_orig = T_orig
-        ctx._use_topk = use_topk
 
-        if use_topk:
-            # Topk path: output is already [N_recv, H], no slicing needed
-            return out
-        else:
-            # Identity path: _DownProjection output is [TK_padded, H] with
-            # interleaved padding zeros (each expert block: real rows + pad rows).
-            # Compact back to [T_orig, H] by selecting positions where score > 0.
-            return out[router_scores > 0]
+        return out
 
     @staticmethod
     def backward(ctx, output_grad: torch.Tensor):
-        global _GRAD_PAD_BUF, _GRAD_PAD_BUF_ROWS
-
         up_ctx = ctx._up_ctx
         down_ctx = ctx._down_ctx
-        T_orig = ctx._T_orig
-        use_topk = ctx._use_topk
-
-        # _DownProjection.backward needs output_grad matching its T dimension.
-        T_padded = down_ctx.T if hasattr(down_ctx, 'T') else output_grad.shape[0]
-
-        if not use_topk and T_padded > T_orig:
-            # Identity path: pad grad from [T_orig, H] back to [TK_padded, H]
-            H = output_grad.shape[1]
-            if _GRAD_PAD_BUF is None or _GRAD_PAD_BUF_ROWS < T_padded:
-                _GRAD_PAD_BUF = torch.zeros(
-                    T_padded, H, dtype=output_grad.dtype, device=output_grad.device
-                )
-                _GRAD_PAD_BUF_ROWS = T_padded
-            grad_padded = _GRAD_PAD_BUF[:T_padded]
-            grad_padded[:T_orig].copy_(output_grad)
-            grad_padded[T_orig:].zero_()
-            output_grad = grad_padded
-        # Topk path: output_grad is [N_recv, H] which matches T_down = N_recv,
-        # so no padding is needed.
 
         # ── DownProjection backward ──────────────────────────────────────
         I = ctx._I

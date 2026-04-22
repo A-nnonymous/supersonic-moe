@@ -1,9 +1,102 @@
 # SonicMoE FP8 Frontier — Handoff
 
 > **Branch:** `paddle_compat`
-> **Date:** 2026-04-20 (Session 58)
+> **Date:** 2026-04-22 (Session 59)
 > **Upstream:** `native-fp8-exploration` + PR #1 "adapt paddle" merged
-> **Status:** Clean frontier. All tests pass. Multi-stream sync eliminated. Ready for ERNIE integration.
+> **Status:** Production-ready MlpNode. Gradient chain fixed. Identity path removed. Topk precision verified.
+
+---
+
+## Session 59 — Production consolidation of SonicMoEMlpNode
+
+### Critical fix: gradient chain restored (P0)
+
+`SonicMoEMlpNode.forward()` previously called `x.detach()` before passing
+`dispatched_hidden_states` into the inner PyLayer. This **severed the autograd
+link** between the MLP and `FusedDispatch.backward`, meaning dx could never
+flow through the reverse A2A back to the original token owners.
+
+In ERNIE's training loop the backward chain is:
+
+```
+FusedCombine.backward → FusionMoePyLayer.backward (= MlpNode.backward)
+                       → FusedDispatch.backward (reverse A2A with dx)
+```
+
+With `detach()`, `FusedDispatch.backward` received **zero dx**, silently
+dropping hidden-layer gradients for all tokens processed by this MoE layer.
+
+**Fix:** removed `x.detach()` and `router_scores.detach()`.  x now passes
+through the PyLayer normally; dx flows back to the caller via Paddle autograd.
+
+### Identity layout path removed
+
+The identity layout path (`dispatched_indices=None`, K=1 pre-sorted tokens)
+had an **unfixable dx bug**: when `total_pad_rows > 0` (i.e. any expert's
+token count is not a multiple of 128), `_UpProjection.backward` produced
+`dx_reduced` indexed by expert-sorted position rather than original token
+order.  For T=256, E=4, this meant 75% of tokens received zero or wrong dx.
+
+The bug was masked by `x.detach()` — since dx was never propagated, no test
+observed the corruption.  Fixing detach without fixing identity-path dx would
+have silently corrupted training.
+
+Since all production callers use the topk dispatch path (with
+`dispatched_indices` and `dispatched_probs`), the identity path was removed
+entirely rather than undertaking a complex metadata redesign.
+
+`dispatched_indices` and `dispatched_probs` are now **required** arguments.
+
+### Other cleanup
+
+- Removed global `_GRAD_PAD_BUF` / `_GRAD_PAD_BUF_ROWS` (identity-path-only
+  mutable module-level state; multi-layer sharing was unsafe under async exec).
+- Removed `_cached_tpe` / `_cached_metadata` (identity-path metadata cache).
+- Removed unused `deepep_to_sonic_metadata` import.
+- Removed `use_topk` parameter and all conditional branches in
+  `_SonicMoEDeepEPFunc`.
+- Updated docstrings with explicit gradient contract matching ERNIE's
+  `FusionMoePyLayer`: dx/ds via autograd, dw via `main_grad`.
+
+### Test updates
+
+- `test_mlpnode_precision.py`: fixed `flush_native_grads()` / `_zero_main_grads()`
+  call order (was flush-after-zero → 5× warmup grads leaked into main_grad,
+  inflating norm 6×).  Fixed Paddle 3.x `from_dlpack` compat (`.detach()`).
+  Removed identity-path test cases.  rrmse assert restored.
+- `bench_mlpnode_topk_nsys.py`: new nsys GPU-projection benchmark for topk path.
+- `test_mlpnode_audit.py`: needs adaptation to topk interface (not yet updated).
+
+### Files changed
+
+| File | Change |
+|------|--------|
+| `sonicmoe/ernie_compat/mlp_node_v2.py` | -154/+68 lines: detach removed, identity path removed, gradient contract documented |
+| `tests/ops/test_mlpnode_precision.py` | flush order fix, dlpack compat, identity tests removed |
+| `tests/ops/bench_mlpnode_topk_nsys.py` | new: nsys GPU-projection benchmark for topk path |
+
+### Lessons learned
+
+64. **`detach()` before PyLayer severs the autograd chain.** In ERNIE's
+    dispatch→MLP→combine pipeline, dx must flow from MLP backward through
+    `FusedDispatch.backward` for the reverse A2A.  `detach()` silently drops
+    this gradient.  The correct pattern (matching ERNIE `MlpNode`) is to run
+    the MLP under `@no_grad()` internally but let the outer PyLayer handle
+    autograd linkage.
+
+65. **Identity layout metadata is incompatible with route-level padding backward.**
+    `deepep_to_sonic_metadata` builds `s_reverse_scatter_idx = arange(TK_padded)`
+    and `naept = arange(TK_padded+1)`, creating a 1:1 mapping between positions
+    and "virtual tokens".  But `_UpProjection` saves `ctx.T = T_orig` (the real
+    token count), so `_token_broadcast_backward` reads `dx_expanded[0..T_orig-1]`
+    — which crosses expert-segment boundaries and includes pad rows.  This is
+    architectural: fixing it requires redesigning the metadata for T_orig-sized
+    scatter, which defeats the purpose of the simple identity layout.
+
+66. **Test warm-up flush order matters.** `flush_native_grads()` must precede
+    `_zero_main_grads()`, not follow it.  Otherwise the native buffer (accumulated
+    during warmup) gets flushed into the freshly-zeroed `main_grad`, leaking N
+    warmup iterations of gradients into the measurement.
 
 ---
 
