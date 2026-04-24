@@ -44,7 +44,7 @@ _SF_TILE_STORAGE = _SF_TILE_M * (_SF_TILE_K // _SF_VEC_SIZE)  # 512
 @triton.jit
 def _swiglu_fwd_kernel(
     Z_ptr, Y1_ptr,
-    TK: tl.constexpr, I: tl.constexpr,
+    I: tl.constexpr,
     stride_z_row: tl.constexpr, stride_y_row: tl.constexpr,
     BLOCK_I: tl.constexpr,
 ):
@@ -78,7 +78,7 @@ def swiglu_forward_triton(z: torch.Tensor) -> torch.Tensor:
 
     _swiglu_fwd_kernel[(TK,)](
         z, y1,
-        TK, I,
+        I,
         z.stride(0), y1.stride(0),
         BLOCK_I=BLOCK_I,
     )
@@ -93,7 +93,7 @@ def swiglu_forward_triton(z: torch.Tensor) -> torch.Tensor:
 @triton.jit
 def _swiglu_fwd_quant_kernel(
     Z_ptr, Y1_FP8_ptr, SCALE_ptr,
-    TK: tl.constexpr, I: tl.constexpr,
+    I: tl.constexpr,
     stride_z_row: tl.constexpr,
     stride_y_row: tl.constexpr,
     stride_scale_row: tl.constexpr,
@@ -161,7 +161,7 @@ def swiglu_forward_quant_triton(
 
     _swiglu_fwd_quant_kernel[(TK,)](
         z, y1_fp8, scales,
-        TK, I,
+        I,
         z.stride(0), y1_fp8.stride(0), scales.stride(0),
         fp8_max=float(torch.finfo(torch.float8_e4m3fn).max),
         GROUP_SIZE=32,
@@ -479,7 +479,7 @@ def swiglu_forward_quant_pack_zsave_triton(
 def _swiglu_bwd_kernel(
     DY1_ptr, Z_ptr, S_ptr,
     DZ_ptr, Y1S_ptr, DS_ptr,
-    TK: tl.constexpr, I: tl.constexpr,
+    I: tl.constexpr,
     stride_dy_row: tl.constexpr,
     stride_z_row: tl.constexpr,
     stride_dz_row: tl.constexpr,
@@ -565,7 +565,7 @@ def swiglu_backward_triton(
     _swiglu_bwd_kernel[(TK,)](
         dy1, z, s,
         dz, y1s, ds,
-        TK, I,
+        I,
         dy1.stride(0), z.stride(0), dz.stride(0), y1s.stride(0),
         BLOCK_I=BLOCK_I,
     )
@@ -582,7 +582,7 @@ def swiglu_backward_triton(
 def _swiglu_bwd_from_fp8_kernel(
     DY1_ptr, Z_FP8_ptr, Z_SCALE_ptr, S_ptr,
     DZ_ptr, Y1S_ptr, DS_ptr,
-    TK: tl.constexpr, I: tl.constexpr,
+    I: tl.constexpr,
     stride_dy_row: tl.constexpr,
     stride_zfp8_row: tl.constexpr,
     stride_zscale_row: tl.constexpr,
@@ -692,7 +692,7 @@ def swiglu_backward_from_fp8_triton(
     _swiglu_bwd_from_fp8_kernel[(TK,)](
         dy1, z_fp8, z_scales_u8, s,
         dz, y1s, ds,
-        TK, I,
+        I,
         dy1.stride(0),
         z_fp8.stride(0),
         z_scales_u8.stride(0),
@@ -713,7 +713,7 @@ def swiglu_backward_from_fp8_triton(
 def _swiglu_bwd_quant_kernel(
     DY1_ptr, Z_ptr, S_ptr,
     DZ_FP8_ptr, DZ_SCALE_ptr, Y1S_ptr, DS_ptr,
-    TK: tl.constexpr, I: tl.constexpr,
+    I: tl.constexpr,
     stride_dy_row: tl.constexpr,
     stride_z_row: tl.constexpr,
     stride_dz_row: tl.constexpr,
@@ -824,7 +824,7 @@ def swiglu_backward_quant_triton(
     _swiglu_bwd_quant_kernel[(TK,)](
         dy1, z, s,
         dz_fp8, dz_scales, y1s, ds,
-        TK, I,
+        I,
         dy1.stride(0), z.stride(0), dz_fp8.stride(0),
         dz_scales.stride(0), y1s.stride(0),
         fp8_max=float(torch.finfo(torch.float8_e4m3fn).max),

@@ -476,6 +476,20 @@ class SonicMoEMlpNode:
         self._activation_type = activation_type
         self._stream_id = stream_id
 
+    def warmup(self, total_K_list: list[int] | None = None, max_workers: int = 0):
+        """Pre-compile all JIT kernels. Call once after model construction.
+
+        After compile_key dynamic-dim fix, a single warmup covers all seqlens.
+        """
+        from sonicmoe.jit_warmup import warmup_jit
+        warmup_jit(
+            self._E, self._H, self._I,
+            device="cuda",
+            fp8=True,
+            total_K_list=total_K_list,
+            max_workers=max_workers,
+        )
+
     def forward(
         self,
         dispatched_hidden_states: torch.Tensor,

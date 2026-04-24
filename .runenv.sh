@@ -5,6 +5,9 @@ export SONIC_MOE_FP8_MODE=perf
 export USE_QUACK_GEMM=1
 export SONIC_MOE_FP8_ASSUME_ALIGNED=1
 export QUACK_CACHE_DIR=/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe/my_quack_cache
+export SONIC_MOE_CACHE_DIR=/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe/.jit_cache
+export TRITON_CACHE_AUTOTUNING=1
+export SONIC_MOE_JIT_VERBOSE=1
 unset PADDLE_ELASTIC_JOB_ID
 unset PADDLE_TRAINER_ENDPOINTS
 unset DISTRIBUTED_TRAINER_ENDPOINTS

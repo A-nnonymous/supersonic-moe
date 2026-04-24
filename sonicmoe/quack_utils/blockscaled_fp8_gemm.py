@@ -109,7 +109,8 @@ _WEIGHT_CACHE: dict[
     tuple[int, tuple[int, ...], tuple[int, ...], int | None, int, str, str, str, str],
     tuple[torch.Tensor, torch.Tensor],
 ] = {}
-_COMPILE_CACHE: dict[tuple[object, ...], object] = {}
+from sonicmoe.cache_manager import InstrumentedCompileCache as _ICC
+_COMPILE_CACHE = _ICC("bfp8_grouped")
 _PAD_PLAN_CACHE: dict = {}       # content-key -> plan
 # Fast-path cache: skip validation/tensor-info/compile-key on steady-state calls.
 # Maps (total_M, K, H, E, out_dtype, w_shape, w_stride, a_sc_cols, w_sc_shape, dev)
@@ -2009,7 +2010,7 @@ def dual_quantize_varlen(
 # varlen_k blockscaled FP8 GEMM for weight gradients
 # ---------------------------------------------------------------------------
 
-_COMPILE_CACHE_VK: dict = {}
+_COMPILE_CACHE_VK = _ICC("bfp8_vk")
 _GEMM_FAST_PATH_VK: dict = {}
 
 
@@ -2122,13 +2123,16 @@ def _run_cutlass_blockscaled_gemm_varlen_k(
     a_scale_cute = _make_cute_tensor_dynamic(a_scales, leading_dim=1)
     b_scale_cute = _make_cute_tensor_dynamic(b_scales, leading_dim=1)
 
+    # compile_key must NOT contain dynamic token dimensions (total_K,
+    # a_scales.size(1), b_scales.size(1)) — those are handled at runtime
+    # via mark_layout_dynamic / CuTe sym_int64 symbols.  Including them
+    # would trigger a CuTe recompile every time seqlen changes.
     compile_key = (
         "vk",
         tensor_infos["A"].dtype, tensor_infos["B"].dtype,
         tensor_infos["D"].dtype,
         tile_shape_mn, cluster_shape_mnk,
-        M, N, total_K,
-        a_scales.size(1), b_scales.size(1),
+        M, N,
         tensor_infos["A"].major, tensor_infos["B"].major,
         tensor_infos["D"].major,
         config.pingpong, _SF_VEC_SIZE,
@@ -2162,7 +2166,7 @@ def _run_cutlass_blockscaled_gemm_varlen_k(
 
 # ── Fused wgrad GEMM + fp32 accumulation (zero extra kernels) ─────────────────
 
-_COMPILE_CACHE_VK_ACCUM: dict = {}
+_COMPILE_CACHE_VK_ACCUM = _ICC("bfp8_vk_accum")
 _GEMM_FAST_PATH_VK_ACCUM: dict = {}
 
 
@@ -2276,13 +2280,13 @@ def _run_cutlass_blockscaled_gemm_varlen_k_accumulate(
     a_scale_cute = _make_cute_tensor_dynamic(a_scales, leading_dim=1)
     b_scale_cute = _make_cute_tensor_dynamic(b_scales, leading_dim=1)
 
+    # compile_key must NOT contain dynamic token dimensions — see "vk" above.
     compile_key = (
         "vk_accum",
         tensor_infos["A"].dtype, tensor_infos["B"].dtype,
         tensor_infos["D"].dtype,
         tile_shape_mn, cluster_shape_mnk,
-        M, N, total_K,
-        a_scales.size(1), b_scales.size(1),
+        M, N,
         tensor_infos["A"].major, tensor_infos["B"].major,
         tensor_infos["D"].major,
         config.pingpong, _SF_VEC_SIZE,
