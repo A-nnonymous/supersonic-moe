@@ -2350,6 +2350,162 @@ def _run_cutlass_blockscaled_gemm_varlen_k_accumulate(
     )
 
 
+# ── TMA Reduce-Add wgrad GEMM (hardware atomic add, ~50 regs) ────────────────
+
+_COMPILE_CACHE_VK_TMA_ADD = _ICC("varlen_k_tma_add")
+_GEMM_FAST_PATH_VK_TMA_ADD: dict = {}
+
+
+def _run_cutlass_blockscaled_gemm_varlen_k_tma_add(
+    a_fp8: torch.Tensor,
+    a_scales: torch.Tensor,
+    b_fp8: torch.Tensor,
+    b_scales: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    M: int,
+    N: int,
+    total_K: int,
+    num_experts: int,
+    device: torch.device,
+    accumulator: torch.Tensor,
+) -> None:
+    """CUTLASS blockscaled FP8 GEMM with TMA reduce-add accumulation.
+
+    Computes: accumulator += A @ B (per-expert varlen_k GEMM)
+
+    Uses TMA hardware reduce-add (add_to_output=True) instead of the CUTLASS
+    epilogue `D = A@B + 1.0*C`.  This avoids loading C via TMA, eliminating
+    the epilogue register overhead (86 -> ~50 regs/thread) and the extra
+    smem staging (epi_c_stage=2 -> 0).
+
+    accumulator must be a contiguous fp32 tensor of shape (num_experts, M, N).
+    """
+    assert accumulator.dtype == torch.float32
+    assert accumulator.shape == (num_experts, M, N)
+    assert accumulator.is_contiguous()
+
+    a_logical = a_fp8.T
+    b_logical = b_fp8.T
+
+    fast_key = (
+        "vk_tma_add", M, N, total_K, num_experts,
+        a_fp8.shape[0], a_fp8.shape[1],
+        b_fp8.shape[0], b_fp8.shape[1],
+        a_scales.size(1), b_scales.size(1),
+        device.index if device.index is not None else -1,
+    )
+    cached = _GEMM_FAST_PATH_VK_TMA_ADD.get(fast_key)
+    if cached is not None:
+        compiled, scheduler_args, epi_args = cached
+        d_permuted = accumulator.permute(1, 2, 0)
+        a_cute = _make_cute_tensor_dynamic(a_logical, leading_dim=0)
+        b_cute = _make_cute_tensor_dynamic(b_logical, leading_dim=0)
+        d_cute = _make_cute_tensor_dynamic(d_permuted, leading_dim=1)
+        a_sc_cute = _make_cute_tensor_dynamic(a_scales, leading_dim=1)
+        b_sc_cute = _make_cute_tensor_dynamic(b_scales, leading_dim=1)
+        varlen_args = GemmWrapperBase.create_varlen_args(
+            cu_seqlens_m=None, cu_seqlens_k=cu_seqlens_k, A_idx=None,
+        )
+        stream = cuda.CUstream(_get_raw_cuda_stream())
+        compiled(
+            a_cute, b_cute, d_cute, None,
+            epi_args, scheduler_args, varlen_args, stream,
+            a_sc_cute, b_sc_cute,
+        )
+        return
+
+    config = default_config(device)
+    if config.swap_ab:
+        raise RuntimeError("blockscaled varlen_k does not support swap_ab")
+
+    # D = accumulator (inplace via TMA reduce-add); C = None (no epilogue load)
+    tensor_infos = {
+        "A": GemmTensorInfo(a_logical),
+        "B": GemmTensorInfo(b_logical),
+        "D": GemmTensorInfo(accumulator),
+        "C": GemmTensorInfo(None),
+    }
+    GemmWrapperBase.permute_tensors(tensor_infos, varlen_k=True)
+
+    major_configs = {
+        "A": ("m", "k", "l"),
+        "B": ("n", "k", "l"),
+        "D": ("m", "n", "l"),
+        "C": ("m", "n", "l"),
+    }
+    GemmWrapperBase.determine_major_orders(tensor_infos, major_configs)
+
+    for name, info in tensor_infos.items():
+        if info.tensor is not None:
+            info.dtype = _TORCH_TO_CUTLASS_DTYPE[info.tensor.dtype]
+            info.cute_tensor = _make_cute_tensor_dynamic(
+                info.tensor,
+                leading_dim=1 if info.major == major_configs[name][1] else 0,
+            )
+
+    tile_shape_mn = (config.tile_m, config.tile_n)
+    cluster_shape_mnk = (config.cluster_m, config.cluster_n, 1)
+    if not GemmDefaultSm100.is_valid_dtypes(
+        tensor_infos["A"].dtype, tensor_infos["B"].dtype,
+        Float32, tensor_infos["D"].dtype,
+        tensor_infos["A"].major, tensor_infos["B"].major,
+    ):
+        raise TypeError("Unsupported FP8 blockscaled type/major combination for varlen_k tma_add")
+
+    max_active_clusters = get_max_active_clusters(config.cluster_m * config.cluster_n)
+    scheduler_args = GemmWrapperBase.create_scheduler_args(
+        max_active_clusters,
+        tile_count_semaphore=None, batch_idx_permute=None,
+        max_swizzle_size=config.max_swizzle_size,
+    )
+    varlen_args = GemmWrapperBase.create_varlen_args(
+        cu_seqlens_m=None, cu_seqlens_k=cu_seqlens_k, A_idx=None,
+    )
+    # add_to_output=True: TMA store becomes CopyReduceBulkTensorTileS2GOp(ADD)
+    # No beta needed — accumulation handled by hardware atomic add on TMA store
+    epi_args = GemmDefaultSm100.EpilogueArguments(add_to_output=True)
+    current_stream = cuda.CUstream(_get_raw_cuda_stream())
+    a_scale_cute = _make_cute_tensor_dynamic(a_scales, leading_dim=1)
+    b_scale_cute = _make_cute_tensor_dynamic(b_scales, leading_dim=1)
+
+    compile_key = (
+        "vk_tma_add",
+        tensor_infos["A"].dtype, tensor_infos["B"].dtype,
+        tensor_infos["D"].dtype,
+        tile_shape_mn, cluster_shape_mnk,
+        M, N,
+        tensor_infos["A"].major, tensor_infos["B"].major,
+        tensor_infos["D"].major,
+        config.pingpong, _SF_VEC_SIZE,
+    )
+    compiled = _COMPILE_CACHE_VK_TMA_ADD.get(compile_key)
+    if compiled is None:
+        gemm_obj = GemmDefaultSm100(
+            Float32, tensor_infos["A"].dtype,
+            tile_shape_mn, cluster_shape_mnk,
+            sf_vec_size=_SF_VEC_SIZE, gather_A=False,
+        )
+        compiled = cute.compile(
+            gemm_obj,
+            tensor_infos["A"].cute_tensor, tensor_infos["B"].cute_tensor,
+            tensor_infos["D"].cute_tensor, None,
+            epi_args, scheduler_args, varlen_args, current_stream,
+            a_scale_cute, b_scale_cute,
+        )
+        _COMPILE_CACHE_VK_TMA_ADD[compile_key] = compiled
+
+    if len(_GEMM_FAST_PATH_VK_TMA_ADD) > _MAX_FAST_PATH_ENTRIES:
+        _GEMM_FAST_PATH_VK_TMA_ADD.clear()
+    _GEMM_FAST_PATH_VK_TMA_ADD[fast_key] = (compiled, scheduler_args, epi_args)
+
+    compiled(
+        tensor_infos["A"].cute_tensor, tensor_infos["B"].cute_tensor,
+        tensor_infos["D"].cute_tensor, None,
+        epi_args, scheduler_args, varlen_args, current_stream,
+        a_scale_cute, b_scale_cute,
+    )
+
+
 def blockscaled_fp8_wgrad_varlen_k(
     a_src: torch.Tensor,
     b_src: torch.Tensor,

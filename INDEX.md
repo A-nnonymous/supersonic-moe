@@ -11,7 +11,8 @@
 - Prefer regenerating indexes with `python tools/generate_directory_indexes.py` after structural changes, then review the generated summaries.
 
 ## Local notes
-- Canonical project state lives in `docs/HANDOFF.md`.
+- Canonical project state: root `HANDOFF.md` (Session 65, TMA reduce-add) + `docs/HANDOFF.md` (redirect).
+- Engineering history: `reports/fp8_upgrade/engineering_log.md` (Phases 1-25, 91 lessons).
 - Use these indexes before broad file searches to reduce token consumption.
 
 ## Shallow overview
@@ -42,12 +43,10 @@
 | `AGENTS.md` | Canonical agent bootstrap note for this repository's FP8 workstream. | canonical agent bootstrap |
 | `LICENSE` | Repository license text. | — |
 | `Makefile` | Convenience commands for tests and common developer workflows. | — |
-| `manifest.json` | Manifest-style metadata file used by repository tooling. | — |
 | `pyproject.toml` | Primary Python packaging and tool configuration. | — |
+| `HANDOFF.md` | Session 65 handoff: TMA reduce-add optimization, precision, performance, constraints. | canonical latest-session handoff |
 | `README.md` | Top-level project overview, installation, testing, and current FP8 status summary. | — |
 | `requirements.txt` | Pinned Python runtime dependencies for local development. | — |
-| `scoreboard.json` | Scoreboard data consumed by visualization or reporting helpers. | — |
-| `setup.cfg` | Setuptools and style configuration. | — |
 | `setup.py` | Setuptools installation entrypoint. | — |
 
 ## Redundancy and cleanup watchlist

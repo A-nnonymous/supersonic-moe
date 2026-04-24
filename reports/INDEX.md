@@ -13,22 +13,22 @@
 ## Stable child directories
 | Path | Summary | Notes |
 | --- | --- | --- |
-| `fp8_upgrade/` | Historical FP8-upgrade notes; partly superseded by newer docs and reports. | `reports/fp8_upgrade/HANDOFF.md` is stale and explicitly superseded by `docs/HANDOFF.md`. |
+| `fp8_upgrade/` | Historical FP8-upgrade engineering log and benchmark reports. | Engineering log is canonical history (Sessions 1-65, Phases 1-25). |
 | `grid_session53/` | Session 53 grid benchmark shards and consolidated JSON output. | — |
 | `nsys_final/` | Final consolidated nsys-derived breakdowns for Session 53. | — |
+| `wgrad_tma_add_nsys/` | Session 65 TMA reduce-add nsys profiles + RESULTS.json. | 4 nsys-rep files for Nsight Systems GUI |
 
 ## Files
 | File | Summary | Notes |
 | --- | --- | --- |
-| `fp8_frontier_path_analysis.json` | Compiled BF16-vs-FP8 path-comparison report consumed by the new visualization module. | untracked in git |
-| `quant_bench.json` | Structured quant benchmark report with per-kernel summaries and metadata. | — |
-| `quant_bench_final.json` | Legacy flat quant benchmark snapshot still emitted by `tools/introspect.py`. | legacy snapshot, compare with `reports/quant_bench.json` before reusing |
-| `README.md` | High-level map of report outputs and profiling artifacts. | keep aligned with `docs/HANDOFF.md` |
-| `session53_breakdown.md` | Markdown note: Session 53 — Performance, Memory & Precision Breakdown (Final). | — |
-| `session53_full_report.json` | JSON artifact with top-level keys: `metadata`, `shapes`. | — |
-| `session53_nsys_consolidated.json` | JSON artifact with top-level keys: `session`, `device`, `method`, `common`. | — |
-| `wgrad_bench.json` | Structured wgrad benchmark report under `reports/`. | — |
-| `wgrad_fp8_benchmark_legacy.json` | Legacy full-replacement wgrad benchmark snapshot kept for history. | legacy benchmark snapshot, kept for historical comparison with `reports/wgrad_bench.json`, untracked in git |
+| `CONTRIBUTION_SUMMARY.md` | Publication-style summary of paddle_compat branch contribution (Session 53-58). | — |
+| `cross_framework_report.md` | 4-way Paddle/SonicMoE BF16/FP8 precision comparison. | — |
+| `fp8_frontier_path_analysis.json` | Compiled BF16-vs-FP8 path-comparison report consumed by the visualization module. | — |
+| `quant_bench_final.json` | Quant benchmark snapshot emitted by `tools/introspect.py`. | — |
+| `session53_breakdown.md` | Session 53 — Performance, Memory & Precision Breakdown (Final). | canonical 27-shape data |
+| `session53_nsys_consolidated.json` | Consolidated nsys data for Session 53. | — |
+| `wgrad_bench.json` | Structured wgrad benchmark report. | — |
+| `wgrad_fp8_benchmark_legacy.json` | Legacy wgrad benchmark snapshot kept for history. | — |
 
 ## Redundancy and cleanup watchlist
 - `reports/README.md` should stay aligned with `docs/HANDOFF.md` whenever the authoritative handoff changes.

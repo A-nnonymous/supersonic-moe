@@ -403,16 +403,82 @@ All previous bench data was from a non-production config.
 
 **Key takeaways**:
 - vs BF16: **1.14x – 1.43x faster** (production-relevant comparison)
-- vs S53 native PyTorch FP8: 6-15% slower (Paddle proxy overhead)
-- fused BF16 wgrad epilogue eliminates 664µs/iter varlen accumulate pass
+- vs S53 native PyTorch FP8: 6-15% slower
+- **100% of overhead from fused wgrad accumulate epilogue** (regs=50→86, +30-38% per-call)
+- S53 has no main_grad accumulation — fair functional difference, not a bug
+- Non-GEMM categories are actually faster in Paddle (-24 to -65µs)
 - Precision verified: 4 shapes × 5 tensors, all cosine > 0.98 with fp8_wgrad=True
+
+### Root Cause: Fused Wgrad Epilogue Register Pressure
+
+nsys sqlite analysis (3 trials × 4 shapes, GPUs 2-7) shows the same CUTLASS
+`quackgemm_default_epiGemmDefaultSm100` kernel compiled with different register counts:
+
+| GEMM variant | S53 regs | Paddle regs | S53 µs | Paddle µs | Delta |
+|---|:---:|:---:|:---:|:---:|:---:|
+| FP8 wgrad compute | 54 | 54 | ~196 | ~222 | +6% |
+| BF16 accumulate (dw1) | **50** | **86** | 325 | 449 | **+38%** |
+| BF16 accumulate (dw2) | **50** | **86** | 174 | 226 | **+30%** |
+
+S53 epilogue: `D = A@B` (simple, 50 regs, ~5 blocks/SM).
+Paddle epilogue: `D = A@B + 1.0*C` (fused fp32 accumulate, 86 regs, ~2-3 blocks/SM).
+
+GemmGated ZeroMat (fwd) and GemmDGated ZeroMat (bwd) are unaffected: same grid,
+same regs=168, same per-call timing (<4% variance). These don't involve wgrad.
 
 Lessons:
 84. **Bench scripts must match production config.** `fp8_wgrad=False` was hardcoded while
-    production auto-detect uses threshold=0 → always True. Bench data was 11-16% worse
-    than real production performance.
-85. **Paddle proxy overhead is 6-15% vs native PyTorch FP8.** Irreducible dispatch overhead
-    from `paddle.enable_compat()` interception layer. Not an FP8 algorithm issue.
+    production auto-detect uses threshold=0 → always True.
+85. **Fused epilogue trades register pressure for fewer kernel launches.** The `D = A@B + C`
+    epilogue increases regs from 50→86 (+72%), reducing occupancy and causing 30-38%
+    per-call slowdown. In a training loop where accumulation is needed anyway, the
+    trade-off may still be net positive vs separate add kernel.
+86. **Non-GEMM categories can be faster in Paddle.** S53 has extra torch elementwise,
+    cuBLAS, and reduce kernels that Paddle's fused path eliminates.
+
+## Phase 25: TMA Reduce-Add Wgrad Epilogue (Session 65, 2026-04-24)
+
+**Key insight**: The fused `D = A@B + 1.0*C` wgrad accumulate epilogue (86 regs/thread)
+can be replaced by TMA hardware atomic add on store (`add_to_output=True`, 50 regs/thread)
+with zero precision impact. Each output tile is written by exactly one CTA (no split-K),
+so the TMA atomic add is deterministic.
+
+**Implementation**:
+- New function `_run_cutlass_blockscaled_gemm_varlen_k_tma_add()` in `blockscaled_fp8_gemm.py`
+  - `C=GemmTensorInfo(None)` (no C tensor loaded)
+  - `epi_args = GemmDefaultSm100.EpilogueArguments(add_to_output=True)`
+  - Separate caches: `_COMPILE_CACHE_VK_TMA_ADD`, `_GEMM_FAST_PATH_VK_TMA_ADD`
+- Replaced all 4 wgrad accumulate sites in `functional/__init__.py`:
+  - FP8 paths: `_accumulate` → `_tma_add`
+  - BF16 paths: `gemm(beta=1.0)` → `gemm_add(C=accum, out=accum, beta=1.0)`
+- QuACK `gemm_add()` auto-detects: when `C is out` and `beta==1.0` and `cu_seqlens_m is None`,
+  uses `add_to_output=True` with `C=None`
+- Legacy fallback: `SONIC_MOE_FP8_WGRAD_BETA_ACCUM=1`
+
+**Results (nsys GPU-projection, MLP-node only)**:
+- E=8: 2886 → 2820 µs/iter (-2.3%)
+- E=32: 3420 → 3283 µs/iter (-4.0%)
+- BF16 wgrad GEMM (4 calls/iter): E=8 -16µs/call (-5.0%), E=32 -33µs/call (-7.7%)
+- FP8 wgrad (isolated bench): 6-13% faster, bitwise identical output
+- FP8 forward GEMMs: unchanged (delta < 5µs, noise)
+
+**Precision**: All 6 shapes × 4 tensors PASS (cos > 0.99, RRMSE < 7.6%).
+E=32 production shape included. ds gradient cos=0.9972 (test_cold_start_e2e.py).
+
+Lessons:
+87. **TMA reduce-add is free when no split-K.** `tile_count_semaphore=None` means each CTA
+    exclusively owns its output tiles. The atomic add degenerates to a simple store-with-add,
+    but the epilogue doesn't load C tensor, saving registers and smem stages.
+88. **QuACK `gemm_add()` vs `gemm()` auto-detection.** `gemm()` passes C/beta through
+    `gemm_out()` which does NOT auto-detect add_to_output. Only `gemm_add()` has the
+    `C is out and beta==1.0` identity check. Use `gemm_add()` for wgrad accumulate.
+89. **Paddle torch-proxy `torch.equal()` fails across tensor types.** Use `(a == b).all()`
+    instead. Also `torch.randn` produces paddle dtypes; use `paddle.randn` for bf16.
+90. **nsys MUST use `--resolve-symbols=false`** on this machine or it hangs attempting to
+    download symbols from network. Template in `/panzhaowu/env.md`.
+91. **`bench_mlpnode_topk_nsys.py` is the gold standard for clean profiling.** Pre-computes
+    routing once, NVTX "BENCH" range brackets measurement. `bench_deepep_topk_nsys.py` is
+    noisy with framework operators (token_gather_sum, Eigen, cub::RadixSort dominating).
 
 ---
 
