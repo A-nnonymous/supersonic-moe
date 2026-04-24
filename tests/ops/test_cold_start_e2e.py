@@ -129,6 +129,7 @@ def main():
 
         out_gold = torch.zeros(N_recv, H, dtype=dtype, device=device)
         dx_gold = torch.zeros_like(x_t)
+        ds_gold = torch.zeros(N_recv, topk, dtype=torch.float32, device=device)
         dw1_gold = [torch.zeros(H, 2*I, dtype=torch.float32, device=device) for _ in range(E)]
         dw2_gold = [torch.zeros(I, H, dtype=torch.float32, device=device) for _ in range(E)]
 
@@ -145,10 +146,22 @@ def main():
             z = x_e @ w_ug
             gate, up = z[:, :I], z[:, I:]
             y1 = _silu(gate.float()).to(dtype) * up
-            out_e = (y1 @ w_d) * scores.to(dtype)
+            out_e_unscaled = y1 @ w_d  # [n_tok, H] — output before score scaling
+            out_e = out_e_unscaled * scores.to(dtype)
             out_gold.index_add_(0, tok_ids, out_e)
 
-            grad_e = grad_t[tok_ids] * scores.to(dtype)
+            # ds: d(loss)/d(score[t,k]) = dot(grad_out[t], out_e_unscaled[t])
+            grad_at_tok = grad_t[tok_ids]  # [n_tok, H]
+            ds_per_tok = (grad_at_tok * out_e_unscaled).sum(dim=1).float()  # [n_tok]
+            # Map back to (N_recv, topk) layout — find which topk slot this expert was in
+            for local_i in range(tok_ids.shape[0]):
+                t_id = tok_ids[local_i].item()
+                for k_slot in range(topk):
+                    if di_t[t_id, k_slot].item() == e_idx:
+                        ds_gold[t_id, k_slot] = ds_per_tok[local_i]
+                        break
+
+            grad_e = grad_at_tok * scores.to(dtype)
             dy1 = grad_e @ w_d.T
             sig = torch.sigmoid(gate.float())
             d_gate = dy1 * up * (sig * (1.0 + gate.float() * (1.0 - sig))).to(dtype)
@@ -158,7 +171,7 @@ def main():
             dw2_gold[e_idx].add_((y1.T @ grad_e).float())
             dx_gold.index_add_(0, tok_ids, dz @ w_ug.T)
 
-        return out_gold, dx_gold, dw1_gold, dw2_gold
+        return out_gold, dx_gold, ds_gold, dw1_gold, dw2_gold
 
     def _cos_sim(a, b):
         a_f = a.float().flatten()
@@ -172,7 +185,9 @@ def main():
 
     def _make_dispatch(N, topk_val):
         di = paddle.zeros([N, topk_val], dtype="int32")
-        dp = paddle.full([N, topk_val], 1.0 / topk_val, dtype="float32")
+        dp = paddle.randn([N, topk_val], dtype="float32").abs() + 0.1
+        dp = dp / dp.sum(axis=1, keepdim=True)
+        dp.stop_gradient = False  # enable ds gradient
         for i in range(N):
             di[i] = paddle.randperm(E)[:topk_val].cast("int32")
         tpe = paddle.bincount(di.reshape([-1]).cast("int64"), minlength=E).tolist()
@@ -199,8 +214,8 @@ def main():
     # ── Phase 3: Multi-shape precision audit ──
     _print(f"\n[Phase 3] Multi-shape precision audit ({len(SHAPES)} shapes)...")
     _print(f"{'N':>6s} {'K':>2s} {'Label':>15s} {'Time':>6s}  "
-           f"{'out':>6s} {'dx':>6s} {'dw1':>6s} {'dw2':>6s} {'Status':>6s}", 1)
-    _print("-" * 75, 1)
+           f"{'out':>6s} {'dx':>6s} {'ds':>6s} {'dw1':>6s} {'dw2':>6s} {'Status':>6s}", 1)
+    _print("-" * 85, 1)
 
     all_pass = True
     first_shape = True
@@ -256,18 +271,23 @@ def main():
         di_t = torch.from_dlpack(di.detach()).to(torch.int32)
         dp_t = torch.from_dlpack(dp.detach()).float()
         grad_t = torch.from_dlpack(grad_out.detach())
-        out_gold, dx_gold, dw1_gold, dw2_gold = _gold_topk(x_t, di_t, dp_t, grad_t, topk_val)
+        out_gold, dx_gold, ds_gold, dw1_gold, dw2_gold = _gold_topk(x_t, di_t, dp_t, grad_t, topk_val)
 
         # Compare
         out_t = _to_torch(out_fp8)
         out_cos = _cos_sim(out_t, out_gold)
         dx_cos = _cos_sim(dx_fp8, dx_gold) if dx_fp8 is not None else 0.0
+
+        # ds: gradient w.r.t. dispatched_probs
+        ds_fp8 = _to_torch(dp.grad) if dp.grad is not None else None
+        ds_cos = _cos_sim(ds_fp8, ds_gold) if ds_fp8 is not None else 0.0
         dw1_min_cos = min(_cos_sim(dw1_fp8[e], dw1_gold[e]) for e in range(E)
                           if dw1_gold[e].norm() > 0) if any(g.norm() > 0 for g in dw1_gold) else 0.0
         dw2_min_cos = min(_cos_sim(dw2_fp8[e], dw2_gold[e]) for e in range(E)
                           if dw2_gold[e].norm() > 0) if any(g.norm() > 0 for g in dw2_gold) else 0.0
 
         ok = (out_cos >= COS_THRESHOLD and dx_cos >= COS_THRESHOLD
+              and ds_cos >= COS_THRESHOLD
               and dw1_min_cos >= COS_THRESHOLD and dw2_min_cos >= COS_THRESHOLD
               and dt < CUTE_COMPILE_THRESHOLD_S)
         if not ok:
@@ -275,7 +295,7 @@ def main():
         status = "PASS" if ok else "FAIL"
 
         _print(f"{N:>6d} {topk_val:>2d} {desc:>15s} {dt:>5.1f}s  "
-               f"{out_cos:.4f} {dx_cos:.4f} {dw1_min_cos:.4f} {dw2_min_cos:.4f} {status:>6s}", 1)
+               f"{out_cos:.4f} {dx_cos:.4f} {ds_cos:.4f} {dw1_min_cos:.4f} {dw2_min_cos:.4f} {status:>6s}", 1)
 
     # ── Phase 4: Steady-state timing ──
     _print(f"\n[Phase 4] Steady-state timing (N=8192, 10 iters)...")
