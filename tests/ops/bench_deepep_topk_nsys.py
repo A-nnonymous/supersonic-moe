@@ -211,8 +211,12 @@ def main():
     cmd = [
         nsys_bin, "profile",
         "--trace=cuda,nvtx",
+        "--sample=none",
+        "--backtrace=none",
+        "--resolve-symbols=false",
         f"--output={rep_path}",
         "--force-overwrite=true",
+        "--export=sqlite",
         sys.executable, script_path,
     ]
 
@@ -244,7 +248,7 @@ def main():
 
     if not os.path.exists(db_file) and os.path.exists(rep_file):
         print(f"  Exporting sqlite from {rep_file} ...")
-        subprocess.run(["nsys", "export", "--type=sqlite",
+        subprocess.run([nsys_bin, "export", "--type=sqlite",
                         "--force-overwrite=true", rep_file],
                        capture_output=True, timeout=120)
 

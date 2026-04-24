@@ -53,6 +53,7 @@ from ..functional.fp8_quant import quantize_activation_blockwise, round_scale_to
 
 import threading as _threading
 from ..triton_utils import wrap_triton_kernel
+from ._validate import check_tensor, check_divisible
 
 _SFA_M_OVERRIDE = _threading.local()
 
@@ -109,11 +110,15 @@ _WEIGHT_CACHE: dict[
     tuple[int, tuple[int, ...], tuple[int, ...], int | None, int, str, str, str, str],
     tuple[torch.Tensor, torch.Tensor],
 ] = {}
-_COMPILE_CACHE: dict[tuple[object, ...], object] = {}
+from sonicmoe.cache_manager import InstrumentedCompileCache as _ICC
+_COMPILE_CACHE = _ICC("blockscaled_grouped")
 _PAD_PLAN_CACHE: dict = {}       # content-key -> plan
 # Fast-path cache: skip validation/tensor-info/compile-key on steady-state calls.
 # Maps (total_M, K, H, E, out_dtype, w_shape, w_stride, a_sc_cols, w_sc_shape, dev)
 #   -> (compiled_fn, scheduler_args, epi_args)
+# Bounded: cleared when exceeding _MAX_FAST_PATH_ENTRIES to prevent memory leak
+# from unbounded unique seqlen values in variable-length training.
+_MAX_FAST_PATH_ENTRIES = 64
 _GEMM_FAST_PATH: dict[tuple, tuple] = {}
 _TORCH_TO_CUTLASS_DTYPE = {
     torch.float8_e4m3fn: cutlass.Float8E4M3FN,
@@ -253,6 +258,22 @@ def _make_cute_tensor_dynamic(tensor: torch.Tensor, leading_dim: int) -> cute.Te
     return from_dlpack(tensor.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=leading_dim)
 
 
+def _tensor_version(t: torch.Tensor) -> int:
+    """Get tensor in-place version, compatible with both PyTorch and Paddle proxy."""
+    v = getattr(t, '_inplace_version', None)
+    if v is not None:
+        return v() if callable(v) else v
+    return getattr(t, '_version', 0)
+
+
+def _get_raw_cuda_stream(device=None) -> int:
+    """Get raw CUDA stream pointer, compatible with both PyTorch and Paddle proxy."""
+    s = torch.cuda.current_stream(device)
+    if hasattr(s, 'stream_base'):
+        return s.stream_base.raw_stream  # Paddle proxy
+    return s.cuda_stream  # native PyTorch
+
+
 def _weight_cache_key(
     weight: torch.Tensor,
     protocol: FP8Protocol,
@@ -263,7 +284,7 @@ def _weight_cache_key(
         tuple(weight.shape),
         tuple(weight.stride()),
         weight.device.index,
-        weight._inplace_version(),
+        _tensor_version(weight),
         protocol.activation_dtype.value,
         protocol.scale_encoding.value,
         protocol.scale_granularity.value,
@@ -281,7 +302,7 @@ def _quantize_w2_cached(
     # permute() calls on the same underlying Parameter hit cache.
     key = (
         w2.data_ptr(),
-        w2._inplace_version(),
+        _tensor_version(w2),
         tuple(w2.shape),
         tuple(w2.stride()),
     )
@@ -326,7 +347,7 @@ def evict_fp8_weight_cache_entry(w: torch.Tensor) -> None:
     """
     key = (
         w.data_ptr(),
-        w._inplace_version(),
+        _tensor_version(w),
         tuple(w.shape),
         tuple(w.stride()),
     )
@@ -550,6 +571,7 @@ def quantize_activation_blockscaled_fast(
 
     Returns (fp8_data, e8m0_scales).
     """
+    check_tensor(x, "x", dtype=torch.bfloat16, ndim=2)
     assert x.is_contiguous(), "Input must be contiguous"
     M, K = x.shape
     num_groups = _div_up(K, group_size)
@@ -1207,6 +1229,8 @@ def fused_transpose_quantize_for_wgrad(
     cache lines vs 128 in the original 32x128 kernel). GROUPS_PER_BLOCK=16
     amortizes block launch overhead.
     """
+    check_tensor(flat_sorted, "flat_sorted", dtype=torch.bfloat16, ndim=2)
+    check_divisible(capacity, 32, "capacity")
     device = flat_sorted.device
     GROUP_SIZE = _SF_VEC_SIZE  # 32
     BLOCK_DIM = 32  # 32x32 tile for minimal L1 pressure
@@ -1430,6 +1454,8 @@ def dual_quantize_and_pack(
     col_fp8 : (E, H, capacity) fp8 — col-major quantized (groups along capacity).
     col_scales : (E, col_packed_size) e8m0fnu ISA-packed scales.
     """
+    check_tensor(src, "src", dtype=torch.bfloat16, ndim=2)
+    check_divisible(capacity, 32, "capacity")
     src = src.contiguous()
     T, H = src.shape
     device = src.device
@@ -1780,6 +1806,7 @@ def colwise_quantize_and_pack(
     fp8_data : (TK, dim) float8_e4m3fn
     packed_scales : (1, packed_size) float8_e8m0fnu in ISA layout for (dim, TK).
     """
+    check_tensor(src, "src", dtype=torch.bfloat16, ndim=2)
     H = logical_rows
     TK = logical_cols
     GROUP_SIZE = _SF_VEC_SIZE
@@ -1960,6 +1987,9 @@ def dual_quantize_varlen(
     col_fp8 : (TK, dim) fp8 — col-quantized (groups along TK, for wgrad).
     col_scales : (1, packed) e8m0fnu ISA-packed for logical (dim, TK).
     """
+    check_tensor(src, "src", dtype=torch.bfloat16, ndim=2)
+    if src.shape != (TK, dim):
+        raise ValueError(f"src shape {src.shape} != ({TK}, {dim})")
     src = src.contiguous()
     device = src.device
     GROUP_SIZE = _SF_VEC_SIZE
@@ -2009,7 +2039,7 @@ def dual_quantize_varlen(
 # varlen_k blockscaled FP8 GEMM for weight gradients
 # ---------------------------------------------------------------------------
 
-_COMPILE_CACHE_VK: dict = {}
+_COMPILE_CACHE_VK = _ICC("varlen_k")
 _GEMM_FAST_PATH_VK: dict = {}
 
 
@@ -2062,7 +2092,7 @@ def _run_cutlass_blockscaled_gemm_varlen_k(
         varlen_args = GemmWrapperBase.create_varlen_args(
             cu_seqlens_m=None, cu_seqlens_k=cu_seqlens_k, A_idx=None,
         )
-        stream = cuda.CUstream(torch.cuda.current_stream().stream_base.raw_stream)
+        stream = cuda.CUstream(_get_raw_cuda_stream())
         compiled(
             a_cute, b_cute, d_cute, None,
             epi_args, scheduler_args, varlen_args, stream,
@@ -2118,17 +2148,20 @@ def _run_cutlass_blockscaled_gemm_varlen_k(
         cu_seqlens_m=None, cu_seqlens_k=cu_seqlens_k, A_idx=None,
     )
     epi_args = GemmDefaultSm100.EpilogueArguments()
-    current_stream = cuda.CUstream(torch.cuda.current_stream().stream_base.raw_stream)
+    current_stream = cuda.CUstream(_get_raw_cuda_stream())
     a_scale_cute = _make_cute_tensor_dynamic(a_scales, leading_dim=1)
     b_scale_cute = _make_cute_tensor_dynamic(b_scales, leading_dim=1)
 
+    # compile_key must NOT contain dynamic token dimensions (total_K,
+    # a_scales.size(1), b_scales.size(1)) — those are handled at runtime
+    # via mark_layout_dynamic / CuTe sym_int64 symbols.  Including them
+    # would trigger a CuTe recompile every time seqlen changes.
     compile_key = (
         "vk",
         tensor_infos["A"].dtype, tensor_infos["B"].dtype,
         tensor_infos["D"].dtype,
         tile_shape_mn, cluster_shape_mnk,
-        M, N, total_K,
-        a_scales.size(1), b_scales.size(1),
+        M, N,
         tensor_infos["A"].major, tensor_infos["B"].major,
         tensor_infos["D"].major,
         config.pingpong, _SF_VEC_SIZE,
@@ -2149,6 +2182,8 @@ def _run_cutlass_blockscaled_gemm_varlen_k(
         )
         _COMPILE_CACHE_VK[compile_key] = compiled
 
+    if len(_GEMM_FAST_PATH_VK) > _MAX_FAST_PATH_ENTRIES:
+        _GEMM_FAST_PATH_VK.clear()
     _GEMM_FAST_PATH_VK[fast_key] = (compiled, scheduler_args, epi_args)
 
     compiled(
@@ -2162,7 +2197,7 @@ def _run_cutlass_blockscaled_gemm_varlen_k(
 
 # ── Fused wgrad GEMM + fp32 accumulation (zero extra kernels) ─────────────────
 
-_COMPILE_CACHE_VK_ACCUM: dict = {}
+_COMPILE_CACHE_VK_ACCUM = _ICC("varlen_k_accum")
 _GEMM_FAST_PATH_VK_ACCUM: dict = {}
 
 
@@ -2215,7 +2250,7 @@ def _run_cutlass_blockscaled_gemm_varlen_k_accumulate(
         varlen_args = GemmWrapperBase.create_varlen_args(
             cu_seqlens_m=None, cu_seqlens_k=cu_seqlens_k, A_idx=None,
         )
-        stream = cuda.CUstream(torch.cuda.current_stream().stream_base.raw_stream)
+        stream = cuda.CUstream(_get_raw_cuda_stream())
         compiled(
             a_cute, b_cute, d_cute, c_cute,
             epi_args, scheduler_args, varlen_args, stream,
@@ -2272,17 +2307,17 @@ def _run_cutlass_blockscaled_gemm_varlen_k_accumulate(
     )
     # beta=1.0: D = 1.0 * (A@B) + 1.0 * C, where C=D=accumulator
     epi_args = GemmDefaultSm100.EpilogueArguments(beta=Float32(1.0))
-    current_stream = cuda.CUstream(torch.cuda.current_stream().stream_base.raw_stream)
+    current_stream = cuda.CUstream(_get_raw_cuda_stream())
     a_scale_cute = _make_cute_tensor_dynamic(a_scales, leading_dim=1)
     b_scale_cute = _make_cute_tensor_dynamic(b_scales, leading_dim=1)
 
+    # compile_key must NOT contain dynamic token dimensions — see "vk" above.
     compile_key = (
         "vk_accum",
         tensor_infos["A"].dtype, tensor_infos["B"].dtype,
         tensor_infos["D"].dtype,
         tile_shape_mn, cluster_shape_mnk,
-        M, N, total_K,
-        a_scales.size(1), b_scales.size(1),
+        M, N,
         tensor_infos["A"].major, tensor_infos["B"].major,
         tensor_infos["D"].major,
         config.pingpong, _SF_VEC_SIZE,
@@ -2303,6 +2338,8 @@ def _run_cutlass_blockscaled_gemm_varlen_k_accumulate(
         )
         _COMPILE_CACHE_VK_ACCUM[compile_key] = compiled
 
+    if len(_GEMM_FAST_PATH_VK_ACCUM) > _MAX_FAST_PATH_ENTRIES:
+        _GEMM_FAST_PATH_VK_ACCUM.clear()
     _GEMM_FAST_PATH_VK_ACCUM[fast_key] = (compiled, scheduler_args, epi_args)
 
     compiled(
@@ -2547,7 +2584,7 @@ def blockscaled_fp8_gemm_grouped(
     )
     varlen_args = None
     epi_args = GemmDefaultSm100.EpilogueArguments()
-    current_stream = cuda.CUstream(torch.cuda.current_stream().stream_base.raw_stream)
+    current_stream = cuda.CUstream(_get_raw_cuda_stream())
     a_scale_cute = _make_cute_tensor_dynamic(packed_a_scales, leading_dim=1)
     b_scale_cute = _make_cute_tensor_dynamic(weight_scales, leading_dim=1)
 
@@ -2791,6 +2828,8 @@ def gather_quantize_and_pack_activation(
     """
     TK = gather_idx.shape[0]
     K = x.shape[1]
+    check_tensor(x, "x", dtype=(torch.bfloat16, torch.float16), ndim=2)
+    check_tensor(gather_idx, "gather_idx", ndim=1, stride0_1=True)
     num_groups = _div_up(K, group_size)
     k_tiles = _div_up(K, _SF_TILE_K)
 
@@ -2850,6 +2889,7 @@ def quantize_and_pack_activation(
     fp8_data : Tensor (M, K) float8_e4m3fn
     packed_scales : Tensor (1, packed_size) float8_e8m0fnu in ISA layout
     """
+    check_tensor(x, "x", dtype=(torch.bfloat16, torch.float16), ndim=2)
     x = x.contiguous()
     M, K = x.shape
     num_groups = _div_up(K, group_size)
@@ -2986,6 +3026,8 @@ def fast_gather_quantize_and_pack_activation(
     fp8_data : Tensor (TK, K) float8_e4m3fn
     packed_scales : Tensor (1, packed_size) float8_e8m0fnu in ISA layout
     """
+    check_tensor(x, "x", dtype=(torch.bfloat16, torch.float16), ndim=2)
+    check_tensor(gather_idx, "gather_idx", ndim=1, stride0_1=True)
     TK = gather_idx.shape[0]
     T, K = x.shape
     k_tiles = _div_up(K, _SF_TILE_K)
@@ -3346,6 +3388,7 @@ def quantize_and_pack_weight_iso32(
     fp8_data : (M, K) float8_e4m3fn
     packed_scales : (1, packed_size) float8_e8m0fnu ISA-packed
     """
+    check_tensor(w, "w", dtype=torch.bfloat16, ndim=2)
     w = w.contiguous()
     M, K = w.shape
     GROUP_SIZE = _SF_VEC_SIZE  # 32
@@ -3437,7 +3480,7 @@ def precompute_weight_fp8(
     """
     key = (
         w.data_ptr(),
-        w._inplace_version(),
+        _tensor_version(w),
         tuple(w.shape),
         tuple(w.stride()),
     )
@@ -3492,7 +3535,7 @@ def precompute_weight_fp8_for_fused_gated(
     """
     key = (
         w.data_ptr(),
-        w._inplace_version(),
+        _tensor_version(w),
         tuple(w.shape),
         tuple(w.stride()),
     )
@@ -3536,7 +3579,7 @@ def precompute_weight_fp8_for_fused_dgated(
     """
     key = (
         w.data_ptr(),
-        w._inplace_version(),
+        _tensor_version(w),
         tuple(w.shape),
         tuple(w.stride()),
     )
@@ -3576,7 +3619,7 @@ def precompute_weight_fp8_for_direct_fused_dgated(
     """
     key = (
         w.data_ptr(),
-        w._inplace_version(),
+        _tensor_version(w),
         tuple(w.shape),
         tuple(w.stride()),
     )
@@ -3799,7 +3842,7 @@ def _run_cutlass_blockscaled_gemm(
         varlen_args = GemmWrapperBase.create_varlen_args(
             cu_seqlens_m, cu_seqlens_k=None, A_idx=None,
         )
-        stream = cuda.CUstream(torch.cuda.current_stream().stream_base.raw_stream)
+        stream = cuda.CUstream(_get_raw_cuda_stream())
         compiled(
             a_cute, b_cute, d_cute, None,
             epi_args, scheduler_args, varlen_args, stream,
@@ -3868,10 +3911,14 @@ def _run_cutlass_blockscaled_gemm(
     )
 
     epi_args = GemmDefaultSm100.EpilogueArguments()
-    current_stream = cuda.CUstream(torch.cuda.current_stream().stream_base.raw_stream)
+    current_stream = cuda.CUstream(_get_raw_cuda_stream())
     a_scale_cute = _make_cute_tensor_dynamic(a_scales_packed, leading_dim=1)
     b_scale_cute = _make_cute_tensor_dynamic(w_scales_packed, leading_dim=1)
 
+    # compile_key must NOT contain dynamic token dimensions (total_M,
+    # a_scales_packed.size(1)) — those change with seqlen and are handled
+    # at runtime via mark_layout_dynamic.  Including them would trigger a
+    # CuTe recompile every time seqlen changes.
     compile_key = (
         "varlen",
         tensor_infos["A"].dtype,
@@ -3883,8 +3930,6 @@ def _run_cutlass_blockscaled_gemm(
         tuple(tensor_infos["B"].tensor.shape),
         tuple(tensor_infos["B"].tensor.stride()),
         H,
-        a_scales_packed.size(1),
-        tuple(w_scales_packed.shape),
         tensor_infos["A"].major,
         tensor_infos["B"].major,
         config.pingpong,
@@ -3917,6 +3962,8 @@ def _run_cutlass_blockscaled_gemm(
         _COMPILE_CACHE[compile_key] = compiled
 
     # Populate fast-path cache for subsequent calls
+    if len(_GEMM_FAST_PATH) > _MAX_FAST_PATH_ENTRIES:
+        _GEMM_FAST_PATH.clear()
     _GEMM_FAST_PATH[fast_key] = (compiled, scheduler_args, epi_args)
 
     compiled(
@@ -4108,10 +4155,13 @@ def blockscaled_fp8_weight_grad_gemm(
     )
     varlen_args = None
     epi_args = GemmDefaultSm100.EpilogueArguments()
-    current_stream = cuda.CUstream(torch.cuda.current_stream().stream_base.raw_stream)
+    current_stream = cuda.CUstream(_get_raw_cuda_stream())
     a_scale_cute = _make_cute_tensor_dynamic(packed_a_scales, leading_dim=1)
     b_scale_cute = _make_cute_tensor_dynamic(packed_b_scales, leading_dim=1)
 
+    # compile_key must NOT contain dynamic dims (capacity changes with routing).
+    # All tensors use mark_layout_dynamic — the compiled kernel handles any capacity.
+    # Only include static model dims (dim_A, dim_B) and device config.
     compile_key = (
         "weight_grad",
         tensor_infos["A"].dtype,
@@ -4119,14 +4169,9 @@ def blockscaled_fp8_weight_grad_gemm(
         tensor_infos["D"].dtype,
         tile_shape_mn,
         cluster_shape_mnk,
-        tuple(tensor_infos["A"].tensor.shape),
-        tuple(tensor_infos["A"].tensor.stride()),
-        tuple(tensor_infos["B"].tensor.shape),
-        tuple(tensor_infos["B"].tensor.stride()),
-        tuple(tensor_infos["D"].tensor.shape),
-        tuple(tensor_infos["D"].tensor.stride()),
-        tuple(packed_a_scales.shape),
-        tuple(packed_b_scales.shape),
+        tensor_infos["A"].tensor.shape[1],  # dim_A — STATIC
+        tensor_infos["B"].tensor.shape[1],  # dim_B — STATIC
+        num_experts,
         tensor_infos["A"].major,
         tensor_infos["B"].major,
         config.pingpong,
@@ -4306,10 +4351,11 @@ def blockscaled_fp8_weight_grad_gemm_fast(
     )
     varlen_args = None
     epi_args = GemmDefaultSm100.EpilogueArguments()
-    current_stream = cuda.CUstream(torch.cuda.current_stream().stream_base.raw_stream)
+    current_stream = cuda.CUstream(_get_raw_cuda_stream())
     a_scale_cute = _make_cute_tensor_dynamic(packed_a_scales, leading_dim=1)
     b_scale_cute = _make_cute_tensor_dynamic(packed_b_scales, leading_dim=1)
 
+    # compile_key must NOT contain dynamic dims — same pattern as "weight_grad".
     compile_key = (
         "weight_grad_fast",
         tensor_infos["A"].dtype,
@@ -4317,14 +4363,9 @@ def blockscaled_fp8_weight_grad_gemm_fast(
         tensor_infos["D"].dtype,
         tile_shape_mn,
         cluster_shape_mnk,
-        tuple(tensor_infos["A"].tensor.shape),
-        tuple(tensor_infos["A"].tensor.stride()),
-        tuple(tensor_infos["B"].tensor.shape),
-        tuple(tensor_infos["B"].tensor.stride()),
-        tuple(tensor_infos["D"].tensor.shape),
-        tuple(tensor_infos["D"].tensor.stride()),
-        tuple(packed_a_scales.shape),
-        tuple(packed_b_scales.shape),
+        tensor_infos["A"].tensor.shape[1],  # dim_A — STATIC
+        tensor_infos["B"].tensor.shape[1],  # dim_B — STATIC
+        num_experts,
         tensor_infos["A"].major,
         tensor_infos["B"].major,
         config.pingpong,

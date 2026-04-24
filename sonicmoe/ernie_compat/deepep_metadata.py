@@ -161,6 +161,15 @@ def deepep_topk_to_sonic_metadata(
     N_recv = dispatched_indices.shape[0]
     topk = dispatched_indices.shape[1]
 
+    if "int32" not in str(dispatched_indices.dtype):
+        raise ValueError(f"dispatched_indices: expected int32, got {dispatched_indices.dtype}")
+    if "float32" not in str(dispatched_probs.dtype):
+        raise ValueError(f"dispatched_probs: expected float32, got {dispatched_probs.dtype}")
+    if dispatched_indices.ndim != 2 or dispatched_probs.ndim != 2:
+        raise ValueError("dispatched_indices and dispatched_probs must be 2D")
+    if dispatched_probs.shape != dispatched_indices.shape:
+        raise ValueError(f"shape mismatch: indices={dispatched_indices.shape} vs probs={dispatched_probs.shape}")
+
     # Dispatch to CUDA kernel if available
     if _HAS_TOPK_CUDA_KERNEL:
         return _deepep_topk_to_sonic_metadata_cuda(

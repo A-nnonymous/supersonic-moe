@@ -508,12 +508,13 @@ _PREQUANT_HIT_COUNT: dict[str, int] = collections.defaultdict(int)
 def _matches_prequant_tensor(lhs: torch.Tensor | None, rhs: torch.Tensor | None) -> bool:
     if lhs is None or rhs is None:
         return False
+    _offset = lambda t: t._offset() if hasattr(t, '_offset') else t.storage_offset()
     return (
         lhs.device == rhs.device
         and lhs.dtype == rhs.dtype
         and tuple(lhs.shape) == tuple(rhs.shape)
         and tuple(lhs.stride()) == tuple(rhs.stride())
-        and lhs._offset() == rhs._offset()
+        and _offset(lhs) == _offset(rhs)
         and lhs.data_ptr() == rhs.data_ptr()
     )
 
@@ -533,9 +534,7 @@ def _get_cu_seqlens_cpu(cu_seqlens: torch.Tensor) -> tuple:
 
 
 _ALIGNMENT_STREAK: int = 0
-_ALIGNMENT_ASSUMED: bool = (
-    os.getenv("SONIC_MOE_FP8_ASSUME_ALIGNED", "").lower() in {"1", "true", "yes", "on"}
-)
+_ALIGNMENT_ASSUMED: bool = True  # route-level padding guarantees 128-alignment
 _ALIGNMENT_STREAK_THRESHOLD: int = 3
 
 
@@ -575,11 +574,6 @@ def _all_segments_128_aligned(cu_seqlens: torch.Tensor) -> bool:
     return result
 
 
-def _use_cutely_fused_fp8_adapter() -> bool:
-    """Deprecated: always returns False. The cutely-fused adapter is only used
-    for non-quack-gemm fallback which is a dead path on the frontier."""
-    return False
-
 
 def _parse_runtime_precision(name: str, default: str, allowed: set[str]) -> str:
     value = os.getenv(name, "").strip().lower()
@@ -591,10 +585,6 @@ def _parse_runtime_precision(name: str, default: str, allowed: set[str]) -> str:
     return value
 
 
-def _legacy_blockscaled_fp8_downproj_enabled() -> bool:
-    return os.getenv("SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ", "").lower() in {"1", "true", "yes", "on"}
-
-
 def _upproj_epilogue_precision() -> str:
     return _parse_runtime_precision(
         "SONIC_MOE_FP8_UPPROJ_EPILOGUE_PRECISION",
@@ -604,10 +594,9 @@ def _upproj_epilogue_precision() -> str:
 
 
 def _downproj_mainloop_precision() -> str:
-    legacy_default = "fp8-blockscaled" if _legacy_blockscaled_fp8_downproj_enabled() else "bf16"
     return _parse_runtime_precision(
         "SONIC_MOE_FP8_DOWNPROJ_MAINLOOP_PRECISION",
-        default=legacy_default,
+        default="bf16",
         allowed={"bf16", "fp8-blockscaled"},
     )
 
@@ -624,20 +613,6 @@ def _downproj_weight_precision() -> str:
 def _use_blockscaled_fp8_downproj() -> bool:
     return _downproj_mainloop_precision() == "fp8-blockscaled"
 
-
-def _use_native_fp8_upproj() -> bool:
-    """Deprecated legacy flag — use SONIC_MOE_FP8_MODE=perf instead."""
-    return False
-
-
-def _use_dummy_fp8_postact_buffer() -> bool:
-    """Deprecated test-only flag — always disabled on the frontier path."""
-    return False
-
-
-def _use_mixed_dtype_downproj_dw2() -> bool:
-    """Deprecated legacy flag — use SONIC_MOE_FP8_MODE=perf instead."""
-    return False
 
 
 def _fp8_mode() -> str:
@@ -1791,7 +1766,7 @@ class _DownProjection(torch.autograd.Function):
                         dout_fp8,
                         w2_fp8_enk,
                         dz,
-                        dz,  # PreAct: ignored when preact_fp8 is set (C=None in wrapper)
+                        z if not use_fp8_preact else dz,  # PreAct: bf16 z when not fp8, ignored otherwise
                         y1s,
                         None,
                         "swiglu",
@@ -1835,32 +1810,30 @@ class _DownProjection(torch.autograd.Function):
                     if ctx._fp8_cfg.fp8_wgrad:
                         from ..quack_utils.blockscaled_fp8_gemm import (
                             colwise_quantize_and_pack,
-                            dual_quantize_varlen,
                             _run_cutlass_blockscaled_gemm_varlen_k,
+                        )
+                        from ..quack_utils.fused_quant_kernels import (
+                            fused_dual_colwise_quantize,
                         )
                         TK_wgrad = x_gather_idx.shape[0]
 
                         # Memory-optimized wgrad pipeline (all main stream):
-                        # Triton nw=1 colwise is 2.3× faster than default nw=4.
-                        # dual_quantize_varlen fuses row+col quant in one HBM read
-                        # (157µs vs separate 274µs = 43% faster).
+                        # Step 1: colwise(y1s) then del y1s to free 192 MiB
                         y1s_col_fp8, y1s_col_sc = colwise_quantize_and_pack(
                             y1s, logical_rows=y1s.shape[1], logical_cols=TK_wgrad,
                         )
                         del y1s
 
-                        dz_fp8, dz_packed_scales, dz_col_fp8, dz_col_scales = \
-                            dual_quantize_varlen(dz, dz.shape[0], dz.shape[1])
+                        # Step 2: Fused dual(dz) + colwise(dout, gather)
+                        # API-level fusion: pre-alloc all outputs, back-to-back
+                        # kernel launch, zero Python overhead between the two.
+                        dz_fp8, dz_packed_scales, dz_col_fp8, dz_col_scales, \
+                            dout_col_fp8, dout_col_sc = fused_dual_colwise_quantize(
+                                dz, dout, x_gather_idx,
+                                TK_wgrad, dz.shape[1], dout.shape[1],
+                            )
                         _PREQUANTIZED_SCALES["bwd"] = (dz, dz_fp8, dz_packed_scales)
                         _PREQUANTIZED_SCALES["bwd_col"] = (dz_col_fp8, dz_col_scales)
-                        # dz.untyped_storage().resize_(0)
-
-                        # Triton colwise quant with gather (faster than CuTe for indirect access)
-                        dout_col_fp8, dout_col_sc = colwise_quantize_and_pack(
-                            dout, logical_rows=dout.shape[1],
-                            logical_cols=TK_wgrad,
-                            gather_idx=x_gather_idx,
-                        )
 
                         # Fused wgrad accumulation (same as w1 path)
                         _wgrad_accum_w2 = getattr(ctx, '_wgrad_w2_accumulator', None)

@@ -226,3 +226,4 @@ tools/_archive/
 *.npy
 *.pt
 my_quack_cache/
+.jit_cache/

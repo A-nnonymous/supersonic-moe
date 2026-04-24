@@ -265,7 +265,8 @@ def _up_projection_backward_act(
     )
 
 
-_up_projection_backward_act.compile_cache = {}
+from sonicmoe.cache_manager import InstrumentedCompileCache as _ICC
+_up_projection_backward_act.compile_cache = _ICC("up_proj_bwd_act")
 
 
 @torch.library.custom_op(f"{LIBRARY_NAME}::_up_projection_backward_weight", mutates_args={"dw1"})
@@ -328,7 +329,7 @@ def _up_projection_backward_weight(
     )
 
 
-_up_projection_backward_weight.compile_cache = {}
+_up_projection_backward_weight.compile_cache = _ICC("up_proj_bwd_wgt")
 
 
 @torch.library.custom_op(f"{LIBRARY_NAME}::_down_projection_backward_act", mutates_args={"dz", "ds", "db2", "y1s"})
@@ -483,7 +484,7 @@ def _down_projection_backward_act(
             ds.copy_(torch.sum(new_ds_partial, dim=-1, dtype=ds.dtype))
 
 
-_down_projection_backward_act.compile_cache = {}
+_down_projection_backward_act.compile_cache = _ICC("down_proj_bwd_act")
 
 
 @torch.library.custom_op(f"{LIBRARY_NAME}::_down_projection_backward_weight", mutates_args={"dw2"})
@@ -533,7 +534,7 @@ def _down_projection_backward_weight(
     )
 
 
-_down_projection_backward_weight.compile_cache = {}
+_down_projection_backward_weight.compile_cache = _ICC("down_proj_bwd_wgt")
 
 
 @torch.library.custom_op(f"{LIBRARY_NAME}::_token_broadcast_backward", mutates_args={"dx_reduced"})

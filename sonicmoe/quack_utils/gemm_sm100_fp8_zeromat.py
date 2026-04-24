@@ -422,7 +422,8 @@ _gate_fn_map = {
     "swiglu": quack.activation.swiglu,
 }
 
-_zeromat_compile_cache: dict = {}
+from sonicmoe.cache_manager import InstrumentedCompileCache as _ICC
+_zeromat_compile_cache = _ICC("zeromat")
 
 
 def _make_cute(tensor: Tensor, leading_dim: int) -> cute.Tensor:
@@ -495,18 +496,22 @@ def gemm_gated_zeromat(
     epi_args = GemmCls.EpilogueArguments(tensor_infos["PostAct"].cute_tensor, act_fn)
     scheduler_args = GemmWrapperBase.create_scheduler_args(max_active_clusters, None, max_swizzle_size=8)
     varlen_args = GemmWrapperBase.create_varlen_args(cu_seqlens_m, None, A_idx)
-    current_stream = cuda.CUstream(torch.cuda.current_stream().stream_base.raw_stream)
+    _stream_obj = torch.cuda.current_stream()
+    current_stream = cuda.CUstream(_stream_obj.stream_base.raw_stream if hasattr(_stream_obj, "stream_base") else _stream_obj.cuda_stream)
 
     a_scale_cute = _make_cute(a_scales, leading_dim=1)
     b_scale_cute = _make_cute(b_scales, leading_dim=1)
 
+    # compile_key must NOT contain dynamic token dimensions (A.shape[0],
+    # preact_out.shape[0], PostAct.shape[0], TK) — those change with seqlen
+    # and are handled at runtime via mark_layout_dynamic.
     compile_key = (
         "zeromat_gated",
-        tuple(A.shape), A.dtype,
-        tuple(B.shape), B.dtype,
-        tuple(preact_out.shape), preact_out.dtype,
-        tuple(PostAct.shape), PostAct.dtype,
-        activation, TK,
+        A.shape[-1], A.dtype,           # K only — static (model dim)
+        tuple(B.shape), B.dtype,        # (E,N,K) — static
+        preact_out.dtype,
+        PostAct.dtype,
+        activation,
         True,  # blockscaled
     )
 

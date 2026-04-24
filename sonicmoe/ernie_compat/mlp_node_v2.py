@@ -30,6 +30,8 @@ from typing import Any, Sequence
 
 import paddle
 import torch
+import triton
+import triton.language as tl
 
 from sonicmoe.enums import ActivationType
 from sonicmoe.ernie_compat.deepep_metadata import (
@@ -52,7 +54,12 @@ _W_CACHE: dict[tuple, torch.Tensor] = {}
 
 
 def _cache_key(*tensors: torch.Tensor) -> tuple:
-    return tuple((t.data_ptr(), t._inplace_version) for t in tensors)
+    def _ver(t):
+        v = getattr(t, '_inplace_version', None)
+        if v is not None:
+            return v() if callable(v) else v
+        return getattr(t, '_version', 0)
+    return tuple((t.data_ptr(), _ver(t)) for t in tensors)
 
 
 def invalidate_weight_caches() -> None:
@@ -426,6 +433,107 @@ class SonicMoEFunc(paddle.autograd.PyLayer):
         return dx, ds, None, None, None, None
 
 
+# ── Differentiable router-scores reconstruction ──────────────────────────────
+
+@triton.jit
+def _build_score_src_idx_kernel(
+    INDICES_ptr,  # [N_recv, topk] int32 — dispatched_indices
+    NAEPT_ptr,    # [N_recv+1] int32 — prefix-sum of valid counts per token
+    OUT_ptr,      # [TK] int64 — output: flat index into dispatched_probs.reshape(-1)
+    TOPK: tl.constexpr,
+    E: tl.constexpr,
+):
+    """Build score_src_idx without boolean indexing (zero CPU-GPU sync).
+
+    For each token t, sort its valid expert IDs ascending, then write
+    the flat source indices (t * topk + original_column) to the output
+    at positions [naept[t], naept[t+1]).
+
+    Grid: (N_recv,).  Each program processes one token.
+    Uses iterative argmin for stable ascending sort (topk <= 8, fully unrolled).
+    """
+    t = tl.program_id(0)
+    start = tl.load(NAEPT_ptr + t).to(tl.int32)
+    end = tl.load(NAEPT_ptr + t + 1).to(tl.int32)
+    n_valid = end - start
+    if n_valid == 0:
+        return
+
+    # Load expert IDs; replace invalid (-1) with E so they sort last
+    cols = tl.arange(0, TOPK)
+    experts = tl.load(INDICES_ptr + t * TOPK + cols, mask=cols < TOPK).to(tl.int32)
+    experts = tl.where(experts >= 0, experts, E)
+
+    # Iterative argmin: for each output slot j, find the column with the
+    # smallest expert ID (ties broken by lowest column = stable sort),
+    # write its flat source index, then mark it used (set to E+1).
+    for j in range(TOPK):
+        # Guard: skip if we've already placed all valid entries
+        if j < n_valid:
+            min_val = tl.min(experts, axis=0)
+            is_min = (experts == min_val)
+            # Stable tiebreak: among columns with min expert, pick lowest col
+            best_col = tl.min(tl.where(is_min, cols, TOPK), axis=0).to(tl.int32)
+            tl.store(OUT_ptr + start + j, (t * TOPK + best_col).to(tl.int64))
+            experts = tl.where(cols == best_col, E + 1, experts)
+
+
+def _differentiable_router_scores(
+    dispatched_probs: torch.Tensor,    # [N_recv, topk] float32
+    dispatched_indices: torch.Tensor,  # [N_recv, topk] int32, -1 = masked
+    naept: torch.Tensor,               # [N_recv+1] int32 — prefix-sum of valid counts
+    TK: int,                           # number of real (non-padding) entries
+    TK_padded: int,                    # TK + padding for 128-alignment
+    E: int,                            # number of experts
+) -> torch.Tensor:
+    """Reconstruct router_scores from dispatched_probs with autograd connection.
+
+    The CUDA metadata kernel produces topk_scores as a non-differentiable data
+    copy.  This function builds the same [TK_padded] tensor using differentiable
+    fancy-indexing into dispatched_probs, so that ds gradients flow back through
+    Paddle autograd to the caller's gate / dispatched_probs tensor.
+
+    Within each token, entries are ordered by ascending expert ID, matching the
+    CUDA kernel's rank-based ordering in ``scatter_and_fixup_kernel``.
+
+    Zero CPU-GPU synchronization: uses a Triton kernel to build the [TK] index
+    tensor from naept (known-size prefix-sum) instead of boolean indexing.
+    """
+    N_recv, topk = dispatched_indices.shape
+    device = dispatched_indices.device
+
+    if dispatched_indices.stride(1) != 1:
+        raise ValueError("dispatched_indices must be contiguous in last dim")
+    if "int32" not in str(dispatched_indices.dtype):
+        raise ValueError(f"dispatched_indices: expected int32, got {dispatched_indices.dtype}")
+    if naept.stride(0) != 1:
+        raise ValueError("naept must be contiguous 1D")
+    if naept.shape[0] != N_recv + 1:
+        raise ValueError(f"naept: expected shape ({N_recv+1},), got {naept.shape}")
+
+    if TK == 0:
+        return torch.zeros(TK_padded, dtype=dispatched_probs.dtype, device=device)
+
+    # Build score_src_idx: [TK] int64 flat indices into dispatched_probs.reshape(-1)
+    # Uses Triton kernel — no boolean indexing, no dynamic shapes, no D2H sync.
+    score_src_idx = torch.empty(TK, dtype=torch.int64, device=device)
+    _build_score_src_idx_kernel[(N_recv,)](
+        dispatched_indices, naept, score_src_idx,
+        TOPK=triton.next_power_of_2(topk),
+        E=E,
+    )
+
+    # Differentiable gather from dispatched_probs
+    gathered = dispatched_probs.reshape(-1)[score_src_idx]  # [TK]
+
+    if TK_padded > TK:
+        padding = torch.zeros(
+            TK_padded - TK, dtype=gathered.dtype, device=device,
+        )
+        return torch.cat([gathered, padding])
+    return gathered
+
+
 # ── SonicMoEMlpNode (production path using DeepEP metadata) ──────────────────
 
 class SonicMoEMlpNode:
@@ -476,6 +584,20 @@ class SonicMoEMlpNode:
         self._activation_type = activation_type
         self._stream_id = stream_id
 
+    def warmup(self, total_K_list: list[int] | None = None, max_workers: int = 0):
+        """Pre-compile all JIT kernels. Call once after model construction.
+
+        After compile_key dynamic-dim fix, a single warmup covers all seqlens.
+        """
+        from sonicmoe.jit_warmup import warmup_jit
+        warmup_jit(
+            self._E, self._H, self._I,
+            device="cuda",
+            fp8=True,
+            total_K_list=total_K_list,
+            max_workers=max_workers,
+        )
+
     def forward(
         self,
         dispatched_hidden_states: torch.Tensor,
@@ -523,13 +645,23 @@ class SonicMoEMlpNode:
             s_scatter_idx,
             s_reverse_scatter_idx,
             num_activated_expert_per_token_offset,
-            router_scores,
+            _router_scores_data,
             TK_padded,
             total_pad_rows,
             N_recv,
         ) = deepep_topk_to_sonic_metadata(
             dispatched_indices, dispatched_probs,
             tokens_per_expert, E, device=x.device,
+        )
+
+        # Build router_scores differentiably from dispatched_probs so that
+        # ds gradients flow back to the caller (e.g. DeepEP's gate).
+        # deepep_topk_to_sonic_metadata produces a non-differentiable copy;
+        # we reconstruct the same values using autograd-tracked indexing.
+        router_scores = _differentiable_router_scores(
+            dispatched_probs, dispatched_indices,
+            num_activated_expert_per_token_offset,
+            TK_padded - total_pad_rows, TK_padded, E,
         )
         # T_down = N_recv for the topk path: _router_forward outputs [N_recv, H]
         T_down = N_recv
@@ -544,9 +676,11 @@ class SonicMoEMlpNode:
         # 4. Prepare tensor inputs for PyLayer.
         #    x passes through WITHOUT detach — dx must flow back to the caller
         #    so that FusedDispatch.backward can do the reverse A2A with it.
-        #    router_scores is freshly constructed by deepep_topk_to_sonic_metadata
-        #    (not on any external autograd graph), so detach is unnecessary.
+        #    router_scores is differentiably derived from dispatched_probs,
+        #    so ds gradients propagate back to the gate automatically.
         x.stop_gradient = False
+        # router_scores is a non-leaf tensor (computed from dispatched_probs),
+        # Paddle autograd tracks it automatically; explicit flag is defensive.
         router_scores.stop_gradient = False
 
         # Non-differentiable inputs (integer metadata + stacked weights whose
@@ -573,6 +707,20 @@ class SonicMoEMlpNode:
         )
 
         return output
+
+    def step(self):
+        """Call after optimizer.step(). Flushes wgrad and invalidates all caches.
+
+        Training loop contract:
+            for microbatch in microbatches:
+                out = node(x, tpe, indices, probs)
+                out.backward(grad)
+            optimizer.step()
+            node.step()         # ← here
+            optimizer.zero_grad()
+        """
+        flush_native_grads()
+        invalidate_weight_caches()
 
     def __call__(
         self,
@@ -692,6 +840,9 @@ class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
         dw1 = up_grads[1]
 
         # ── Weight grads → per-expert main_grad ──────────────────────────
+        # FP8 path: CUTLASS accumulates directly into _NATIVE_W{1,2}_GRAD
+        # via the _wgrad_accumulator, returning dw1=dw2=None. If non-None,
+        # we're on the BF16 fallback — accumulate with per-iter transpose.
         if dw1 is not None:
             _accumulate_w1(dw1, ctx._experts, ctx._I)
         if dw2 is not None:

@@ -50,7 +50,8 @@ def _topk_fwd(
     _topk_fwd.compile_cache[compile_key](x_tensor, values_tensor, indices_tensor, current_stream)
 
 
-_topk_fwd.compile_cache = {}
+from sonicmoe.cache_manager import InstrumentedCompileCache as _ICC
+_topk_fwd.compile_cache = _ICC("topk_fwd")
 
 
 @torch.library.custom_op(f"{LIBRARY_NAME}::_up_projection_forward", mutates_args={"z", "y1"})
@@ -129,7 +130,7 @@ def _up_projection_forward(
     )
 
 
-_up_projection_forward.compile_cache = {}
+_up_projection_forward.compile_cache = _ICC("up_proj_fwd")
 
 
 @torch.library.custom_op(f"{LIBRARY_NAME}::_down_projection_forward", mutates_args={"y2"})
@@ -178,7 +179,7 @@ def _down_projection_forward(
     )
 
 
-_down_projection_forward.compile_cache = {}
+_down_projection_forward.compile_cache = _ICC("down_proj_fwd")
 
 
 @torch.library.custom_op(f"{LIBRARY_NAME}::_router_forward", mutates_args={"o"})

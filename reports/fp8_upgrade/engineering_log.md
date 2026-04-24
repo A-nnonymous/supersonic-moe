@@ -327,6 +327,37 @@
 63. **`_WGRAD_STREAM` was dead code.** Declared in Session 32, never called. Always grep for
     callers before assuming infrastructure is live.
 
+## Phase 21: Session 60 — Gate↔MLP Gradient Chain (2026-04-22)
+
+- Fixed ds silently dropped (`_topk_scores_needs_grad` always True)
+- Fixed segfault from native Paddle autograd nodes on ds return path
+- Removed `x.detach()` that severed dx flow, removed identity layout path
+- Lessons 64-72 in `docs/session60_lessons.md`
+
+## Phase 22: Session 62 — Production Hardening (2026-04-24)
+
+- Eliminated CPU-GPU sync in `_differentiable_router_scores` (Triton kernel, 17µs)
+- Fixed 3 compile_keys with dynamic token dims: "varlen" (a_scales_packed.size(1)),
+  "weight_grad" + "weight_grad_fast" (capacity from _auto_capacity)
+- Fixed Paddle/PyTorch compat: _inplace_version, stream API, _offset, dtype comparison,
+  bf16 tensor conversion (only torch.from_dlpack works correctly)
+- Fixed warmup_jit: unpack (y1, z), run under Paddle proxy, 2-iter for wgrad accumulate
+- Added SonicMoEMlpNode.step() API (flush grads + invalidate caches)
+- Added input validation to 18 operator wrappers (zero GPU sync)
+- Added _GEMM_FAST_PATH 64-entry high-water-mark eviction
+- Deleted 4 dead functions + 2 dead unfused quant kernels + legacy flags
+- Defaulted ASSUME_ALIGNED=True (route-level padding guarantees 128-alignment)
+- Added test_cold_start_e2e.py: cache clear → warmup → 6-shape × 5-tensor precision
+- nsys GPU-projection verified: 2871µs (3-GPU mean, CV=0.6%, +5.7% vs S53 baseline)
+
+Lessons:
+73. `mark_layout_dynamic` has zero GPU kernel overhead (A/B nsys: Δ<1%).
+74. CUDA events ≠ GPU kernel time (5100µs events vs 2871µs GPU-proj).
+75. nsys `cuda_gpu_kern_sum` is wrong without NVTX filtering.
+76. Paddle bf16 → numpy is silently broken (returns uint16).
+77. compile_key must not contain ISA-packed scale shapes (_storage_per_batch is dynamic).
+78. `_auto_capacity` makes tensor shapes dynamic — never include in compile_key.
+
 ---
 
-> **Canonical handoff for next agent: `docs/HANDOFF.md`**
+> **Canonical handoff: root `HANDOFF.md`**
