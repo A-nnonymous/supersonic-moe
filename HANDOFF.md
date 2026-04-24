@@ -54,12 +54,22 @@ the correct production config.
 
 ### Overhead Sources (Paddle vs native PyTorch FP8)
 
-| Source | Estimated cost | Notes |
+**100% of overhead comes from fused BF16 wgrad accumulate GEMM** (regs=50→86).
+
+S53 has no main_grad accumulation in its wgrad path. Paddle fuses `D = A@B + 1.0*C`
+(beta=1 epilogue) to accumulate wgrad directly into the fp32 native_grad buffer.
+This increases register pressure by 72% (50→86 regs/thread), reducing SM occupancy
+from ~5 to ~2-3 blocks/SM and causing 30-38% per-call slowdown on the accumulate GEMMs.
+
+See `reports/wgrad_overhead_analysis.md` for full per-kernel breakdown with register
+counts and grid configurations.
+
+| Source | Per-iter cost | Notes |
 |---|:---:|---|
-| Paddle torch-proxy dispatch | ~3-5% | Per-op overhead from `paddle.enable_compat()` interception |
-| BF16 wgrad accumulate (CUTLASS varlen) | ~664 µs/iter | Same as native — inherent to blockscaled FP8 wgrad |
-| `token_gather_sum` router scatter | ~55-57 µs/iter | Paddle-specific routing metadata path |
-| Dynamic shape overhead | ~1-2% | `mark_layout_dynamic` vs static shapes in native path |
+| Fused wgrad epilogue (regs=86 vs 50) | +206 to +563 µs | 99-113% of total overhead |
+| Score Src Idx (Triton topk) | +25 to +45 µs | New Paddle-specific kernel |
+| Paddle Framework (phi:: kernels) | +15 to +17 µs | Routing metadata path |
+| Offset: fewer torch ops | -24 to -65 µs | S53 has extra elementwise/cuBLAS |
 
 ### ERNIE-Shape (E=32, H=3072, I=1536, K=8, EP=8, SEQ=4096)
 
@@ -221,7 +231,7 @@ Training iteration:
 
 1. **GEMM 占 GPU 时间 78%**。Forward: CUTLASS GEMM 65%, 量化 10%. Backward: wgrad+accumulate 78%, actgrad 13%. 优化量化内核的收益已接近天花板。
 
-2. **fused BF16 wgrad epilogue 消除 664µs/iter accumulate**。Session 64 确认 `fp8_wgrad=True` 生产配置下，CUTLASS wgrad 直接写入 native grad buffer，消除了单独的 varlen accumulate pass（之前 backward 最大单项开销 34.9%）。
+2. **fused BF16 wgrad epilogue causes 100% of the S53 overhead.** The `D = A@B + 1.0*C` fused epilogue (commit 1898a91) increases register pressure from 50→86 regs/thread, reducing occupancy from ~5 to ~2-3 blocks/SM. Per-call: +30-38% slower. S53 has no main_grad accumulation, so this is a fair functional difference, not a bug.
 
 3. **bench_mlpnode_mem.py 之前硬编码 `fp8_wgrad=False`**。导致之前 bench 测试的是非生产配置。Session 64 修正后与 auto-detect 默认（threshold=0 → 全 I 开启）一致。
 
@@ -229,7 +239,7 @@ Training iteration:
 
 5. **并行 autotuning 对冷启动很关键**。36 configs × 8 workers = 45s 并行编译。单线程需要 ~360s (8x)。确保 Paddle 环境下 worker 能正常工作。
 
-6. **Paddle proxy 引入 6-15% overhead vs native PyTorch FP8**。主要来自 dispatch interception 和动态 shape 处理，不来自 FP8 算法差异。
+6. **Paddle vs S53 overhead is NOT from proxy dispatch.** Non-GEMM categories are actually faster in Paddle (-24 to -65µs). The entire overhead is from fused wgrad accumulate epilogue register pressure.
 
 ### Next Steps (Priority)
 
@@ -237,7 +247,7 @@ Training iteration:
 
 2. **E=32 生产规模验证** — 当前 E=32 用 SEQ=4096 验证通过。需要用完整 SEQ=16384+EP=32 规模验证显存和延迟。
 
-3. **Paddle proxy overhead 优化** — 6-15% overhead 主要来自 dispatch interception。可探索 hot-path bypass 或 native Paddle kernel 注册。
+3. **Wgrad accumulate epilogue register tuning** — fused `D = A@B + C` epilogue uses 86 regs vs S53's 50 regs, causing 30-38% per-call slowdown. Options: CuTe DSL maxrregcount hint, shared memory staging for C, or separate add kernel if cheaper.
 
 4. **Epilogue forward quantization** — 将 x→fp8 量化融入 GemmGated epilogue，消除 ~65µs forward overhead。
 

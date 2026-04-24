@@ -403,16 +403,38 @@ All previous bench data was from a non-production config.
 
 **Key takeaways**:
 - vs BF16: **1.14x – 1.43x faster** (production-relevant comparison)
-- vs S53 native PyTorch FP8: 6-15% slower (Paddle proxy overhead)
-- fused BF16 wgrad epilogue eliminates 664µs/iter varlen accumulate pass
+- vs S53 native PyTorch FP8: 6-15% slower
+- **100% of overhead from fused wgrad accumulate epilogue** (regs=50→86, +30-38% per-call)
+- S53 has no main_grad accumulation — fair functional difference, not a bug
+- Non-GEMM categories are actually faster in Paddle (-24 to -65µs)
 - Precision verified: 4 shapes × 5 tensors, all cosine > 0.98 with fp8_wgrad=True
+
+### Root Cause: Fused Wgrad Epilogue Register Pressure
+
+nsys sqlite analysis (3 trials × 4 shapes, GPUs 2-7) shows the same CUTLASS
+`quackgemm_default_epiGemmDefaultSm100` kernel compiled with different register counts:
+
+| GEMM variant | S53 regs | Paddle regs | S53 µs | Paddle µs | Delta |
+|---|:---:|:---:|:---:|:---:|:---:|
+| FP8 wgrad compute | 54 | 54 | ~196 | ~222 | +6% |
+| BF16 accumulate (dw1) | **50** | **86** | 325 | 449 | **+38%** |
+| BF16 accumulate (dw2) | **50** | **86** | 174 | 226 | **+30%** |
+
+S53 epilogue: `D = A@B` (simple, 50 regs, ~5 blocks/SM).
+Paddle epilogue: `D = A@B + 1.0*C` (fused fp32 accumulate, 86 regs, ~2-3 blocks/SM).
+
+GemmGated ZeroMat (fwd) and GemmDGated ZeroMat (bwd) are unaffected: same grid,
+same regs=168, same per-call timing (<4% variance). These don't involve wgrad.
 
 Lessons:
 84. **Bench scripts must match production config.** `fp8_wgrad=False` was hardcoded while
-    production auto-detect uses threshold=0 → always True. Bench data was 11-16% worse
-    than real production performance.
-85. **Paddle proxy overhead is 6-15% vs native PyTorch FP8.** Irreducible dispatch overhead
-    from `paddle.enable_compat()` interception layer. Not an FP8 algorithm issue.
+    production auto-detect uses threshold=0 → always True.
+85. **Fused epilogue trades register pressure for fewer kernel launches.** The `D = A@B + C`
+    epilogue increases regs from 50→86 (+72%), reducing occupancy and causing 30-38%
+    per-call slowdown. In a training loop where accumulation is needed anyway, the
+    trade-off may still be net positive vs separate add kernel.
+86. **Non-GEMM categories can be faster in Paddle.** S53 has extra torch elementwise,
+    cuBLAS, and reduce kernels that Paddle's fused path eliminates.
 
 ---
 
