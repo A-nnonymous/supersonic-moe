@@ -426,6 +426,55 @@ class SonicMoEFunc(paddle.autograd.PyLayer):
         return dx, ds, None, None, None, None
 
 
+# ── Differentiable router-scores reconstruction ──────────────────────────────
+
+def _differentiable_router_scores(
+    dispatched_probs: torch.Tensor,    # [N_recv, topk] float32
+    dispatched_indices: torch.Tensor,  # [N_recv, topk] int32, -1 = masked
+    TK: int,                           # number of real (non-padding) entries
+    TK_padded: int,                    # TK + padding for 128-alignment
+    E: int,                            # number of experts
+) -> torch.Tensor:
+    """Reconstruct router_scores from dispatched_probs with autograd connection.
+
+    The CUDA metadata kernel produces topk_scores as a non-differentiable data
+    copy.  This function builds the same [TK_padded] tensor using differentiable
+    fancy-indexing into dispatched_probs, so that ds gradients flow back through
+    Paddle autograd to the caller's gate / dispatched_probs tensor.
+
+    Within each token, entries are ordered by ascending expert ID, matching the
+    CUDA kernel's rank-based ordering in ``scatter_and_fixup_kernel``.
+    """
+    N_recv, topk = dispatched_indices.shape
+    device = dispatched_indices.device
+
+    # Sort each token's expert IDs ascending.  Invalid slots (-1) sort to end
+    # by replacing with E (larger than any valid expert 0..E-1).
+    masked = dispatched_indices.int().clone()
+    masked[masked < 0] = E
+    sort_perm = masked.argsort(axis=1, stable=True)  # [N_recv, topk]
+
+    # After sorting, valid entries (expert < E) come first within each token.
+    sorted_valid = torch.gather(masked, 1, sort_perm) < E  # [N_recv, topk]
+
+    # Flat source index into dispatched_probs.reshape(-1):
+    #   dispatched_probs[t, sort_perm[t, j]] → flat = t * topk + sort_perm[t, j]
+    row_offsets = torch.arange(N_recv, device=device, dtype=sort_perm.dtype)
+    src_flat = row_offsets.unsqueeze(1) * topk + sort_perm  # [N_recv, topk]
+    score_src_idx = src_flat[sorted_valid]  # [TK]
+
+    # Differentiable gather from dispatched_probs
+    gathered = dispatched_probs.reshape(-1)[score_src_idx]  # [TK]
+
+    if TK_padded > TK:
+        # Padding zeros (no gradient contribution)
+        padding = torch.zeros(
+            TK_padded - TK, dtype=gathered.dtype, device=device,
+        )
+        return torch.cat([gathered, padding])
+    return gathered
+
+
 # ── SonicMoEMlpNode (production path using DeepEP metadata) ──────────────────
 
 class SonicMoEMlpNode:
@@ -537,13 +586,22 @@ class SonicMoEMlpNode:
             s_scatter_idx,
             s_reverse_scatter_idx,
             num_activated_expert_per_token_offset,
-            router_scores,
+            _router_scores_data,
             TK_padded,
             total_pad_rows,
             N_recv,
         ) = deepep_topk_to_sonic_metadata(
             dispatched_indices, dispatched_probs,
             tokens_per_expert, E, device=x.device,
+        )
+
+        # Build router_scores differentiably from dispatched_probs so that
+        # ds gradients flow back to the caller (e.g. DeepEP's gate).
+        # deepep_topk_to_sonic_metadata produces a non-differentiable copy;
+        # we reconstruct the same values using autograd-tracked indexing.
+        router_scores = _differentiable_router_scores(
+            dispatched_probs, dispatched_indices,
+            TK_padded - total_pad_rows, TK_padded, E,
         )
         # T_down = N_recv for the topk path: _router_forward outputs [N_recv, H]
         T_down = N_recv
@@ -558,9 +616,11 @@ class SonicMoEMlpNode:
         # 4. Prepare tensor inputs for PyLayer.
         #    x passes through WITHOUT detach — dx must flow back to the caller
         #    so that FusedDispatch.backward can do the reverse A2A with it.
-        #    router_scores is freshly constructed by deepep_topk_to_sonic_metadata
-        #    (not on any external autograd graph), so detach is unnecessary.
+        #    router_scores is differentiably derived from dispatched_probs,
+        #    so ds gradients propagate back to the gate automatically.
         x.stop_gradient = False
+        # router_scores is a non-leaf tensor (computed from dispatched_probs),
+        # Paddle autograd tracks it automatically; explicit flag is defensive.
         router_scores.stop_gradient = False
 
         # Non-differentiable inputs (integer metadata + stacked weights whose

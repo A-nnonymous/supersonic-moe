@@ -1791,7 +1791,7 @@ class _DownProjection(torch.autograd.Function):
                         dout_fp8,
                         w2_fp8_enk,
                         dz,
-                        dz,  # PreAct: ignored when preact_fp8 is set (C=None in wrapper)
+                        z if not use_fp8_preact else dz,  # PreAct: bf16 z when not fp8, ignored otherwise
                         y1s,
                         None,
                         "swiglu",
@@ -1835,32 +1835,30 @@ class _DownProjection(torch.autograd.Function):
                     if ctx._fp8_cfg.fp8_wgrad:
                         from ..quack_utils.blockscaled_fp8_gemm import (
                             colwise_quantize_and_pack,
-                            dual_quantize_varlen,
                             _run_cutlass_blockscaled_gemm_varlen_k,
+                        )
+                        from ..quack_utils.fused_quant_kernels import (
+                            fused_dual_colwise_quantize,
                         )
                         TK_wgrad = x_gather_idx.shape[0]
 
                         # Memory-optimized wgrad pipeline (all main stream):
-                        # Triton nw=1 colwise is 2.3× faster than default nw=4.
-                        # dual_quantize_varlen fuses row+col quant in one HBM read
-                        # (157µs vs separate 274µs = 43% faster).
+                        # Step 1: colwise(y1s) then del y1s to free 192 MiB
                         y1s_col_fp8, y1s_col_sc = colwise_quantize_and_pack(
                             y1s, logical_rows=y1s.shape[1], logical_cols=TK_wgrad,
                         )
                         del y1s
 
-                        dz_fp8, dz_packed_scales, dz_col_fp8, dz_col_scales = \
-                            dual_quantize_varlen(dz, dz.shape[0], dz.shape[1])
+                        # Step 2: Fused dual(dz) + colwise(dout, gather)
+                        # API-level fusion: pre-alloc all outputs, back-to-back
+                        # kernel launch, zero Python overhead between the two.
+                        dz_fp8, dz_packed_scales, dz_col_fp8, dz_col_scales, \
+                            dout_col_fp8, dout_col_sc = fused_dual_colwise_quantize(
+                                dz, dout, x_gather_idx,
+                                TK_wgrad, dz.shape[1], dout.shape[1],
+                            )
                         _PREQUANTIZED_SCALES["bwd"] = (dz, dz_fp8, dz_packed_scales)
                         _PREQUANTIZED_SCALES["bwd_col"] = (dz_col_fp8, dz_col_scales)
-                        # dz.untyped_storage().resize_(0)
-
-                        # Triton colwise quant with gather (faster than CuTe for indirect access)
-                        dout_col_fp8, dout_col_sc = colwise_quantize_and_pack(
-                            dout, logical_rows=dout.shape[1],
-                            logical_cols=TK_wgrad,
-                            gather_idx=x_gather_idx,
-                        )
 
                         # Fused wgrad accumulation (same as w1 path)
                         _wgrad_accum_w2 = getattr(ctx, '_wgrad_w2_accumulator', None)
