@@ -1,4 +1,4 @@
-# HANDOFF — Session 64 (2026-04-24)
+# HANDOFF — Session 65 (2026-04-24)
 
 > **Single source of truth.** `docs/HANDOFF.md` redirects here.
 
@@ -16,11 +16,12 @@
 | FP8 fwd + bwd (E=8, topk=8) | `test_mlpnode_precision.py`, `bench_mlpnode_mem.py` | PASS |
 | FP8 fwd + bwd (E=32, topk=8, has -1 entries) | `bench_mlpnode_mem.py` E=32 with real EP routing | PASS |
 | FP8 fwd + bwd (E=128, topk=8) | `/tmp/test_all_e_seq.py` | PASS |
-| Precision: all cos > 0.99 | `test_mlpnode_precision.py` 4 shapes × 5 tensors | PASS |
-| ds gradient flows back to dispatched_probs | Triton `_build_score_src_idx_kernel` | PASS |
+| Precision: all cos > 0.99 (6 shapes incl. E=32) | `test_mlpnode_precision.py` 6 shapes × 4 tensors | PASS |
+| ds gradient flows back to dispatched_probs | `test_cold_start_e2e.py` ds cos=0.9972 | PASS |
 | Dynamic seqlen (zero CuTe recompile) | compile_key static-only design | PASS |
 | `SonicMoEMlpNode.step()` API | flush grads + invalidate caches | PASS |
 | QuACK parallel compile workers (Paddle proxy) | dtype normalization fix in autotuner | PASS |
+| TMA reduce-add wgrad epilogue | 2-4% E2E improvement, bitwise deterministic | PASS |
 
 ## 2. What Doesn't Work / Known Issues
 
@@ -30,46 +31,36 @@
 | Multi-card EP>1 | Requires DeepEP buffer; single-card only tested |
 | ERNIE training loop plug-in | MlpNode interface verified, not yet in actual ERNIE training |
 | Pipeline microbatch overlap | `_PREQUANTIZED_SCALES` module-level dict unsafe under overlap |
+| `test_cold_start_e2e.py` K=4 timing | K=4 JIT takes >5s (8.3s), triggers timing FAIL — precision is correct |
 
-## 3. Performance — GPU-Projection (nsys sqlite, verified 2026-04-24)
+## 3. Performance — GPU-Projection (nsys sqlite)
 
-### Session 64 correction: fp8_wgrad=True (production config)
+### Session 65: TMA Reduce-Add wgrad epilogue (default)
 
-Session 63 nsys grid used `fp8_wgrad=False` in the bench script, while production
-auto-detect defaults to `fp8_wgrad=True` (threshold=0). Session 64 re-measured with
-the correct production config.
+| Shape (I=1536, K=8) | S53 BF16 (µs) | Paddle FP8 (µs) | vs BF16 |
+|---|:---:|:---:|:---:|
+| T=8192 E=8 | 3644 | **2820** | **1.29x** |
+| T=8192 E=32 | 3844 | **3283** | **1.17x** |
+| T=16384 E=8 | 7953 | 5548 | **1.43x** |
+| T=16384 E=32 | 8129 | 5916 | **1.37x** |
 
-### nsys GPU-projection grid (I=1536, K=8, fp8_wgrad=True)
+### TMA Reduce-Add vs Fused Beta=1.0 (Session 65 optimization)
 
-| Shape | S53 BF16 (µs) | S53 FP8 (µs) | Paddle FP8 (µs) | vs BF16 | vs S53 FP8 |
-|---|:---:|:---:|:---:|:---:|:---:|
-| T=8192 E=8 | 3644 | 2715 | 2887 | **1.26x** | 1.06x slower |
-| T=8192 E=32 | 3844 | 2922 | 3372 | **1.14x** | 1.15x slower |
-| T=16384 E=8 | 7953 | 5227 | 5548 | **1.43x** | 1.06x slower |
-| T=16384 E=32 | 8129 | 5432 | 5916 | **1.37x** | 1.09x slower |
+| Shape | Baseline beta=1.0 (µs) | TMA add (µs) | Improvement |
+|---|:---:|:---:|:---:|
+| T=8192 E=8 | 2886 | 2820 | **-65 µs (-2.3%)** |
+| T=8192 E=32 | 3420 | 3283 | **-138 µs (-4.0%)** |
 
-- **vs BF16**: 1.14x — 1.43x faster (the production-relevant comparison)
-- **vs S53 native PyTorch FP8**: 6-15% slower (Paddle proxy overhead, not FP8 config issue)
-- S53 = Session 53 native PyTorch benchmark on same hardware (no Paddle proxy)
+BF16 wgrad GEMM kernel (`quackgemm_default_epi`, 4 calls/iter):
+- E=8: 321→305 µs/call (-5.0%), E=32: 429→396 µs/call (-7.7%)
 
-### Overhead Sources (Paddle vs native PyTorch FP8)
+**Mechanism**: `add_to_output=True` in QuACK triggers TMA hardware `CopyReduceBulkTensorTileS2GOp(ReductionOp.ADD)` on store. No C tensor load → no `epi_c_stage` → regs 86→50 → SM occupancy ~2-3→~5 blocks/SM.
 
-**100% of overhead comes from fused BF16 wgrad accumulate GEMM** (regs=50→86).
+**Determinism**: Safe because `tile_count_semaphore=None` (no split-K) — each CTA exclusively owns its output tiles. Verified bitwise-identical in isolated benchmark.
 
-S53 has no main_grad accumulation in its wgrad path. Paddle fuses `D = A@B + 1.0*C`
-(beta=1 epilogue) to accumulate wgrad directly into the fp32 native_grad buffer.
-This increases register pressure by 72% (50→86 regs/thread), reducing SM occupancy
-from ~5 to ~2-3 blocks/SM and causing 30-38% per-call slowdown on the accumulate GEMMs.
+**Fallback**: `SONIC_MOE_FP8_WGRAD_BETA_ACCUM=1` reverts to legacy fused beta=1.0 epilogue.
 
-See `reports/wgrad_overhead_analysis.md` for full per-kernel breakdown with register
-counts and grid configurations.
-
-| Source | Per-iter cost | Notes |
-|---|:---:|---|
-| Fused wgrad epilogue (regs=86 vs 50) | +206 to +563 µs | 99-113% of total overhead |
-| Score Src Idx (Triton topk) | +25 to +45 µs | New Paddle-specific kernel |
-| Paddle Framework (phi:: kernels) | +15 to +17 µs | Routing metadata path |
-| Offset: fewer torch ops | -24 to -65 µs | S53 has extra elementwise/cuBLAS |
+nsys-rep files: `reports/wgrad_tma_add_nsys/*.nsys-rep`
 
 ### ERNIE-Shape (E=32, H=3072, I=1536, K=8, EP=8, SEQ=4096)
 
@@ -80,32 +71,6 @@ N_recv ≈ 21725, TK ≈ 32822, TK_padded ≈ 34816
 | **Forward** | **625** | 0.3% |
 | **Backward** | **1904** | 0.1% |
 | **Total (fw+bw)** | **2530** | 0.2% |
-
-### Forward Kernel Breakdown (625 µs, 34 kernels)
-
-| Kernel | µs | % |
-|---|:---:|:---:|
-| CUTLASS FP8 ZeroMat GEMM (UpProj) | 275 | 44.1% |
-| CUTLASS GEMM (DownProj) | 131 | 21.0% |
-| FP8 quantize_and_pack | 65 | 10.4% |
-| token_gather_sum (router scatter) | 57 | 9.1% |
-| _build_score_src_idx (topk sort) | 30 | 4.7% |
-| histogram_and_prefix (metadata) | 22 | 3.5% |
-
-### Backward Kernel Breakdown (1903 µs, 17 kernels)
-
-> **Session 64 note**: The `CUTLASS varlen accumulate` (664µs, 34.9%) was eliminated
-> by fusing BF16 wgrad accumulate into the GEMM epilogue. With `fp8_wgrad=True`
-> (production default), CUTLASS wgrad writes directly to the native grad buffer,
-> so the separate accumulate pass is no longer needed.
-
-| Kernel | µs | % |
-|---|:---:|:---:|
-| CUTLASS GEMM wgrad | 814 | 42.8% |
-| CUTLASS varlen accumulate (wgrad acc) | 664 | 34.9% |
-| CUTLASS FP8 ZeroMat GEMM (actgrad) | 253 | 13.3% |
-| FP8 quantize_and_pack | 91 | 4.8% |
-| token_gather_sum (scatter bw) | 55 | 2.9% |
 
 ### Memory (E=32, bench_mlpnode_mem.py)
 
@@ -121,61 +86,54 @@ N_recv ≈ 21725, TK ≈ 32822, TK_padded ≈ 34816
 - FP8 weight caches: ~650 MiB
 - 激活 (x + z_fp8 + output): ~360 MiB
 
-### Precision (test_mlpnode_precision.py, FP8 vs BF16 gold)
+### Precision (Session 65, test_mlpnode_precision.py, 6 shapes)
 
-| Shape | out cos | dx cos | dw1 cos | dw2 cos |
-|---|:---:|:---:|:---:|:---:|
-| N=128 K=4 E=4 I=384 | >0.99 | >0.99 | >0.98 | >0.98 |
-| N=128 K=8 E=8 I=384 | >0.99 | >0.99 | >0.98 | >0.98 |
-| N=512 K=4 E=8 I=1536 | >0.99 | >0.99 | >0.98 | >0.98 |
-| N=512 K=8 E=8 I=1536 | >0.99 | >0.99 | >0.98 | >0.98 |
+| Shape | out cos | dx cos | dw1 cos | dw2 cos | RRMSE (max) |
+|---|:---:|:---:|:---:|:---:|:---:|
+| N=128 K=4 E=4 I=384 | 0.9979 | 0.9975 | 0.9975 | 0.9972 | 7.5% |
+| N=128 K=8 E=8 I=384 | 0.9979 | 0.9975 | 0.9975 | 0.9971 | 7.6% |
+| N=512 K=4 E=8 I=1536 | 0.9979 | 0.9975 | 0.9975 | 0.9972 | 7.5% |
+| N=512 K=8 E=8 I=1536 | 0.9979 | 0.9975 | 0.9975 | 0.9972 | 7.5% |
+| N=1024 K=8 E=8 I=1536 | 0.9979 | 0.9975 | 0.9975 | 0.9972 | 7.5% |
+| N=256 K=8 E=32 I=1536 | 0.9979 | 0.9975 | 0.9975 | 0.9971 | 7.6% |
 
-## 4. Session 63 Bugs Fixed (3 bugs)
+ds gradient (test_cold_start_e2e.py): cos=0.9972 across all 6 shapes.
+
+## 4. Session 65 Changes (TMA Reduce-Add Optimization)
+
+### What changed
+
+1. **New function `_run_cutlass_blockscaled_gemm_varlen_k_tma_add()`** in `blockscaled_fp8_gemm.py`:
+   - Uses `add_to_output=True` + `C=GemmTensorInfo(None)` instead of `beta=1.0` + loaded C tensor
+   - Separate caches: `_COMPILE_CACHE_VK_TMA_ADD`, `_GEMM_FAST_PATH_VK_TMA_ADD`
+   - Registers: ~50 (vs 86 for fused beta=1.0)
+
+2. **Replaced all 4 wgrad accumulate calls** in `functional/__init__.py`:
+   - FP8 w1 wgrad (~line 1248): `_accumulate` → `_tma_add`
+   - FP8 w2 wgrad (~line 1900): `_accumulate` → `_tma_add`
+   - BF16 w1 wgrad (~line 1290): `gemm(beta=1.0)` → `gemm_add(C=accum, out=accum, beta=1.0)`
+   - BF16 w2 wgrad (~line 1948): same
+
+3. **Env flag `SONIC_MOE_FP8_WGRAD_BETA_ACCUM`** (default off): reverts to legacy fused epilogue
+
+4. **New benchmark** `tests/ops/bench_wgrad_epilogue.py`: isolated A/B comparison, 4 production shapes
+
+### QuACK `gemm_add()` auto-detection mechanism
+When `C is out` (identity check) and `beta==1.0` and `cu_seqlens_m is None`, `gemm_add()` automatically uses `add_to_output=True` with `C=None`. This is the BF16 wgrad path. The FP8 path uses `_tma_add()` directly.
+
+## 5. Bugs Fixed (Sessions 63-64, prior to this session)
 
 ### Bug 1: `_build_score_src_idx_kernel` PTXASError
-
-- **症状**: E=32 crash, `tl.min(vector, axis=0)` PTXASError on SM103a
-- **根因**: Triton 3.5.0 bundled ptxas 是 CUDA 12.8，不支持 SM103a。`tl.min` 向量 reduce 生成了 SM103a 不支持的 PTX 指令
-- **修复**: 用纯标量操作重写（WORK_ptr scratch buffer + `tl.static_range` selection sort）
-- **文件**: `mlp_node_v2.py:438-474`
+- E=32 crash from `tl.min(vector, axis=0)` on SM103a (Triton bundled ptxas=CUDA 12.8)
+- Fix: scalar selection sort with WORK_ptr scratch buffer
 
 ### Bug 2: `varlen_K_max = E` instead of `topk`
+- E=32,topk=8 crash (MAX_K=32 vs correct 8). Masked when E==topk==8
+- Fix: `varlen_K_max=(K if K is not None else E)` + `_topk` class var
 
-- **症状**: E=8,topk=8 正常（巧合 E==topk），E=32,topk=8 crash（MAX_K=32 vs 正确值 8）
-- **根因**: `_DownProjection.forward` 把 `E` 当 `varlen_K_max` 传给 `token_gather_sum_kernel`，该值作为 `tl.constexpr MAX_K` 参与 autotune key。E=32 导致编译了错误的 kernel 特化
-- **修复**: `varlen_K_max=(K if K is not None else E)`；topk 通过 `_SonicMoEDeepEPFunc._topk` 类变量传递
-- **文件**: `mlp_node_v2.py:690,768,793` + `functional/__init__.py:1345,1494`
-- **为什么之前没暴露**: 所有测试和生产配置都用 E==topk==8
-
-### Bug 3: QuACK `_compile_worker.py` Paddle dtype 不兼容 — BrokenPipe 根因
-
-- **症状**: 冷启动 autotuning 时 `BrokenPipeError` crash backward
-- **根因**: Paddle proxy 下 `str(tensor.dtype)` 返回 `'paddle.bfloat16'` 而非 `'torch.bfloat16'`。autotuner `_precompile` 序列化 tensor metadata → worker 的 `_dtype_map` 只有 `'torch.*'` → KeyError → worker crash → BrokenPipeError
-- **修复** (两层防御):
-  1. `autotuner.py`: `_normalize_dtype_str()` 在序列化时将 `'paddle.*'` 转为 `'torch.*'`
-  2. `_compile_worker.py`: `_dtype_map` 增加 `'paddle.*'` 条目
-  3. `_precompile` 整体包 try/except (best-effort, 失败 graceful fallback)
-  4. `_send`/`_recv` 加 BrokenPipe/OSError catch
-- **文件**: quack repo `quack/autotuner.py`, `quack/_compile_worker.py`
-- **影响**: 修复后并行编译正常工作（`Pre-compiling 36 configs with 8 workers` 45s 完成），不再 fallback 到单线程
-
-## 5. JIT Cache Design
-
-### compile_key 原则: 只含静态模型维度
-
-所有 compile_key 只含 (H, I, E, dtype, tile config)。**不含** TK、total_M、capacity 等动态值。动态维度通过 `mark_layout_dynamic` 运行时处理。
-
-### Cache lifecycle
-
-```
-Training iteration:
-  forward():  compile_key hit → fast_path hit → CuTe kernel launch
-  backward(): same
-  optimizer.step()
-  node.step():
-    flush_native_grads()        # _NATIVE_W1/W2_GRAD → per-expert main_grad
-    invalidate_weight_caches()  # clear _W_CACHE + FP8 weight caches + topk cache
-```
+### Bug 3: QuACK `_compile_worker.py` Paddle dtype
+- `'paddle.bfloat16'` in `_dtype_map` → KeyError → BrokenPipeError
+- Fix: dtype normalization + paddle.* entries + robustness hardening
 
 ## 6. Critical Constraints (给下一个 agent 的陷阱警告)
 
@@ -193,53 +151,47 @@ Training iteration:
 
 7. **`E != topk` 时必须显式传 topk**: 旧代码假设 E==topk。当 E=32, topk=8 时，`varlen_K_max` 必须用 topk 而非 E。
 
-## 7. Lessons Learned (Session 63, appended)
+8. **nsys `--resolve-symbols=false`**: 必须加此 flag，否则 nsys 会尝试从网络下载符号表而 hang。参见 `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/env.md`。
 
-79. **`str(dtype)` under Paddle proxy returns `'paddle.bfloat16'` not `'torch.bfloat16'`**. This breaks any code that maps dtype strings to torch dtype objects. Always normalize with `s.replace('paddle.', 'torch.')`.
+9. **不要使用 GPU 0-1**: 可能被 freq-locked 或被其他进程占用。测试/profiling 始终使用 GPU 2+。
 
-80. **Hidden semantic coupling: `E == topk` assumption.** When all tests use E=8 topk=8, a bug where `E` is used instead of `topk` goes undetected. Always test with E >> topk (e.g. E=32 topk=8) to catch these.
-
-81. **Triton `tl.min(vector, axis=0)` generates PTX that old ptxas can't handle.** On SM103a with Triton's bundled CUDA 12.8 ptxas, vector reduction intrinsics fail silently during PTX assembly. Scalar loops are universally compatible.
-
-82. **QuACK autotuner `_precompile` subprocess workers crash silently.** Worker crash → parent BrokenPipeError on `_send` → entire backward dies. Always wrap `_precompile` in try/except since it's a pure optimization.
-
-83. **bench_mlpnode_mem.py `make_inputs` 极慢 (~30s for SEQ=7168).** 纯 Python 循环 + numpy 操作 57344 次。看起来像 hang。用 SEQ=512 做冒烟测试。
-
-## 8. High-Value Information Sources
+## 7. High-Value Information Sources
 
 | Source | Path | Why |
 |---|---|---|
-| 精度测试 | `tests/ops/test_mlpnode_precision.py` | 4-shape × 5-tensor topk precision audit |
-| 显存基准 | `tests/ops/bench_mlpnode_mem.py` | E=32 full fwd+bwd memory profile (迁移自 liangshuhao) |
-| nsys 解析脚本 | `/tmp/parse_gpu_proj.py` | 从 sqlite 解析 GPU-projection (merged overlapping kernels) |
+| 环境教训 | `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/env.md` | nsys flags, GPU 限制, Paddle 兼容性 pitfalls |
+| 精度测试 | `tests/ops/test_mlpnode_precision.py` | 6-shape × 4-tensor topk precision audit (Session 65 updated) |
+| 冷启动测试 | `tests/ops/test_cold_start_e2e.py` | 6-shape × 5-tensor (incl. ds) + timing + memory |
+| wgrad epilogue bench | `tests/ops/bench_wgrad_epilogue.py` | Isolated TMA add vs fused beta A/B comparison |
+| nsys profiling脚本 | `tests/ops/bench_mlpnode_topk_nsys.py` | Clean MLP-node-only nsys profile with NVTX BENCH range |
+| nsys 结果 | `reports/wgrad_tma_add_nsys/RESULTS.json` | Session 65 TMA optimization A/B GPU-projection data |
+| QuACK gemm_add auto-detect | `quack/gemm_interface.py:521` | `gemm_add()` auto-detects `add_to_output` when `C is out` |
+| Engineering log | `reports/fp8_upgrade/engineering_log.md` | 86 lessons across 25 phases (Sessions 1-65) |
 | QuACK autotuner | `quack/autotuner.py` | Session 63 修复了 Paddle dtype compat + robustness |
-| QuACK compile worker | `quack/_compile_worker.py` | Session 63 修复了 dtype map + error handling |
 
-## 9. QuACK 仓库改动 (Session 63)
+## 8. QuACK 仓库改动 (Session 63)
 
 **仓库位置**: `/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack`
 
 改动文件:
-- `quack/autotuner.py`: dtype normalization + _precompile robustness (try/except, _send/_recv error handling, worker shutdown timeout)
-- `quack/_compile_worker.py`: paddle.* dtype map + error handling for _send/_recv/import
+- `quack/autotuner.py`: dtype normalization + _precompile robustness
+- `quack/_compile_worker.py`: paddle.* dtype map + error handling
 
-**注意**: 这些改动在 quack 仓库中，不在 sonic-moe 仓库中。需要单独 commit/push 到 quack 仓库，或告知 quack 维护者合入。
+**注意**: 这些改动在 quack 仓库中，不在 sonic-moe 仓库中。需要单独 commit/push 到 quack 仓库。
 
-## 10. Insights & Next Steps
+## 9. Insights & Next Steps
 
 ### Insights
 
-1. **GEMM 占 GPU 时间 78%**。Forward: CUTLASS GEMM 65%, 量化 10%. Backward: wgrad+accumulate 78%, actgrad 13%. 优化量化内核的收益已接近天花板。
+1. **TMA reduce-add is free performance.** No precision change, no functional change, just lower register pressure from not loading C tensor. 2-4% E2E improvement with zero downside.
 
-2. **fused BF16 wgrad epilogue causes 100% of the S53 overhead.** The `D = A@B + 1.0*C` fused epilogue (commit 1898a91) increases register pressure from 50→86 regs/thread, reducing occupancy from ~5 to ~2-3 blocks/SM. Per-call: +30-38% slower. S53 has no main_grad accumulation, so this is a fair functional difference, not a bug.
+2. **BF16 wgrad GEMM is the remaining bottleneck.** After TMA optimization, the `quackgemm_default_epi` kernel still takes 43-48% of total backward GPU time. Further optimization would require QuACK-level changes (maxrregcount hints, tile size tuning).
 
-3. **bench_mlpnode_mem.py 之前硬编码 `fp8_wgrad=False`**。导致之前 bench 测试的是非生产配置。Session 64 修正后与 auto-detect 默认（threshold=0 → 全 I 开启）一致。
+3. **vs S53 native PyTorch gap reduced.** T=8192 E=8 went from 1.06x slower to 1.04x slower vs S53 FP8. T=8192 E=32 went from 1.15x to 1.12x. The remaining gap is the inherent cost of fp32 main_grad accumulation (S53 has no accumulation).
 
-4. **Host Python overhead 不影响 GPU pipeline**。NVTX wall-clock ~6.7ms/iter 但 GPU-projection 只有 2.5ms。GPU 利用率约 37%（单 MLP layer），在完整 transformer 中会更高。
+4. **FP8 wgrad kernel (`_tma_add`) shows 6-13% speedup in isolation.** But it's only 2 calls/iter and fast (~600µs total), so E2E contribution is small vs the 4 BF16 wgrad calls (~1200-1600µs).
 
-5. **并行 autotuning 对冷启动很关键**。36 configs × 8 workers = 45s 并行编译。单线程需要 ~360s (8x)。确保 Paddle 环境下 worker 能正常工作。
-
-6. **Paddle vs S53 overhead is NOT from proxy dispatch.** Non-GEMM categories are actually faster in Paddle (-24 to -65µs). The entire overhead is from fused wgrad accumulate epilogue register pressure.
+5. **Host Python overhead 不影响 GPU pipeline**: CUDA events ~5.4ms/iter 但 GPU-projection 只有 2.8ms。GPU 利用率约 52%（单 MLP layer），在完整 transformer 中会更高。
 
 ### Next Steps (Priority)
 
@@ -247,8 +199,8 @@ Training iteration:
 
 2. **E=32 生产规模验证** — 当前 E=32 用 SEQ=4096 验证通过。需要用完整 SEQ=16384+EP=32 规模验证显存和延迟。
 
-3. **Wgrad accumulate epilogue register tuning** — fused `D = A@B + C` epilogue uses 86 regs vs S53's 50 regs, causing 30-38% per-call slowdown. Options: CuTe DSL maxrregcount hint, shared memory staging for C, or separate add kernel if cheaper.
+3. **Epilogue forward quantization** — 将 x→fp8 量化融入 GemmGated epilogue，消除 ~65µs forward overhead。需要 CUTLASS epilogue modification。
 
-4. **Epilogue forward quantization** — 将 x→fp8 量化融入 GemmGated epilogue，消除 ~65µs forward overhead。
+4. **Multi-card EP>1** — 接入 DeepEP buffer，验证 dispatch→MlpNode→combine pipeline。
 
-5. **Multi-card EP>1** — 接入 DeepEP buffer，验证 dispatch→MlpNode→combine pipeline。
+5. **BF16 wgrad tile tuning** — 当前 BF16 wgrad GEMM 用 default tile config。调查 QuACK 是否支持 tile shape override 或 maxrregcount hint。

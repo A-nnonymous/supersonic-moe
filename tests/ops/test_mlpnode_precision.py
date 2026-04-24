@@ -324,9 +324,10 @@ def _run_identity_case(T, E, I):
     print("PASS")
 
 
-def _run_topk_case(N_recv, topk, E, I):
-    """Single topk-layout precision test."""
-    print(f"\n  topk      N={N_recv:5d} K={topk} E={E:3d} I={I:5d}", end=" ")
+def _run_topk_case(N_recv, topk, E, I, verbose=False):
+    """Single topk-layout precision test. Returns dict of (cos, rrmse) per tensor."""
+    label = f"N={N_recv:5d} K={topk} E={E:3d} I={I:5d}"
+    print(f"\n  topk      {label}", end=" ", flush=True)
     device = "cuda"
 
     experts = [MockExpert(H, I, e) for e in range(E)]
@@ -359,34 +360,49 @@ def _run_topk_case(N_recv, topk, E, I):
         x, experts, dispatched_indices, dispatched_probs, grad_out,
     )
 
+    results = {}
+
     # output
     cos, rrmse = _cosine_rrmse(out_fp8, out_gold)
+    results["out"] = (cos, rrmse)
     assert cos > 0.99, f"forward cos={cos:.4f}"
     assert rrmse < 0.10, f"forward rrmse={rrmse:.4f}"
 
     # dx
     if dx_fp8 is not None:
         cos, rrmse = _cosine_rrmse(dx_fp8, dx_gold)
+        results["dx"] = (cos, rrmse)
         assert cos > 0.99, f"dx cos={cos:.4f}"
         assert rrmse < 0.10, f"dx rrmse={rrmse:.4f}"
 
-    # dw1
+    # dw1 (min across experts)
+    dw1_cos_list = []
+    dw1_rrmse_list = []
     for e_idx in range(E):
         if tpe[e_idx] == 0:
             continue
         cos, rrmse = _cosine_rrmse(dw1_fp8[e_idx], dw1_gold[e_idx])
+        dw1_cos_list.append(cos)
+        dw1_rrmse_list.append(rrmse)
         assert cos > 0.98, f"dw1[{e_idx}] cos={cos:.4f}"
         assert rrmse < 0.15, f"dw1[{e_idx}] rrmse={rrmse:.4f}"
+    results["dw1"] = (min(dw1_cos_list), max(dw1_rrmse_list))
 
-    # dw2
+    # dw2 (min across experts)
+    dw2_cos_list = []
+    dw2_rrmse_list = []
     for e_idx in range(E):
         if tpe[e_idx] == 0:
             continue
         cos, rrmse = _cosine_rrmse(dw2_fp8[e_idx], dw2_gold[e_idx])
+        dw2_cos_list.append(cos)
+        dw2_rrmse_list.append(rrmse)
         assert cos > 0.98, f"dw2[{e_idx}] cos={cos:.4f}"
         assert rrmse < 0.15, f"dw2[{e_idx}] rrmse={rrmse:.4f}"
+    results["dw2"] = (min(dw2_cos_list), max(dw2_rrmse_list))
 
     print("PASS")
+    return results
 
 
 # ── internal dx regression test (bypasses SonicMoEMlpNode.detach) ──────────
@@ -516,13 +532,31 @@ def main():
 
     # Topk path (production path — real DeepEP dispatch)
     print("\n--- Topk path ---")
+    all_results = []
     for N_recv, topk, E, I in [
         (128, 4, 4, 384),
         (128, 8, 8, 384),
         (512, 4, 8, 1536),
         (512, 8, 8, 1536),
+        (1024, 8, 8, 1536),
+        (256, 8, 32, 1536),
     ]:
-        _run_topk_case(N_recv, topk, E, I)
+        r = _run_topk_case(N_recv, topk, E, I, verbose=True)
+        all_results.append((N_recv, topk, E, I, r))
+
+    # Print summary table
+    print("\n" + "=" * 90)
+    print("  PRECISION SUMMARY (cosine similarity / RRMSE)")
+    print("=" * 90)
+    print(f"  {'Shape':>30s} | {'out cos':>8s} {'rrmse':>7s} | {'dx cos':>8s} {'rrmse':>7s} | {'dw1 cos':>8s} {'rrmse':>7s} | {'dw2 cos':>8s} {'rrmse':>7s}")
+    print("  " + "-" * 88)
+    for N, K, E, I, r in all_results:
+        label = f"N={N} K={K} E={E} I={I}"
+        out_c, out_r = r.get("out", (0, 0))
+        dx_c, dx_r = r.get("dx", (0, 0))
+        dw1_c, dw1_r = r.get("dw1", (0, 0))
+        dw2_c, dw2_r = r.get("dw2", (0, 0))
+        print(f"  {label:>30s} | {out_c:.4f}  {out_r:.4f} | {dx_c:.4f}  {dx_r:.4f} | {dw1_c:.4f}  {dw1_r:.4f} | {dw2_c:.4f}  {dw2_r:.4f}")
 
     print("\n" + "=" * 60)
     print("ALL PRECISION TESTS PASSED")

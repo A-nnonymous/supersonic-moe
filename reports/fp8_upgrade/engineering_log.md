@@ -436,6 +436,50 @@ Lessons:
 86. **Non-GEMM categories can be faster in Paddle.** S53 has extra torch elementwise,
     cuBLAS, and reduce kernels that Paddle's fused path eliminates.
 
+## Phase 25: TMA Reduce-Add Wgrad Epilogue (Session 65, 2026-04-24)
+
+**Key insight**: The fused `D = A@B + 1.0*C` wgrad accumulate epilogue (86 regs/thread)
+can be replaced by TMA hardware atomic add on store (`add_to_output=True`, 50 regs/thread)
+with zero precision impact. Each output tile is written by exactly one CTA (no split-K),
+so the TMA atomic add is deterministic.
+
+**Implementation**:
+- New function `_run_cutlass_blockscaled_gemm_varlen_k_tma_add()` in `blockscaled_fp8_gemm.py`
+  - `C=GemmTensorInfo(None)` (no C tensor loaded)
+  - `epi_args = GemmDefaultSm100.EpilogueArguments(add_to_output=True)`
+  - Separate caches: `_COMPILE_CACHE_VK_TMA_ADD`, `_GEMM_FAST_PATH_VK_TMA_ADD`
+- Replaced all 4 wgrad accumulate sites in `functional/__init__.py`:
+  - FP8 paths: `_accumulate` → `_tma_add`
+  - BF16 paths: `gemm(beta=1.0)` → `gemm_add(C=accum, out=accum, beta=1.0)`
+- QuACK `gemm_add()` auto-detects: when `C is out` and `beta==1.0` and `cu_seqlens_m is None`,
+  uses `add_to_output=True` with `C=None`
+- Legacy fallback: `SONIC_MOE_FP8_WGRAD_BETA_ACCUM=1`
+
+**Results (nsys GPU-projection, MLP-node only)**:
+- E=8: 2886 → 2820 µs/iter (-2.3%)
+- E=32: 3420 → 3283 µs/iter (-4.0%)
+- BF16 wgrad GEMM (4 calls/iter): E=8 -16µs/call (-5.0%), E=32 -33µs/call (-7.7%)
+- FP8 wgrad (isolated bench): 6-13% faster, bitwise identical output
+- FP8 forward GEMMs: unchanged (delta < 5µs, noise)
+
+**Precision**: All 6 shapes × 4 tensors PASS (cos > 0.99, RRMSE < 7.6%).
+E=32 production shape included. ds gradient cos=0.9972 (test_cold_start_e2e.py).
+
+Lessons:
+87. **TMA reduce-add is free when no split-K.** `tile_count_semaphore=None` means each CTA
+    exclusively owns its output tiles. The atomic add degenerates to a simple store-with-add,
+    but the epilogue doesn't load C tensor, saving registers and smem stages.
+88. **QuACK `gemm_add()` vs `gemm()` auto-detection.** `gemm()` passes C/beta through
+    `gemm_out()` which does NOT auto-detect add_to_output. Only `gemm_add()` has the
+    `C is out and beta==1.0` identity check. Use `gemm_add()` for wgrad accumulate.
+89. **Paddle torch-proxy `torch.equal()` fails across tensor types.** Use `(a == b).all()`
+    instead. Also `torch.randn` produces paddle dtypes; use `paddle.randn` for bf16.
+90. **nsys MUST use `--resolve-symbols=false`** on this machine or it hangs attempting to
+    download symbols from network. Template in `/panzhaowu/env.md`.
+91. **`bench_mlpnode_topk_nsys.py` is the gold standard for clean profiling.** Pre-computes
+    routing once, NVTX "BENCH" range brackets measurement. `bench_deepep_topk_nsys.py` is
+    noisy with framework operators (token_gather_sum, Eigen, cub::RadixSort dominating).
+
 ---
 
 > **Canonical handoff: root `HANDOFF.md`**

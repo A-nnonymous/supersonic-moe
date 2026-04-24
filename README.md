@@ -73,29 +73,39 @@ Three tiers of caching, each with different invalidation strategies:
 | **ds** (d/d dispatched_probs) | Triton `_build_score_src_idx_kernel` → differentiable fancy-index → autograd | cos=0.9972 |
 | **dw1, dw2** | CUTLASS wgrad accumulate directly into `_NATIVE_W{1,2}_GRAD`; `flush_native_grads()` transposes to per-expert `main_grad` at step time | cos=0.9975/0.9972 |
 
-### Precision (Session 62, FP8 vs BF16 gold, 6 shapes, cosine similarity)
+### Precision (Session 65, FP8 vs BF16 gold, TMA Reduce-Add epilogue)
 
-| N | K | out | dx | ds | dw1 | dw2 |
-|---:|---:|:---:|:---:|:---:|:---:|:---:|
-| 1024 | 8 | 0.9979 | 0.9975 | 0.9972 | 0.9975 | 0.9972 |
-| 8192 | 8 | 0.9979 | 0.9975 | 0.9972 | 0.9975 | 0.9972 |
-| 4096 | 8 | 0.9979 | 0.9975 | 0.9972 | 0.9975 | 0.9972 |
-| 2048 | 4 | 0.9979 | 0.9975 | 0.9972 | 0.9975 | 0.9972 |
-| 512 | 8 | 0.9979 | 0.9975 | 0.9972 | 0.9975 | 0.9972 |
-| 16384 | 8 | 0.9979 | 0.9975 | 0.9972 | 0.9975 | 0.9972 |
+| N | K | E | I | out | dx | dw1 | dw2 |
+|---:|---:|---:|---:|:---:|:---:|:---:|:---:|
+| 128 | 4 | 4 | 384 | 0.9979 | 0.9975 | 0.9975 | 0.9972 |
+| 128 | 8 | 8 | 384 | 0.9979 | 0.9975 | 0.9975 | 0.9971 |
+| 512 | 4 | 8 | 1536 | 0.9979 | 0.9975 | 0.9975 | 0.9972 |
+| 512 | 8 | 8 | 1536 | 0.9979 | 0.9975 | 0.9975 | 0.9972 |
+| 1024 | 8 | 8 | 1536 | 0.9979 | 0.9975 | 0.9975 | 0.9972 |
+| 256 | 8 | 32 | 1536 | 0.9979 | 0.9975 | 0.9975 | 0.9971 |
 
-All cosine > 0.99, RRMSE < 7%.  Shapes include warmup, expected, and unexpected (never-seen-during-warmup) token counts.
+ds gradient verified via `test_cold_start_e2e.py`: cos=0.9972 across all 6 shapes (1024/8192/4096/2048/512/16384 tokens).
 
-### Performance (nsys GPU-projection, B30Z)
+All cosine > 0.99, RRMSE < 7.6%.  Shapes include E=32 (production), varying topk (4/8), small/large token counts.
 
-Session 64 (Paddle `SonicMoEMlpNode`, production config with `fp8_wgrad=True`):
+### Performance (nsys GPU-projection, B30Z, TMA Reduce-Add)
+
+Session 65 (`SonicMoEMlpNode`, TMA reduce-add wgrad epilogue, default config):
 
 | Shape (I=1536 K=8) | S53 BF16 (µs) | Paddle FP8 (µs) | Speedup vs BF16 |
 |---|:---:|:---:|:---:|
-| T=8192 E=8 | 3644 | 2887 | **1.26x** |
-| T=8192 E=32 | 3844 | 3372 | **1.14x** |
+| T=8192 E=8 | 3644 | 2820 | **1.29x** |
+| T=8192 E=32 | 3844 | 3283 | **1.17x** |
 | T=16384 E=8 | 7953 | 5548 | **1.43x** |
 | T=16384 E=32 | 8129 | 5916 | **1.37x** |
+
+TMA reduce-add optimization (Session 65): replaced fused `D=A@B+1.0*C` wgrad epilogue
+(86 regs/thread) with TMA hardware atomic add on store (50 regs/thread). Improvement:
+- E=8: -65 µs/iter (-2.3%)
+- E=32: -138 µs/iter (-4.0%)
+- BF16 wgrad GEMM per-call: -16µs (E=8), -33µs (E=32), 5-7.7% faster
+
+To fall back to the legacy fused beta=1.0 epilogue: `SONIC_MOE_FP8_WGRAD_BETA_ACCUM=1`
 
 ERNIE-shape detail (E=32 H=3072 I=1536 K=8 EP=8 SEQ=4096):
 - **Forward GPU-proj: 625 µs** (CUTLASS GEMM 65%, FP8 quant 10%, router 14%)
@@ -124,6 +134,7 @@ See `HANDOFF.md` for full kernel breakdown and Session 53 baseline comparison.
 | `test_jit_optimization.py --quick` | Correctness (cos>0.99), zero JIT recompile, memory | `CUDA_VISIBLE_DEVICES=0 python tests/ops/test_jit_optimization.py --quick` |
 | `test_mlpnode_precision.py` | Multi-topk precision audit | `CUDA_VISIBLE_DEVICES=0 python tests/ops/test_mlpnode_precision.py` |
 | `bench_mlpnode_mem.py` | E=32 fwd+bwd memory benchmark (ERNIE shape) | `CUDA_VISIBLE_DEVICES=1 python tests/ops/bench_mlpnode_mem.py` |
+| `bench_wgrad_epilogue.py` | A/B wgrad epilogue benchmark (TMA add vs fused beta) | `CUDA_VISIBLE_DEVICES=2 python tests/ops/bench_wgrad_epilogue.py` |
 | `bench_mlpnode_topk_nsys.py` | nsys GPU-projection benchmark | Wrap with `nsys profile --resolve-symbols=false` |
 
 ### Read First (for next developer/agent)

@@ -26,7 +26,7 @@ from ..quack_utils import (
     precompute_weight_fp8_for_fused_gated,
     quantize_and_pack_activation,
 )
-from quack.gemm_interface import default_config, gemm
+from quack.gemm_interface import default_config, gemm, gemm_add
 from ..quack_utils.gemm_dgated import gemm_dgated as gemm_dgated_kernel
 from ..quack_utils.fp8_quack_patch import apply_fp8_quack_patch
 
@@ -420,6 +420,19 @@ def _use_fused_swiglu_quant() -> bool:
     cfg = get_active_config()
     if cfg is not None and cfg.fused_swiglu_quant is not None:
         return cfg.fused_swiglu_quant
+
+
+def _use_wgrad_beta_accum() -> bool:
+    """Use legacy fused beta=1.0 epilogue for wgrad accumulation (default: disabled).
+
+    When disabled (default), the wgrad GEMM uses TMA hardware reduce-add
+    (add_to_output=True) which avoids loading C via TMA epilogue, reducing
+    register usage from ~86 to ~50 regs/thread and improving SM occupancy.
+
+    Set SONIC_MOE_FP8_WGRAD_BETA_ACCUM=1 to fall back to the old D = A@B + 1.0*C
+    epilogue (86 regs, epi_c_stage=2).
+    """
+    return os.getenv("SONIC_MOE_FP8_WGRAD_BETA_ACCUM", "").lower() in {"1", "true", "yes", "on"}
     return os.getenv("SONIC_MOE_FP8_FUSED_SWIGLU_QUANT", "1").lower() in {"1", "true", "yes", "on"}
 
 
@@ -1229,20 +1242,33 @@ class _UpProjection(torch.autograd.Function):
 
                     # CUTLASS wgrad GEMM
                     # If a fp32 wgrad accumulator is provided (ERNIE main_grad path),
-                    # fuse accumulation into the GEMM epilogue (D = A@B + C, beta=1).
+                    # use TMA hardware reduce-add (default) or fused beta=1.0 epilogue.
                     _wgrad_accum = getattr(ctx, '_wgrad_w1_accumulator', None)
                     if _wgrad_accum is not None:
-                        from ..quack_utils.blockscaled_fp8_gemm import (
-                            _run_cutlass_blockscaled_gemm_varlen_k_accumulate,
-                        )
-                        _run_cutlass_blockscaled_gemm_varlen_k_accumulate(
-                            dz_col_fp8, dz_col_scales,
-                            x_col_fp8, x_col_scales,
-                            expert_frequency_offset,
-                            M=w1_shape[0], N=H, total_K=TK,
-                            num_experts=E, device=x.device,
-                            accumulator=_wgrad_accum,
-                        )
+                        if _use_wgrad_beta_accum():
+                            from ..quack_utils.blockscaled_fp8_gemm import (
+                                _run_cutlass_blockscaled_gemm_varlen_k_accumulate,
+                            )
+                            _run_cutlass_blockscaled_gemm_varlen_k_accumulate(
+                                dz_col_fp8, dz_col_scales,
+                                x_col_fp8, x_col_scales,
+                                expert_frequency_offset,
+                                M=w1_shape[0], N=H, total_K=TK,
+                                num_experts=E, device=x.device,
+                                accumulator=_wgrad_accum,
+                            )
+                        else:
+                            from ..quack_utils.blockscaled_fp8_gemm import (
+                                _run_cutlass_blockscaled_gemm_varlen_k_tma_add,
+                            )
+                            _run_cutlass_blockscaled_gemm_varlen_k_tma_add(
+                                dz_col_fp8, dz_col_scales,
+                                x_col_fp8, x_col_scales,
+                                expert_frequency_offset,
+                                M=w1_shape[0], N=H, total_K=TK,
+                                num_experts=E, device=x.device,
+                                accumulator=_wgrad_accum,
+                            )
                         dw1_base = None
                         dw1 = None
                     else:
@@ -1258,23 +1284,37 @@ class _UpProjection(torch.autograd.Function):
                 else:
                     _wgrad_accum = getattr(ctx, '_wgrad_w1_accumulator', None)
                     if _wgrad_accum is not None:
-                        # Fused BF16 wgrad + fp32 accumulate via CUTLASS epilogue
-                        # (same mechanism as FP8 path: D = A@B + C, beta=1.0).
+                        # BF16 wgrad + fp32 accumulate.
                         # _wgrad_accum: [E, 2I, H] fp32. GEMM out: [E, H, 2I].
                         # permute(0,2,1) gives [E,H,2I] non-contiguous view —
-                        # CuTe handles via stride (same as FP8 _run_..._accumulate).
+                        # CuTe handles via stride.
                         accum_view = _wgrad_accum.permute(0, 2, 1)  # [E, H, 2I]
-                        gemm(
-                            x.T,
-                            dz_bf16,
-                            out=accum_view,
-                            C=accum_view,
-                            beta=1.0,
-                            cu_seqlens_k=expert_frequency_offset,
-                            A_idx=x_gather_idx,
-                            batch_idx_permute=None,
-                            dynamic_scheduler=False,
-                        )
+                        if _use_wgrad_beta_accum():
+                            # Legacy: fused beta=1.0 epilogue (86 regs)
+                            gemm(
+                                x.T,
+                                dz_bf16,
+                                out=accum_view,
+                                C=accum_view,
+                                beta=1.0,
+                                cu_seqlens_k=expert_frequency_offset,
+                                A_idx=x_gather_idx,
+                                batch_idx_permute=None,
+                                dynamic_scheduler=False,
+                            )
+                        else:
+                            # TMA reduce-add: C=out triggers add_to_output (~50 regs)
+                            gemm_add(
+                                x.T,
+                                dz_bf16,
+                                C=accum_view,
+                                out=accum_view,
+                                beta=1.0,
+                                cu_seqlens_k=expert_frequency_offset,
+                                A_idx=x_gather_idx,
+                                batch_idx_permute=None,
+                                dynamic_scheduler=False,
+                            )
                         dw1_base = None
                         dw1 = None
                     else:
@@ -1860,18 +1900,32 @@ class _DownProjection(torch.autograd.Function):
                         # Fused wgrad accumulation (same as w1 path)
                         _wgrad_accum_w2 = getattr(ctx, '_wgrad_w2_accumulator', None)
                         if _wgrad_accum_w2 is not None:
-                            from ..quack_utils.blockscaled_fp8_gemm import (
-                                _run_cutlass_blockscaled_gemm_varlen_k_accumulate,
-                            )
-                            _run_cutlass_blockscaled_gemm_varlen_k_accumulate(
-                                dout_col_fp8, dout_col_sc,
-                                y1s_col_fp8, y1s_col_sc,
-                                expert_frequency_offset,
-                                M=dout.shape[1], N=w2_shape[1],
-                                total_K=TK_wgrad, num_experts=w2_shape[2],
-                                device=dout.device,
-                                accumulator=_wgrad_accum_w2,
-                            )
+                            if _use_wgrad_beta_accum():
+                                from ..quack_utils.blockscaled_fp8_gemm import (
+                                    _run_cutlass_blockscaled_gemm_varlen_k_accumulate,
+                                )
+                                _run_cutlass_blockscaled_gemm_varlen_k_accumulate(
+                                    dout_col_fp8, dout_col_sc,
+                                    y1s_col_fp8, y1s_col_sc,
+                                    expert_frequency_offset,
+                                    M=dout.shape[1], N=w2_shape[1],
+                                    total_K=TK_wgrad, num_experts=w2_shape[2],
+                                    device=dout.device,
+                                    accumulator=_wgrad_accum_w2,
+                                )
+                            else:
+                                from ..quack_utils.blockscaled_fp8_gemm import (
+                                    _run_cutlass_blockscaled_gemm_varlen_k_tma_add,
+                                )
+                                _run_cutlass_blockscaled_gemm_varlen_k_tma_add(
+                                    dout_col_fp8, dout_col_sc,
+                                    y1s_col_fp8, y1s_col_sc,
+                                    expert_frequency_offset,
+                                    M=dout.shape[1], N=w2_shape[1],
+                                    total_K=TK_wgrad, num_experts=w2_shape[2],
+                                    device=dout.device,
+                                    accumulator=_wgrad_accum_w2,
+                                )
                             dw2_base = None
                             dw2 = None
                         else:
@@ -1888,21 +1942,34 @@ class _DownProjection(torch.autograd.Function):
                     else:
                         _wgrad_accum_w2 = getattr(ctx, '_wgrad_w2_accumulator', None)
                         if _wgrad_accum_w2 is not None:
-                            # Fused BF16 wgrad + fp32 accumulate via CUTLASS epilogue.
+                            # BF16 wgrad + fp32 accumulate.
                             # _wgrad_accum_w2: [E, H, I] fp32.
                             # GEMM out: [E, H, I] — same layout, no permute needed.
                             y1s_wgrad = y1s if y1s.dtype == torch.bfloat16 else y1s.to(torch.bfloat16)
-                            gemm(
-                                dout.T,
-                                y1s_wgrad,
-                                out=_wgrad_accum_w2,
-                                C=_wgrad_accum_w2,
-                                beta=1.0,
-                                cu_seqlens_k=expert_frequency_offset,
-                                A_idx=x_gather_idx,
-                                batch_idx_permute=None,
-                                dynamic_scheduler=False,
-                            )
+                            if _use_wgrad_beta_accum():
+                                gemm(
+                                    dout.T,
+                                    y1s_wgrad,
+                                    out=_wgrad_accum_w2,
+                                    C=_wgrad_accum_w2,
+                                    beta=1.0,
+                                    cu_seqlens_k=expert_frequency_offset,
+                                    A_idx=x_gather_idx,
+                                    batch_idx_permute=None,
+                                    dynamic_scheduler=False,
+                                )
+                            else:
+                                gemm_add(
+                                    dout.T,
+                                    y1s_wgrad,
+                                    C=_wgrad_accum_w2,
+                                    out=_wgrad_accum_w2,
+                                    beta=1.0,
+                                    cu_seqlens_k=expert_frequency_offset,
+                                    A_idx=x_gather_idx,
+                                    batch_idx_permute=None,
+                                    dynamic_scheduler=False,
+                                )
                             del y1s_wgrad
                             del y1s
                             dw2_base = None
