@@ -1256,17 +1256,39 @@ class _UpProjection(torch.autograd.Function):
                         dw1 = dw1_base.permute(1, 2, 0)
                     del dz_col_fp8, dz_col_scales, x_col_fp8, x_col_scales
                 else:
-                    dw1_base = torch.empty((E, w1_shape[0], w1_shape[1]), dtype=w1_dtype, device=w1_device)
-                    dw1 = dw1_base.permute(1, 2, 0)
-                    gemm(
-                        x.T,
-                        dz_bf16,
-                        out=dw1_base.permute(0, 2, 1),
-                        cu_seqlens_k=expert_frequency_offset,
-                        A_idx=x_gather_idx,
-                        batch_idx_permute=None,
-                        dynamic_scheduler=False,
-                    )
+                    _wgrad_accum = getattr(ctx, '_wgrad_w1_accumulator', None)
+                    if _wgrad_accum is not None:
+                        # Fused BF16 wgrad + fp32 accumulate via CUTLASS epilogue
+                        # (same mechanism as FP8 path: D = A@B + C, beta=1.0).
+                        # _wgrad_accum: [E, 2I, H] fp32. GEMM out: [E, H, 2I].
+                        # permute(0,2,1) gives [E,H,2I] non-contiguous view —
+                        # CuTe handles via stride (same as FP8 _run_..._accumulate).
+                        accum_view = _wgrad_accum.permute(0, 2, 1)  # [E, H, 2I]
+                        gemm(
+                            x.T,
+                            dz_bf16,
+                            out=accum_view,
+                            C=accum_view,
+                            beta=1.0,
+                            cu_seqlens_k=expert_frequency_offset,
+                            A_idx=x_gather_idx,
+                            batch_idx_permute=None,
+                            dynamic_scheduler=False,
+                        )
+                        dw1_base = None
+                        dw1 = None
+                    else:
+                        dw1_base = torch.empty((E, w1_shape[0], w1_shape[1]), dtype=w1_dtype, device=w1_device)
+                        dw1 = dw1_base.permute(1, 2, 0)
+                        gemm(
+                            x.T,
+                            dz_bf16,
+                            out=dw1_base.permute(0, 2, 1),
+                            cu_seqlens_k=expert_frequency_offset,
+                            A_idx=x_gather_idx,
+                            batch_idx_permute=None,
+                            dynamic_scheduler=False,
+                        )
 
                 # Phase 2: Free dz bf16 storage (~384 MiB at Ernie shape).
                 # FP8 wgrad already freed it in step 2 above; BF16 path frees here.
@@ -1342,7 +1364,7 @@ class _UpProjection(torch.autograd.Function):
             dx_expanded=dx_expanded,
             s_reverse_scatter_idx=s_reverse_scatter_idx,
             num_activated_expert_per_token_offset=num_activated_expert_per_token_offset,
-            varlen_K_max=(E if is_varlen_K else K),
+            varlen_K_max=(K if K is not None else E),
             H=H,
             is_varlen_K=is_varlen_K,
         )
@@ -1491,7 +1513,7 @@ class _DownProjection(torch.autograd.Function):
             topk_scores=topk_scores,
             s_reverse_scatter_idx=router_perm,
             num_activated_expert_per_token_offset=num_activated_expert_per_token_offset,
-            varlen_K_max=(E if is_varlen_K else K),
+            varlen_K_max=(K if K is not None else E),
             H=H,
             is_varlen_K=is_varlen_K,
         )
@@ -1864,20 +1886,42 @@ class _DownProjection(torch.autograd.Function):
                             dw2 = dw2_base.permute(1, 2, 0)
                         del dout_col_fp8, dout_col_sc, y1s_col_fp8, y1s_col_sc
                     else:
-                        dw2_base = torch.empty((w2_shape[2], w2_shape[0], w2_shape[1]), dtype=w2_dtype, device=w2_device)
-                        dw2 = dw2_base.permute(1, 2, 0)
-                        y1s_wgrad = y1s if y1s.dtype == torch.bfloat16 else y1s.to(torch.bfloat16)
-                        gemm(
-                            dout.T,
-                            y1s_wgrad,
-                            out=dw2.permute(2, 0, 1),
-                            cu_seqlens_k=expert_frequency_offset,
-                            A_idx=x_gather_idx,
-                            batch_idx_permute=None,
-                            dynamic_scheduler=False,
-                        )
-                        del y1s_wgrad
-                        del y1s
+                        _wgrad_accum_w2 = getattr(ctx, '_wgrad_w2_accumulator', None)
+                        if _wgrad_accum_w2 is not None:
+                            # Fused BF16 wgrad + fp32 accumulate via CUTLASS epilogue.
+                            # _wgrad_accum_w2: [E, H, I] fp32.
+                            # GEMM out: [E, H, I] — same layout, no permute needed.
+                            y1s_wgrad = y1s if y1s.dtype == torch.bfloat16 else y1s.to(torch.bfloat16)
+                            gemm(
+                                dout.T,
+                                y1s_wgrad,
+                                out=_wgrad_accum_w2,
+                                C=_wgrad_accum_w2,
+                                beta=1.0,
+                                cu_seqlens_k=expert_frequency_offset,
+                                A_idx=x_gather_idx,
+                                batch_idx_permute=None,
+                                dynamic_scheduler=False,
+                            )
+                            del y1s_wgrad
+                            del y1s
+                            dw2_base = None
+                            dw2 = None
+                        else:
+                            dw2_base = torch.empty((w2_shape[2], w2_shape[0], w2_shape[1]), dtype=w2_dtype, device=w2_device)
+                            dw2 = dw2_base.permute(1, 2, 0)
+                            y1s_wgrad = y1s if y1s.dtype == torch.bfloat16 else y1s.to(torch.bfloat16)
+                            gemm(
+                                dout.T,
+                                y1s_wgrad,
+                                out=dw2.permute(2, 0, 1),
+                                cu_seqlens_k=expert_frequency_offset,
+                                A_idx=x_gather_idx,
+                                batch_idx_permute=None,
+                                dynamic_scheduler=False,
+                            )
+                            del y1s_wgrad
+                            del y1s
                     _log_stage_memory("backward:down-proj-weight")
 
                     # Pre-quantize dz for UpProj.backward (non-wgrad path only;
