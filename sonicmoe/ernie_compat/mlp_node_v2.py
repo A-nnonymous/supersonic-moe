@@ -437,45 +437,41 @@ class SonicMoEFunc(paddle.autograd.PyLayer):
 
 @triton.jit
 def _build_score_src_idx_kernel(
-    INDICES_ptr,  # [N_recv, topk] int32 — dispatched_indices
-    NAEPT_ptr,    # [N_recv+1] int32 — prefix-sum of valid counts per token
-    OUT_ptr,      # [TK] int64 — output: flat index into dispatched_probs.reshape(-1)
+    INDICES_ptr,  # [N_recv, topk] int32 — dispatched_indices (read-only)
+    NAEPT_ptr,    # [N_recv+1] int32
+    OUT_ptr,      # [TK] int64
+    WORK_ptr,     # [N_recv * TOPK] int32 — scratch (same size as INDICES)
     TOPK: tl.constexpr,
-    E: tl.constexpr,
 ):
-    """Build score_src_idx without boolean indexing (zero CPU-GPU sync).
+    """Build score_src_idx: per-token ascending sort of expert IDs.
 
-    For each token t, sort its valid expert IDs ascending, then write
-    the flat source indices (t * topk + original_column) to the output
-    at positions [naept[t], naept[t+1]).
-
-    Grid: (N_recv,).  Each program processes one token.
-    Uses iterative argmin for stable ascending sort (topk <= 8, fully unrolled).
+    Pure scalar ops — compatible with Triton 3.5.0 + SM103a (no tl.min).
     """
     t = tl.program_id(0)
-    start = tl.load(NAEPT_ptr + t).to(tl.int32)
-    end = tl.load(NAEPT_ptr + t + 1).to(tl.int32)
+    start = tl.load(NAEPT_ptr + t)
+    end = tl.load(NAEPT_ptr + t + 1)
     n_valid = end - start
     if n_valid == 0:
         return
 
-    # Load expert IDs; replace invalid (-1) with E so they sort last
-    cols = tl.arange(0, TOPK)
-    experts = tl.load(INDICES_ptr + t * TOPK + cols, mask=cols < TOPK).to(tl.int32)
-    experts = tl.where(experts >= 0, experts, E)
+    base = t * TOPK
+    # Copy to scratch; replace invalid (-1) with 0x7FFF
+    for k in tl.static_range(TOPK):
+        e = tl.load(INDICES_ptr + base + k)
+        tl.store(WORK_ptr + base + k, tl.where(e >= 0, e, 0x7FFF))
 
-    # Iterative argmin: for each output slot j, find the column with the
-    # smallest expert ID (ties broken by lowest column = stable sort),
-    # write its flat source index, then mark it used (set to E+1).
+    # Selection sort: for each output position, find argmin in scratch
     for j in range(TOPK):
-        # Guard: skip if we've already placed all valid entries
         if j < n_valid:
-            min_val = tl.min(experts, axis=0)
-            is_min = (experts == min_val)
-            # Stable tiebreak: among columns with min expert, pick lowest col
-            best_col = tl.min(tl.where(is_min, cols, TOPK), axis=0).to(tl.int32)
-            tl.store(OUT_ptr + start + j, (t * TOPK + best_col).to(tl.int64))
-            experts = tl.where(cols == best_col, E + 1, experts)
+            best_e: tl.int32 = 0x7FFF + 1
+            best_c: tl.int32 = 0
+            for k in tl.static_range(TOPK):
+                ek = tl.load(WORK_ptr + base + k)
+                better = (ek < best_e) | ((ek == best_e) & (k < best_c))
+                best_e = tl.where(better, ek, best_e)
+                best_c = tl.where(better, k, best_c)
+            tl.store(OUT_ptr + start + j, (t * TOPK + best_c).to(tl.int64))
+            tl.store(WORK_ptr + base + best_c, 0x7FFF + 1)
 
 
 def _differentiable_router_scores(
@@ -517,10 +513,10 @@ def _differentiable_router_scores(
     # Build score_src_idx: [TK] int64 flat indices into dispatched_probs.reshape(-1)
     # Uses Triton kernel — no boolean indexing, no dynamic shapes, no D2H sync.
     score_src_idx = torch.empty(TK, dtype=torch.int64, device=device)
+    work = torch.empty_like(dispatched_indices)  # scratch buffer
     _build_score_src_idx_kernel[(N_recv,)](
-        dispatched_indices, naept, score_src_idx,
+        dispatched_indices, naept, score_src_idx, work,
         TOPK=triton.next_power_of_2(topk),
-        E=E,
     )
 
     # Differentiable gather from dispatched_probs
@@ -691,6 +687,7 @@ class SonicMoEMlpNode:
         w2.stop_gradient = True
 
         # 5. Run _SonicMoEDeepEPFunc (FP8 fwd + manual bwd with main_grad)
+        _SonicMoEDeepEPFunc._topk = dispatched_indices.shape[1]
         output = _SonicMoEDeepEPFunc.apply(
             x,
             router_scores,
@@ -768,6 +765,7 @@ class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
         stream_id: int = 0,
     ) -> torch.Tensor:
         _refresh_fp8_config()
+        topk = getattr(_SonicMoEDeepEPFunc, '_topk', n_experts)
 
         # ── UpProjection forward (via FakeCtx) ───────────────────────────
         up_ctx = _FakeCtx()
@@ -792,7 +790,7 @@ class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
                 down_ctx,
                 y1, z, w2, None,                # y1, z, w2, b2
                 router_scores, s_scatter_idx, expert_frequency_offset,
-                T_down, None, stream_id,
+                T_down, topk, stream_id,
                 x_gather_idx, s_scatter_idx, s_reverse_scatter_idx,
                 num_activated_expert_per_token_offset,
                 True,                           # is_varlen_K

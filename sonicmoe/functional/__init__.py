@@ -1342,7 +1342,7 @@ class _UpProjection(torch.autograd.Function):
             dx_expanded=dx_expanded,
             s_reverse_scatter_idx=s_reverse_scatter_idx,
             num_activated_expert_per_token_offset=num_activated_expert_per_token_offset,
-            varlen_K_max=(E if is_varlen_K else K),
+            varlen_K_max=(K if K is not None else E),
             H=H,
             is_varlen_K=is_varlen_K,
         )
@@ -1491,7 +1491,7 @@ class _DownProjection(torch.autograd.Function):
             topk_scores=topk_scores,
             s_reverse_scatter_idx=router_perm,
             num_activated_expert_per_token_offset=num_activated_expert_per_token_offset,
-            varlen_K_max=(E if is_varlen_K else K),
+            varlen_K_max=(K if K is not None else E),
             H=H,
             is_varlen_K=is_varlen_K,
         )
