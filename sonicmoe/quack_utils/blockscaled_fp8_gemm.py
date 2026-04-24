@@ -110,7 +110,7 @@ _WEIGHT_CACHE: dict[
     tuple[torch.Tensor, torch.Tensor],
 ] = {}
 from sonicmoe.cache_manager import InstrumentedCompileCache as _ICC
-_COMPILE_CACHE = _ICC("bfp8_grouped")
+_COMPILE_CACHE = _ICC("blockscaled_grouped")
 _PAD_PLAN_CACHE: dict = {}       # content-key -> plan
 # Fast-path cache: skip validation/tensor-info/compile-key on steady-state calls.
 # Maps (total_M, K, H, E, out_dtype, w_shape, w_stride, a_sc_cols, w_sc_shape, dev)
@@ -2010,7 +2010,7 @@ def dual_quantize_varlen(
 # varlen_k blockscaled FP8 GEMM for weight gradients
 # ---------------------------------------------------------------------------
 
-_COMPILE_CACHE_VK = _ICC("bfp8_vk")
+_COMPILE_CACHE_VK = _ICC("varlen_k")
 _GEMM_FAST_PATH_VK: dict = {}
 
 
@@ -2166,7 +2166,7 @@ def _run_cutlass_blockscaled_gemm_varlen_k(
 
 # ── Fused wgrad GEMM + fp32 accumulation (zero extra kernels) ─────────────────
 
-_COMPILE_CACHE_VK_ACCUM = _ICC("bfp8_vk_accum")
+_COMPILE_CACHE_VK_ACCUM = _ICC("varlen_k_accum")
 _GEMM_FAST_PATH_VK_ACCUM: dict = {}
 
 
