@@ -145,9 +145,14 @@ The reporting policy for every FP8 step is:
 - memory baseline: official bf16
 - performance baselines: previous commit and official bf16
 
-## 🔥 FP8 Blockscaled Status (2026-04-18, Session 58)
+## 🔥 FP8 Blockscaled Status (2026-04-22, Session 60)
 
-The `paddle_compat` branch has a fully functional **zero-materialization** blockscaled FP8 training path for Blackwell (B30Z) with **32×32 isotropic weight quantization**, optional **weight stash** memory optimization, native **CUTLASS / QuACK** FP8 kernels, **Pythonic config API** (`SonicMoEConfig`), **route-level padding** (forward + backward, mathematically proven zero error), **epilogue FP8 D output** (z written directly as fp8 by CUTLASS), **NCU-guided quant kernel optimization** (num_warps=1 → 2.3× colwise speedup), **shape-based wgrad FP8 auto-tuning**, **fused dual row+col quantization**, **single-stream backward** (zero `cudaStreamSynchronize`), and **Paddle compat** (54/54 shapes verified). No TK-sized FP8 activation is materialized.
+The `session60-ds-fix` branch has a fully functional **zero-materialization** blockscaled FP8 training path for Blackwell (B30Z) with **32×32 isotropic weight quantization**, optional **weight stash** memory optimization, native **CUTLASS / QuACK** FP8 kernels, **Pythonic config API** (`SonicMoEConfig`), **route-level padding** (forward + backward, mathematically proven zero error), **epilogue FP8 D output** (z written directly as fp8 by CUTLASS), **NCU-guided quant kernel optimization** (num_warps=1 → 2.3× colwise speedup), **shape-based wgrad FP8 auto-tuning**, **fused dual row+col quantization**, **single-stream backward** (zero `cudaStreamSynchronize`), **Paddle compat** (54/54 shapes verified), and **gate→MLP gradient chain verified** (ds flows through router, dx through dispatch). No TK-sized FP8 activation is materialized.
+
+### Session 60 Additions
+
+- **Gate→MLP gradient chain fix**: Fixed `_topk_scores_needs_grad` always-True (Paddle torch-proxy `.apply()` sets `stop_gradient=True`), eliminated ds-path segfault from intermediate Paddle autograd nodes, aligned single-card test with PaddleFleet `_forward_single_card_grouped_gemm_moe` pattern. See `docs/session60_lessons.md`.
+- **Gradient chain restored**: Removed `x.detach()` that severed autograd link in `SonicMoEMlpNode.forward()`. Identity layout path removed (unfixable dx bug with padding).
 
 ### Session 58 Additions
 
@@ -433,17 +438,62 @@ moe.unstash_bf16()                # +216 MiB GPU (CPU → bf16)
 
 | Priority | Resource | Path | Why |
 |:---:|----------|------|-----|
-| 1 | **Handoff** | `docs/HANDOFF.md` | **Start here** — complete project state, architecture, perf/mem/precision, lessons, next steps |
-| 2 | **Pad audit** | `docs/pad_audit_methodology.md` | Route-level padding design + backward correctness proof (dz[pad]=0) |
-| 3 | **Grid data** | `reports/grid_session53/session53_grid_full.json` | Raw 27-shape benchmark JSON (performance + memory per shape) |
-| 4 | **Breakdown** | `reports/session53_breakdown.md` | Performance/memory table with scaling rules |
-| 5 | **Engineering log** | `reports/fp8_upgrade/engineering_log.md` | Historical development log (Phases 1-20, 60 lessons) |
-| 6 | **BF16 baseline** | `/lab/official/sonic-moe` (env: `official_bf16`) | The ONLY valid BF16 baseline for comparison |
-| 7 | **Environment** | `/panzhaowu/env.md` | Machine setup, compilation, cluster tools |
-| 8 | Introspect tool | `tools/introspect.py` | All-in-one profiling: `--mode nsys/grid/precision/report/compare-viz` |
-| 9 | Contract tests | `tests/fp8_large_project_contract_test.py` | 34-test contract gate (+20 subtests) |
+| 1 | **Handoff** | Root `HANDOFF.md` | **Start here** — Session 60 bug fixes, gate-MLP rewire |
+| 2 | **Knowledge Base** | `docs/KNOWLEDGE_BASE.md` | Self-contained expert reference: architecture, padding proof, dead ends, config |
+| 3 | **Deep Handoff** | `docs/HANDOFF.md` | Complete project state, architecture, perf/mem/precision, 66 lessons |
+| 4 | **Pad audit** | `docs/pad_audit_methodology.md` | Route-level padding mathematical proof (dz[pad]=0) |
+| 5 | **Session 60 lessons** | `docs/session60_lessons.md` | torch-proxy gradient chain, PaddleFleet alignment |
+| 6 | **Grid data** | `reports/grid_session53/session53_grid_full.json` | Raw 27-shape benchmark JSON |
+| 7 | **Engineering log** | `reports/fp8_upgrade/engineering_log.md` | Historical development log (Phases 1-21, 60+ lessons) |
+| 8 | **Full KB** | `/panzhaowu/knowledges/INDEX.md` | 11-file expert knowledge base (1900+ lines) |
+| 9 | **Environment** | `/panzhaowu/env.md` | Machine setup, compilation, cluster tools |
 
 > **Note:** `reports/fp8_upgrade/HANDOFF.md` is **stale** (Session 52 data). Use `docs/HANDOFF.md` only.
+
+### Session 62 — Production Integration
+
+**Cold-start validation** (from blank state, all caches cleared):
+```bash
+CUDA_VISIBLE_DEVICES=0 python tests/ops/test_cold_start_e2e.py
+```
+
+**JIT Cache Design**:
+- CuTe compile_key: static dims only (H, I, E, dtype, tile) — zero recompile on seqlen change
+- Dynamic token dims handled at runtime via `mark_layout_dynamic` (GPU kernel perf verified identical)
+- Triton kernels: cached in `~/.triton/cache`, ~2.5s one-time compile per unique TK
+- `_GEMM_FAST_PATH*` dicts: 64-entry high-water-mark eviction prevents memory leak
+
+**Key files**:
+| File | Purpose |
+|------|---------|
+| `sonicmoe/ernie_compat/mlp_node_v2.py` | Production MlpNode: `SonicMoEMlpNode.forward()`, `.step()`, `.warmup()` |
+| `sonicmoe/jit_warmup.py` | JIT warmup: `warmup_jit(E, H, I)` — single call compiles all kernels |
+| `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` | FP8 GEMM + quant kernels (CUTLASS/Triton) |
+| `sonicmoe/quack_utils/swiglu_triton.py` | Fused SwiGLU Triton kernels (7 variants) |
+| `sonicmoe/quack_utils/_validate.py` | Input validation helpers (zero GPU sync) |
+| `sonicmoe/ernie_compat/deepep_metadata.py` | DeepEP → SonicMoE metadata conversion |
+
+**Test files**:
+| Test | What it validates |
+|------|-------------------|
+| `tests/ops/test_jit_optimization.py --quick` | Correctness (cos>0.99), JIT (0 recompile), memory |
+| `tests/ops/test_mlpnode_precision.py` | Multi-topk precision audit |
+| `tests/ops/test_cold_start_e2e.py` | Full cold-start: cache clear → warmup → multi-shape |
+| `tests/ops/bench_mlpnode_topk_nsys.py` | nsys GPU-projection benchmark (Ernie shape) |
+
+**Training loop**:
+```python
+node = SonicMoEMlpNode(experts, E, H, I)
+node.warmup()  # one-time JIT compilation (~42s)
+
+for step in range(num_steps):
+    for mb in microbatches:
+        out = node(x, tpe, dispatched_indices, dispatched_probs)
+        out.backward(grad)
+    optimizer.step()
+    node.step()          # flush wgrad + invalidate caches
+    optimizer.zero_grad()
+```
 
 ## 📊 Architecture & Dataflow Visualization
 

@@ -882,7 +882,8 @@ def gemm_dgated(
         A_idx,
     )
 
-    current_stream = cuda.CUstream(torch.cuda.current_stream().stream_base.raw_stream)
+    _stream_obj = torch.cuda.current_stream()
+    current_stream = cuda.CUstream(_stream_obj.stream_base.raw_stream if hasattr(_stream_obj, "stream_base") else _stream_obj.cuda_stream)
 
     blockscaled = a_scales is not None and b_scales is not None
     sf_vec_size = 32 if blockscaled else None

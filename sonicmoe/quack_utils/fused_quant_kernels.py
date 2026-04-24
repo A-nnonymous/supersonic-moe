@@ -17,6 +17,7 @@ NCU analysis (Session 61) showed:
 import torch
 
 from ..triton_utils import wrap_triton_kernel
+from ._validate import check_tensor
 
 
 def fused_dual_colwise_quantize(
@@ -37,6 +38,13 @@ def fused_dual_colwise_quantize(
     back-to-back with zero Python overhead between them.
     Bit-exact with sequential dual_quantize_varlen + colwise_quantize_and_pack.
     """
+    check_tensor(dz, "dz", dtype=torch.bfloat16, ndim=2, last_stride_1=True)
+    check_tensor(dout, "dout", dtype=torch.bfloat16, ndim=2, last_stride_1=True)
+    check_tensor(gather_idx, "gather_idx", ndim=1, stride0_1=True)
+    if dz.shape[0] < TK or dz.shape[1] < dz_dim:
+        raise ValueError(f"dz shape {dz.shape} too small for TK={TK} dz_dim={dz_dim}")
+    if dout.shape[1] < dout_dim:
+        raise ValueError(f"dout shape {dout.shape} too small for dout_dim={dout_dim}")
     from .blockscaled_fp8_gemm import (
         _dual_varlen_quantize_kernel,
         _colwise_quantize_and_pack_kernel,

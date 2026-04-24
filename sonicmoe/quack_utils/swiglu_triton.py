@@ -3,19 +3,16 @@
 The interleaved layout stores gate/up pairs as z(TK, 2I) where:
   z[:, 0::2] = gate,  z[:, 1::2] = up
 
-Provides seven kernel variants:
+Provides five kernel variants:
   1. SwiGLU -> bf16 (unfused, for non-fp8 paths)
-  2. SwiGLU -> blockscaled fp8 + raw e8m0 scales (fused forward quant)
-  3. dSwiGLU -> blockscaled fp8 + raw e8m0 scales (fused backward quant)
-  4. SwiGLU -> blockscaled fp8 + ISA-packed e8m0 scales (fused forward quant+pack)
-  5. dSwiGLU -> blockscaled fp8 + ISA-packed e8m0 scales (fused backward quant+pack)
-  6. dSwiGLU from FP8 z: fused dequant + backward (eliminates bf16 z materialization)
-  7. dSwiGLU from FP8 z + dz quant+pack: fused dequant + backward + dz fp8 ISA-pack
+  2. SwiGLU -> blockscaled fp8 + ISA-packed e8m0 scales (fused forward quant+pack)
+  3. dSwiGLU -> blockscaled fp8 + ISA-packed e8m0 scales (fused backward quant+pack)
+  4. dSwiGLU from FP8 z: fused dequant + backward (eliminates bf16 z materialization)
+  5. dSwiGLU from FP8 z + dz quant+pack: fused dequant + backward + dz fp8 ISA-pack
      (eliminates bf16 z materialization AND separate dz quantize for act-grad GEMM)
 
-Variants 4 & 5 eliminate the intermediate raw-scale tensor and
-produce scales directly in the ISA tile layout consumed by CUTLASS
-blockscaled GEMMs, removing the separate pack_blockscaled_1x32_scales
+ISA-packed variants produce scales directly in the ISA tile layout consumed by
+CUTLASS blockscaled GEMMs, removing the separate pack_blockscaled_1x32_scales
 step entirely.
 """
 
@@ -26,6 +23,7 @@ _E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", torch.uint8)
 import triton
 import triton.language as tl
 from ..triton_utils import wrap_triton_kernel
+from ._validate import check_tensor, check_divisible
 
 _GROUP_SIZE: tl.constexpr = 32  # 1×32 blockscaled granularity
 
@@ -68,6 +66,7 @@ def _swiglu_fwd_kernel(
 
 def swiglu_forward_triton(z: torch.Tensor) -> torch.Tensor:
     """Fused SwiGLU forward: z(TK, 2I) -> y1(TK, I)."""
+    check_tensor(z, "z", dtype=torch.bfloat16, ndim=2, last_stride_1=True)
     TK, two_I = z.shape
     assert two_I % 2 == 0
     I = two_I // 2
@@ -83,90 +82,6 @@ def swiglu_forward_triton(z: torch.Tensor) -> torch.Tensor:
         BLOCK_I=BLOCK_I,
     )
     return y1
-
-
-# ===================================================================
-# Forward fused: z(TK, 2I) -> y1_fp8(TK, I) + e8m0_scales(TK, I//32)
-# ===================================================================
-
-@wrap_triton_kernel
-@triton.jit
-def _swiglu_fwd_quant_kernel(
-    Z_ptr, Y1_FP8_ptr, SCALE_ptr,
-    I: tl.constexpr,
-    stride_z_row: tl.constexpr,
-    stride_y_row: tl.constexpr,
-    stride_scale_row: tl.constexpr,
-    fp8_max: tl.constexpr,
-    GROUP_SIZE: tl.constexpr,
-):
-    """Fused SwiGLU + blockscaled fp8 quantize.
-
-    Each program processes one row. Iterates over I in GROUP_SIZE (32)
-    chunks, computing SwiGLU then immediately quantizing to fp8 with
-    per-group e8m0 scale factor. Zero intermediate bf16 materialisation.
-    """
-    row = tl.program_id(0)
-    z_base = Z_ptr + row * stride_z_row
-    y_base = Y1_FP8_ptr + row * stride_y_row
-    sc_base = SCALE_ptr + row * stride_scale_row
-
-    num_groups: tl.constexpr = I // GROUP_SIZE
-
-    for g in range(num_groups):
-        j_offs = g * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
-
-        gate = tl.load(z_base + j_offs * 2).to(tl.float32)
-        up = tl.load(z_base + j_offs * 2 + 1).to(tl.float32)
-
-        sig = tl.sigmoid(gate)
-        y1 = gate * sig * up
-
-        # Blockscaled quantize: e8m0 pow2 scale
-        amax = tl.max(tl.abs(y1))
-        positive = amax > 0
-        exponent = tl.where(positive,
-                            tl.ceil(tl.log2(tl.where(positive, amax / fp8_max, 1.0))),
-                            0.0)
-        quant_scale = tl.exp2(-exponent)
-        y1_fp8 = (y1 * quant_scale).to(tl.float8e4nv)
-        tl.store(y_base + j_offs, y1_fp8)
-
-        # E8M0 exponent byte
-        dequant = tl.exp2(exponent).to(tl.float32)
-        e8m0 = ((dequant.to(tl.int32, bitcast=True) >> 23) & 0xFF).to(tl.uint8)
-        tl.store(sc_base + g, e8m0)
-
-
-def swiglu_forward_quant_triton(
-    z: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fused SwiGLU forward + blockscaled fp8 quantize.
-
-    Args:
-        z: (TK, 2I) bf16 pre-activation (interleaved gate/up).
-
-    Returns:
-        y1_fp8:  (TK, I) float8_e4m3fn — quantized SwiGLU output.
-        scales:  (TK, I//32) uint8 — e8m0 scale per group of 32.
-    """
-    TK, two_I = z.shape
-    assert two_I % 2 == 0
-    I = two_I // 2
-    assert I % 32 == 0, f"I={I} must be multiple of 32 for blockscaled"
-
-    num_groups = I // 32
-    y1_fp8 = torch.empty(TK, I, dtype=torch.float8_e4m3fn, device=z.device)
-    scales = torch.empty(TK, num_groups, dtype=torch.uint8, device=z.device)
-
-    _swiglu_fwd_quant_kernel[(TK,)](
-        z, y1_fp8, scales,
-        I,
-        z.stride(0), y1_fp8.stride(0), scales.stride(0),
-        fp8_max=float(torch.finfo(torch.float8_e4m3fn).max),
-        GROUP_SIZE=32,
-    )
-    return y1_fp8, scales
 
 
 # ===================================================================
@@ -378,6 +293,7 @@ def swiglu_forward_quant_pack_triton(
         y1_fp8:       (TK, I) float8_e4m3fn — quantized SwiGLU output.
         packed_scales: (1, packed_size) float8_e8m0fnu — ISA-packed scales.
     """
+    check_tensor(z, "z", dtype=torch.bfloat16, ndim=2, last_stride_1=True)
     TK, two_I = z.shape
     assert two_I % 2 == 0
     I = two_I // 2
@@ -430,6 +346,7 @@ def swiglu_forward_quant_pack_zsave_triton(
         z_fp8:        (TK, 2I) float8_e4m3fn — z quantized for backward.
         z_scales:     (TK, num_z_groups) float8_e8m0fnu — flat z scales.
     """
+    check_tensor(z, "z", dtype=torch.bfloat16, ndim=2, last_stride_1=True)
     TK, two_I = z.shape
     assert two_I % 2 == 0
     I = two_I // 2
@@ -554,6 +471,9 @@ def swiglu_backward_triton(
         y1s: (TK, I) forward SwiGLU output weighted by s (for weight grad)
         ds:  (TK,) gradient w.r.t. router scores
     """
+    check_tensor(dy1, "dy1", dtype=torch.bfloat16, ndim=2, last_stride_1=True)
+    check_tensor(z, "z", dtype=torch.bfloat16, ndim=2, last_stride_1=True)
+    check_tensor(s, "s", ndim=1, stride0_1=True)
     TK, I = dy1.shape
 
     dz = torch.empty_like(z)
@@ -679,6 +599,10 @@ def swiglu_backward_from_fp8_triton(
         y1s: (TK, I) bf16 — SwiGLU(z) * s (for weight grad)
         ds:  (TK,) f32 — gradient w.r.t. router scores
     """
+    check_tensor(dy1, "dy1", dtype=torch.bfloat16, ndim=2, last_stride_1=True)
+    check_tensor(z_fp8, "z_fp8", dtype=torch.float8_e4m3fn, ndim=2, last_stride_1=True)
+    check_tensor(z_scales_u8, "z_scales_u8", dtype=torch.uint8, ndim=2, last_stride_1=True)
+    check_tensor(s, "s", ndim=1, stride0_1=True)
     TK, I = dy1.shape
     assert z_fp8.shape == (TK, 2 * I), f"z_fp8 shape {z_fp8.shape} != ({TK}, {2*I})"
     assert z_scales_u8.shape == (TK, 2 * I // _GROUP_SIZE)
@@ -702,135 +626,6 @@ def swiglu_backward_from_fp8_triton(
         BLOCK_I=BLOCK_I,
     )
     return dz, y1s, ds
-
-
-# ===================================================================
-# Backward fused: (dy1, z, s) -> dz_fp8 + scales, y1s(bf16), ds
-# ===================================================================
-
-@wrap_triton_kernel
-@triton.jit
-def _swiglu_bwd_quant_kernel(
-    DY1_ptr, Z_ptr, S_ptr,
-    DZ_FP8_ptr, DZ_SCALE_ptr, Y1S_ptr, DS_ptr,
-    I: tl.constexpr,
-    stride_dy_row: tl.constexpr,
-    stride_z_row: tl.constexpr,
-    stride_dz_row: tl.constexpr,
-    stride_dz_scale_row: tl.constexpr,
-    stride_y1s_row: tl.constexpr,
-    fp8_max: tl.constexpr,
-    GROUP_SIZE: tl.constexpr,
-):
-    """Fused dSwiGLU + router score + blockscaled fp8 quantize.
-
-    dz is interleaved [d_gate0, d_up0, d_gate1, ...] with 2I columns.
-    Each blockscaled group of 32 covers 16 interleaved (d_gate, d_up) pairs.
-    y1s is output in bf16 (needed for weight grads via quack.gemm).
-    """
-    row = tl.program_id(0)
-    dy_base = DY1_ptr + row * stride_dy_row
-    z_base = Z_ptr + row * stride_z_row
-    dz_base = DZ_FP8_ptr + row * stride_dz_row
-    sc_base = DZ_SCALE_ptr + row * stride_dz_scale_row
-    y1s_base = Y1S_ptr + row * stride_y1s_row
-
-    s_val = tl.load(S_ptr + row).to(tl.float32)
-    ds_acc = 0.0
-
-    # 2I columns -> 2I/32 groups for dz quantization
-    # Each group of 32 dz elements = 16 (d_gate, d_up) pairs
-    PAIRS_PER_GROUP: tl.constexpr = GROUP_SIZE // 2  # 16
-
-    num_groups: tl.constexpr = (2 * I) // GROUP_SIZE
-
-    for g in range(num_groups):
-        pair_start = g * PAIRS_PER_GROUP
-        pair_offs = pair_start + tl.arange(0, PAIRS_PER_GROUP)
-        mask = pair_offs < I
-
-        gate = tl.load(z_base + pair_offs * 2, mask=mask).to(tl.float32)
-        up = tl.load(z_base + pair_offs * 2 + 1, mask=mask).to(tl.float32)
-        dy1_val = tl.load(dy_base + pair_offs, mask=mask).to(tl.float32)
-
-        # Forward recomputation
-        sig = tl.sigmoid(gate)
-        silu_gate = gate * sig
-        y1 = silu_gate * up
-
-        ds_acc = ds_acc + tl.sum(dy1_val * y1, axis=0)
-
-        dy1_s = dy1_val * s_val
-
-        d_up = dy1_s * silu_gate
-        d_gate = dy1_s * up * sig * (1.0 + gate * (1.0 - sig))
-
-        # y1s in bf16
-        tl.store(y1s_base + pair_offs, (y1 * s_val).to(tl.bfloat16), mask=mask)
-
-        # Blockscaled quantize over 32 interleaved dz elements
-        amax_gate = tl.max(tl.where(mask, tl.abs(d_gate), 0.0))
-        amax_up = tl.max(tl.where(mask, tl.abs(d_up), 0.0))
-        amax = tl.maximum(amax_gate, amax_up)
-
-        positive = amax > 0
-        exponent = tl.where(positive,
-                            tl.ceil(tl.log2(tl.where(positive, amax / fp8_max, 1.0))),
-                            0.0)
-        quant_scale = tl.exp2(-exponent)
-
-        dg_fp8 = (d_gate * quant_scale).to(tl.float8e4nv)
-        du_fp8 = (d_up * quant_scale).to(tl.float8e4nv)
-        tl.store(dz_base + pair_offs * 2, dg_fp8, mask=mask)
-        tl.store(dz_base + pair_offs * 2 + 1, du_fp8, mask=mask)
-
-        # E8M0 scale
-        dequant = tl.exp2(exponent).to(tl.float32)
-        e8m0 = ((dequant.to(tl.int32, bitcast=True) >> 23) & 0xFF).to(tl.uint8)
-        tl.store(sc_base + g, e8m0)
-
-    tl.store(DS_ptr + row, ds_acc)
-
-
-def swiglu_backward_quant_triton(
-    dy1: torch.Tensor,
-    z: torch.Tensor,
-    s: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Fused SwiGLU backward + blockscaled fp8 quantize for dz.
-
-    Args:
-        dy1: (TK, I) gradient w.r.t. post-activation y1
-        z:   (TK, 2I) pre-activation (interleaved gate/up)
-        s:   (TK,) router scores
-
-    Returns:
-        dz_fp8:    (TK, 2I) float8_e4m3fn — quantized gradient
-        dz_scales: (TK, 2I//32) uint8 — e8m0 scales for dz
-        y1s:       (TK, I) bf16 — forward output weighted by s
-        ds:        (TK,) float32 — gradient w.r.t. router scores
-    """
-    TK, I = dy1.shape
-    two_I = z.shape[1]
-    assert two_I == 2 * I
-    assert two_I % 32 == 0, f"2I={two_I} must be multiple of 32"
-
-    num_groups = two_I // 32
-    dz_fp8 = torch.empty(TK, two_I, dtype=torch.float8_e4m3fn, device=z.device)
-    dz_scales = torch.empty(TK, num_groups, dtype=torch.uint8, device=z.device)
-    y1s = torch.empty(TK, I, dtype=torch.bfloat16, device=z.device)
-    ds = torch.empty(TK, dtype=torch.float32, device=z.device)
-
-    _swiglu_bwd_quant_kernel[(TK,)](
-        dy1, z, s,
-        dz_fp8, dz_scales, y1s, ds,
-        I,
-        dy1.stride(0), z.stride(0), dz_fp8.stride(0),
-        dz_scales.stride(0), y1s.stride(0),
-        fp8_max=float(torch.finfo(torch.float8_e4m3fn).max),
-        GROUP_SIZE=32,
-    )
-    return dz_fp8, dz_scales, y1s, ds
 
 
 # ===================================================================
@@ -881,6 +676,8 @@ def dequantize_blockscaled_fp8(
     Returns:
         (TK, D) bfloat16 — properly dequantized values.
     """
+    check_tensor(fp8_data, "fp8_data", dtype=torch.float8_e4m3fn, ndim=2, last_stride_1=True)
+    check_tensor(scales_uint8, "scales_uint8", dtype=torch.uint8, ndim=2, last_stride_1=True)
     TK, D = fp8_data.shape
     assert D % _GROUP_SIZE == 0, f"D={D} must be multiple of {_GROUP_SIZE}"
     out = torch.empty(TK, D, dtype=torch.bfloat16, device=fp8_data.device)
@@ -1038,6 +835,9 @@ def swiglu_backward_quant_pack_triton(
         y1s:             (TK, I) bf16 — forward output weighted by s
         ds:              (TK,) float32 — gradient w.r.t. router scores
     """
+    check_tensor(dy1, "dy1", dtype=torch.bfloat16, ndim=2, last_stride_1=True)
+    check_tensor(z, "z", dtype=torch.bfloat16, ndim=2, last_stride_1=True)
+    check_tensor(s, "s", ndim=1, stride0_1=True)
     TK, I = dy1.shape
     two_I = z.shape[1]
     assert two_I == 2 * I
@@ -1248,6 +1048,10 @@ def swiglu_backward_from_fp8_quant_pack_triton(
         y1s:              (TK, I) bf16 — SwiGLU(z) * s (for weight grad)
         ds:               (TK,) f32 — gradient w.r.t. router scores
     """
+    check_tensor(dy1, "dy1", dtype=torch.bfloat16, ndim=2, last_stride_1=True)
+    check_tensor(z_fp8, "z_fp8", dtype=torch.float8_e4m3fn, ndim=2, last_stride_1=True)
+    check_tensor(z_scales_u8, "z_scales_u8", dtype=torch.uint8, ndim=2, last_stride_1=True)
+    check_tensor(s, "s", ndim=1, stride0_1=True)
     TK, I = dy1.shape
     two_I = z_fp8.shape[1]
     assert two_I == 2 * I, f"z_fp8 shape {z_fp8.shape} != ({TK}, {2*I})"

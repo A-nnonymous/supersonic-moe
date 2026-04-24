@@ -508,12 +508,13 @@ _PREQUANT_HIT_COUNT: dict[str, int] = collections.defaultdict(int)
 def _matches_prequant_tensor(lhs: torch.Tensor | None, rhs: torch.Tensor | None) -> bool:
     if lhs is None or rhs is None:
         return False
+    _offset = lambda t: t._offset() if hasattr(t, '_offset') else t.storage_offset()
     return (
         lhs.device == rhs.device
         and lhs.dtype == rhs.dtype
         and tuple(lhs.shape) == tuple(rhs.shape)
         and tuple(lhs.stride()) == tuple(rhs.stride())
-        and lhs._offset() == rhs._offset()
+        and _offset(lhs) == _offset(rhs)
         and lhs.data_ptr() == rhs.data_ptr()
     )
 
@@ -533,9 +534,7 @@ def _get_cu_seqlens_cpu(cu_seqlens: torch.Tensor) -> tuple:
 
 
 _ALIGNMENT_STREAK: int = 0
-_ALIGNMENT_ASSUMED: bool = (
-    os.getenv("SONIC_MOE_FP8_ASSUME_ALIGNED", "").lower() in {"1", "true", "yes", "on"}
-)
+_ALIGNMENT_ASSUMED: bool = True  # route-level padding guarantees 128-alignment
 _ALIGNMENT_STREAK_THRESHOLD: int = 3
 
 
@@ -575,11 +574,6 @@ def _all_segments_128_aligned(cu_seqlens: torch.Tensor) -> bool:
     return result
 
 
-def _use_cutely_fused_fp8_adapter() -> bool:
-    """Deprecated: always returns False. The cutely-fused adapter is only used
-    for non-quack-gemm fallback which is a dead path on the frontier."""
-    return False
-
 
 def _parse_runtime_precision(name: str, default: str, allowed: set[str]) -> str:
     value = os.getenv(name, "").strip().lower()
@@ -591,10 +585,6 @@ def _parse_runtime_precision(name: str, default: str, allowed: set[str]) -> str:
     return value
 
 
-def _legacy_blockscaled_fp8_downproj_enabled() -> bool:
-    return os.getenv("SONIC_MOE_FP8_BLOCKSCALED_DOWNPROJ", "").lower() in {"1", "true", "yes", "on"}
-
-
 def _upproj_epilogue_precision() -> str:
     return _parse_runtime_precision(
         "SONIC_MOE_FP8_UPPROJ_EPILOGUE_PRECISION",
@@ -604,10 +594,9 @@ def _upproj_epilogue_precision() -> str:
 
 
 def _downproj_mainloop_precision() -> str:
-    legacy_default = "fp8-blockscaled" if _legacy_blockscaled_fp8_downproj_enabled() else "bf16"
     return _parse_runtime_precision(
         "SONIC_MOE_FP8_DOWNPROJ_MAINLOOP_PRECISION",
-        default=legacy_default,
+        default="bf16",
         allowed={"bf16", "fp8-blockscaled"},
     )
 
@@ -624,20 +613,6 @@ def _downproj_weight_precision() -> str:
 def _use_blockscaled_fp8_downproj() -> bool:
     return _downproj_mainloop_precision() == "fp8-blockscaled"
 
-
-def _use_native_fp8_upproj() -> bool:
-    """Deprecated legacy flag — use SONIC_MOE_FP8_MODE=perf instead."""
-    return False
-
-
-def _use_dummy_fp8_postact_buffer() -> bool:
-    """Deprecated test-only flag — always disabled on the frontier path."""
-    return False
-
-
-def _use_mixed_dtype_downproj_dw2() -> bool:
-    """Deprecated legacy flag — use SONIC_MOE_FP8_MODE=perf instead."""
-    return False
 
 
 def _fp8_mode() -> str:

@@ -30,6 +30,8 @@ from typing import Any, Sequence
 
 import paddle
 import torch
+import triton
+import triton.language as tl
 
 from sonicmoe.enums import ActivationType
 from sonicmoe.ernie_compat.deepep_metadata import (
@@ -52,7 +54,12 @@ _W_CACHE: dict[tuple, torch.Tensor] = {}
 
 
 def _cache_key(*tensors: torch.Tensor) -> tuple:
-    return tuple((t.data_ptr(), t._inplace_version) for t in tensors)
+    def _ver(t):
+        v = getattr(t, '_inplace_version', None)
+        if v is not None:
+            return v() if callable(v) else v
+        return getattr(t, '_version', 0)
+    return tuple((t.data_ptr(), _ver(t)) for t in tensors)
 
 
 def invalidate_weight_caches() -> None:
@@ -428,9 +435,53 @@ class SonicMoEFunc(paddle.autograd.PyLayer):
 
 # ── Differentiable router-scores reconstruction ──────────────────────────────
 
+@triton.jit
+def _build_score_src_idx_kernel(
+    INDICES_ptr,  # [N_recv, topk] int32 — dispatched_indices
+    NAEPT_ptr,    # [N_recv+1] int32 — prefix-sum of valid counts per token
+    OUT_ptr,      # [TK] int64 — output: flat index into dispatched_probs.reshape(-1)
+    TOPK: tl.constexpr,
+    E: tl.constexpr,
+):
+    """Build score_src_idx without boolean indexing (zero CPU-GPU sync).
+
+    For each token t, sort its valid expert IDs ascending, then write
+    the flat source indices (t * topk + original_column) to the output
+    at positions [naept[t], naept[t+1]).
+
+    Grid: (N_recv,).  Each program processes one token.
+    Uses iterative argmin for stable ascending sort (topk <= 8, fully unrolled).
+    """
+    t = tl.program_id(0)
+    start = tl.load(NAEPT_ptr + t).to(tl.int32)
+    end = tl.load(NAEPT_ptr + t + 1).to(tl.int32)
+    n_valid = end - start
+    if n_valid == 0:
+        return
+
+    # Load expert IDs; replace invalid (-1) with E so they sort last
+    cols = tl.arange(0, TOPK)
+    experts = tl.load(INDICES_ptr + t * TOPK + cols, mask=cols < TOPK).to(tl.int32)
+    experts = tl.where(experts >= 0, experts, E)
+
+    # Iterative argmin: for each output slot j, find the column with the
+    # smallest expert ID (ties broken by lowest column = stable sort),
+    # write its flat source index, then mark it used (set to E+1).
+    for j in range(TOPK):
+        # Guard: skip if we've already placed all valid entries
+        if j < n_valid:
+            min_val = tl.min(experts, axis=0)
+            is_min = (experts == min_val)
+            # Stable tiebreak: among columns with min expert, pick lowest col
+            best_col = tl.min(tl.where(is_min, cols, TOPK), axis=0).to(tl.int32)
+            tl.store(OUT_ptr + start + j, (t * TOPK + best_col).to(tl.int64))
+            experts = tl.where(cols == best_col, E + 1, experts)
+
+
 def _differentiable_router_scores(
     dispatched_probs: torch.Tensor,    # [N_recv, topk] float32
     dispatched_indices: torch.Tensor,  # [N_recv, topk] int32, -1 = masked
+    naept: torch.Tensor,               # [N_recv+1] int32 — prefix-sum of valid counts
     TK: int,                           # number of real (non-padding) entries
     TK_padded: int,                    # TK + padding for 128-alignment
     E: int,                            # number of experts
@@ -444,30 +495,38 @@ def _differentiable_router_scores(
 
     Within each token, entries are ordered by ascending expert ID, matching the
     CUDA kernel's rank-based ordering in ``scatter_and_fixup_kernel``.
+
+    Zero CPU-GPU synchronization: uses a Triton kernel to build the [TK] index
+    tensor from naept (known-size prefix-sum) instead of boolean indexing.
     """
     N_recv, topk = dispatched_indices.shape
     device = dispatched_indices.device
 
-    # Sort each token's expert IDs ascending.  Invalid slots (-1) sort to end
-    # by replacing with E (larger than any valid expert 0..E-1).
-    masked = dispatched_indices.int().clone()
-    masked[masked < 0] = E
-    sort_perm = masked.argsort(axis=1, stable=True)  # [N_recv, topk]
+    if dispatched_indices.stride(1) != 1:
+        raise ValueError("dispatched_indices must be contiguous in last dim")
+    if "int32" not in str(dispatched_indices.dtype):
+        raise ValueError(f"dispatched_indices: expected int32, got {dispatched_indices.dtype}")
+    if naept.stride(0) != 1:
+        raise ValueError("naept must be contiguous 1D")
+    if naept.shape[0] != N_recv + 1:
+        raise ValueError(f"naept: expected shape ({N_recv+1},), got {naept.shape}")
 
-    # After sorting, valid entries (expert < E) come first within each token.
-    sorted_valid = torch.gather(masked, 1, sort_perm) < E  # [N_recv, topk]
+    if TK == 0:
+        return torch.zeros(TK_padded, dtype=dispatched_probs.dtype, device=device)
 
-    # Flat source index into dispatched_probs.reshape(-1):
-    #   dispatched_probs[t, sort_perm[t, j]] → flat = t * topk + sort_perm[t, j]
-    row_offsets = torch.arange(N_recv, device=device, dtype=sort_perm.dtype)
-    src_flat = row_offsets.unsqueeze(1) * topk + sort_perm  # [N_recv, topk]
-    score_src_idx = src_flat[sorted_valid]  # [TK]
+    # Build score_src_idx: [TK] int64 flat indices into dispatched_probs.reshape(-1)
+    # Uses Triton kernel — no boolean indexing, no dynamic shapes, no D2H sync.
+    score_src_idx = torch.empty(TK, dtype=torch.int64, device=device)
+    _build_score_src_idx_kernel[(N_recv,)](
+        dispatched_indices, naept, score_src_idx,
+        TOPK=triton.next_power_of_2(topk),
+        E=E,
+    )
 
     # Differentiable gather from dispatched_probs
     gathered = dispatched_probs.reshape(-1)[score_src_idx]  # [TK]
 
     if TK_padded > TK:
-        # Padding zeros (no gradient contribution)
         padding = torch.zeros(
             TK_padded - TK, dtype=gathered.dtype, device=device,
         )
@@ -601,6 +660,7 @@ class SonicMoEMlpNode:
         # we reconstruct the same values using autograd-tracked indexing.
         router_scores = _differentiable_router_scores(
             dispatched_probs, dispatched_indices,
+            num_activated_expert_per_token_offset,
             TK_padded - total_pad_rows, TK_padded, E,
         )
         # T_down = N_recv for the topk path: _router_forward outputs [N_recv, H]
@@ -647,6 +707,20 @@ class SonicMoEMlpNode:
         )
 
         return output
+
+    def step(self):
+        """Call after optimizer.step(). Flushes wgrad and invalidates all caches.
+
+        Training loop contract:
+            for microbatch in microbatches:
+                out = node(x, tpe, indices, probs)
+                out.backward(grad)
+            optimizer.step()
+            node.step()         # ← here
+            optimizer.zero_grad()
+        """
+        flush_native_grads()
+        invalidate_weight_caches()
 
     def __call__(
         self,
@@ -766,6 +840,9 @@ class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
         dw1 = up_grads[1]
 
         # ── Weight grads → per-expert main_grad ──────────────────────────
+        # FP8 path: CUTLASS accumulates directly into _NATIVE_W{1,2}_GRAD
+        # via the _wgrad_accumulator, returning dw1=dw2=None. If non-None,
+        # we're on the BF16 fallback — accumulate with per-iter transpose.
         if dw1 is not None:
             _accumulate_w1(dw1, ctx._experts, ctx._I)
         if dw2 is not None:
