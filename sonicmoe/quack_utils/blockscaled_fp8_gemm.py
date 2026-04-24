@@ -3915,6 +3915,10 @@ def _run_cutlass_blockscaled_gemm(
     a_scale_cute = _make_cute_tensor_dynamic(a_scales_packed, leading_dim=1)
     b_scale_cute = _make_cute_tensor_dynamic(w_scales_packed, leading_dim=1)
 
+    # compile_key must NOT contain dynamic token dimensions (total_M,
+    # a_scales_packed.size(1)) — those change with seqlen and are handled
+    # at runtime via mark_layout_dynamic.  Including them would trigger a
+    # CuTe recompile every time seqlen changes.
     compile_key = (
         "varlen",
         tensor_infos["A"].dtype,
@@ -3926,8 +3930,6 @@ def _run_cutlass_blockscaled_gemm(
         tuple(tensor_infos["B"].tensor.shape),
         tuple(tensor_infos["B"].tensor.stride()),
         H,
-        a_scales_packed.size(1),
-        tuple(w_scales_packed.shape),
         tensor_infos["A"].major,
         tensor_infos["B"].major,
         config.pingpong,
@@ -4157,6 +4159,9 @@ def blockscaled_fp8_weight_grad_gemm(
     a_scale_cute = _make_cute_tensor_dynamic(packed_a_scales, leading_dim=1)
     b_scale_cute = _make_cute_tensor_dynamic(packed_b_scales, leading_dim=1)
 
+    # compile_key must NOT contain dynamic dims (capacity changes with routing).
+    # All tensors use mark_layout_dynamic — the compiled kernel handles any capacity.
+    # Only include static model dims (dim_A, dim_B) and device config.
     compile_key = (
         "weight_grad",
         tensor_infos["A"].dtype,
@@ -4164,14 +4169,9 @@ def blockscaled_fp8_weight_grad_gemm(
         tensor_infos["D"].dtype,
         tile_shape_mn,
         cluster_shape_mnk,
-        tuple(tensor_infos["A"].tensor.shape),
-        tuple(tensor_infos["A"].tensor.stride()),
-        tuple(tensor_infos["B"].tensor.shape),
-        tuple(tensor_infos["B"].tensor.stride()),
-        tuple(tensor_infos["D"].tensor.shape),
-        tuple(tensor_infos["D"].tensor.stride()),
-        tuple(packed_a_scales.shape),
-        tuple(packed_b_scales.shape),
+        tensor_infos["A"].tensor.shape[1],  # dim_A — STATIC
+        tensor_infos["B"].tensor.shape[1],  # dim_B — STATIC
+        num_experts,
         tensor_infos["A"].major,
         tensor_infos["B"].major,
         config.pingpong,
@@ -4355,6 +4355,7 @@ def blockscaled_fp8_weight_grad_gemm_fast(
     a_scale_cute = _make_cute_tensor_dynamic(packed_a_scales, leading_dim=1)
     b_scale_cute = _make_cute_tensor_dynamic(packed_b_scales, leading_dim=1)
 
+    # compile_key must NOT contain dynamic dims — same pattern as "weight_grad".
     compile_key = (
         "weight_grad_fast",
         tensor_infos["A"].dtype,
@@ -4362,14 +4363,9 @@ def blockscaled_fp8_weight_grad_gemm_fast(
         tensor_infos["D"].dtype,
         tile_shape_mn,
         cluster_shape_mnk,
-        tuple(tensor_infos["A"].tensor.shape),
-        tuple(tensor_infos["A"].tensor.stride()),
-        tuple(tensor_infos["B"].tensor.shape),
-        tuple(tensor_infos["B"].tensor.stride()),
-        tuple(tensor_infos["D"].tensor.shape),
-        tuple(tensor_infos["D"].tensor.stride()),
-        tuple(packed_a_scales.shape),
-        tuple(packed_b_scales.shape),
+        tensor_infos["A"].tensor.shape[1],  # dim_A — STATIC
+        tensor_infos["B"].tensor.shape[1],  # dim_B — STATIC
+        num_experts,
         tensor_infos["A"].major,
         tensor_infos["B"].major,
         config.pingpong,
