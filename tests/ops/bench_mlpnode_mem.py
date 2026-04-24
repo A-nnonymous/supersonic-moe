@@ -9,7 +9,7 @@
 
 精度策略：
     - 前向/actgrad/dgated：FP8 (USE_QUACK_GEMM=1)
-    - wgrad (dw1/dw2)：bf16（fp8_wgrad=False，算法侧要求）
+    - wgrad (dw1/dw2)：FP8（auto-detect，threshold=0 → 全 I 开启）
     - z 保存格式：fp8（save_z_fp8=True，默认）
 """
 import os
@@ -210,12 +210,11 @@ def main():
     )
     invalidate_weight_caches()
 
-    # 3. 精度配置：FP8 前向 + bf16 wgrad
+    # 3. 精度配置：FP8 全路径（含 wgrad）
     cfg = SonicMoEConfig(
         use_fp8        = True,
-        fp8_wgrad      = False,   # 算法要求 bf16 wgrad
         assume_aligned = True,
-        save_z_fp8     = True,   # 算法要求 bf16 的 z
+        save_z_fp8     = True,
         stagewise_memory = True,  # 开启阶段显存 log
     )
 
@@ -230,7 +229,7 @@ def main():
     grad_out = paddle.randn_like(output)
     _print_mem("反向开始前")
     output.backward(grad_out)
-    # flush_native_grads() 不再需要：bf16 wgrad 路径直接写 main_grad
+    # flush_native_grads() 不再需要：wgrad 路径直接写 main_grad
     _print_mem("反向结束后（含 flush_native_grads）")
 
     # 6. 基本健全性检查

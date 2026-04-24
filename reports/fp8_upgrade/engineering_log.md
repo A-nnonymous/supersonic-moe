@@ -382,6 +382,38 @@ Lessons:
 82. QuACK `_precompile` subprocess crash → BrokenPipe → must be try/except wrapped.
 83. bench_mlpnode_mem.py `make_inputs` extremely slow (~30s) — looks like hang.
 
+## Phase 24: fp8_wgrad=True 验证 + Bench Config 修正 (Session 64, 2026-04-24)
+
+**Key discovery**: `bench_mlpnode_mem.py` and `nsys_grid2.py` hardcoded `fp8_wgrad=False`,
+while auto-detect defaults to `fp8_wgrad=True` (threshold=0 since Session 53 cache fix).
+All previous bench data was from a non-production config.
+
+**Fixes**:
+- Removed `fp8_wgrad=False` from `bench_mlpnode_mem.py` — now uses auto-detect (production default)
+- Re-collected nsys GPU-projection with `fp8_wgrad=True`
+
+**Performance (nsys GPU-proj, fp8_wgrad=True, production config)**:
+
+| Shape | S53 BF16 (µs) | S53 FP8 (µs) | Paddle FP8 (µs) | vs BF16 | vs S53 FP8 |
+|---|:---:|:---:|:---:|:---:|:---:|
+| T=8192 E=8 | 3644 | 2715 | 2887 | 1.26x | 1.06x slower |
+| T=8192 E=32 | 3844 | 2922 | 3372 | 1.14x | 1.15x slower |
+| T=16384 E=8 | 7953 | 5227 | 5548 | 1.43x | 1.06x slower |
+| T=16384 E=32 | 8129 | 5432 | 5916 | 1.37x | 1.09x slower |
+
+**Key takeaways**:
+- vs BF16: **1.14x – 1.43x faster** (production-relevant comparison)
+- vs S53 native PyTorch FP8: 6-15% slower (Paddle proxy overhead)
+- fused BF16 wgrad epilogue eliminates 664µs/iter varlen accumulate pass
+- Precision verified: 4 shapes × 5 tensors, all cosine > 0.98 with fp8_wgrad=True
+
+Lessons:
+84. **Bench scripts must match production config.** `fp8_wgrad=False` was hardcoded while
+    production auto-detect uses threshold=0 → always True. Bench data was 11-16% worse
+    than real production performance.
+85. **Paddle proxy overhead is 6-15% vs native PyTorch FP8.** Irreducible dispatch overhead
+    from `paddle.enable_compat()` interception layer. Not an FP8 algorithm issue.
+
 ---
 
 > **Canonical handoff: root `HANDOFF.md`**

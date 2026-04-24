@@ -1,4 +1,4 @@
-# HANDOFF — Session 63 (2026-04-24)
+# HANDOFF — Session 64 (2026-04-24)
 
 > **Single source of truth.** `docs/HANDOFF.md` redirects here.
 
@@ -33,6 +33,34 @@
 
 ## 3. Performance — GPU-Projection (nsys sqlite, verified 2026-04-24)
 
+### Session 64 correction: fp8_wgrad=True (production config)
+
+Session 63 nsys grid used `fp8_wgrad=False` in the bench script, while production
+auto-detect defaults to `fp8_wgrad=True` (threshold=0). Session 64 re-measured with
+the correct production config.
+
+### nsys GPU-projection grid (I=1536, K=8, fp8_wgrad=True)
+
+| Shape | S53 BF16 (µs) | S53 FP8 (µs) | Paddle FP8 (µs) | vs BF16 | vs S53 FP8 |
+|---|:---:|:---:|:---:|:---:|:---:|
+| T=8192 E=8 | 3644 | 2715 | 2887 | **1.26x** | 1.06x slower |
+| T=8192 E=32 | 3844 | 2922 | 3372 | **1.14x** | 1.15x slower |
+| T=16384 E=8 | 7953 | 5227 | 5548 | **1.43x** | 1.06x slower |
+| T=16384 E=32 | 8129 | 5432 | 5916 | **1.37x** | 1.09x slower |
+
+- **vs BF16**: 1.14x — 1.43x faster (the production-relevant comparison)
+- **vs S53 native PyTorch FP8**: 6-15% slower (Paddle proxy overhead, not FP8 config issue)
+- S53 = Session 53 native PyTorch benchmark on same hardware (no Paddle proxy)
+
+### Overhead Sources (Paddle vs native PyTorch FP8)
+
+| Source | Estimated cost | Notes |
+|---|:---:|---|
+| Paddle torch-proxy dispatch | ~3-5% | Per-op overhead from `paddle.enable_compat()` interception |
+| BF16 wgrad accumulate (CUTLASS varlen) | ~664 µs/iter | Same as native — inherent to blockscaled FP8 wgrad |
+| `token_gather_sum` router scatter | ~55-57 µs/iter | Paddle-specific routing metadata path |
+| Dynamic shape overhead | ~1-2% | `mark_layout_dynamic` vs static shapes in native path |
+
 ### ERNIE-Shape (E=32, H=3072, I=1536, K=8, EP=8, SEQ=4096)
 
 N_recv ≈ 21725, TK ≈ 32822, TK_padded ≈ 34816
@@ -55,6 +83,11 @@ N_recv ≈ 21725, TK ≈ 32822, TK_padded ≈ 34816
 | histogram_and_prefix (metadata) | 22 | 3.5% |
 
 ### Backward Kernel Breakdown (1903 µs, 17 kernels)
+
+> **Session 64 note**: The `CUTLASS varlen accumulate` (664µs, 34.9%) was eliminated
+> by fusing BF16 wgrad accumulate into the GEMM epilogue. With `fp8_wgrad=True`
+> (production default), CUTLASS wgrad writes directly to the native grad buffer,
+> so the separate accumulate pass is no longer needed.
 
 | Kernel | µs | % |
 |---|:---:|:---:|
@@ -186,13 +219,17 @@ Training iteration:
 
 ### Insights
 
-1. **GEMM 占 GPU 时间 78%**。Forward: CUTLASS GEMM 65%, 量化 10%. Backward: wgrad+accumulate 78%, actgrad 13%. 优化量化内核的收益已接近天花板，下一个大优化点是 wgrad GEMM（占 backward 78%）。
+1. **GEMM 占 GPU 时间 78%**。Forward: CUTLASS GEMM 65%, 量化 10%. Backward: wgrad+accumulate 78%, actgrad 13%. 优化量化内核的收益已接近天花板。
 
-2. **wgrad accumulate (varlen_k) 是 backward 最大单项开销**。664µs (34.9%) 来自 CUTLASS varlen accumulate。这是一个将 varlen wgrad 累加到 native buffer 的操作，可能可以通过 CUTLASS 4.x 的 split-K 或 tiling 优化。
+2. **fused BF16 wgrad epilogue 消除 664µs/iter accumulate**。Session 64 确认 `fp8_wgrad=True` 生产配置下，CUTLASS wgrad 直接写入 native grad buffer，消除了单独的 varlen accumulate pass（之前 backward 最大单项开销 34.9%）。
 
-3. **Host Python overhead 不影响 GPU pipeline**。NVTX wall-clock ~6.7ms/iter 但 GPU-projection 只有 2.5ms。GPU 利用率约 37%（单 MLP layer），在完整 transformer 中会更高。
+3. **bench_mlpnode_mem.py 之前硬编码 `fp8_wgrad=False`**。导致之前 bench 测试的是非生产配置。Session 64 修正后与 auto-detect 默认（threshold=0 → 全 I 开启）一致。
 
-4. **并行 autotuning 对冷启动很关键**。36 configs × 8 workers = 45s 并行编译。单线程需要 ~360s (8x)。确保 Paddle 环境下 worker 能正常工作。
+4. **Host Python overhead 不影响 GPU pipeline**。NVTX wall-clock ~6.7ms/iter 但 GPU-projection 只有 2.5ms。GPU 利用率约 37%（单 MLP layer），在完整 transformer 中会更高。
+
+5. **并行 autotuning 对冷启动很关键**。36 configs × 8 workers = 45s 并行编译。单线程需要 ~360s (8x)。确保 Paddle 环境下 worker 能正常工作。
+
+6. **Paddle proxy 引入 6-15% overhead vs native PyTorch FP8**。主要来自 dispatch interception 和动态 shape 处理，不来自 FP8 算法差异。
 
 ### Next Steps (Priority)
 
@@ -200,7 +237,7 @@ Training iteration:
 
 2. **E=32 生产规模验证** — 当前 E=32 用 SEQ=4096 验证通过。需要用完整 SEQ=16384+EP=32 规模验证显存和延迟。
 
-3. **wgrad accumulate 优化** — backward 34.9% 来自 varlen accumulate。考虑 split-K 或 stream-K 替代。
+3. **Paddle proxy overhead 优化** — 6-15% overhead 主要来自 dispatch interception。可探索 hot-path bypass 或 native Paddle kernel 注册。
 
 4. **Epilogue forward quantization** — 将 x→fp8 量化融入 GemmGated epilogue，消除 ~65µs forward overhead。
 

@@ -88,10 +88,19 @@ All cosine > 0.99, RRMSE < 7%.  Shapes include warmup, expected, and unexpected 
 
 ### Performance (nsys GPU-projection, B30Z)
 
-Session 63 (Paddle `SonicMoEMlpNode`, E=32 H=3072 I=1536 K=8 EP=8 SEQ=4096, GPU1, CV<0.3%):
+Session 64 (Paddle `SonicMoEMlpNode`, production config with `fp8_wgrad=True`):
+
+| Shape (I=1536 K=8) | S53 BF16 (µs) | Paddle FP8 (µs) | Speedup vs BF16 |
+|---|:---:|:---:|:---:|
+| T=8192 E=8 | 3644 | 2887 | **1.26x** |
+| T=8192 E=32 | 3844 | 3372 | **1.14x** |
+| T=16384 E=8 | 7953 | 5548 | **1.43x** |
+| T=16384 E=32 | 8129 | 5916 | **1.37x** |
+
+ERNIE-shape detail (E=32 H=3072 I=1536 K=8 EP=8 SEQ=4096):
 - **Forward GPU-proj: 625 µs** (CUTLASS GEMM 65%, FP8 quant 10%, router 14%)
-- **Backward GPU-proj: 1904 µs** (wgrad+accum 78%, actgrad 13%, quant 5%)
-- **Total: 2530 µs/iter**
+- **Backward GPU-proj: 1904 µs** (wgrad 78%, actgrad 13%, quant 5%)
+- **Total: 2530 µs/iter** (CV < 0.3%)
 
 See `HANDOFF.md` for full kernel breakdown and Session 53 baseline comparison.
 
