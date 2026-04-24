@@ -360,4 +360,29 @@ Lessons:
 
 ---
 
+## Phase 23: E!=topk Fix + QuACK Paddle Compat (Session 63, 2026-04-24)
+
+Fixed 3 critical bugs blocking E=32 production deployment:
+
+1. **_build_score_src_idx_kernel PTXASError**: Triton `tl.min(vector, axis=0)` generates PTX incompatible with SM103a's ptxas (CUDA 12.8 bundled with Triton 3.5.0). Rewrote with pure scalar selection sort using WORK_ptr scratch buffer.
+
+2. **varlen_K_max=E instead of topk**: When E=32 topk=8, `token_gather_sum_kernel` received MAX_K=32 instead of 8. This was masked when E==topk==8. Fixed by passing topk through `_SonicMoEDeepEPFunc._topk` class variable.
+
+3. **QuACK autotuner BrokenPipeError**: `_compile_worker.py` crashed on `'paddle.bfloat16'` dtype string (KeyError in `_dtype_map`). Root cause: `str(tensor.dtype)` returns `'paddle.bfloat16'` under Paddle proxy. Fixed with dtype normalization + paddle.* entries in worker dtype map + robustness hardening.
+
+Performance (ERNIE-shape E=32 H=3072 I=1536 K=8 EP=8 SEQ=4096):
+- Forward GPU-proj: 625µs (CV=0.3%)
+- Backward GPU-proj: 1904µs (CV=0.1%)
+- Total: 2530µs (CV=0.2%)
+
+Lessons:
+79. `str(dtype)` under Paddle proxy returns `'paddle.bfloat16'` — normalize to `'torch.*'`.
+80. Hidden semantic coupling: `E==topk` assumption hid varlen_K_max bug across all sessions.
+81. `tl.min(vector, axis=0)` generates PTX that old ptxas can't handle on SM103a.
+82. QuACK `_precompile` subprocess crash → BrokenPipe → must be try/except wrapped.
+83. bench_mlpnode_mem.py `make_inputs` extremely slow (~30s) — looks like hang.
+
+---
+
 > **Canonical handoff: root `HANDOFF.md`**
+

@@ -86,16 +86,14 @@ Three tiers of caching, each with different invalidation strategies:
 
 All cosine > 0.99, RRMSE < 7%.  Shapes include warmup, expected, and unexpected (never-seen-during-warmup) token counts.
 
-### Performance (Session 53/62, nsys GPU-projection, B30Z)
+### Performance (nsys GPU-projection, B30Z)
 
-Session 53 baseline (native PyTorch `MoE` module, 27-shape grid):
-- **Speedup range: 1.29x - 1.70x** (FP8 vs BF16), mean 1.53x
-- Memory overhead: +5-10% (FP8 weight shadow caches)
+Session 63 (Paddle `SonicMoEMlpNode`, E=32 H=3072 I=1536 K=8 EP=8 SEQ=4096, GPU1, CV<0.3%):
+- **Forward GPU-proj: 625 µs** (CUTLASS GEMM 65%, FP8 quant 10%, router 14%)
+- **Backward GPU-proj: 1904 µs** (wgrad+accum 78%, actgrad 13%, quant 5%)
+- **Total: 2530 µs/iter**
 
-Session 62 (Paddle `SonicMoEMlpNode`, Ernie shape T=8192 E=8 I=1536, 3-GPU mean, CV=0.6%):
-- **GPU-projection: 2871 µs/iter** (+5.7% vs Session 53 native FP8 baseline of 2715 µs)
-- Delta from: new routing metadata kernel (34µs) + Paddle compat framework kernels
-- GEMM per-call latency: **identical** to baseline (verified per-call nsys comparison)
+See `HANDOFF.md` for full kernel breakdown and Session 53 baseline comparison.
 
 ### Key Files
 
@@ -116,6 +114,7 @@ Session 62 (Paddle `SonicMoEMlpNode`, Ernie shape T=8192 E=8 I=1536, 3-GPU mean,
 | `test_cold_start_e2e.py` | Cache clear → JIT → 6-shape precision (out/dx/ds/dw1/dw2) | `CUDA_VISIBLE_DEVICES=2 python tests/ops/test_cold_start_e2e.py` |
 | `test_jit_optimization.py --quick` | Correctness (cos>0.99), zero JIT recompile, memory | `CUDA_VISIBLE_DEVICES=0 python tests/ops/test_jit_optimization.py --quick` |
 | `test_mlpnode_precision.py` | Multi-topk precision audit | `CUDA_VISIBLE_DEVICES=0 python tests/ops/test_mlpnode_precision.py` |
+| `bench_mlpnode_mem.py` | E=32 fwd+bwd memory benchmark (ERNIE shape) | `CUDA_VISIBLE_DEVICES=1 python tests/ops/bench_mlpnode_mem.py` |
 | `bench_mlpnode_topk_nsys.py` | nsys GPU-projection benchmark | Wrap with `nsys profile --resolve-symbols=false` |
 
 ### Read First (for next developer/agent)
