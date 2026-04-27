@@ -482,9 +482,19 @@ void deepep_topk_metadata_cuda(
         static_cast<int>(alignment), scatter_blocks);
 
     // ── Kernel 2: Scatter + fixup ────────────────────────────────────────────
-    // Grid: enough blocks for scatter (32 rows each) and pad-fill coverage
-    int grid2_blocks = scatter_blocks > ((int)(TK_padded + BLOCK_DIM - 1) / BLOCK_DIM) ? scatter_blocks : (int)(TK_padded + BLOCK_DIM - 1) / BLOCK_DIM;
-    grid2_blocks = grid2_blocks < 2048 ? grid2_blocks : 2048;  // cap for responsiveness
+    // Grid must cover ALL scatter blocks: scatter phase relies on blockIdx.x
+    // mapping 1:1 to a 32-row chunk of N_recv (block_row_base = blockIdx.x*32).
+    // Capping the grid here would silently skip rows beyond cap*32 — which is
+    // exactly what caused the SEQ_LEN ≥ 12K illegal-memory-access in
+    // token_gather_sum_kernel: scatter_blocks=2712 capped at 2048 left rows
+    // 65536..86768 unscattered, so x_gather_idx beyond TK_padded position
+    // 2048*32 stayed at the pad-fill default and downstream gathers tried to
+    // read 0-row data using s_scatter_idx pointing past valid topk_scores.
+    // Pad-fill (Phase 2) uses a grid-stride loop, so any grid ≥ scatter_blocks
+    // is correct and equally efficient.
+    int grid2_blocks = scatter_blocks;
+    int padfill_blocks = (int)(TK_padded + BLOCK_DIM - 1) / BLOCK_DIM;
+    if (padfill_blocks > grid2_blocks) grid2_blocks = padfill_blocks;
 
     // Shared memory: expert_bitmask[E] + my_offset[E]
     int smem_k2 = (E * sizeof(uint32_t)) + (E * sizeof(int));
