@@ -5,7 +5,7 @@
 ## How to run (eb_venv — runs all tests)
 
 ```bash
-EBVENV=/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/baidu/ernie/erniebot/eb_venv
+EBVENV=/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/erniebot/eb_venv
 export USE_QUACK_GEMM=1 SONIC_MOE_FP8_ASSUME_ALIGNED=1
 
 # Quantization + SwiGLU tests (fully passing)

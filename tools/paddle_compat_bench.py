@@ -35,7 +35,7 @@ REPORT_DIR = ROOT / "reports" / "paddle_compat_bench"
 # ── Environment ───────────────────────────────────────────────────────────────
 EB_VENV_PYTHON = (
     "/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/"
-    "baidu/ernie/erniebot/eb_venv/bin/python"
+    "erniebot/eb_venv/bin/python"
 )
 QUACK_PATH = (
     "/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/"
