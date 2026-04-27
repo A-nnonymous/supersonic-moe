@@ -51,3 +51,18 @@
 | File | Purpose |
 | --- | --- |
 | `test_argsort_sync.py` | Reproducer for Paddle argsort 1D `cudaStreamSynchronize` stall. nsys-profilable. |
+
+## Topk kernel correctness regression (Paddle compat, script + subprocess watchdog)
+
+| File | What it validates | Run command |
+| --- | --- | --- |
+| `test_mlpnode_correctness_large.py` | **Session 66 regression** for the two topk-metadata kernel bugs (Class A grid-spinwait deadlock, Class B grid-cap silent corruption). 9 cases × 5 tensors (out/dx/ds/dw1/dw2) vs BF16 gold; SEQ up to 16384 (TK=131072); skew/extreme/holes/0-token-expert. Subprocess-per-case + 600s hard timeout. | `CUDA_VISIBLE_DEVICES=7 $EBVENV/bin/python tests/ops/test_mlpnode_correctness_large.py` |
+
+## Profiling / nsys benches
+
+| File | Purpose |
+| --- | --- |
+| `bench_mlpnode_topk_nsys.py` | Gold-standard mlpnode-only nsys profile: BENCH NVTX, sqlite GPU-projection parser, `--imbalance {none,skew,extreme}`. |
+| `bench_coldstart_nsys.py` | Cache-clear → JIT → ITER NVTX per-iter + FLUSH NVTX (matches production `node.step()` semantics). |
+| `bench_mlpnode_mem.py` | E=32 fwd+bwd peak memory profile (ERNIE shape sweep including SEQ=16384). |
+| `bench_wgrad_epilogue.py` | TMA reduce-add vs fused beta=1.0 wgrad epilogue A/B (Session 65). |

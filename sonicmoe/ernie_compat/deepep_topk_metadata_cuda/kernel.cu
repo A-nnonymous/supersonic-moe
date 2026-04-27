@@ -24,35 +24,28 @@ static constexpr int BLOCK_DIM = 256;
 static constexpr int MAX_TOPK = 16;
 
 // ============================================================================
-//  Kernel 1: Histogram + prefix sums (everything needed before scatter)
+//  Kernel 1a: Histogram only (Phase A)
 //
-//  Phase A (all blocks, parallel): Each block counts per-expert tokens in its
-//           32 rows using warp ballot → writes block_hist[blockIdx.x * E + e]
-//           Also writes naept[row+1] = per-token valid count.
-//  Phase B (last block to finish, via atomic counter):
-//           - Column-wise exclusive prefix sum of block_hist → block_offset
-//           - Padded expert offsets from tokens_per_expert
-//           - naept exclusive prefix sum
-//           All done by one block (256 threads) in parallel.
+//  Each block independently counts per-expert tokens in its 32 rows using warp
+//  ballot → writes block_hist[blockIdx.x * E + e]; also writes
+//  naept[row+1] = per-token valid count.
+//
+//  No inter-block synchronization — safe for arbitrarily large grids.
+//  Phase B (prefix sums) runs as a separate kernel launch on the same stream,
+//  giving an implicit grid barrier.  This avoids the ad-hoc grid spin-wait
+//  that deadlocks once `scatter_blocks` exceeds device occupancy (B30Z hangs
+//  at scatter_blocks ≈ 1358, observed via cuda-gdb on the legacy combined
+//  kernel at kernel.cu:121).
 // ============================================================================
 template <int TOPK>
 __global__ __launch_bounds__(BLOCK_DIM)
-void histogram_and_prefix_kernel(
+void histogram_kernel(
     const int*   __restrict__ dispatched_indices,   // [N_recv, topk]
-    const int*   __restrict__ tokens_per_expert,    // [E]
     int*         __restrict__ block_hist,            // [scatter_blocks * E] output
-    int*         __restrict__ block_offset,          // [scatter_blocks * E] output
-    int*         __restrict__ expert_offsets,        // [E+1] output
-    int*         __restrict__ seg_starts,            // [E] output
-    int*         __restrict__ real_bases,            // [E] output
-    int*         __restrict__ naept,                 // [N_recv+1] output
-    int*         __restrict__ completion_flag,       // [1] atomic counter
+    int*         __restrict__ naept,                 // [N_recv+1] output (entries [1..N_recv])
     int          N_recv,
     int          num_experts,
-    int          topk_param,
-    int          TK_padded,
-    int          alignment,
-    int          scatter_blocks)
+    int          topk_param)
 {
     const int lane_id = threadIdx.x & 31;
     const int warp_id = threadIdx.x >> 5;
@@ -62,12 +55,8 @@ void histogram_and_prefix_kernel(
     const int global_row = block_row_base + lane_id;
     const bool row_valid = global_row < N_recv;
 
-    // ═══════════ Phase A: Histogram via warp ballot ═══════════════════════════
-    // Shared memory: expert bitmask [num_experts] for ballot counting
     extern __shared__ char smem[];
     uint32_t* expert_bitmask = reinterpret_cast<uint32_t*>(smem);
-    // After bitmask: scan buffer for Phase B prefix sums
-    int* scan_buf = reinterpret_cast<int*>(smem);  // reused in Phase B
 
     // Initialize bitmask
     for (int i = threadIdx.x; i < num_experts; i += BLOCK_DIM) {
@@ -99,10 +88,6 @@ void histogram_and_prefix_kernel(
     if (row_valid) {
         naept[global_row + 1] = reg_valid_count;
     }
-    // First thread of first block writes naept[0] = 0
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        naept[0] = 0;
-    }
 
     // Write per-expert counts for this block to block_hist
     for (int e = warp_id; e < num_experts; e += warp_num) {
@@ -111,20 +96,39 @@ void histogram_and_prefix_kernel(
             block_hist[blockIdx.x * num_experts + e] = count;
         }
     }
+}
 
-    // ═══════════ Phase B: Parallel prefix sums (ALL blocks participate) ═══════
-    // Grid barrier: all blocks wait for Phase A to complete.
-    __syncthreads();
+// ============================================================================
+//  Kernel 1b: Prefix sums (Phase B) — single block, depends on histogram_kernel
+//
+//  Launched with grid=(1, 1, 1), block=(BLOCK_DIM=256, 1, 1) on the same
+//  CUDA stream as histogram_kernel.  Stream ordering gives an implicit
+//  grid-wide barrier between Phase A and Phase B with no spin-wait.
+//
+//  Computes:
+//    B.1  expert_offsets / seg_starts / real_bases  (sequential, thread 0)
+//    B.2  column-wise exclusive prefix sum of block_hist → block_offset
+//    B.3  exclusive prefix sum of naept[1..N_recv] → naept[0..N_recv]
+// ============================================================================
+__global__ __launch_bounds__(BLOCK_DIM)
+void prefix_sums_kernel(
+    const int*   __restrict__ tokens_per_expert,    // [E]
+    int*         __restrict__ block_hist,            // [scatter_blocks * E] in
+    int*         __restrict__ block_offset,          // [scatter_blocks * E] out
+    int*         __restrict__ expert_offsets,        // [E+1] out
+    int*         __restrict__ seg_starts,            // [E] out
+    int*         __restrict__ real_bases,            // [E] out
+    int*         __restrict__ naept,                 // [N_recv+1] in/out
+    int          N_recv,
+    int          num_experts,
+    int          alignment,
+    int          scatter_blocks)
+{
+    extern __shared__ char smem[];
+    int* scan_buf = reinterpret_cast<int*>(smem);
+
+    // --- B.1: Expert offsets (thread 0, O(E) — typically 8..128) ---
     if (threadIdx.x == 0) {
-        atomicAdd(completion_flag, 1);
-        // Spin until all blocks have arrived
-        while (atomicAdd(completion_flag, 0) < scatter_blocks) {}
-    }
-    __syncthreads();
-    __threadfence();  // ensure all block_hist/naept writes from all blocks are visible
-
-    // --- B.1: Expert offsets (block 0, thread 0 — O(E)=8, negligible) ---
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
         int padded_cum = 0, real_cum = 0;
         expert_offsets[0] = 0;
         for (int e = 0; e < num_experts; e++) {
@@ -136,79 +140,66 @@ void histogram_and_prefix_kernel(
             real_cum += count;
             expert_offsets[e + 1] = padded_cum;
         }
+        naept[0] = 0;  // moved out of histogram_kernel — written here for clarity
     }
 
-    // --- B.2: Column-wise prefix sum of block_hist → block_offset -----------
-    // E columns, each of length scatter_blocks.
-    // Assign threads across all blocks: global_tid handles specific columns.
-    // Each column scan is done by (BLOCK_DIM / num_experts) threads cooperatively.
-    // Simpler & fast: assign 1 thread per column, each scans scatter_blocks elements.
-    // With gridDim.x * BLOCK_DIM >> E, we have massive thread surplus.
-    // Best approach: block 0's threads each handle one column (for E ≤ 256).
-    // For E=8: 8 threads each scan 512 elements. Total: 512 sequential ops per thread.
-    // This is 512 * 4ns ≈ 2us — acceptable for E=8.
-    // For E=64: 64 threads each scan 512 elements — same 2us.
-    // Parallelization within each column (multiple threads per column):
-    //   Thread group for column e: threads [e*G .. (e+1)*G - 1] where G = BLOCK_DIM/E
-    //   Each thread in group handles scatter_blocks/G elements, then tree-reduce.
-    if (blockIdx.x == 0) {
-        // Parallel approach: assign G = BLOCK_DIM / num_experts threads per column
-        // Each thread handles a chunk of scatter_blocks / G rows
-        const int G = BLOCK_DIM / num_experts;  // threads per column (256/8=32 for E=8)
-        const int col_id = threadIdx.x / G;      // which expert column
-        const int local_tid = threadIdx.x % G;   // position within column group
+    // --- B.2: Column-wise exclusive prefix sum of block_hist → block_offset ---
+    // G = BLOCK_DIM / num_experts threads per column; each scans a chunk.
+    // E ≤ 256 assumed (otherwise G == 0).
+    const int G = (num_experts > 0 && num_experts <= BLOCK_DIM)
+                  ? (BLOCK_DIM / num_experts) : 1;
+    const int col_id = threadIdx.x / G;
+    const int local_tid = threadIdx.x % G;
 
-        if (col_id < num_experts) {
-            const int rows_per_thread = (scatter_blocks + G - 1) / G;
-            const int row_start = local_tid * rows_per_thread;
-            const int row_end_val = row_start + rows_per_thread;
-            const int row_end = row_end_val < scatter_blocks ? row_end_val : scatter_blocks;
+    if (col_id < num_experts) {
+        const int rows_per_thread = (scatter_blocks + G - 1) / G;
+        const int row_start = local_tid * rows_per_thread;
+        const int row_end_val = row_start + rows_per_thread;
+        const int row_end = row_end_val < scatter_blocks ? row_end_val : scatter_blocks;
 
-            // Each thread sums its chunk of the column
-            int local_sum = 0;
-            for (int b = row_start; b < row_end; b++) {
-                local_sum += block_hist[b * num_experts + col_id];
-            }
+        int local_sum = 0;
+        for (int b = row_start; b < row_end; b++) {
+            local_sum += block_hist[b * num_experts + col_id];
+        }
 
-            // Write partial sum to shared memory for intra-group scan
-            scan_buf[threadIdx.x] = local_sum;
-            __syncthreads();
+        scan_buf[threadIdx.x] = local_sum;
+    } else {
+        scan_buf[threadIdx.x] = 0;
+    }
+    __syncthreads();
 
-            // Exclusive prefix sum within the group (G threads, warp-sized or smaller)
-            // Use a simple serial scan by thread 0 of each group (G ≤ 32, fast)
-            if (local_tid == 0) {
-                int acc = 0;
-                for (int i = 0; i < G; i++) {
-                    int val = scan_buf[col_id * G + i];
-                    scan_buf[col_id * G + i] = acc;
-                    acc += val;
-                }
-            }
-            __syncthreads();
-
-            // Each thread applies its base and writes exclusive prefix sum values
-            int base_val = scan_buf[threadIdx.x];
-            int running = base_val;
-            for (int b = row_start; b < row_end; b++) {
-                int val = block_hist[b * num_experts + col_id];
-                block_offset[b * num_experts + col_id] = running;
-                running += val;
-            }
+    if (col_id < num_experts && local_tid == 0) {
+        int acc = 0;
+        for (int i = 0; i < G; i++) {
+            int val = scan_buf[col_id * G + i];
+            scan_buf[col_id * G + i] = acc;
+            acc += val;
         }
     }
+    __syncthreads();
 
-    // --- B.3: naept exclusive prefix sum (block 1 or block 0 if only 1 block) ---
-    // Use one full block (256 threads) for N_recv elements.
-    const int naept_block = (scatter_blocks > 1) ? 1 : 0;
-    if (blockIdx.x == naept_block) {
-        __syncthreads();  // ensure smem reusable
+    if (col_id < num_experts) {
+        const int rows_per_thread = (scatter_blocks + G - 1) / G;
+        const int row_start = local_tid * rows_per_thread;
+        const int row_end_val = row_start + rows_per_thread;
+        const int row_end = row_end_val < scatter_blocks ? row_end_val : scatter_blocks;
 
+        int running = scan_buf[threadIdx.x];
+        for (int b = row_start; b < row_end; b++) {
+            int val = block_hist[b * num_experts + col_id];
+            block_offset[b * num_experts + col_id] = running;
+            running += val;
+        }
+    }
+    __syncthreads();  // ensure scan_buf reusable for B.3
+
+    // --- B.3: naept exclusive prefix sum (one block, BLOCK_DIM threads) ---
+    {
         const int chunk = (N_recv + BLOCK_DIM - 1) / BLOCK_DIM;
         const int start_idx = threadIdx.x * chunk;
         const int end_idx_raw = start_idx + chunk;
         const int end_idx = end_idx_raw < N_recv ? end_idx_raw : N_recv;
 
-        // Each thread sums its chunk
         int partial_sum = 0;
         for (int i = start_idx; i < end_idx; i++) {
             partial_sum += naept[i + 1];
@@ -216,7 +207,6 @@ void histogram_and_prefix_kernel(
         scan_buf[threadIdx.x] = partial_sum;
         __syncthreads();
 
-        // Thread 0: serial exclusive scan of 256 partial sums (fast, in-register)
         if (threadIdx.x == 0) {
             int acc = 0;
             for (int i = 0; i < BLOCK_DIM; i++) {
@@ -228,18 +218,13 @@ void histogram_and_prefix_kernel(
         }
         __syncthreads();
 
-        // Each thread writes final prefix sum for its chunk
-        int base_val = scan_buf[threadIdx.x];
-        int running = base_val;
+        int running = scan_buf[threadIdx.x];
         for (int i = start_idx; i < end_idx; i++) {
             int val = naept[i + 1];
             naept[i] = running;
             running += val;
         }
     }
-
-    // Grid barrier: wait for Phase B to complete before kernel 2 uses results.
-    // This is handled by kernel launch ordering (kernel 2 launches after kernel 1).
 }
 
 // ============================================================================
@@ -451,49 +436,65 @@ void deepep_topk_metadata_cuda(
     const int scatter_blocks = (N_recv + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
 
     // Workspace layout within global_block_cumsum:
-    //   [0 .. scatter_blocks*E-1]: block_hist
+    //   [0 .. scatter_blocks*E-1]:                  block_hist
     //   [scatter_blocks*E .. 2*scatter_blocks*E-1]: block_offset
-    //   [2*scatter_blocks*E]: completion_flag
+    //   [2*scatter_blocks*E] (legacy):              previously completion_flag
+    //                                               (no longer used; barrier
+    //                                                is now a separate kernel
+    //                                                launch).
     int* workspace = global_block_cumsum.data_ptr<int>();
     int* block_hist = workspace;
     int* block_offset = workspace + scatter_blocks * E;
-    int* completion_flag = workspace + 2 * scatter_blocks * E;
 
-    // Zero the completion flag
-    cudaMemsetAsync(completion_flag, 0, sizeof(int), stream);
+    // Shared memory for histogram_kernel: expert_bitmask[E]
+    int smem_hist = static_cast<int>(E * sizeof(uint32_t));
+    // Shared memory for prefix_sums_kernel: scan_buf[BLOCK_DIM]
+    int smem_prefix = static_cast<int>(BLOCK_DIM * sizeof(int));
 
-    // Shared memory for Kernel 1: max(expert_bitmask[E], scan_buf[256])
-    int smem_k1 = static_cast<int>(E * sizeof(uint32_t));
-    if (static_cast<int>(BLOCK_DIM * sizeof(int)) > smem_k1)
-        smem_k1 = static_cast<int>(BLOCK_DIM * sizeof(int));
-
-    // ── Kernel 1: Histogram + prefix sums ────────────────────────────────────
     dim3 grid1(scatter_blocks);
     dim3 block1(BLOCK_DIM);
 
-    #define LAUNCH_K1(TV) \
-        histogram_and_prefix_kernel<TV><<<grid1, block1, smem_k1, stream>>>( \
+    // ── Kernel 1a: Phase A — per-block histogram (no inter-block sync) ───────
+    #define LAUNCH_HIST(TV) \
+        histogram_kernel<TV><<<grid1, block1, smem_hist, stream>>>( \
             dispatched_indices.data_ptr<int>(), \
-            tokens_per_expert.data_ptr<int>(), \
-            block_hist, block_offset, \
-            expert_offsets.data_ptr<int>(), \
-            seg_starts.data_ptr<int>(), \
-            real_bases.data_ptr<int>(), \
+            block_hist, \
             naept.data_ptr<int>(), \
-            completion_flag, \
             static_cast<int>(N_recv), static_cast<int>(E), \
-            static_cast<int>(topk), static_cast<int>(TK_padded), \
-            static_cast<int>(alignment), scatter_blocks);
+            static_cast<int>(topk));
 
-    if (topk <= 4) { LAUNCH_K1(4); }
-    else if (topk <= 8) { LAUNCH_K1(8); }
-    else { LAUNCH_K1(16); }
-    #undef LAUNCH_K1
+    if (topk <= 4) { LAUNCH_HIST(4); }
+    else if (topk <= 8) { LAUNCH_HIST(8); }
+    else { LAUNCH_HIST(16); }
+    #undef LAUNCH_HIST
+
+    // ── Kernel 1b: Phase B — prefix sums (single block, runs after 1a) ───────
+    // Stream ordering between 1a and 1b provides the inter-phase grid barrier
+    // that the legacy combined kernel implemented with an ad-hoc spin-wait.
+    prefix_sums_kernel<<<dim3(1), block1, smem_prefix, stream>>>(
+        tokens_per_expert.data_ptr<int>(),
+        block_hist, block_offset,
+        expert_offsets.data_ptr<int>(),
+        seg_starts.data_ptr<int>(),
+        real_bases.data_ptr<int>(),
+        naept.data_ptr<int>(),
+        static_cast<int>(N_recv), static_cast<int>(E),
+        static_cast<int>(alignment), scatter_blocks);
 
     // ── Kernel 2: Scatter + fixup ────────────────────────────────────────────
-    // Grid: enough blocks for scatter (32 rows each) and pad-fill coverage
-    int grid2_blocks = scatter_blocks > ((int)(TK_padded + BLOCK_DIM - 1) / BLOCK_DIM) ? scatter_blocks : (int)(TK_padded + BLOCK_DIM - 1) / BLOCK_DIM;
-    grid2_blocks = grid2_blocks < 2048 ? grid2_blocks : 2048;  // cap for responsiveness
+    // Grid must cover ALL scatter blocks: scatter phase relies on blockIdx.x
+    // mapping 1:1 to a 32-row chunk of N_recv (block_row_base = blockIdx.x*32).
+    // Capping the grid here would silently skip rows beyond cap*32 — which is
+    // exactly what caused the SEQ_LEN ≥ 12K illegal-memory-access in
+    // token_gather_sum_kernel: scatter_blocks=2712 capped at 2048 left rows
+    // 65536..86768 unscattered, so x_gather_idx beyond TK_padded position
+    // 2048*32 stayed at the pad-fill default and downstream gathers tried to
+    // read 0-row data using s_scatter_idx pointing past valid topk_scores.
+    // Pad-fill (Phase 2) uses a grid-stride loop, so any grid ≥ scatter_blocks
+    // is correct and equally efficient.
+    int grid2_blocks = scatter_blocks;
+    int padfill_blocks = (int)(TK_padded + BLOCK_DIM - 1) / BLOCK_DIM;
+    if (padfill_blocks > grid2_blocks) grid2_blocks = padfill_blocks;
 
     // Shared memory: expert_bitmask[E] + my_offset[E]
     int smem_k2 = (E * sizeof(uint32_t)) + (E * sizeof(int));

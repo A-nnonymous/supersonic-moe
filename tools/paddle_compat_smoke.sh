@@ -23,7 +23,7 @@ GPU=${CUDA_VISIBLE_DEVICES:-0}
 export CUDA_VISIBLE_DEVICES=$GPU
 
 # ── Environments ──────────────────────────────────────────────────────────
-PADDLE_VENV="/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/baidu/ernie/erniebot/eb_venv"
+PADDLE_VENV="/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/erniebot/eb_venv"
 TORCH_VENV="/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/envs/xfer"
 QUACK_PATH="/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack"
 

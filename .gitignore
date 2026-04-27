@@ -227,3 +227,14 @@ tools/_archive/
 *.pt
 my_quack_cache/
 .jit_cache/
+
+# Vendored / local-only working copies
+third_party/
+
+# Local heavy bench artifacts (nsys dirs, validation dumps, scratch reports)
+reports/mlpnode_nsys/
+reports/jit_opt_validation/
+reports/jit_opt_validation.json
+reports/mlpnode_bench.json
+reports/frontier_perf_sweep_smoke.md
+docs/KNOWLEDGE_BASE.md

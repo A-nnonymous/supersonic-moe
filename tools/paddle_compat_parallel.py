@@ -19,7 +19,7 @@ import json, os, shutil, sqlite3, subprocess, sys, tempfile, textwrap, time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-EB_PY = "/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/baidu/ernie/erniebot/eb_venv/bin/python"
+EB_PY = "/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/erniebot/eb_venv/bin/python"
 QUACK = "/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack"
 NSYS = shutil.which("nsys") or "/usr/local/bin/nsys"
 REPORT_DIR = ROOT / "reports" / "paddle_compat"

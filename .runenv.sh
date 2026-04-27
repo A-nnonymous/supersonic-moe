@@ -1,6 +1,6 @@
 #!/bin/bash
-source /root/paddlejob/share-storage/gpfs/system-public/zhangyichen/baidu/ernie/erniebot/eb_venv/bin/activate
-export PYTHONPATH=/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/baidu/ernie/erniebot/third_party/ernie-core/src:/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe:/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack:$PYTHONPATH
+source /root/paddlejob/share-storage/gpfs/system-public/zhangyichen/erniebot/eb_venv/bin/activate
+export PYTHONPATH=/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/erniebot/third_party/ernie-core/src:/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/lab/sonic-moe:/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack:$PYTHONPATH
 export SONIC_MOE_FP8_MODE=perf
 export USE_QUACK_GEMM=1
 unset PADDLE_ELASTIC_JOB_ID

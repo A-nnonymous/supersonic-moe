@@ -247,7 +247,7 @@ python -m visualization  # → assets/fig1..fig16.png
 
 ```bash
 # Environment
-source /root/.../zhangyichen/baidu/ernie/erniebot/eb_venv/bin/activate
+source /root/.../zhangyichen/erniebot/eb_venv/bin/activate
 export SONIC_MOE_FP8_MODE=perf USE_QUACK_GEMM=1 QUACK_CACHE_DIR=./my_quack_cache
 
 # Axiomatic correctness (11 tests, ~10s)
