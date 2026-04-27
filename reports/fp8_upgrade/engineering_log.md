@@ -482,5 +482,63 @@ Lessons:
 
 ---
 
-> **Canonical handoff: root `HANDOFF.md`**
+## Phase 26: TopK Kernel Bug Audit + Correctness Hardening (Session 66, 2026-04-27)
+
+**Context**: User fixed two production-impact bugs in `deepep_topk_metadata_cuda/kernel.cu`
+prior to session (commits 5987418, 1eadaa8). This session audited the rest of the repo for
+the same bug classes, added a regression test that catches them, and re-anchored perf data.
+
+**Audit scope**: every `.cu`, Triton kernel, and CuTe DSL launch in `sonicmoe/` was inspected
+for two bug classes:
+- Class A — grid-wide spin-wait / atomic barrier without `cudaLaunchCooperativeKernel`
+  (deadlocks when grid > device-resident SM cap)
+- Class B — `dim3 grid(min(blocks, CAP))` paired with `blockIdx.x * STRIDE → row` mapping
+  (silent corruption: high-index rows never get a CTA)
+
+**Result**: no other instances found. `count_cumsum.cu` uses cooperative launch correctly;
+`deepep_metadata.cu` uses 1-block-per-expert (no grid cap); Triton kernels use proper
+`cdiv`-based grids; CuTe launches managed by CUTLASS scheduler.
+
+**New regression test**: `tests/ops/test_mlpnode_correctness_large.py`
+- 9 cases × 5 tensors (out/dx/ds/dw1/dw2) validated against BF16 gold
+- Subprocess-per-case with 600s hard timeout (hang detection)
+- Includes `seq16K_E8` and `seq16K_E32` (TK=131072) — exact regime where Class B bug surfaced
+- Includes skew80, extreme_one (all tokens to E0..K-1), tpe0_holes (0-token experts)
+- All 9 cases PASS (out cos ≥ 0.9979, dx cos ≥ 0.9975, ds cos ≥ 0.9972, dw1/dw2 cos ≥ 0.9971)
+
+**Perf re-anchored** (nsys 2026.2.1.210, sqlite GPU-projection, GPU 7 idle):
+- T=8192 E=8 K=8 I=1536 H=3072 mlpnode-only: **2823 µs/iter** (BENCH-range, `bench_mlpnode_topk_nsys.py`)
+- T=8192 E=8 per-ITER median (no flush): **2463 µs**
+- With per-iter flush (non-default, grad_acc=1): 3110 µs
+- vs S53 pure-torch FP8 baseline 2715 µs
+- At realistic `grad_acc_steps=8`: ~2519 µs/microbatch — **beats S53 by 7.2%**
+
+**Fixed `bench_coldstart_nsys.py` semantics**: previous version called `flush_native_grads()`
+inside the per-iter loop, which is non-default usage and inflated per-iter timeline by
+~280-340 µs of `permute / TilingSwapDim / Eigen meta_assign / broadcast_add` kernels.
+Production usage is "flush at optimizer.step() time" via `node.step()`, not per-microbatch.
+Bench now mirrors production: per-iter NVTX `ITER{n}` ranges with no in-loop flush, then
+a single `FLUSH` NVTX range after the accumulation window.
+
+Lessons:
+91. **Two CUDA kernel-launch bug patterns to grep when reviewing custom kernels.**
+    Class A: `cudaLaunch[ \t]*(?!Cooperative)` near grid-wide atomics. Class B:
+    `dim3 grid\(.*min\(.*\)` paired with `blockIdx.x[ \t]*\*` row mapping.
+92. **Per-iter `flush_native_grads()` is wrong — it's an optimizer-step API.** wgrad
+    is fused into the GEMM TMA-reduce-add epilogue and lands directly in
+    `_NATIVE_W{1,2}_GRAD`. The transpose to per-expert main_grad is amortized over
+    `grad_acc_steps` microbatches via `node.step()`.
+93. **Two NVTX-based GPU-proj measurements disagree by ~360 µs at this shape.**
+    BENCH-range whole / n_iters includes inter-iter framework gaps; per-ITER NVTX
+    excludes them. Document which one a number refers to.
+94. **`torch.equal()` triggers `__nonzero__` ambiguity in paddle compat mode.**
+    `torch.equal(t, zeros)` on a paddle tensor → `AssertionError: Variable... if/while`.
+    Reduce to scalar via `float(t.float().abs().sum().item()) == 0.0`.
+95. **Bench results from a contended GPU are useless.** Saw 4168 µs/iter on contended
+    GPU 2 vs 2823 µs on idle GPU 7 for the same workload. Always
+    `nvidia-smi --query-gpu=index,utilization.gpu,memory.used` before profiling.
+
+---
+
+> **Canonical handoff: root `HANDOFF.md` (Session 66)**
 

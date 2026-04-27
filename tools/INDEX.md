@@ -33,6 +33,7 @@
 | `rigorous_benchmark_s42.py` | Rigorous benchmark: 3 modes × 3 seeds × 3 repeats, subprocess-isolated. | — |
 | `rigorous_profiler.py` | Rigorous GPU-projection kernel profiling + fine-grained memory lifecycle. | — |
 | `run_blackwell_test_shards.py` | Developer utility for run blackwell test shards. | — |
+| `run_frontier_perf_sweep.py` | Multi-shape multi-GPU FP8 frontier perf sweep driver (subprocess-per-shape, sqlite GPU-projection extraction). | Session 66 |
 | `run_regression.sh` | Shell helper for run regression. | — |
 | `scoreboard.py` | SonicMoE Buffer Scoreboard — Operator-buffer dependency & phase-state analysis. | — |
 | `session42_benchmark.py` | Session 42 Complete Benchmark: Performance + Memory + Precision. | — |

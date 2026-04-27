@@ -111,16 +111,24 @@ torch.cuda.synchronize()
 
 # ── Profiled region (steady-state: NO cache invalidation inside loop) ──
 print(f"BENCH {ITERS} fwd+bwd iters...")
+import time as _t
 torch.cuda.nvtx.range_push("BENCH")
 start_ev.record()
+per_iter = []
+import time as _t2
+t_loop0 = _t2.perf_counter()
 for it in range(ITERS):
+    torch.cuda.nvtx.range_push(f"ITER{it}")
     xt = paddle.randn_like(x); xt.stop_gradient = False
 
     with enable_fp8(True):
         _refresh_fp8_config()
         ot = node(xt, tpe, di, dp)
     ot.backward(out_grad)
-    flush_native_grads()
+    torch.cuda.nvtx.range_pop()
+torch.cuda.nvtx.range_push("FLUSH")
+flush_native_grads()
+torch.cuda.nvtx.range_pop()
 end_ev.record()
 torch.cuda.synchronize()
 torch.cuda.nvtx.range_pop()

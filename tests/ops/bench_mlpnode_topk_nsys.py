@@ -90,7 +90,7 @@ def gpu_projection_us(sqlite_path: str, n_iters: int) -> float:
     return total_ns / 1000.0 / n_iters  # ns → µs, per iter
 
 
-def run_benchmark(T, E, I, topk, n_warmup, n_iters):
+def run_benchmark(T, E, I, topk, n_warmup, n_iters, imbalance="none", seed=42):
     """Run FP8 topk MlpNode benchmark (forward + backward)."""
     import paddle
     paddle.enable_compat()
@@ -130,13 +130,26 @@ def run_benchmark(T, E, I, topk, n_warmup, n_iters):
     )
 
     # Build deterministic topk dispatch
-    torch.manual_seed(42)
-    raw_scores = torch.randn(N_recv, E, device=device)
-    _, top_experts = raw_scores.topk(topk, dim=-1)
-    dispatched_indices = top_experts.int()
+    torch.manual_seed(seed)
+    if imbalance == "extreme":
+        # All tokens routed to expert 0..topk-1 — pathological hot-expert case
+        idx = torch.arange(topk, device=device, dtype=torch.int32)
+        dispatched_indices = idx.unsqueeze(0).expand(N_recv, topk).contiguous()
+    elif imbalance == "skew":
+        # 80% of tokens go to expert 0 (rest random)
+        raw_scores = torch.randn(N_recv, E, device=device)
+        hot_mask = (torch.rand(N_recv, device=device) < 0.8)
+        raw_scores[hot_mask, 0] += 100.0
+        _, top_experts = raw_scores.topk(topk, dim=-1)
+        dispatched_indices = top_experts.int()
+    else:
+        raw_scores = torch.randn(N_recv, E, device=device)
+        _, top_experts = raw_scores.topk(topk, dim=-1)
+        dispatched_indices = top_experts.int()
     dispatched_probs = torch.rand(N_recv, topk, device=device) * 0.5 + 0.5
     dispatched_probs = (dispatched_probs / dispatched_probs.sum(dim=1, keepdim=True)).float()
     tpe = [int((dispatched_indices == e).sum().item()) for e in range(E)]
+    print(f"  imbalance={imbalance} tpe(min/max/sum)={min(tpe)}/{max(tpe)}/{sum(tpe)}")
 
     paddle.seed(0)
     x = paddle.randn([N_recv, H], dtype="bfloat16") * 0.02
@@ -194,6 +207,10 @@ def main():
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=8)
     parser.add_argument("--iters", type=int, default=12)
+    parser.add_argument("--imbalance", type=str, default="none",
+                        choices=["none", "skew", "extreme"],
+                        help="Routing distribution: none (uniform random), skew (80% to E0), extreme (all to first topk experts)")
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--extract", type=str, default=None,
                         help="Path to nsys sqlite file to extract GPU-projection")
     args = parser.parse_args()
@@ -204,7 +221,8 @@ def main():
         print(f"README baseline (PyTorch native FP8): 2715 µs/iter")
         return
 
-    run_benchmark(args.T, args.E, args.I, args.topk, args.warmup, args.iters)
+    run_benchmark(args.T, args.E, args.I, args.topk, args.warmup, args.iters,
+                  imbalance=args.imbalance, seed=args.seed)
 
 
 if __name__ == "__main__":

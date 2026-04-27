@@ -131,6 +131,7 @@ See `HANDOFF.md` for full kernel breakdown and Session 53 baseline comparison.
 | Test | What it validates | Run command |
 |------|-------------------|-------------|
 | `test_cold_start_e2e.py` | Cache clear → JIT → 6-shape precision (out/dx/ds/dw1/dw2) | `CUDA_VISIBLE_DEVICES=2 python tests/ops/test_cold_start_e2e.py` |
+| `test_mlpnode_correctness_large.py` | **Topk kernel bug-fix regression** — 9 cases incl. SEQ=16K (TK=131072), skew/extreme/holes | `CUDA_VISIBLE_DEVICES=7 python tests/ops/test_mlpnode_correctness_large.py` |
 | `test_jit_optimization.py --quick` | Correctness (cos>0.99), zero JIT recompile, memory | `CUDA_VISIBLE_DEVICES=0 python tests/ops/test_jit_optimization.py --quick` |
 | `test_mlpnode_precision.py` | Multi-topk precision audit | `CUDA_VISIBLE_DEVICES=0 python tests/ops/test_mlpnode_precision.py` |
 | `bench_mlpnode_mem.py` | E=32 fwd+bwd memory benchmark (ERNIE shape) | `CUDA_VISIBLE_DEVICES=1 python tests/ops/bench_mlpnode_mem.py` |
@@ -141,10 +142,16 @@ See `HANDOFF.md` for full kernel breakdown and Session 53 baseline comparison.
 
 | Priority | Resource | Path |
 |:---:|----------|------|
-| 1 | **This README** | Root `README.md` — architecture, cache design, training loop, test matrix |
-| 2 | **Handoff** | Root `HANDOFF.md` — bugs found, constraints, what works / what doesn't |
+| 1 | **Handoff** | Root `HANDOFF.md` (Session 66) — current state, perf, bugs fixed, audit, next steps |
+| 2 | **This README** | Root `README.md` — architecture, cache design, training loop, test matrix |
 | 3 | **Knowledge Base** | `docs/KNOWLEDGE_BASE.md` — deep expert reference |
-| 4 | **Environment** | `/panzhaowu/env.md` — machine setup, Paddle compat pitfalls, perf methodology |
+| 4 | **Engineering Log** | `reports/fp8_upgrade/engineering_log.md` — Phases 1-26, 95 lessons |
+| 5 | **Environment** | `/panzhaowu/env.md` — machine setup, Paddle compat pitfalls, perf methodology |
+
+**For the audit / regression test introduced in Session 66**:
+run `tests/ops/test_mlpnode_correctness_large.py` (9 cases, subprocess + 600s timeout,
+validates out/dx/ds/dw1/dw2 against BF16 gold). Includes the bug-fix regression cases
+`seq16K_E8` and `seq16K_E32` (TK=131072).
 
 ## Native PyTorch Quick Start
 
