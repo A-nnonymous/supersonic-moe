@@ -34,18 +34,6 @@ from sonicmoe.ernie_compat.deepep_metadata import (
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
-def _t_eq(a, b) -> bool:
-    """Cross-framework tensor equality reduction.
-    Paddle compat's ``torch.equal`` returns an element-wise bool tensor (not a
-    Python bool). Reduce to a single bool here so ``assert _t_eq(...)`` works
-    on both real PyTorch and the Paddle compat layer.
-    """
-    r = torch.equal(a, b)
-    if hasattr(r, "all") and not isinstance(r, bool):
-        return bool(r.all().item())
-    return bool(r)
-
-
 def fabricate_dispatch_result(
     N_recv: int, topk: int, E: int, broadcast_ratio: float = 0.5,
     device="cuda",
@@ -53,42 +41,27 @@ def fabricate_dispatch_result(
     """Generate realistic DeepEP dispatch results for testing.
 
     Returns (dispatched_indices, dispatched_probs, tokens_per_expert).
-
-    Fully vectorized: O(1) GPU syncs regardless of N_recv (was O(N_recv) Python
-    loop with per-token randperm + .item()).  Per-token expert-count is sampled
-    from a clipped Gaussian (matching the legacy distribution) and the topk
-    expert IDs come from argsort(rand) — same uniform-without-replacement
-    semantics as randperm, but batched.
     """
+    # Each token gets 1..min(topk, E) random experts
     expected_experts = max(1, min(int(broadcast_ratio * E), topk))
-    max_active = min(topk, E)
-
-    # Per-token active-count: clipped Gaussian around expected_experts.
-    counts = torch.randn(N_recv, device=device) * 2 + expected_experts
-    counts = counts.round().clamp_(min=1, max=max_active).to(torch.int64)
-
-    # Per-token uniform random permutation of [0, E): argsort(rand_per_row).
-    rand_keys = torch.rand(N_recv, E, device=device)
-    perm = rand_keys.argsort(dim=1)              # [N, E] random permutations
-    perm = perm[:, :topk].to(torch.int32)        # [N, topk] candidate experts
-
-    # Mask trailing slots (col >= count) to -1.
-    col_idx = torch.arange(topk, device=device).unsqueeze(0)  # [1, topk]
-    valid_mask = col_idx < counts.unsqueeze(1)                # [N, topk]
-    dispatched_indices = torch.where(
-        valid_mask, perm, torch.full_like(perm, -1)
+    dispatched_indices = torch.full(
+        (N_recv, topk), -1, dtype=torch.int32, device=device
+    )
+    dispatched_probs = torch.zeros(
+        (N_recv, topk), dtype=torch.float32, device=device
     )
 
-    # Probability = 1/count for valid slots, 0 otherwise.
-    inv_counts = (1.0 / counts.to(torch.float32)).unsqueeze(1)  # [N, 1]
-    dispatched_probs = torch.where(
-        valid_mask, inv_counts.expand(-1, topk),
-        torch.zeros((), dtype=torch.float32, device=device).expand(N_recv, topk),
-    ).contiguous()
+    for i in range(N_recv):
+        count = min(max(1, int(torch.randn(1).item() * 2 + expected_experts)), min(topk, E))
+        perm = torch.randperm(E, device=device)[:count]
+        dispatched_indices[i, :count] = perm.int()
+        prob_val = 1.0 / count
+        dispatched_probs[i, :count] = prob_val
 
-    # tokens_per_expert via bincount on valid entries.
-    valid_flat = dispatched_indices[valid_mask].long()
-    tpe = torch.bincount(valid_flat, minlength=E).tolist()
+    # Compute tokens_per_expert
+    valid = dispatched_indices >= 0
+    valid_experts = dispatched_indices[valid].long()
+    tpe = torch.bincount(valid_experts, minlength=E).tolist()
 
     return dispatched_indices, dispatched_probs, tpe
 
@@ -118,7 +91,7 @@ def fabricate_identity_layout(
 class TestStructuralInvariants:
     """Test that output metadata satisfies required structural properties."""
 
-    @pytest.fixture(scope="class", params=[
+    @pytest.fixture(params=[
         (256, 8, 8),     # small
         (1024, 4, 8),    # medium
         (4096, 8, 32),   # larger
@@ -158,7 +131,7 @@ class TestStructuralInvariants:
         indices, probs, tpe = dispatch_data
         E = len(tpe)
         result = deepep_topk_to_sonic_metadata(indices, probs, tpe, E)
-        efo, _, _, _, _, _, TK_padded, _, _, _ = result
+        efo, _, _, _, _, _, TK_padded, _, _ = result
         assert efo[-1].item() == TK_padded
 
     def test_x_gather_idx_bounds(self, dispatch_data):
@@ -275,14 +248,14 @@ class TestScoreConsistency:
         TK = (indices >= 0).sum().item()
         TK_padded = result[6]
 
-        # Per-token bounds via naept must wrap exactly the non-zero scores.
-        # Vectorized: build a mask from naept ranges and check vs (scores>0).
-        ranges = naept[1:] - naept[:-1]              # [N_recv]
-        # All non-zero scores are inside some [naept[t], naept[t+1]) range and
-        # those ranges tile [0, TK). Hence (topk_scores>0).sum() == TK suffices
-        # to certify both "all positives in valid ranges" and "no spurious
-        # positives in padding". Check ranges sum == TK as a structural cross-check.
-        assert int(ranges.sum().item()) == TK
+        # Check per-token: scores accessed via naept should be > 0
+        for t in range(N_recv):
+            start = naept[t].item()
+            end = naept[t + 1].item()
+            if end > start:
+                assert (topk_scores[start:end] > 0).all(), (
+                    f"Token {t}: valid scores should be > 0"
+                )
 
         # Total non-zero scores should equal TK
         nonzero_count = (topk_scores > 0).sum().item()
@@ -307,24 +280,24 @@ class TestGatherConsistency:
         efo = result[0]
         x_gather_idx = result[1]
 
-        # Vectorize expected_set per expert: build [E, N_recv] bool of "is t routed to e"
-        idx_long = indices.long().clamp(min=0)                       # avoid -1 indices
-        valid_mask = indices >= 0                                    # [N, topk]
-        # one_hot[N, topk, E] then reduce to [E, N]
-        # Use scatter to avoid materializing one_hot: for each (t,k) with valid,
-        # set expert_membership[expert, t] = True.
-        expert_membership = torch.zeros((E, N_recv), dtype=torch.bool, device="cuda")
-        flat_t = torch.arange(N_recv, device="cuda").unsqueeze(1).expand(-1, topk)[valid_mask]
-        flat_e = idx_long[valid_mask]
-        expert_membership[flat_e, flat_t] = True
-        expected_sets = [set(torch.nonzero(expert_membership[e], as_tuple=False).flatten().tolist())
-                         for e in range(E)]
         for e in range(E):
             seg_start = efo[e].item()
+            seg_end = efo[e + 1].item()
             real_count = tpe[e]
-            gathered_set = set(x_gather_idx[seg_start:seg_start + real_count].tolist())
-            assert gathered_set == expected_sets[e], (
-                f"Expert {e}: gathered={sorted(gathered_set)} vs expected={sorted(expected_sets[e])}"
+
+            # Gather the real entries (first real_count in the segment)
+            gathered_tokens = x_gather_idx[seg_start:seg_start + real_count]
+
+            # Expected: set of tokens routed to expert e
+            expected_set = set()
+            for t in range(N_recv):
+                for k in range(topk):
+                    if indices[t, k].item() == e:
+                        expected_set.add(t)
+
+            gathered_set = set(gathered_tokens.tolist())
+            assert gathered_set == expected_set, (
+                f"Expert {e}: gathered={sorted(gathered_set)} vs expected={sorted(expected_set)}"
             )
 
 
@@ -341,7 +314,7 @@ class TestEdgeCases:
         tpe = [0] * E
 
         result = deepep_topk_to_sonic_metadata(indices, probs, tpe, E)
-        efo, x_gather, s_scatter, s_reverse, naept, scores, TK_padded, pad_rows, n_recv, _ = result
+        efo, x_gather, s_scatter, s_reverse, naept, scores, TK_padded, pad_rows, n_recv = result
 
         assert TK_padded == 0
         assert pad_rows == 0
@@ -357,7 +330,7 @@ class TestEdgeCases:
         E = 4
 
         result = deepep_topk_to_sonic_metadata(indices, probs, tpe, E)
-        efo, x_gather, s_scatter, s_reverse, naept, scores, TK_padded, pad_rows, n_recv, _ = result
+        efo, x_gather, s_scatter, s_reverse, naept, scores, TK_padded, pad_rows, n_recv = result
 
         assert n_recv == 1
         assert naept[0].item() == 0
@@ -375,7 +348,7 @@ class TestEdgeCases:
         tpe = [N_recv] + [0] * (E - 1)
 
         result = deepep_topk_to_sonic_metadata(indices, probs, tpe, E)
-        efo, x_gather, _, _, naept, _, TK_padded, _, n_recv, _ = result
+        efo, x_gather, _, _, naept, _, TK_padded, _, n_recv = result
 
         assert n_recv == N_recv
         assert efo[1].item() == 128  # 64 padded to 128
@@ -398,8 +371,10 @@ class TestEdgeCases:
         naept = result[4]
 
         # Tokens 8..15 should have naept[i] == naept[i+1] (zero assignments)
-        diffs = (naept[1:] - naept[:-1])[8:]
-        assert int(diffs.abs().sum().item()) == 0, "tokens 8..N_recv should have 0 assignments"
+        for t in range(8, N_recv):
+            assert naept[t].item() == naept[t + 1].item(), (
+                f"Token {t} should have 0 local expert assignments"
+            )
 
     def test_tokens_per_expert_with_zeros(self):
         """Some experts have zero tokens."""
@@ -408,10 +383,11 @@ class TestEdgeCases:
         indices = torch.full((N_recv, topk), -1, dtype=torch.int32, device="cuda")
         probs = torch.zeros(N_recv, topk, dtype=torch.float32, device="cuda")
 
-        # Route to experts 0, 2, 4, 6 only (skip odd experts) — vectorized
-        rows = torch.arange(N_recv, device="cuda")
-        indices[:, 0] = ((rows % 4) * 2).to(torch.int32)
-        probs[:, 0] = 1.0
+        # Route to experts 0, 2, 4, 6 only (skip odd experts)
+        for i in range(N_recv):
+            expert = (i % 4) * 2
+            indices[i, 0] = expert
+            probs[i, 0] = 1.0
 
         tpe = [32, 0, 32, 0, 32, 0, 32, 0]
 
@@ -432,7 +408,7 @@ class TestIdentityEquivalence:
         [512] * 8,
         [128, 256, 64, 512, 384, 100, 200, 300],
         [128] * 4,
-        [16] * 64,  # many small experts (was [32]*256, too slow)
+        [32] * 256,  # 256 experts, uniform
     ])
     def test_equivalence(self, tpe):
         """K=1 pre-sorted input should produce equivalent metadata."""
@@ -442,7 +418,7 @@ class TestIdentityEquivalence:
 
         # Topk path
         topk_result = deepep_topk_to_sonic_metadata(indices, probs, tpe, E)
-        (topk_efo, topk_xg, _, _, _, _, topk_TK_padded, topk_pad, _, _) = topk_result
+        (topk_efo, topk_xg, _, _, _, _, topk_TK_padded, topk_pad, _) = topk_result
 
         # Identity path
         id_result = deepep_to_sonic_metadata(tpe, T, E)
@@ -455,20 +431,13 @@ class TestIdentityEquivalence:
             f"TK_padded: topk={topk_TK_padded} vs id={id_TK_padded}"
         )
 
-        # Per-expert token-set check (vectorized via combined sort key).
-        seg_starts = topk_efo[:-1].long()
-        tpe_t = torch.tensor(tpe, dtype=torch.int64, device="cuda")
-        positions = torch.arange(topk_TK_padded, device="cuda", dtype=torch.int64)
-        expert_id = torch.searchsorted(topk_efo[1:].long(), positions, right=True).clamp(max=E - 1)
-        local_pos = positions - seg_starts[expert_id]
-        is_real = local_pos < tpe_t[expert_id]
-        real_pos = positions[is_real]
-        real_exp = expert_id[is_real]
-        topk_key = real_exp * (T + 1) + topk_xg[real_pos].long()
-        id_key   = real_exp * (T + 1) + id_xg[real_pos].long()
-        assert _t_eq(topk_key.sort(), id_key.sort()), (
-            "Per-expert token multisets differ between topk and identity paths"
-        )
+        # x_gather_idx should produce the same token set per expert
+        for e in range(E):
+            seg_start = topk_efo[e].item()
+            real_count = tpe[e]
+            topk_set = set(topk_xg[seg_start:seg_start + real_count].tolist())
+            id_set = set(id_xg[seg_start:seg_start + real_count].tolist())
+            assert topk_set == id_set, f"Expert {e}: token sets differ"
 
 
 # ── moe_permute Cross-Validation ──────────────────────────────────────────
@@ -480,7 +449,7 @@ class TestMoePermuteConsistency:
         (64, 2, 4),
         (128, 4, 8),
         (256, 8, 8),   # N_recv <= 256 to avoid bf16 integer precision issues
-        (128, 4, 64),  # many experts (was E=256, too slow)
+        (128, 4, 256), # 256 experts
     ])
     def test_token_set_per_expert(self, N_recv, topk, E):
         """Per-expert token sets from our metadata must match moe_permute's output."""
@@ -491,7 +460,8 @@ class TestMoePermuteConsistency:
         # ── Gold: paddle.nn.functional.moe_permute ────────────────────────
         # Make each token identifiable via its row content
         x = torch.zeros(N_recv, H, dtype=torch.bfloat16, device="cuda")
-        x[:, 0] = torch.arange(N_recv, dtype=torch.bfloat16, device="cuda")  # tag row=token id (exact for i <= 256)
+        for i in range(N_recv):
+            x[i, 0] = float(i)  # tag: first element = token id (exact for i <= 256)
 
         gold_permuted, _, gold_probs, _ = paddle.nn.functional.moe_permute(
             x, None, indices, probs,
@@ -510,28 +480,31 @@ class TestMoePermuteConsistency:
             f"TK_padded mismatch: moe_permute={gold_permuted.shape[0]} vs ours={TK_padded}"
         )
 
-        # Vectorized per-expert token-set equality via combined sort key.
-        seg_starts = efo[:-1].long()
-        tpe_t = torch.tensor(tpe, dtype=torch.int64, device="cuda")
-        positions = torch.arange(TK_padded, device="cuda", dtype=torch.int64)
-        expert_id = torch.searchsorted(efo[1:].long(), positions, right=True).clamp(max=E - 1)
-        local_pos = positions - seg_starts[expert_id]
-        is_real = local_pos < tpe_t[expert_id]
-        real_pos = positions[is_real]
-        real_exp = expert_id[is_real]
-        # gold token id encoded in column 0
-        gold_tok = gold_permuted[real_pos, 0].to(torch.int64)
-        our_tok = x_gather_idx[real_pos].long()
-        gold_key = real_exp * (N_recv + 1) + gold_tok
-        our_key  = real_exp * (N_recv + 1) + our_tok
-        assert _t_eq(gold_key.sort(), our_key.sort()), (
-            "Per-expert token multisets differ between ours and moe_permute"
-        )
+        # Per-expert: compare gathered rows (using x[x_gather_idx] vs gold_permuted)
+        for e in range(E):
+            seg_start = efo[e].item()
+            real_count = tpe[e]
+            if real_count == 0:
+                continue
+
+            # Our gathered token ids
+            our_ids = set(x_gather_idx[seg_start:seg_start + real_count].tolist())
+
+            # Gold: extract token ids from permuted rows
+            gold_ids = set()
+            for pos in range(seg_start, seg_start + real_count):
+                tok_id = int(gold_permuted[pos, 0].item())
+                gold_ids.add(tok_id)
+
+            assert our_ids == gold_ids, (
+                f"Expert {e}: our tokens={sorted(our_ids)} vs "
+                f"moe_permute tokens={sorted(gold_ids)}"
+            )
 
     @pytest.mark.parametrize("N_recv,topk,E", [
         (64, 2, 4),
         (256, 4, 8),
-        (128, 4, 64),  # many experts (was E=256)
+        (128, 4, 256),  # 256 experts
     ])
     def test_padding_alignment_consistent(self, N_recv, topk, E):
         """Padding alignment (128) must match between our metadata and moe_permute."""
@@ -553,14 +526,17 @@ class TestMoePermuteConsistency:
         # Total padded size must match
         assert gold_permuted.shape[0] == TK_padded
 
-        # Vectorized per-expert segment alignment check.
-        seg = (efo[1:] - efo[:-1])
-        nonzero = seg[seg > 0]
-        assert _t_eq(nonzero % 128, torch.zeros_like(nonzero)), "Segment not 128-aligned"
+        # Per-expert segment alignment
+        for e in range(E):
+            seg = (efo[e + 1] - efo[e]).item()
+            if seg > 0:
+                assert seg % 128 == 0
+                gold_seg = seg  # moe_permute uses same total => same segments
+                assert seg == gold_seg
 
     @pytest.mark.parametrize("N_recv,topk,E", [
         (128, 4, 8),
-        (128, 4, 64),  # many experts (was E=256)
+        (128, 4, 256),  # 256 experts
     ])
     def test_score_per_expert_consistent(self, N_recv, topk, E):
         """Per-token scores within each expert segment must match moe_permute probs."""
@@ -569,7 +545,8 @@ class TestMoePermuteConsistency:
         indices, probs, tpe = fabricate_dispatch_result(N_recv, topk, E)
 
         x = torch.zeros(N_recv, H, dtype=torch.bfloat16, device="cuda")
-        x[:, 0] = torch.arange(N_recv, dtype=torch.bfloat16, device="cuda")
+        for i in range(N_recv):
+            x[i, 0] = float(i)
 
         gold_permuted, _, gold_probs, _ = paddle.nn.functional.moe_permute(
             x, None, indices, probs,
@@ -584,24 +561,29 @@ class TestMoePermuteConsistency:
         topk_scores = result[5]
         TK_padded = result[6]
 
-        # Vectorized per-position score check (only where token ids align).
-        seg_starts = efo[:-1].long()
-        tpe_t = torch.tensor(tpe, dtype=torch.int64, device="cuda")
-        positions = torch.arange(TK_padded, device="cuda", dtype=torch.int64)
-        expert_id = torch.searchsorted(efo[1:].long(), positions, right=True).clamp(max=E - 1)
-        local_pos = positions - seg_starts[expert_id]
-        is_real = local_pos < tpe_t[expert_id]
-        real_pos = positions[is_real]
-        our_tok = x_gather_idx[real_pos].long()
-        gold_tok = gold_permuted[real_pos, 0].to(torch.int64)
-        match = our_tok == gold_tok
-        if match.any():
-            mp = real_pos[match]
-            our_score = topk_scores[s_scatter_idx[mp].long()]
-            gold_score = gold_probs[mp]
-            assert torch.allclose(our_score.float(), gold_score.float(), atol=1e-5), (
-                "Per-position scores differ where token ids align"
-            )
+        # Build a map from (token_id, expert_id) → our score
+        for e in range(E):
+            seg_start = efo[e].item()
+            real_count = tpe[e]
+
+            for local_pos in range(real_count):
+                pos = seg_start + local_pos
+                tok_id = x_gather_idx[pos].item()
+
+                # Our score: s_scatter_idx maps expert-sorted → token-major
+                token_major_pos = s_scatter_idx[pos].item()
+                our_score = topk_scores[token_major_pos].item()
+
+                # Gold score at the same position
+                gold_tok_id = int(gold_permuted[pos, 0].item())
+                gold_score = gold_probs[pos].item()
+
+                # Same token at this position? (ordering is stable ascending)
+                if tok_id == gold_tok_id:
+                    assert abs(our_score - gold_score) < 1e-5, (
+                        f"Expert {e}, pos {local_pos}: tok={tok_id}, "
+                        f"our_score={our_score:.6f} vs gold={gold_score:.6f}"
+                    )
 
 
 # ── CUDA vs Python Fallback Comparison ────────────────────────────────────
@@ -612,7 +594,9 @@ class TestCudaVsPythonFallback:
     @pytest.mark.parametrize("N_recv,topk,E", [
         (64, 2, 4),
         (256, 8, 8),
-        (512, 4, 32),
+        (1024, 4, 8),
+        (512, 8, 32),
+        (512, 4, 256),   # 256 experts
     ])
     def test_element_wise_consistency(self, N_recv, topk, E):
         """CUDA kernel and Python fallback must produce equivalent metadata.
@@ -643,8 +627,8 @@ class TestCudaVsPythonFallback:
             indices, probs, tpe, E, "cuda", 128,
         )
 
-        py_efo, py_xg, py_ss, py_sr, py_naept, py_scores, py_TKp, py_pad, py_N, _ = py_result
-        cu_efo, cu_xg, cu_ss, cu_sr, cu_naept, cu_scores, cu_TKp, cu_pad, cu_N, _ = cu_result
+        py_efo, py_xg, py_ss, py_sr, py_naept, py_scores, py_TKp, py_pad, py_N = py_result
+        cu_efo, cu_xg, cu_ss, cu_sr, cu_naept, cu_scores, cu_TKp, cu_pad, cu_N = cu_result
 
         # Scalars must match exactly
         assert py_TKp == cu_TKp, f"TK_padded: py={py_TKp} cu={cu_TKp}"
@@ -657,10 +641,22 @@ class TestCudaVsPythonFallback:
         # naept must match exactly
         assert (py_naept == cu_naept).all(), "naept mismatch"
 
-        # Per-expert token-set check is subsumed by the vectorized Check 2 below
-        # (which compares (expert, token_id) multisets across all experts at once).
+        # Per-expert comparison: token SETS must match
         TK_padded = py_TKp
         TK = sum(tpe)
+        for e_idx in range(E):
+            seg_start = py_efo[e_idx].item()
+            real_count = tpe[e_idx]
+            if real_count == 0:
+                continue
+            seg_end = seg_start + real_count
+
+            # x_gather_idx: real positions must have same token SET
+            py_set = set(py_xg[seg_start:seg_end].tolist())
+            cu_set = set(cu_xg[seg_start:seg_end].tolist())
+            assert py_set == cu_set, (
+                f"Expert {e_idx}: x_gather token sets differ"
+            )
 
         # s_reverse_scatter_idx: shape must match
         assert py_sr.shape == cu_sr.shape, f"s_reverse shape mismatch"
@@ -675,128 +671,85 @@ class TestCudaVsPythonFallback:
         # values) since Python uses argsort order and CUDA uses warp-ballot
         # order. But the gathered scores must match per (token, expert).
 
-        # Check 1: Per-token score multiset via naept (sorted comparison).
-        # Vectorized: build per-row sort within naept ranges. Since each token
-        # has at most `topk` valid entries, gather them into a fixed [N, topk]
-        # tensor padded with -inf, sort, and compare.
-        col_idx = torch.arange(topk, dtype=torch.int64, device="cuda").unsqueeze(0)  # [1, topk]
-        py_naept_l = py_naept.long()
-        row_lens = (py_naept_l[1:] - py_naept_l[:-1]).unsqueeze(1)         # [N, 1]
-        valid = col_idx < row_lens                                          # [N, topk]
-        # Clamp gather indices into bounds; invalid slots will be masked out.
-        gather_pos = (py_naept_l[:-1].unsqueeze(1) + col_idx).clamp(max=py_scores.numel() - 1)
-        py_g = torch.where(valid, py_scores[gather_pos], torch.full_like(py_scores[gather_pos], float("-inf")))
-        cu_g = torch.where(valid, cu_scores[gather_pos], torch.full_like(cu_scores[gather_pos], float("-inf")))
-        py_g_sorted = py_g.sort(axis=1) if "paddle" in str(type(py_g)) else py_g.sort(dim=1)[0]
-        cu_g_sorted = cu_g.sort(axis=1) if "paddle" in str(type(cu_g)) else cu_g.sort(dim=1)[0]
-        assert torch.allclose(py_g_sorted, cu_g_sorted, atol=1e-6), (
-            "Per-token score multisets differ (CUDA vs Python)"
-        )
+        # Check 1: Per-token score multiset via naept (sorted comparison)
+        for t in range(min(py_N, 200)):
+            start = py_naept[t].item()
+            end = py_naept[t + 1].item()
+            if end > start:
+                py_s = py_scores[start:end].sort()[0]
+                cu_s = cu_scores[start:end].sort()[0]
+                assert torch.allclose(py_s, cu_s, atol=1e-6), (
+                    f"Token {t}: scores differ: py={py_s.tolist()} cu={cu_s.tolist()}"
+                )
 
         # Check 2: For each expert segment, the (token_id → score) mapping
         # via topk_scores[s_scatter_idx[pos]] must agree.
-        # Vectorized across ALL experts simultaneously: build per-segment
-        # position bounds, gather token ids and scores, compare sorted-by-token.
-        # Use the "real_count per expert" mask to identify real positions.
-        py_pos2score = py_scores[py_ss.long()]   # [TK_padded] (incl. padding)
-        cu_pos2score = cu_scores[cu_ss.long()]
-        # Build per-position expert id and "is real" mask via efo + tpe.
-        seg_starts_t = py_efo[:-1].long()                                  # [E]
-        tpe_t = torch.tensor(tpe, dtype=torch.int64, device="cuda")        # [E]
-        real_ends_t = seg_starts_t + tpe_t                                 # [E]
-        # For each padded position, compute expert id by searchsorted.
-        positions = torch.arange(py_TKp, device="cuda", dtype=torch.int64)
-        expert_id = torch.searchsorted(py_efo[1:].long(), positions, right=True).clamp(max=E - 1)
-        # Real if local_pos < tpe[expert]
-        local_pos = positions - seg_starts_t[expert_id]
-        is_real = local_pos < tpe_t[expert_id]
-        real_positions = positions[is_real]                                # [TK]
-        real_experts = expert_id[is_real]
-        # Per-expert sort key = expert*N_recv + token_id → a single global sort.
-        py_tok = py_xg[real_positions].long()
-        cu_tok = cu_xg[real_positions].long()
-        py_key = real_experts * (py_N + 1) + py_tok
-        cu_key = real_experts * (py_N + 1) + cu_tok
-        py_perm = py_key.argsort(stable=True)
-        cu_perm = cu_key.argsort(stable=True)
-        assert _t_eq(py_key[py_perm], cu_key[cu_perm]), (
-            "Per-expert (token-id) multisets differ between CUDA and Python"
-        )
-        py_sorted_scores = py_pos2score[real_positions][py_perm]
-        cu_sorted_scores = cu_pos2score[real_positions][cu_perm]
-        assert torch.allclose(py_sorted_scores, cu_sorted_scores, atol=1e-6), (
-            "Per-(expert,token) scores differ between CUDA and Python"
-        )
+        for e_idx in range(E):
+            seg_start = py_efo[e_idx].item()
+            real_count = tpe[e_idx]
+            if real_count == 0:
+                continue
+
+            py_tok_score = {}
+            cu_tok_score = {}
+            for i in range(real_count):
+                pos = seg_start + i
+                py_tok = py_xg[pos].item()
+                cu_tok = cu_xg[pos].item()
+                py_tok_score[py_tok] = py_scores[py_ss[pos].item()].item()
+                cu_tok_score[cu_tok] = cu_scores[cu_ss[pos].item()].item()
+
+            assert py_tok_score.keys() == cu_tok_score.keys(), (
+                f"Expert {e_idx}: token sets differ"
+            )
+            for tok in py_tok_score:
+                assert abs(py_tok_score[tok] - cu_tok_score[tok]) < 1e-6, (
+                    f"Expert {e_idx}, token {tok}: "
+                    f"py_score={py_tok_score[tok]:.6f} cu_score={cu_tok_score[tok]:.6f}"
+                )
 
         # Check 3: round-trip s_reverse_scatter_idx[s_scatter_idx[pos]] == pos
-        # for all real positions (vectorized — reuses real_positions from Check 2).
-        if real_positions.numel() > 0:
-            py_rt = py_sr[py_ss[real_positions].long()]
-            cu_rt = cu_sr[cu_ss[real_positions].long()]
-            assert _t_eq(py_rt, real_positions.to(py_rt.dtype)), "Python round-trip fail"
-            assert _t_eq(cu_rt, real_positions.to(cu_rt.dtype)), "CUDA round-trip fail"
-        # Also drop expensive set-based per-expert check above by checking
-        # token multiset across ALL experts in one go (already done in Check 2 via py_key/cu_key).
+        # for all real positions in each expert segment
+        for e_idx in range(E):
+            seg_start = py_efo[e_idx].item()
+            real_count = tpe[e_idx]
+            for i in range(real_count):
+                pos = seg_start + i
+                py_rt = py_sr[py_ss[pos].item()].item()
+                cu_rt = cu_sr[cu_ss[pos].item()].item()
+                assert py_rt == pos, (
+                    f"Python round-trip fail: expert {e_idx}, pos {pos}, got {py_rt}"
+                )
+                assert cu_rt == pos, (
+                    f"CUDA round-trip fail: expert {e_idx}, pos {pos}, got {cu_rt}"
+                )
+
 
 # ── Performance Benchmark ───────────────────────────────────────────────────
 
 class TestPerformance:
-    """Benchmark metadata conversion latency.
-
-    Note on threshold: CUDA-event timing under the Paddle compat layer
-    includes ~1.5–2.5 ms of host-side Python/launch overhead per call which
-    is **not** representative of real GPU work. The true GPU-projection
-    (measured via nsys) is ~165 µs for the sonic-meta region of the
-    forward pass. This test is therefore a **gross-regression guard**, not
-    a perf contract — the contract lives in the nsys benchmarks
-    (`tests/ops/bench_user_shape_fwd_nsys.py`).
-    """
+    """Benchmark metadata conversion latency."""
 
     @pytest.mark.parametrize("N_recv,topk,E", [
-        (1024, 4, 8),
-        (2048, 8, 32),
-        (4096, 8, 64),
+        (4096, 8, 8),
+        (16384, 8, 8),
+        (16384, 8, 64),
+        (16384, 8, 256),  # 256 experts
     ])
     def test_latency_under_target(self, N_recv, topk, E):
-        """Sanity-check perf does not blow up by orders of magnitude.
-
-        OOM root-cause: paddle's auto-growth allocator caches every chunk
-        ever requested by the 60+ preceding tests in the same pytest
-        process. Even though this test only needs a few MB, the pool can
-        grow to >200 GB resident; on a contested shared GPU the next
-        chunk request (Paddle doubles, so ~47 GB) fails. Empty_cache()
-        helps but is not sufficient — we must also clear the module-level
-        high-watermark caches *and* drop the dispatch_data fixture
-        residuals before timing.
-        """
-        import gc
-        from sonicmoe.ernie_compat import deepep_metadata as _dm
-        # Clear module-level high-watermark caches
-        try:
-            _dm._TOPK_CACHE.clear()
-            _dm._ARANGE_CACHE.clear()
-        except AttributeError:
-            pass
-        gc.collect()
-        torch.cuda.empty_cache()
-        try:
-            import paddle
-            paddle.device.cuda.empty_cache()
-        except Exception:
-            pass
-
+        """Metadata conversion should complete in < 500us."""
         torch.manual_seed(42)
         indices, probs, tpe = fabricate_dispatch_result(N_recv, topk, E)
 
         # Warmup
-        for _ in range(3):
+        for _ in range(10):
             deepep_topk_to_sonic_metadata(indices, probs, tpe, E)
         torch.cuda.synchronize()
 
         # Timed run
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
-        repeats = 20
+        repeats = 100
 
         start.record()
         for _ in range(repeats):
@@ -805,12 +758,9 @@ class TestPerformance:
         torch.cuda.synchronize()
 
         avg_us = start.elapsed_time(end) * 1000 / repeats
-        print(f"\n  [N={N_recv}, topk={topk}, E={E}] avg={avg_us:.1f}us "
-              f"(includes ~2ms compat-layer host overhead)")
-        # Gross regression guard only: real GPU work is <1ms; 10ms catches
-        # 50x+ slowdowns without false-positives from host scheduling jitter
-        # on the shared GPU.
-        assert avg_us < 10000, f"Egregious regression: {avg_us:.1f}us > 10ms"
+        print(f"\n  [N={N_recv}, topk={topk}, E={E}] avg={avg_us:.1f}us")
+        # Target: < 500us (generous for the argsort-dominated path)
+        assert avg_us < 500, f"Too slow: {avg_us:.1f}us > 500us target"
 
 
 # ── Standalone runner ───────────────────────────────────────────────────────
@@ -823,7 +773,7 @@ if __name__ == "__main__":
     N_recv, topk, E = 1024, 8, 8
     indices, probs, tpe = fabricate_dispatch_result(N_recv, topk, E)
     result = deepep_topk_to_sonic_metadata(indices, probs, tpe, E)
-    efo, x_gather, s_scatter, s_reverse, naept, scores, TK_padded, pad_rows, n_recv, _ = result
+    efo, x_gather, s_scatter, s_reverse, naept, scores, TK_padded, pad_rows, n_recv = result
 
     TK = (indices >= 0).sum().item()
     print(f"Config: N_recv={N_recv}, topk={topk}, E={E}")

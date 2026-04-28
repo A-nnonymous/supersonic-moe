@@ -17,51 +17,6 @@ Copyright (c) 2025, Wentao Guo, Mayank Mishra, Xinle Cheng, Ion Stoica, Tri Dao
 - Python 3.12+, PyTorch 2.7+
 - `USE_QUACK_GEMM=1` for Blackwell kernels
 
-## Default Path & Environment Flags
-
-The default code path is the **fused-v2 frontier** (FP8 epilogue blockscaled quant + fused-gated up-proj + TMA reduce-add wgrad + CUDA fused topk-metadata kernel). Most flags below are already set to their production-recommended defaults; they are documented here so other agents can quickly reason about the active path.
-
-### Sonic-meta routing kernel (always-on)
-
-The fused CUDA topk→metadata kernel (`sonicmoe.ernie_compat.deepep_topk_metadata_cuda`) is **JIT-compiled on first import** and dispatched automatically by `deepep_topk_to_sonic_metadata`. There is **no env flag** to gate it: when the import succeeds it is always used; when the build fails the code falls back to the Triton-only path. To force the legacy path for A/B comparison, delete the build directory before import:
-
-```bash
-rm -rf $TORCH_EXTENSIONS_DIR/sonicmoe_deepep_topk_metadata_cuda  # (or matching paddle build dir)
-```
-
-### FP8 / Frontier flags
-
-| Env flag | Default | Recommended | What it gates |
-|---|:---:|:---:|---|
-| `SONIC_MOE_FP8_MODE` | unset | `perf` (or via `enable_fp8()` ctx) | Master switch. `perf` enables the full FP8 frontier; `mem` enables FP8 with stage-wise memory reuse; unset = BF16 path. |
-| `USE_QUACK_GEMM` | unset | `1` | Required on Blackwell (B200/B300) to enable the CuTeDSL FP8 GEMMs. Without it the Paddle compat layer falls back to BF16. |
-| `SONIC_MOE_FP8_WGRAD` | unset | `1` | Enable FP8 wgrad (otherwise wgrad runs in BF16). Implied when `fp8_wgrad=True` on the config. |
-| `SONIC_MOE_FP8_FUSED_GATED` | `1` | `1` | Fuse SwiGLU gate + epilogue blockscaled quant inside the up-proj GEMM. |
-| `SONIC_MOE_FP8_EPILOGUE_QUANT` | `1` | `1` | Quantize y2 / z to FP8 inside the GEMM epilogue (vs. a separate quant kernel). |
-| `SONIC_MOE_FP8_FUSED_SWIGLU_QUANT` | `1` | `1` | Fuse SwiGLU activation with the row-wise FP8 quant on the y1 path. |
-| `SONIC_MOE_FP8_SAVE_Z_FP8` | `1` | `1` | Save z_fp8 (post-up-proj activation in FP8) for the down-proj backward, instead of storing y1 in BF16. |
-| `SONIC_MOE_FP8_RECOMPUTE_Z` | `0` | `0` | Skip storing z_fp8 in fwd; rerun up-proj GEMM in down-proj bwd (Option A). Saves ~213 MiB / active layer at ERNIE shape; ~5–15% extra cost per layer. |
-| `SONIC_MOE_FP8_RECOMPUTE_OPT_B` | `0` | `0` | **Do not enable.** Experimental quant-only recompute kernel; produces an `illegal-instruction` fault on non-uniform routing (verified). Kept for research. |
-| `SONIC_MOE_FP8_FUSED_ZY1_QUANT` | `0` | `0` | Fuse z & y1 quant into a single dual kernel. Off by default — activate only after benchmarking; the separated path is currently faster on production shapes. |
-| `SONIC_MOE_FP8_WGRAD_BETA_ACCUM` | `0` | `0` | Fall back to the legacy `D = A@B + 1.0*C` fused beta-accumulation epilogue (86 regs/thread) instead of TMA reduce-add (50 regs/thread). TMA reduce-add is 2–4% faster end-to-end. |
-| `SONIC_MOE_FP8_ASSUME_ALIGNED` | `0` | `0` (eager-mode); `1` (full-graph training) | Skip the runtime padding-check H2D sync; assume `TK % 32 == 0`. Required for zero-sync execution but unsafe if any caller can produce mis-aligned token counts. |
-| `SONIC_MOE_FP8_BLOCKSCALED_EXPERT_CAPACITY` | unset | unset (use real load) | Override the per-expert capacity used by the blockscaled FP8 GEMM. Only set when comparing fixed-capacity baselines; the default uses the runtime expert load. |
-| `SONIC_MOE_FP8_UPPROJ_EPILOGUE_PRECISION` | `fp8-blockscaled` | `fp8-blockscaled` | Output precision of up-proj epilogue. `bf16` = legacy fallback. |
-| `SONIC_MOE_FP8_DOWNPROJ_MAINLOOP_PRECISION` | `fp8-blockscaled` | `fp8-blockscaled` | Mainloop precision of down-proj. |
-| `SONIC_MOE_FP8_DOWNPROJ_WEIGHT_PRECISION` | `bf16` | `bf16` | Weight precision feeding down-proj. `fp8` requires `..._MAINLOOP_PRECISION=fp8-blockscaled`. |
-| `SONIC_MOE_STAGEWISE_MEMORY` | `0` | `0` (perf); `1` (mem) | Free up-proj activations as soon as down-proj consumes them — tradeoff: ~3–5% extra cost for ~1.0–1.5 GB peak savings at ERNIE shape. |
-| `SONIC_MOE_CACHE_DIR` | `~/.cache/sonicmoe` | (default) | Override the JIT compile-cache directory used by `jit_warmup`. |
-
-Production single-GPU launcher template (matches `tests/single_card_tests/...test_gpt_model_moe_sonic_moe.py`):
-
-```bash
-USE_QUACK_GEMM=1 \
-SONIC_MOE_FP8_MODE=perf \
-SONIC_MOE_FP8_WGRAD=1 \
-TRITON_PTXAS_PATH=/usr/local/cuda-13.0/bin/ptxas \
-python -m pytest tests/...
-```
-
 ## Paddle Integration (ERNIE / PaddleFleet)
 
 The `session60-ds-fix` branch integrates SonicMoE into PaddleFleet via `paddle.compat.enable_torch_proxy`. Production entry point: `SonicMoEMlpNode`.
@@ -80,11 +35,6 @@ node = SonicMoEMlpNode(experts, n_experts=E, hidden_size=H, intermediate_size=I)
 
 for step in range(num_steps):
     for mb in microbatches:
-        # First fwd of each step transparently runs a fused single-pass FP8
-        # prequantize for w1/w2 (all 4 layouts, ~3x faster than the legacy
-        # 4-call sequence — ~297 µs vs. ~943 µs at H=3072 I=1536 E=8).
-        # To prefetch even earlier (e.g. overlap with comm), call
-        #   node.prequantize_weights()
         out = node(x, tokens_per_expert, dispatched_indices, dispatched_probs)
         out.backward(grad)
     optimizer.step()

@@ -46,7 +46,6 @@ from sonicmoe.functional import (
     general_routing_router_metadata,
 )
 from sonicmoe.functional.utils import enable_fp8
-from sonicmoe.quack_utils import precompute_weight_fp8_warmup
 
 
 # ── Weight layout cache ──────────────────────────────────────────────────────
@@ -186,124 +185,110 @@ def prepare_sonic_inputs(
 
 # ── Weight-grad → main_grad ─────────────────────────────────────────────────
 
-# ── Native-layout accumulators (zero-transpose path, per-layer) ──────────────
-# We accumulate dw1/dw2 in SonicMoE's native physical layout
-# (W1: [E, 2I, H], W2: [E, H, I]) and defer the layout conversion to ERNIE's
-# per-expert layout (W1: [E, H, 2I] split-half, W2: [E, I, H]) until
-# ``flush_native_grads()`` is called at optimizer-step time. This eliminates
-# the per-iter TilingSwapDim/contiguous kernels from the profiled path.
-#
-# Critically, the buffer is the *same storage* as the per-expert
-# ``weight.main_grad`` allocated by ``stack_ernie_w{1,2}`` (a single
-# contiguous fp32 tensor sliced into per-expert views). We just re-interpret
-# that storage as the native shape during accumulation, then transpose it
-# back into the ERNIE shape in-place at flush time. Benefits:
-#   1. Per-layer binding "for free" — main_grad is already per-weight, so
-#      models with multiple MoE layers each get their own buffer (the old
-#      single-global ``_NATIVE_W1_GRAD`` silently lost grads when a second
-#      layer's backward overwrote the global).
-#   2. Zero extra permanent allocation (saves E*H*2I*4 + E*I*H*4 fp32 bytes
-#      per layer — ~288 MB for the production E=8/H=3072/I=1536 shape).
-#
-# Layer registry: each backward that touched native layout records its
-# ``experts`` list here; ``flush_native_grads`` iterates and converts every
-# pending layer. List (not set) to preserve order; identity comparison
-# because ``experts`` is typically a Paddle LayerList that isn't hashable.
-#
-# Caveat for callers: between accumulation and ``flush_native_grads()``,
-# ``param.main_grad`` contains *native-layout* data (scrambled relative to
-# ERNIE's expected [H, 2I] / [I, H] view). Always call ``node.step()`` (or
-# ``flush_native_grads()`` directly) before reading or optimizing main_grad.
+# ── Native-layout accumulators (zero-transpose path) ─────────────────────────
+# Instead of transposing wgrad every iter to match ERNIE's per-expert layout,
+# we accumulate in SonicMoE's native layout (dw1: [2I,H,E], dw2: [H,I,E])
+# and defer the transpose to optimizer-step time via flush_native_grads().
+# This eliminates 2 contiguous() kernels per iter from the profiled path.
 
-_PENDING_FLUSH_LAYERS: list = []  # list of `experts` lists awaiting flush
-
-# ── Deprecated compatibility shims ────────────────────────────────────────────
-# The native-layout buffer used to be a single global tensor; it's now backed
-# by per-expert main_grad storage (see _w1_native_view / _w2_native_view).
-# These aliases remain so tests/benchmarks that "reset" the globals to None
-# (a no-op cleanup) don't break. Nothing in the live path reads them.
-_NATIVE_W1_GRAD: torch.Tensor | None = None
-_NATIVE_W2_GRAD: torch.Tensor | None = None
-_NATIVE_GRAD_EXPERTS: list | None = None
+_NATIVE_W1_GRAD: torch.Tensor | None = None  # [2I, H, E] fp32
+_NATIVE_W2_GRAD: torch.Tensor | None = None  # [H, I, E] fp32
+_NATIVE_GRAD_EXPERTS: list | None = None  # reference to experts for flush
 _NATIVE_GRAD_I: int = 0
 
 
-def _ensure_native_grads(*_args, **_kwargs) -> None:
-    """Deprecated no-op: native buffers now live in per-expert main_grad."""
-    return
+def _ensure_native_grads(experts, I: int, w1_shape: tuple, w2_shape: tuple, device):
+    """Lazily allocate fp32 grad accumulators in physical layout [E, 2I, H] / [E, H, I].
 
+    dw1 from backward: logical [2I, H, E], physical [E, 2I, H] (non-contiguous view).
+    dw2 from backward: logical [H, I, E], physical [E, H, I] (non-contiguous view).
 
-def _w1_native_view(experts) -> torch.Tensor:
-    """View per-expert main_grad storage as native [E, 2I, H] contiguous fp32."""
-    mg = _w1_mg_stacked(experts)  # [E, H, 2I] contig fp32 (aliases per-expert main_grad)
-    E, H, two_I = mg.shape
-    return mg.view(E, two_I, H)
-
-
-def _w2_native_view(experts) -> torch.Tensor:
-    """View per-expert main_grad storage as native [E, H, I] contiguous fp32."""
-    mg = _w2_mg_stacked(experts)  # [E, I, H] contig fp32
-    E, I, H = mg.shape
-    return mg.view(E, H, I)
-
-
-def _mark_pending_flush(experts) -> None:
-    for e in _PENDING_FLUSH_LAYERS:
-        if e is experts:
-            return
-    _PENDING_FLUSH_LAYERS.append(experts)
-
-
-def _accumulate_w1(dw1: torch.Tensor, experts: list, I: int) -> None:
-    """BF16-fallback accumulator: dw1 [2I, H, E] → native [E, 2I, H] storage.
-
-    Only used when the FP8 wgrad path returns a non-None dw1 (i.e., the
-    BF16 fallback). Cost: 1 TilingSwapDim + 1 MultiPrecisionAdd.
+    We store in physical layout [E, 2I, H] / [E, H, I] (contiguous).
+    accumulate does permute(2,0,1) on dw to get [E, ...] then add_.
+    The permute+contiguous is 1 TilingSwapDim kernel — this is the inherent cost
+    of main_grad accumulation (frontier avoids it by not accumulating at all).
     """
-    native = _w1_native_view(experts)
-    native.add_(dw1.permute(2, 0, 1).contiguous())
-    _mark_pending_flush(experts)
-
-
-def _accumulate_w2(dw2: torch.Tensor, experts: list) -> None:
-    """BF16-fallback accumulator: dw2 [H, I, E] → native [E, H, I] storage."""
-    native = _w2_native_view(experts)
-    native.add_(dw2.permute(2, 0, 1).contiguous())
-    _mark_pending_flush(experts)
-
-
-def flush_native_grads() -> None:
-    """Convert every pending layer's native-layout main_grad → ERNIE layout in-place.
-
-    Call this at optimizer-step time (typically via ``node.step()``).
-    For each pending layer:
-      W1: storage [E, 2I, H] interleaved (gate0,up0,gate1,up1,...)
-          → ERNIE [E, H, 2I] split-half (gates then ups)
-      W2: storage [E, H, I] → ERNIE [E, I, H]
-    Conversion is in-place via a single contiguous() scratch (one alloc per
-    flush, freed after copy_), then the pending list is cleared.
-    """
-    global _PENDING_FLUSH_LAYERS
-    if not _PENDING_FLUSH_LAYERS:
+    global _NATIVE_W1_GRAD, _NATIVE_W2_GRAD, _NATIVE_GRAD_EXPERTS, _NATIVE_GRAD_I
+    if _NATIVE_W1_GRAD is not None and _NATIVE_W2_GRAD is not None \
+       and _NATIVE_GRAD_EXPERTS is experts:
         return
 
-    pending, _PENDING_FLUSH_LAYERS = _PENDING_FLUSH_LAYERS, []
-    for experts in pending:
-        # ── W1 ──────────────────────────────────────────────────────────────
-        mg1 = _w1_mg_stacked(experts)  # alias view [E, H, 2I]; storage holds [E, 2I, H] data
-        E, H, two_I = mg1.shape
-        I = two_I // 2
-        native = mg1.view(E, two_I, H)  # correct view of the native data
-        # native [E, 2I, H] is interleaved: 2I groups as (I, 2) → split-half [E, H, 2, I]
-        rhs = native.view(E, I, 2, H).permute(0, 3, 2, 1).contiguous()
-        mg1.view(E, H, 2, I).copy_(rhs)
+    two_I = w1_shape[0]; H = w1_shape[1]; E = w1_shape[2]
+    if _NATIVE_W1_GRAD is None or _NATIVE_GRAD_EXPERTS is not experts:
+        _NATIVE_W1_GRAD = torch.zeros(E, two_I, H, dtype=torch.float32, device=device)
 
-        # ── W2 ──────────────────────────────────────────────────────────────
-        mg2 = _w2_mg_stacked(experts)  # alias view [E, I, H]; storage holds [E, H, I] data
-        E2, I2, H2 = mg2.shape
-        native2 = mg2.view(E2, H2, I2)
-        rhs2 = native2.permute(0, 2, 1).contiguous()  # [E, I, H]
-        mg2.copy_(rhs2)
+    H2 = w2_shape[0]; I2 = w2_shape[1]; E2 = w2_shape[2]
+    if _NATIVE_W2_GRAD is None or _NATIVE_GRAD_EXPERTS is not experts:
+        _NATIVE_W2_GRAD = torch.zeros(E2, H2, I2, dtype=torch.float32, device=device)
+
+    _NATIVE_GRAD_EXPERTS = experts
+    _NATIVE_GRAD_I = I
+
+
+def _accumulate_w1(dw1: torch.Tensor, experts: list, I: int):
+    """Accumulate dw1 [2I, H, E] → physical [E, 2I, H] buffer.
+
+    Cost: 1 TilingSwapDim (contiguous copy to [E,2I,H]) + 1 MultiPrecisionAdd.
+    This is the inherent cost of main_grad accumulation in ERNIE training.
+    The frontier benchmark avoids this entirely via zero_grad(set_to_none=True).
+    """
+    global _NATIVE_W1_GRAD
+    _ensure_native_grads(
+        experts, I, dw1.shape, (dw1.shape[1], I, dw1.shape[2]),
+        dw1.device,
+    )
+    # dw1 logical [2I,H,E] → permute(2,0,1) → [E,2I,H] non-contiguous
+    # .contiguous() materializes it (TilingSwapDim kernel) → then add_ (MultiPrecisionAdd)
+    _NATIVE_W1_GRAD.add_(dw1.permute(2, 0, 1).contiguous())
+
+
+def _accumulate_w2(dw2: torch.Tensor, experts: list):
+    """Accumulate dw2 [H, I, E] → physical [E, H, I] buffer.
+
+    Same cost structure as _accumulate_w1.
+    """
+    global _NATIVE_W2_GRAD
+    I = dw2.shape[1]
+    _ensure_native_grads(
+        experts, I, (2 * I, dw2.shape[0], dw2.shape[2]), dw2.shape,
+        dw2.device,
+    )
+    _NATIVE_W2_GRAD.add_(dw2.permute(2, 0, 1).contiguous())
+
+
+def flush_native_grads():
+    """Transpose native-layout grad accumulators into per-expert main_grad.
+
+    Call this at optimizer-step time (NOT per-iter). Performs the layout
+    conversion that was deferred from per-iter _accumulate_w1/_accumulate_w2.
+
+    After flushing, the native buffers are zeroed for the next accumulation window.
+    """
+    global _NATIVE_W1_GRAD, _NATIVE_W2_GRAD, _NATIVE_GRAD_EXPERTS, _NATIVE_GRAD_I
+    if _NATIVE_GRAD_EXPERTS is None:
+        return
+
+    experts = _NATIVE_GRAD_EXPERTS
+    I = _NATIVE_GRAD_I
+
+    # ── W1: physical [E, 2I, H] → per-expert main_grad [E, H, 2I] split-half ──
+    if _NATIVE_W1_GRAD is not None:
+        mg = _w1_mg_stacked(experts)  # [E, H, 2I] contig fp32
+        E_val = mg.shape[0]
+        H = mg.shape[1]
+        # Buffer is already [E, 2I, H] contiguous
+        # Interleave→split-half: [E,I,2,H] → [E,H,2,I] contiguous
+        rhs = _NATIVE_W1_GRAD.view(E_val, I, 2, H).permute(0, 3, 2, 1).contiguous()
+        mg.view(E_val, H, 2, I).add_(rhs)
+        _NATIVE_W1_GRAD.zero_()
+
+    # ── W2: physical [E, H, I] → per-expert main_grad [E, I, H] ───────────────
+    if _NATIVE_W2_GRAD is not None:
+        mg = _w2_mg_stacked(experts)  # [E, I, H] contig fp32
+        # Buffer is [E, H, I], need [E, I, H] → permute(0, 2, 1)
+        rhs = _NATIVE_W2_GRAD.permute(0, 2, 1).contiguous()
+        mg.add_(rhs)
+        _NATIVE_W2_GRAD.zero_()
 
 
 # ── The legacy PyLayer (argsort-based) ────────────────────────────────────────
@@ -496,7 +481,6 @@ def _differentiable_router_scores(
     TK: int,                           # number of real (non-padding) entries
     TK_padded: int,                    # TK + padding for 128-alignment
     E: int,                            # number of experts
-    score_src_idx: torch.Tensor | None = None,  # [TK] int32 from CUDA kernel
 ) -> torch.Tensor:
     """Reconstruct router_scores from dispatched_probs with autograd connection.
 
@@ -508,12 +492,8 @@ def _differentiable_router_scores(
     Within each token, entries are ordered by ascending expert ID, matching the
     CUDA kernel's rank-based ordering in ``scatter_and_fixup_kernel``.
 
-    Zero CPU-GPU synchronization.
-
-    Fast path: when ``score_src_idx`` is provided (CUDA metadata path) it is
-    used directly — bit-exact with the standalone Triton _build_score_src_idx
-    kernel and saves a separate launch.  Falls back to the Triton kernel only
-    when CUDA path is unavailable (Python metadata fallback).
+    Zero CPU-GPU synchronization: uses a Triton kernel to build the [TK] index
+    tensor from naept (known-size prefix-sum) instead of boolean indexing.
     """
     N_recv, topk = dispatched_indices.shape
     device = dispatched_indices.device
@@ -530,27 +510,17 @@ def _differentiable_router_scores(
     if TK == 0:
         return torch.zeros(TK_padded, dtype=dispatched_probs.dtype, device=device)
 
-    if score_src_idx is not None:
-        # Provided by scatter_and_fixup_kernel — int32, already in token-major
-        # + ascending-expert order matching the metadata path.
-        if score_src_idx.shape[0] != TK:
-            raise ValueError(
-                f"score_src_idx: expected shape ({TK},), got {score_src_idx.shape}"
-            )
-        gather_idx = score_src_idx.to(torch.int64)
-    else:
-        # Build score_src_idx: [TK] int64 flat indices into dispatched_probs.reshape(-1)
-        # Uses Triton kernel — no boolean indexing, no dynamic shapes, no D2H sync.
-        built = torch.empty(TK, dtype=torch.int64, device=device)
-        work = torch.empty_like(dispatched_indices)  # scratch buffer
-        _build_score_src_idx_kernel[(N_recv,)](
-            dispatched_indices, naept, built, work,
-            TOPK=triton.next_power_of_2(topk),
-        )
-        gather_idx = built
+    # Build score_src_idx: [TK] int64 flat indices into dispatched_probs.reshape(-1)
+    # Uses Triton kernel — no boolean indexing, no dynamic shapes, no D2H sync.
+    score_src_idx = torch.empty(TK, dtype=torch.int64, device=device)
+    work = torch.empty_like(dispatched_indices)  # scratch buffer
+    _build_score_src_idx_kernel[(N_recv,)](
+        dispatched_indices, naept, score_src_idx, work,
+        TOPK=triton.next_power_of_2(topk),
+    )
 
     # Differentiable gather from dispatched_probs
-    gathered = dispatched_probs.reshape(-1)[gather_idx]  # [TK]
+    gathered = dispatched_probs.reshape(-1)[score_src_idx]  # [TK]
 
     if TK_padded > TK:
         padding = torch.zeros(
@@ -609,26 +579,6 @@ class SonicMoEMlpNode:
         self._I = intermediate_size
         self._activation_type = activation_type
         self._stream_id = stream_id
-        self._warmed_for_step = False
-
-    def prequantize_weights(self) -> None:
-        """Fused single-pass FP8 prequantize for w1/w2 (all 4 layouts).
-
-        Reads each BF16 weight ONCE and writes both transposed FP8 layouts +
-        ISA-packed scales in a single Triton kernel per weight.  ~3x faster
-        than letting the four ``precompute_weight_fp8_*`` helpers fire lazily
-        inside the first microbatch's forward.
-
-        Idempotent within a step: the second call is a cheap cache lookup.
-        ``step()`` clears the flag so the next step re-quantizes the freshly
-        updated weights.
-        """
-        if self._warmed_for_step:
-            return
-        w1 = stack_ernie_w1(self._experts, self._H, self._I)  # [2I, H, E]
-        w2 = stack_ernie_w2(self._experts)                    # [H, I, E]
-        precompute_weight_fp8_warmup(w1, w2)
-        self._warmed_for_step = True
 
     def warmup(self, total_K_list: list[int] | None = None, max_workers: int = 0):
         """Pre-compile all JIT kernels. Call once after model construction.
@@ -695,7 +645,6 @@ class SonicMoEMlpNode:
             TK_padded,
             total_pad_rows,
             N_recv,
-            score_src_idx,
         ) = deepep_topk_to_sonic_metadata(
             dispatched_indices, dispatched_probs,
             tokens_per_expert, E, device=x.device,
@@ -705,15 +654,10 @@ class SonicMoEMlpNode:
         # ds gradients flow back to the caller (e.g. DeepEP's gate).
         # deepep_topk_to_sonic_metadata produces a non-differentiable copy;
         # we reconstruct the same values using autograd-tracked indexing.
-        # When the CUDA metadata kernel is available, score_src_idx is
-        # produced as a free side-output of scatter_and_fixup_kernel and we
-        # skip the standalone Triton _build_score_src_idx_kernel entirely
-        # (saves ~252 µs/iter at user shape).
         router_scores = _differentiable_router_scores(
             dispatched_probs, dispatched_indices,
             num_activated_expert_per_token_offset,
             TK_padded - total_pad_rows, TK_padded, E,
-            score_src_idx=score_src_idx,
         )
         # T_down = N_recv for the topk path: _router_forward outputs [N_recv, H]
         T_down = N_recv
@@ -721,8 +665,7 @@ class SonicMoEMlpNode:
         # 2. NO x-padding needed — route-level padding handles alignment.
         #    Padding rows in x_gather_idx point to row 0 with score=0.
 
-        # 3. Stack weights (cached) + fused FP8 prequantize on first microbatch.
-        self.prequantize_weights()
+        # 3. Stack weights (cached)
         w1 = stack_ernie_w1(self._experts, H, I)
         w2 = stack_ernie_w2(self._experts)
 
@@ -775,7 +718,6 @@ class SonicMoEMlpNode:
         """
         flush_native_grads()
         invalidate_weight_caches()
-        self._warmed_for_step = False
 
     def __call__(
         self,
@@ -871,14 +813,15 @@ class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
 
         # ── DownProjection backward ──────────────────────────────────────
         I = ctx._I
-        # Native-layout views into per-expert main_grad storage (per-layer,
-        # zero extra alloc). Caller MUST flush_native_grads() before reading
-        # main_grad — see module-level comment.
-        w1_native = _w1_native_view(ctx._experts)  # [E, 2I, H] fp32
-        w2_native = _w2_native_view(ctx._experts)  # [E, H, I] fp32
-        _mark_pending_flush(ctx._experts)
-
-        down_ctx._wgrad_w2_accumulator = w2_native
+        E_val = len(ctx._experts)
+        H_val = output_grad.shape[1]
+        _ensure_native_grads(
+            ctx._experts, I,
+            (2 * I, H_val, E_val),  # w1_shape
+            (H_val, I, E_val),       # w2_shape
+            output_grad.device,
+        )
+        down_ctx._wgrad_w2_accumulator = _NATIVE_W2_GRAD
         down_grads = _DownProjection.backward(down_ctx, output_grad)
         dz = down_grads[1]
         dw2 = down_grads[2]
@@ -889,16 +832,15 @@ class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
         ds = down_grads[ds_idx]
 
         # ── UpProjection backward ────────────────────────────────────────
-        up_ctx._wgrad_w1_accumulator = w1_native
+        up_ctx._wgrad_w1_accumulator = _NATIVE_W1_GRAD
         up_grads = _UpProjection.backward(up_ctx, None, dz)
         dx = up_grads[0]   # [T_orig, H] — matches x input shape
         dw1 = up_grads[1]
 
         # ── Weight grads → per-expert main_grad ──────────────────────────
-        # FP8 path: CUTLASS accumulates directly into the native-layout view
-        # of main_grad via the _wgrad_accumulator, returning dw1=dw2=None.
-        # If non-None, we're on the BF16 fallback — accumulate with per-iter
-        # transpose into the same native view.
+        # FP8 path: CUTLASS accumulates directly into _NATIVE_W{1,2}_GRAD
+        # via the _wgrad_accumulator, returning dw1=dw2=None. If non-None,
+        # we're on the BF16 fallback — accumulate with per-iter transpose.
         if dw1 is not None:
             _accumulate_w1(dw1, ctx._experts, ctx._I)
         if dw2 is not None:

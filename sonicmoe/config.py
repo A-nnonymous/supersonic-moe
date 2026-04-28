@@ -79,7 +79,6 @@ class SonicMoEConfig:
     fp8_wgrad: Optional[bool] = None
     fused_gated: Optional[bool] = None
     save_z_fp8: Optional[bool] = None
-    recompute_z: Optional[bool] = None
     fused_swiglu_quant: Optional[bool] = None
     epilogue_quant: Optional[bool] = None
     fused_zy1_quant: Optional[bool] = None
@@ -118,22 +117,6 @@ class SonicMoEConfig:
         if self.save_z_fp8 is not None:
             return self.save_z_fp8
         return _env_bool("SONIC_MOE_FP8_SAVE_Z_FP8", True) or False
-
-    def resolve_recompute_z(self) -> bool:
-        """Recompute z_fp8 in DownProj backward (skip storing in forward).
-
-        When True, ``_UpProjection.forward`` does NOT populate the
-        ``z_fp8`` prequant cache and ``_DownProjection.forward`` saves a
-        recompute closure to ctx instead of the fp8 z tensor.  Backward
-        re-runs the up-proj GEMM (gather-A + epilogue blockscaled fp8
-        quant) just-in-time and discards the recomputed y1 (SwiGLU /
-        PostAct write are wasted, ~5-15% of an up-proj fwd cost).
-        Saves ~213 MiB peak (fp8 z) per active layer at ERNIE shape.
-        Implies save_z_fp8=True semantically.
-        """
-        if self.recompute_z is not None:
-            return self.recompute_z
-        return _env_bool("SONIC_MOE_FP8_RECOMPUTE_Z", False) or False
 
     def resolve_fused_swiglu_quant(self) -> bool:
         if self.fused_swiglu_quant is not None:

@@ -40,11 +40,7 @@ from quack.varlen_utils import VarlenArguments, VarlenManager
 from .blockscaled_fp8_gemm import _tile_atom_to_shape_SF_rank_aware
 
 # Import mixins for GemmGated/GemmDGated from our local files
-from .gemm_gated import (
-    GemmGatedMixin,
-    GemmGatedBlockscaledQuantMixin,
-    BlockscaledQuantOnlyMixin,
-)
+from .gemm_gated import GemmGatedMixin, GemmGatedBlockscaledQuantMixin
 from .gemm_dgated import GemmDGatedMixin, GemmDGatedFP8CLoadMixin
 
 from cutlass.utils import LayoutEnum
@@ -376,19 +372,6 @@ class GemmGatedSm100ZeroMatBlockscaledQuant(GemmGatedBlockscaledQuantMixin, _Gem
     pass
 
 
-class GemmSm100ZeroMatBlockscaledQuant(BlockscaledQuantOnlyMixin, _GemmSm100ZeroMatMixin, GemmSm100):
-    """SM100 GemmDefault + epilogue blockscaled FP8 quant + zero-materialization SFA fix.
-
-    No swiglu, no PostAct.  Used by recompute_z (Option B): backward-only path
-    that re-runs the up-projection GEMM to materialize z_fp8 + scales without
-    paying for y1 (the original y1 was already saved in forward).
-
-    Bit-exactness contract: for the same inputs, this kernel's D and mZScale
-    outputs must match GemmGatedSm100ZeroMatBlockscaledQuant byte-for-byte.
-    """
-    pass
-
-
 class GemmDGatedSm100ZeroMat(GemmDGatedMixin, _GemmSm100ZeroMatMixin, GemmSm100):
     """SM100 GemmDGated with zero-materialization FP8 SFA fix."""
     pass
@@ -568,125 +551,3 @@ def gemm_gated_zeromat(
         b_scale_cute,
     )
     return preact_out, PostAct
-
-
-# ---------------------------------------------------------------------------
-# Non-gated blockscaled FP8 quant wrapper (Option B for recompute_z)
-# ---------------------------------------------------------------------------
-# Mirrors gemm_gated_zeromat() but uses GemmSm100ZeroMatBlockscaledQuant —
-# no swiglu, no PostAct allocation, no postact write.  Only writes z_fp8 (D)
-# and a per-(M, N//32) UE8M0 scale tensor.
-
-def blockscaled_fp8_gemm_zeromat_quant(
-    A: Tensor,              # (T, K) FP8 — T-sized, NOT gathered
-    B: Tensor,              # (E, N, K) — contiguous expert weights (FP8)
-    cu_seqlens_m: Tensor,   # (E+1,) cumulative expert offsets, sums to TK
-    A_idx: Tensor,          # (TK,) gather indices into A
-    a_scales: Tensor,       # TK-sized ISA-packed scales (pre-gathered)
-    b_scales: Tensor,       # Expert weight scales
-    z_fp8_out: Optional[Tensor] = None,    # (TK, N) FP8 — z output (allocated if None)
-    z_scale_out: Optional[Tensor] = None,  # (TK, N//32) uint8 — UE8M0 scale output (allocated if None)
-) -> tuple[Tensor, Tensor]:
-    """Recompute-only kernel: blockscaled FP8 GEMM that ONLY emits z_fp8 + scales.
-
-    Used by `_recompute_z_fp8` (Option B): backward materializes z without
-    paying for swiglu activation, postact register convert, R2S/S2G smem copy,
-    or the y1 TMA store.
-
-    Bit-exactness: the z_fp8_out and z_scale_out bytes produced by this kernel
-    are byte-equal to those produced by `gemm_gated()` with `epilogue_quant=True`
-    on the same (A, B, A_idx, a_scales, b_scales).  Validated by
-    tests/ops/test_recompute_z_optionB.py.
-    """
-    TK = A_idx.shape[0]
-    N = B.shape[-2]
-    K = A.shape[-1]
-    assert N % 32 == 0, f"N must be divisible by 32 for blockscaled scale output, got {N}"
-
-    if z_fp8_out is None:
-        z_fp8_out = torch.empty((TK, N), dtype=torch.float8_e4m3fn, device=A.device)
-    if z_scale_out is None:
-        z_scale_out = torch.empty((TK, N // 32), dtype=torch.uint8, device=A.device)
-
-    L, M, _, _, tensor_infos = GemmWrapperBase.validate_and_prepare_tensors(
-        A, B, z_fp8_out, None, cu_seqlens_m=cu_seqlens_m, A_idx=A_idx
-    )
-    GemmWrapperBase.permute_tensors(tensor_infos, varlen_m=True)
-    major_configs = {
-        "A": ("m", "k", "l"), "B": ("n", "k", "l"),
-        "D": ("m", "n", "l"), "C": ("m", "n", "l"),
-    }
-    GemmWrapperBase.determine_major_orders(tensor_infos, major_configs)
-    for info in tensor_infos.values():
-        if info.tensor is not None:
-            info.dtype = _TORCH_TO_CUTLASS[info.tensor.dtype]
-
-    device_cap = get_device_capacity(A.device)
-    assert device_cap[0] == 10, "Zero-mat quant-only kernel requires SM100 (Blackwell)"
-    GemmCls = GemmSm100ZeroMatBlockscaledQuant
-
-    tile_M, tile_N = 128, 128
-    cluster_M, cluster_N = 1, 1
-    max_active_clusters = get_max_active_clusters(cluster_M * cluster_N)
-
-    for name, info in tensor_infos.items():
-        if info.tensor is not None and name in major_configs:
-            leading_dim = 1 if info.major == major_configs[name][1] else 0
-            info.cute_tensor = _make_cute(info.tensor, leading_dim)
-
-    z_scale_cute = _make_cute(z_scale_out, leading_dim=1)
-    epi_args = GemmCls.EpilogueArguments(mZScale=z_scale_cute)
-    scheduler_args = GemmWrapperBase.create_scheduler_args(max_active_clusters, None, max_swizzle_size=8)
-    varlen_args = GemmWrapperBase.create_varlen_args(cu_seqlens_m, None, A_idx)
-    _stream_obj = torch.cuda.current_stream()
-    current_stream = cuda.CUstream(
-        _stream_obj.stream_base.raw_stream if hasattr(_stream_obj, "stream_base") else _stream_obj.cuda_stream
-    )
-
-    a_scale_cute = _make_cute(a_scales, leading_dim=1)
-    b_scale_cute = _make_cute(b_scales, leading_dim=1)
-
-    compile_key = (
-        "zeromat_quant_only",
-        A.shape[-1], A.dtype,
-        tuple(B.shape), B.dtype,
-        z_fp8_out.dtype,
-        True,  # blockscaled
-    )
-
-    cache = _zeromat_compile_cache
-    if compile_key not in cache:
-        gemm_obj = GemmCls(
-            cutlass.Float32,
-            _TORCH_TO_CUTLASS[A.dtype],
-            (tile_M, tile_N),
-            (cluster_M, cluster_N, 1),
-            gather_A=True,
-            sf_vec_size=32,
-        )
-        cache[compile_key] = cute.compile(
-            gemm_obj,
-            tensor_infos["A"].cute_tensor,
-            tensor_infos["B"].cute_tensor,
-            tensor_infos["D"].cute_tensor,
-            tensor_infos["C"].cute_tensor,
-            epi_args,
-            scheduler_args,
-            varlen_args,
-            current_stream,
-            a_scale_cute,
-            b_scale_cute,
-        )
-    cache[compile_key](
-        tensor_infos["A"].cute_tensor,
-        tensor_infos["B"].cute_tensor,
-        tensor_infos["D"].cute_tensor,
-        tensor_infos["C"].cute_tensor,
-        epi_args,
-        scheduler_args,
-        varlen_args,
-        current_stream,
-        a_scale_cute,
-        b_scale_cute,
-    )
-    return z_fp8_out, z_scale_out
