@@ -33,6 +33,7 @@ from sonicmoe.jit import cpp_jit
         "topk_scores",
         "naept",
         "global_block_cumsum",
+        "score_src_idx",
     },
 )
 @cpp_jit()
@@ -49,6 +50,7 @@ def deepep_topk_metadata_cuda(
     topk_scores: torch.Tensor,
     naept: torch.Tensor,
     global_block_cumsum: torch.Tensor,
+    score_src_idx: torch.Tensor,
     N_recv: int,
     E: int,
     topk: int,

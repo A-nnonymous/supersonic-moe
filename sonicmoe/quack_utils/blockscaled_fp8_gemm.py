@@ -3805,6 +3805,368 @@ def precompute_weight_fp8_for_direct_fused_dgated(
     return result_contiguous  # Return contiguous (direct convention)
 
 
+# ---------------------------------------------------------------------------
+# Fused pair quantize: read bf16 once, produce two transposed FP8 outputs.
+# ---------------------------------------------------------------------------
+# The four per-step prequantize calls do redundant work: each separately
+# permute+contiguous'es the BF16 weight (a strided read + contig write of the
+# full tensor) and then reads it back to compute amax+quantize.  When the same
+# weight is needed in two transposed layouts (forward = scales-along-K,
+# backward = scales-along-N), most of that DRAM traffic is wasted.
+#
+# This fused kernel reads the source BF16 ONCE (strided), and writes:
+#   - output A: fp8 (E, N, K) row-major + ISA-packed scales-along-K
+#   - output B: fp8 (E, K, N) row-major + ISA-packed scales-along-N
+# Per (E, N=128, K=128) tile, both A's and B's ISA scale tile are produced
+# in-flight from registers — no second BF16 read, no .contiguous() copy.
+# ---------------------------------------------------------------------------
+
+
+@wrap_triton_kernel
+@triton.jit
+def _quantize_pair_kernel(
+    src_ptr,                    # bf16, any-stride (E, N, K) view
+    A_fp8_ptr, A_packed_scale_ptr,
+    B_fp8_ptr, B_packed_scale_ptr,
+    E, N, K,
+    src_stride_e, src_stride_n, src_stride_k,
+    A_stride_e, A_stride_n, A_stride_k,
+    B_stride_e, B_stride_k, B_stride_n,
+    A_k_tiles_per_row, B_k_tiles_per_row,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SF_TILE_M: tl.constexpr,
+    SF_TILE_STORAGE: tl.constexpr,
+    GROUPS_PER_TILE_K: tl.constexpr,   # BLOCK_K / GROUP_SIZE  (e.g. 4)
+    GROUPS_PER_TILE_N: tl.constexpr,   # BLOCK_N / GROUP_SIZE  (e.g. 4)
+):
+    """Fuse two transposed blockscaled FP8 quantizations into one kernel.
+
+    Per program (e, n_tile, k_tile):
+      1. Load BLOCK_N × BLOCK_K bf16 tile from src (strided).
+      2. For each of GROUPS_PER_TILE_K K-groups (size GROUP_SIZE=32):
+           - per-row amax over the group → BLOCK_N E8M0 scales for A.
+           - quantize and store fp8 to A.
+           - pack 4 scale bytes per N-row into uint32; store to A's ISA tile.
+      3. For each of GROUPS_PER_TILE_N N-groups (size GROUP_SIZE=32):
+           - per-col amax over the group → BLOCK_K E8M0 scales for B.
+           - quantize and store fp8 to B (transposed offsets).
+           - pack 4 scale bytes per K-row into uint32; store to B's ISA tile.
+    """
+    e = tl.program_id(0)
+    n_tile = tl.program_id(1)
+    k_tile = tl.program_id(2)
+
+    n_offs = n_tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    k_offs = k_tile * BLOCK_K + tl.arange(0, BLOCK_K)
+    n_mask = n_offs < N
+    k_mask = k_offs < K
+    tile_mask = n_mask[:, None] & k_mask[None, :]
+
+    # int64 base pointers to avoid stride*index overflow on multi-GB tensors
+    src_e_base = src_ptr + e.to(tl.int64) * src_stride_e
+    src_ptrs = (
+        src_e_base
+        + n_offs[:, None].to(tl.int64) * src_stride_n
+        + k_offs[None, :].to(tl.int64) * src_stride_k
+    )
+    vals = tl.load(src_ptrs, mask=tile_mask, other=0.0).to(tl.float32)
+    abs_vals = tl.abs(vals)
+
+    # ------------------------------------------------------------------
+    # Output A: scales along K, layout (E, N, K) row-major
+    # ------------------------------------------------------------------
+    # Per-row amax for each of the 4 K-groups in this tile.
+    abs_grouped_k = tl.reshape(abs_vals, (BLOCK_N, GROUPS_PER_TILE_K, GROUP_SIZE))
+    row_amax = tl.max(abs_grouped_k, axis=2)              # (BLOCK_N, GROUPS_PER_TILE_K)
+
+    amax_bits = row_amax.to(tl.int32, bitcast=True)
+    biased_exp = (amax_bits >> 23) & 0xFF
+    mantissa_bits = amax_bits & 0x7FFFFF
+    carry = tl.where(mantissa_bits > 0x600000, 1, 0)
+    e8m0_i32 = biased_exp - 8 + carry
+    e8m0_i32 = tl.where(biased_exp > 0, e8m0_i32, 0)
+    e8m0_clamped_a = tl.maximum(e8m0_i32, 0)
+    quant_exp = 254 - e8m0_i32
+    quant_exp = tl.maximum(tl.minimum(quant_exp, 254), 1)
+    quant_scale_a = (quant_exp.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+    # broadcast scale to (BLOCK_N, GROUPS_PER_TILE_K, GROUP_SIZE) → (BLOCK_N, BLOCK_K)
+    quant_scale_a_full = tl.reshape(
+        tl.broadcast_to(quant_scale_a[:, :, None], (BLOCK_N, GROUPS_PER_TILE_K, GROUP_SIZE)),
+        (BLOCK_N, BLOCK_K),
+    )
+    fp8_a = (vals * quant_scale_a_full).to(tl.float8e4nv)
+
+    A_e_base = A_fp8_ptr + e.to(tl.int64) * A_stride_e
+    A_ptrs = (
+        A_e_base
+        + n_offs[:, None].to(tl.int64) * A_stride_n
+        + k_offs[None, :].to(tl.int64) * A_stride_k
+    )
+    tl.store(A_ptrs, fp8_a, mask=tile_mask)
+
+    # Pack 4 K-group scale bytes per N-row into one uint32 word.
+    # e8m0_clamped_a is (BLOCK_N, GROUPS_PER_TILE_K). Build uint32 per row:
+    g_idx = tl.arange(0, GROUPS_PER_TILE_K)
+    packed_a = tl.sum((e8m0_clamped_a & 0xFF) << (g_idx[None, :] * 8), axis=1)
+
+    # ISA layout: tile_base = (row_tile * k_tiles + k_tile_idx) * SF_TILE_STORAGE.
+    # Match the layout of the existing kernel which reshapes (E, N, K) -> (E*N, K)
+    # and uses a global 2D row_tile.  Since N % SF_TILE_M == 0, the per-expert
+    # offset is exactly e * (N / SF_TILE_M).
+    row_tile_a = e * (N // SF_TILE_M) + n_tile
+    row_in_tile = tl.arange(0, BLOCK_N) % SF_TILE_M
+    row_off_a = (row_in_tile % 32) * 16 + (row_in_tile // 32) * 4
+    tile_base_a = (row_tile_a * A_k_tiles_per_row + k_tile).to(tl.int64) * SF_TILE_STORAGE
+    A_scale_i32_ptr = A_packed_scale_ptr.to(tl.pointer_type(tl.int32))
+    tl.store(A_scale_i32_ptr + (tile_base_a + row_off_a.to(tl.int64)) // 4, packed_a, mask=n_mask)
+
+    # ------------------------------------------------------------------
+    # Output B: scales along N (= rows of B's (E, K, N) layout), transposed
+    # ------------------------------------------------------------------
+    # Per-col amax for each of the 4 N-groups in this tile.
+    abs_grouped_n = tl.reshape(abs_vals, (GROUPS_PER_TILE_N, GROUP_SIZE, BLOCK_K))
+    col_amax = tl.max(abs_grouped_n, axis=1)              # (GROUPS_PER_TILE_N, BLOCK_K)
+
+    amax_bits_b = col_amax.to(tl.int32, bitcast=True)
+    biased_exp_b = (amax_bits_b >> 23) & 0xFF
+    mantissa_bits_b = amax_bits_b & 0x7FFFFF
+    carry_b = tl.where(mantissa_bits_b > 0x600000, 1, 0)
+    e8m0_i32_b = biased_exp_b - 8 + carry_b
+    e8m0_i32_b = tl.where(biased_exp_b > 0, e8m0_i32_b, 0)
+    e8m0_clamped_b = tl.maximum(e8m0_i32_b, 0)
+    quant_exp_b = 254 - e8m0_i32_b
+    quant_exp_b = tl.maximum(tl.minimum(quant_exp_b, 254), 1)
+    quant_scale_b = (quant_exp_b.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+    quant_scale_b_full = tl.reshape(
+        tl.broadcast_to(quant_scale_b[:, None, :], (GROUPS_PER_TILE_N, GROUP_SIZE, BLOCK_K)),
+        (BLOCK_N, BLOCK_K),
+    )
+    fp8_b_NK = (vals * quant_scale_b_full).to(tl.float8e4nv)
+    # B is laid out (E, K, N): we wrote N as outer, K as inner — store at
+    # B[e, k_offs, n_offs] with strides (B_stride_k, B_stride_n).
+    B_e_base = B_fp8_ptr + e.to(tl.int64) * B_stride_e
+    B_ptrs = (
+        B_e_base
+        + n_offs[:, None].to(tl.int64) * B_stride_n      # N is the inner dim of B's row layout
+        + k_offs[None, :].to(tl.int64) * B_stride_k      # K is the row dim
+    )
+    tl.store(B_ptrs, fp8_b_NK, mask=tile_mask)
+
+    # Pack 4 N-group scale bytes per K-row into one uint32 word. e8m0_clamped_b
+    # is (GROUPS_PER_TILE_N, BLOCK_K) — transpose semantically: each K-row
+    # gets GROUPS_PER_TILE_N scale bytes (one per N-group).
+    g2_idx = tl.arange(0, GROUPS_PER_TILE_N)
+    packed_b = tl.sum((e8m0_clamped_b & 0xFF) << (g2_idx[:, None] * 8), axis=0)  # (BLOCK_K,)
+
+    # B's M-axis is K (since B has shape (E, K, N) row-major). Match 2D-reshape
+    # layout: row_tile_b = e * (K / SF_TILE_M) + k_tile.
+    row_tile_b = e * (K // SF_TILE_M) + k_tile
+    row_in_tile_b = tl.arange(0, BLOCK_K) % SF_TILE_M
+    row_off_b = (row_in_tile_b % 32) * 16 + (row_in_tile_b // 32) * 4
+    tile_base_b = (row_tile_b * B_k_tiles_per_row + n_tile).to(tl.int64) * SF_TILE_STORAGE
+    B_scale_i32_ptr = B_packed_scale_ptr.to(tl.pointer_type(tl.int32))
+    tl.store(B_scale_i32_ptr + (tile_base_b + row_off_b.to(tl.int64)) // 4, packed_b, mask=k_mask)
+
+
+def _quantize_weight_pair_3d_triton(
+    src_enk: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Single-pass dual quantize of an (E, N, K) bf16 tensor.
+
+    Returns four tensors:
+        (A_fp8 (E, N, K), A_scales packed,  B_fp8 (E, K, N), B_scales packed)
+
+    A is the "scales along K" layout (forward GEMM convention).
+    B is the "scales along N" layout (transposed; backward GEMM convention).
+    """
+    assert src_enk.dtype == torch.bfloat16, "pair quantize requires bf16 src"
+    assert src_enk.ndim == 3, "expected (E, N, K) shape"
+    E, N, K = src_enk.shape
+    assert N % _SF_TILE_M == 0 and K % _SF_TILE_K == 0, (
+        f"pair-quantize fast path requires N%{_SF_TILE_M}==0 and K%{_SF_TILE_K}==0, got N={N} K={K}"
+    )
+
+    BLOCK_N = _SF_TILE_M       # 128
+    BLOCK_K = _SF_TILE_K       # 128
+    GROUP_SIZE = _SF_VEC_SIZE  # 32
+    groups_per_tile_k = BLOCK_K // GROUP_SIZE
+    groups_per_tile_n = BLOCK_N // GROUP_SIZE
+
+    A_fp8 = torch.empty((E, N, K), dtype=torch.float8_e4m3fn, device=src_enk.device)
+    B_fp8 = torch.empty((E, K, N), dtype=torch.float8_e4m3fn, device=src_enk.device)
+
+    A_per_batch = _storage_per_batch(N, K)
+    B_per_batch = _storage_per_batch(K, N)
+    A_scales = torch.empty((E, A_per_batch), dtype=torch.uint8, device=src_enk.device)
+    B_scales = torch.empty((E, B_per_batch), dtype=torch.uint8, device=src_enk.device)
+
+    A_k_tiles = K // _SF_TILE_K
+    B_k_tiles = N // _SF_TILE_K  # B's K-axis is the original N
+
+    grid = (E, _div_up(N, BLOCK_N), _div_up(K, BLOCK_K))
+    _quantize_pair_kernel[grid](
+        src_enk,
+        A_fp8, A_scales,
+        B_fp8, B_scales,
+        E, N, K,
+        src_enk.stride(0), src_enk.stride(1), src_enk.stride(2),
+        A_fp8.stride(0), A_fp8.stride(1), A_fp8.stride(2),
+        B_fp8.stride(0), B_fp8.stride(1), B_fp8.stride(2),
+        A_k_tiles, B_k_tiles,
+        GROUP_SIZE=GROUP_SIZE,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        SF_TILE_M=_SF_TILE_M,
+        SF_TILE_STORAGE=_SF_TILE_STORAGE,
+        GROUPS_PER_TILE_K=groups_per_tile_k,
+        GROUPS_PER_TILE_N=groups_per_tile_n,
+        num_warps=4,
+    )
+    # Per-expert ISA scales are concatenated along last dim by other helpers;
+    # match _quantize_weight_3d_triton's behaviour: when N%SF_TILE_M==0 the
+    # scales for the (E,N,K) tensor are a single contiguous (1, E*per_batch)
+    # block.  Reshape (E, per_batch) → (1, E*per_batch) view-only.
+    A_scales_flat = A_scales.view(1, E * A_per_batch)
+    B_scales_flat = B_scales.view(1, E * B_per_batch)
+    return A_fp8, A_scales_flat.view(_E8M0_DTYPE), B_fp8, B_scales_flat.view(_E8M0_DTYPE)
+
+
+# ---------------------------------------------------------------------------
+# Multi-stream warmup: launch the 4 weight prequantize kernels concurrently
+# on separate CUDA streams.  Each call is HBM-bandwidth-bound but only uses a
+# small fraction of available SMs, so concurrent execution overlaps cleanly.
+# Eliminates ~50% of the per-step warmup wall-clock vs. sequential calls.
+# ---------------------------------------------------------------------------
+_WARMUP_STREAMS: list = []
+
+
+def _get_warmup_streams(n: int = 4) -> list:
+    global _WARMUP_STREAMS
+    if len(_WARMUP_STREAMS) < n:
+        _WARMUP_STREAMS = [torch.cuda.Stream() for _ in range(n)]
+    return _WARMUP_STREAMS[:n]
+
+
+def _cache_pair_w1(w1: torch.Tensor) -> None:
+    """One-pass quantize w1 in both transposed layouts; populate both caches.
+
+    w1 has logical shape (2I, H, E) bf16.  Two consumers want it as:
+      A (forward, fused_gated):  contig (E, 2I, H), scales-along-K=H
+      B (backward, w1T_varlen):  contig (E, H, 2I), scales-along-K=2I
+    A and B are physical transposes of each other in (N, K).  We read the
+    strided bf16 from w1 directly (no .contiguous() copies) and write both.
+    """
+    # Source view in (E, N=2I, K=H) order with original strides.  The four
+    # dims of `_quantize_pair_kernel` are (e, n, k) and the kernel uses
+    # the supplied strides — we don't need a copy.
+    w1_enk = w1.permute(2, 0, 1)  # (E, 2I, H), strided
+    A_fp8, A_scales, B_fp8, B_scales = _quantize_weight_pair_3d_triton(w1_enk)
+
+    # A populates _FUSED_WEIGHT_CACHE (returned as .mT view per the existing
+    # convention of precompute_weight_fp8_for_fused_gated).
+    fused_key = (
+        w1.data_ptr(),
+        _tensor_version(w1),
+        tuple(w1.shape),
+        tuple(w1.stride()),
+    )
+    if len(_FUSED_WEIGHT_CACHE) > 8:
+        _FUSED_WEIGHT_CACHE.clear()
+    _FUSED_WEIGHT_CACHE[fused_key] = (A_fp8.mT, A_scales)
+
+    # B populates _VARLEN_WEIGHT_CACHE keyed under w1.permute(1, 0, 2),
+    # matching what precompute_weight_fp8(w1.permute(1,0,2)) would key on.
+    w1_perm = w1.permute(1, 0, 2)
+    varlen_key = (
+        w1_perm.data_ptr(),
+        _tensor_version(w1_perm),
+        tuple(w1_perm.shape),
+        tuple(w1_perm.stride()),
+    )
+    if len(_VARLEN_WEIGHT_CACHE) > 8:
+        _VARLEN_WEIGHT_CACHE.clear()
+    _VARLEN_WEIGHT_CACHE[varlen_key] = (B_fp8, B_scales)
+
+
+def _cache_pair_w2(w2: torch.Tensor) -> None:
+    """One-pass quantize w2 in both transposed layouts; populate both caches.
+
+    w2 has logical shape (H, I, E) bf16.  Two consumers want it as:
+      A (forward, varlen):                 contig (E, H, I), scales-along-K=I
+      B (backward, direct_fused_dgated):   contig (E, I, H), scales-along-K=H
+    """
+    w2_enk = w2.permute(2, 0, 1)  # (E, H, I), strided
+    A_fp8, A_scales, B_fp8, B_scales = _quantize_weight_pair_3d_triton(w2_enk)
+
+    # A populates _VARLEN_WEIGHT_CACHE keyed on w2.
+    varlen_key = (
+        w2.data_ptr(),
+        _tensor_version(w2),
+        tuple(w2.shape),
+        tuple(w2.stride()),
+    )
+    if len(_VARLEN_WEIGHT_CACHE) > 8:
+        _VARLEN_WEIGHT_CACHE.clear()
+    _VARLEN_WEIGHT_CACHE[varlen_key] = (A_fp8, A_scales)
+
+    # B populates _FUSED_WEIGHT_CACHE under w2's key, with the
+    # ``direct_fused_dgated`` convention: stored as the contiguous (E, I, H)
+    # tensor.  fused_dgated readers create the .mT view on demand.
+    fused_key = (
+        w2.data_ptr(),
+        _tensor_version(w2),
+        tuple(w2.shape),
+        tuple(w2.stride()),
+    )
+    if len(_FUSED_WEIGHT_CACHE) > 8:
+        _FUSED_WEIGHT_CACHE.clear()
+    # precompute_weight_fp8_for_direct_fused_dgated returns the contig tensor
+    # but stores the .mT view in cache so fused_dgated still works.  Mirror.
+    _FUSED_WEIGHT_CACHE[fused_key] = (B_fp8.mT, B_scales)
+
+
+def precompute_weight_fp8_warmup(
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+) -> None:
+    """Warm both forward+backward FP8 weight caches for w1 and w2 concurrently.
+
+    Replaces the four sequential calls::
+
+        precompute_weight_fp8_for_fused_gated(w1)            # UpProj fwd
+        precompute_weight_fp8(w2)                            # DownProj fwd varlen
+        precompute_weight_fp8_for_direct_fused_dgated(w2)    # DownProj bwd dgated
+        precompute_weight_fp8(w1.permute(1, 0, 2))           # UpProj bwd w1T_varlen
+
+    Implementation: a single fused Triton pair-quantize kernel per weight
+    reads the BF16 source ONCE (strided, no .contiguous() copy) and writes
+    both transposed FP8 outputs + both ISA-packed scale tensors in one pass.
+    The two per-weight kernels then run on separate streams so w1 and w2
+    overlap.  Caches populated here are picked up transparently by the
+    existing `precompute_weight_fp8*` lookup paths.
+
+    Parameters
+    ----------
+    w1 : Tensor (2I, H, E) bf16 — UpProj expert weights.
+    w2 : Tensor (H, I, E) bf16 — DownProj expert weights.
+    """
+    streams = _get_warmup_streams(2)
+    cur = torch.cuda.current_stream()
+    fork_ev = cur.record_event()
+    for st in streams:
+        st.wait_event(fork_ev)
+
+    with torch.cuda.stream(streams[0]):
+        _cache_pair_w1(w1)
+    with torch.cuda.stream(streams[1]):
+        _cache_pair_w2(w2)
+
+    for st in streams:
+        cur.wait_event(st.record_event())
+
+
 def blockscaled_fp8_gemm_varlen(
     a: torch.Tensor,
     w: torch.Tensor,

@@ -44,6 +44,18 @@ try:
 except Exception:
     pass
 
+# Async pinned-memory H2D copy plumbing (cherry-picked from PR #14).
+# Eliminates the implicit sync of torch.tensor(list, device=device) on the
+# tpe_dev fast path.
+_HAS_CUDA_ART = False
+try:
+    from cuda.bindings import runtime as cudart
+    from collections import deque
+    _HAS_CUDA_ART = True
+    _pin_memory_queue = deque()
+except Exception:
+    pass
+
 
 # ── Identity-arange cache (per-device) ──────────────────────────────────────
 # s_scatter_idx, s_reverse_scatter_idx, num_activated_expert_per_token_offset
@@ -157,6 +169,11 @@ def deepep_topk_to_sonic_metadata(
     total_pad_rows : int
     N_recv : int
         Number of original received tokens (T for _DownProjection).
+    score_src_idx : Tensor [TK] int32 or None
+        Token-major flat indices (row*topk + col) into dispatched_probs for
+        differentiable score reconstruction.  None when the CUDA kernel is
+        not available (Python fallback); callers must then rebuild via the
+        Triton _build_score_src_idx_kernel.
     """
     N_recv = dispatched_indices.shape[0]
     topk = dispatched_indices.shape[1]
@@ -276,10 +293,60 @@ def deepep_topk_to_sonic_metadata(
         TK_padded,
         total_pad_rows,
         N_recv,
+        None,  # score_src_idx unavailable in Python fallback; caller will rebuild
     )
 
 
 # ── CUDA topk implementation ─────────────────────────────────────────────────
+
+
+def _copy_tpe_h2d_async(tpe_list, device):
+    """Async pinned-memory H2D copy for tokens_per_expert.
+
+    Replaces the implicit-sync `torch.tensor(list, device=device)` path with
+    a true async H2D using cudaMemcpyAsync on a pinned source buffer.
+    Pinned tensors are queued and recycled once their copy event completes.
+    Falls back to the legacy sync path if cuda.bindings is unavailable.
+    """
+    if not _HAS_CUDA_ART:
+        return torch.tensor(tpe_list, dtype=torch.int32, device=device)
+
+    if hasattr(torch, "CUDAPinnedPlace"):
+        cpu_tensor = torch.to_tensor(
+            tpe_list, dtype=torch.int32, place=torch.CUDAPinnedPlace())
+    else:
+        cpu_tensor = torch.tensor(tpe_list, dtype=torch.int32, pin_memory=True)
+    gpu_tensor = torch.empty_like(cpu_tensor, device=device)
+    current_stream = torch.cuda.current_stream(device)
+
+    nbytes = (cpu_tensor.nbytes
+              if hasattr(cpu_tensor, "nbytes")
+              else cpu_tensor.numel() * cpu_tensor.element_size())
+    raw_stream = (current_stream.stream_base.cuda_stream
+                  if hasattr(current_stream, "stream_base")
+                  else current_stream.cuda_stream)
+    (err,) = cudart.cudaMemcpyAsync(
+        gpu_tensor.data_ptr(),
+        cpu_tensor.data_ptr(),
+        nbytes,
+        cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
+        raw_stream,
+    )
+    assert err == cudart.cudaError_t.cudaSuccess, f"cudaMemcpyAsync failed: {err}"
+
+    event = torch.cuda.Event()
+    event.record()
+    _pin_memory_queue.append((cpu_tensor, event))
+
+    while _pin_memory_queue:
+        _, ev = _pin_memory_queue[0]
+        if ev.query():
+            _pin_memory_queue.popleft()
+        else:
+            break
+
+    return gpu_tensor
+
 
 def _deepep_topk_to_sonic_metadata_cuda(
     dispatched_indices: torch.Tensor,
@@ -306,10 +373,7 @@ def _deepep_topk_to_sonic_metadata_cuda(
         tpe_dev.copy_(tokens_per_expert.to(device=device, dtype=torch.int32))
     else:
         tpe_list = list(tokens_per_expert)
-        tpe_dev = _TOPK_CACHE.get_or_alloc(
-            "tpe_dev", (E,), torch.int32, device, zero=False,
-        )
-        tpe_dev.copy_(torch.tensor(tpe_list, dtype=torch.int32, device=device))
+        tpe_dev = _copy_tpe_h2d_async(tpe_list, device)
 
     TK = sum(tpe_list)
     # Compute TK_padded (padded sum)
@@ -324,38 +388,41 @@ def _deepep_topk_to_sonic_metadata_cuda(
         empty_i = torch.empty(0, dtype=torch.int32, device=device)
         empty_f = torch.empty(0, dtype=torch.float32, device=device)
         naept = torch.zeros(N_recv + 1, dtype=torch.int32, device=device)
-        return efo, empty_i, empty_i, empty_i, naept, empty_f, 0, 0, N_recv
+        return efo, empty_i, empty_i, empty_i, naept, empty_f, 0, 0, N_recv, empty_i
 
-    # Cached allocations — only re-alloc when shape grows
-    expert_offsets = _TOPK_CACHE.get_or_alloc(
-        "expert_offsets", (E + 1,), torch.int32, device, zero=False,
-    )
+    # Cached intermediate buffers — these are workspace tensors that are
+    # consumed by the kernel call below within this same stream-sequential
+    # block.  They MUST NOT be saved into autograd ctx (they aren't returned).
+    # Output tensors below are allocated fresh per call so they survive
+    # other layers' forward passes when fwd/bwd are interleaved across layers
+    # (e.g. pipeline parallel, gradient checkpointing).
     seg_starts = _TOPK_CACHE.get_or_alloc(
         "seg_starts", (E,), torch.int32, device, zero=False,
     )
     real_bases = _TOPK_CACHE.get_or_alloc(
         "real_bases", (E,), torch.int32, device, zero=False,
     )
-    x_gather_idx = _TOPK_CACHE.get_or_alloc(
-        "x_gather_idx", (TK_padded,), torch.int32, device, zero=True,
-    )
-    s_scatter_idx = _TOPK_CACHE.get_or_alloc(
-        "s_scatter_idx", (TK_padded,), torch.int32, device, zero=False,
-    )
-    s_reverse_scatter_idx = _TOPK_CACHE.get_or_alloc(
-        "s_reverse_scatter", (TK,), torch.int32, device, zero=False,
-    )
-    topk_scores = _TOPK_CACHE.get_or_alloc(
-        "topk_scores", (TK_padded,), torch.float32, device, zero=True,
-    )
-    naept = _TOPK_CACHE.get_or_alloc(
-        "naept", (N_recv + 1,), torch.int32, device, zero=False,
-    )
 
-    # Workspace: block_hist[B*E] + block_offset[B*E] + completion_flag[1]
+    # ── Output tensors (saved on autograd ctx) — MUST be per-call ────────────
+    # Bug 2026-04: when two MoE layers' forwards run before any backward (true
+    # in pipeline parallel and 1F1B-style schedules), reusing a global cache
+    # for these outputs causes the second forward to overwrite the first
+    # layer's saved metadata, silently corrupting its dw1/dw2/dx grads. The
+    # extra alloc cost is ~5–10 µs total via the torch caching allocator,
+    # negligible vs. the GEMM cost; correctness is non-negotiable.
+    expert_offsets = torch.empty(E + 1, dtype=torch.int32, device=device)
+    x_gather_idx = torch.zeros(TK_padded, dtype=torch.int32, device=device)
+    s_scatter_idx = torch.empty(TK_padded, dtype=torch.int32, device=device)
+    s_reverse_scatter_idx = torch.empty(TK, dtype=torch.int32, device=device)
+    topk_scores = torch.zeros(TK_padded, dtype=torch.float32, device=device)
+    naept = torch.empty(N_recv + 1, dtype=torch.int32, device=device)
+    score_src_idx = torch.empty(TK, dtype=torch.int32, device=device)
+
+    # Workspace: block_hist[B*E] + block_offset[B*E] + block_naept_sum[B] +
+    # block_naept_base[B] + 1 (legacy completion_flag tail).
     num_blocks = (N_recv + 31) // 32  # ROWS_PER_BLOCK = 32
     cumsum_workspace = _TOPK_CACHE.get_or_alloc(
-        "cumsum_workspace", (2 * num_blocks * E + 1,), torch.int32, device, zero=False,
+        "cumsum_workspace", (2 * num_blocks * E + 2 * num_blocks + 1,), torch.int32, device, zero=False,
     )
 
     _stream_obj = torch.cuda.current_stream(device)
@@ -374,6 +441,7 @@ def _deepep_topk_to_sonic_metadata_cuda(
         topk_scores=topk_scores,
         naept=naept,
         global_block_cumsum=cumsum_workspace,
+        score_src_idx=score_src_idx,
         N_recv=N_recv,
         E=E,
         topk=topk,
@@ -399,6 +467,7 @@ def _deepep_topk_to_sonic_metadata_cuda(
         TK_padded,
         total_pad_rows,
         N_recv,
+        score_src_idx,
     )
 
 

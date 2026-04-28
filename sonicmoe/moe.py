@@ -23,6 +23,7 @@ from .quack_utils import (
     precompute_weight_fp8,
     precompute_weight_fp8_for_fused_gated,
     precompute_weight_fp8_for_direct_fused_dgated,
+    precompute_weight_fp8_warmup,
     quantize_and_pack_activation,
 )
 
@@ -284,16 +285,24 @@ class MoE(nn.Module):
         w1_perm = w1.permute(1, 2, 0)  # (2I, H, E)
         w2_perm = w2.permute(1, 2, 0)  # (H, I, E)
 
-        # Layout 1: w1 for fused_gated forward — writes _FUSED_WEIGHT_CACHE
+        # Single-pass fused warmup: read each weight ONCE (strided BF16) and
+        # write all four transposed FP8 layouts + ISA-packed scales in one
+        # Triton kernel per weight, on parallel streams.  ~3x faster than the
+        # old four-call sequence (943 µs -> 297 µs at H=3072 I=1536 E=8) and
+        # bit-exact (see tests/ops/test_precompute_weight_fp8_warmup.py).
+        precompute_weight_fp8_warmup(w1_perm, w2_perm)
+
+        # Cache lookups (zero quantize work — everything was just populated above).
+        # Layout 1: w1 for fused_gated forward — reads _FUSED_WEIGHT_CACHE
         self._fp8_w1_fused = precompute_weight_fp8_for_fused_gated(w1_perm)
 
-        # Layout 2: w2 for varlen down-proj forward — writes _VARLEN_WEIGHT_CACHE
+        # Layout 2: w2 for varlen down-proj forward — reads _VARLEN_WEIGHT_CACHE
         self._fp8_w2_varlen = precompute_weight_fp8(w2_perm)
 
-        # Layout 3: w2 for direct_fused_dgated backward — writes _FUSED_WEIGHT_CACHE
+        # Layout 3: w2 for direct_fused_dgated backward — reads _FUSED_WEIGHT_CACHE
         self._fp8_w2_dgated = precompute_weight_fp8_for_direct_fused_dgated(w2_perm)
 
-        # Layout 4: w1T for varlen actgrad backward — writes _VARLEN_WEIGHT_CACHE
+        # Layout 4: w1T for varlen actgrad backward — reads _VARLEN_WEIGHT_CACHE
         self._fp8_w1T_varlen = precompute_weight_fp8(w1_perm.permute(1, 0, 2))  # (H, 2I, E)
 
     @torch.no_grad()
