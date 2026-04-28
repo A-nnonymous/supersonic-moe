@@ -28,6 +28,7 @@
 | `ncu_profile_quant.py` | NCU profiling script for CuTe DSL vs Triton blockscaled FP8 quant kernels. | — |
 | `ncu_profile_wgrad_quant.py` | NCU profiling script for wgrad colwise/fused-transpose quant kernels. | — |
 | `nsys_benchmark.py` | nsys-compatible benchmark: BF16 vs FP8 with NVTX markers. | — |
+| `parse_nsys_per_iter.py` | Generic nsys-sqlite GPU-projection per-iter parser; reads NVTX-bracketed ranges from a `.sqlite` and reports per-iter wall + per-kernel breakdown. | Session 67 |
 | `nsys_session42_v2.sh` | Shell helper for nsys session42 v2. | — |
 | `precision_audit.py` | Quick end-to-end precision audit: FP8 vs BF16 per-tensor comparison. | — |
 | `rigorous_benchmark_s42.py` | Rigorous benchmark: 3 modes × 3 seeds × 3 repeats, subprocess-isolated. | — |

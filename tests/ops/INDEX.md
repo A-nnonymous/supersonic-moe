@@ -57,6 +57,9 @@
 | File | What it validates | Run command |
 | --- | --- | --- |
 | `test_mlpnode_correctness_large.py` | **Session 66 regression** for the two topk-metadata kernel bugs (Class A grid-spinwait deadlock, Class B grid-cap silent corruption). 9 cases × 5 tensors (out/dx/ds/dw1/dw2) vs BF16 gold; SEQ up to 16384 (TK=131072); skew/extreme/holes/0-token-expert. Subprocess-per-case + 600s hard timeout. | `CUDA_VISIBLE_DEVICES=7 $EBVENV/bin/python tests/ops/test_mlpnode_correctness_large.py` |
+| `test_recompute_z.py` | **Session 67** focused validation of `recompute_z` mode: numeric equivalence (out/dx/ds/dw1/dw2 vs `recompute_z=False` baseline, FP8 path) + forward peak-memory drop. Subprocess-per-config. | `CUDA_VISIBLE_DEVICES=0 $EBVENV/bin/python tests/ops/test_recompute_z.py` |
+| `audit_iso32_numerics.py` | **Session 67** pure-PyTorch quant→dequant audit comparing iso32 (32×32) vs 1×32 blockscaled FP8 weight quant on uniform/heavy-tail/per-row-variance shapes. Confirmed bit-identical aggregate metrics. | `python tests/ops/audit_iso32_numerics.py` |
+| `bench_iso32_quant_nsys.py` | **Session 67** NVTX-bracketed perf microbench for 4 weight shapes; pair with `tools/parse_nsys_per_iter.py`. | `nsys profile -o iso32_bench python tests/ops/bench_iso32_quant_nsys.py && python tools/parse_nsys_per_iter.py iso32_bench.sqlite` |
 
 ## Profiling / nsys benches
 

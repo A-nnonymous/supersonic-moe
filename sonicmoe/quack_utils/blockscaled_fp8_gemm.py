@@ -3576,16 +3576,22 @@ def quantize_and_pack_weight_iso32(
 
 def _quantize_weight_3d_triton(
     w_enk: torch.Tensor,
-    *, isotropic: bool = True,
+    *, isotropic: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Quantize a contiguous 3D (E, N, K) weight tensor using the fast Triton kernel.
 
-    When isotropic=True (default), uses 32×32 block quantization where all 32
-    rows in a block share the same E8M0 scale.  This makes the quantized data
-    transpose-compatible: the transposed fp8 tensor has valid scales (same value
-    for both row and column access patterns within each 32×32 tile).
+    Default is per-row 1×32 blockscaled FP8 (same format as activations).
 
-    When isotropic=False, falls back to standard 1×32 row-wise quantization.
+    The legacy ``isotropic=True`` mode uses 32×32 block quantization where all 32
+    rows in a tile share one E8M0 scale. That mode was originally intended for
+    transpose-reuse (one quant for both forward and wgrad), but the current code
+    paths re-quantize the transpose from BF16 anyway, so the property is unused.
+    Iso32 is also strictly equal-or-worse in precision (E4M3 floating-point rounding
+    means a different scale just shifts the precision window — see
+    ``tests/ops/audit_iso32_numerics.py``) and offers no measurable speed advantage
+    (see ``tests/ops/bench_iso32_quant_nsys.py``). Kept opt-in only for back-compat
+    with any external caller that still relies on the byte-identical transpose
+    invariant; **do not add new callers**.
 
     Exploits the fact that when N % SF_TILE_M == 0, the ISA scale tile boundaries
     align perfectly at expert boundaries. So (E, N, K) can be reshaped to (E*N, K),
