@@ -44,18 +44,14 @@ try:
 except Exception:
     pass
 
-# Async pinned-memory H2D copy plumbing (cherry-picked from PR #14).
-# Eliminates the implicit sync of torch.tensor(list, device=device) on the
-# tpe_dev fast path.
 _HAS_CUDA_ART = False
 try:
     from cuda.bindings import runtime as cudart
     from collections import deque
     _HAS_CUDA_ART = True
-    _pin_memory_queue = deque()
+    pin_memory_queue = deque()
 except Exception:
     pass
-
 
 # ── Identity-arange cache (per-device) ──────────────────────────────────────
 # s_scatter_idx, s_reverse_scatter_idx, num_activated_expert_per_token_offset
@@ -297,6 +293,44 @@ def deepep_topk_to_sonic_metadata(
     )
 
 
+def _copy_tpe_h2d_async(tpe_list: list[int], device: str):
+    """
+    Copy a list of ints to the device fully asynchronously.
+    The host buffer is queued until the copy has completed to avoid broken content.
+    """
+    if not _HAS_CUDA_ART:
+        return torch.tensor(tpe_list, dtype=torch.int32, device=device)
+
+    if hasattr(torch, "CUDAPinnedPlace"):
+        cpu_tensor = torch.to_tensor(tpe_list, dtype=torch.int32, place=torch.CUDAPinnedPlace())
+    else:
+        cpu_tensor = torch.tensor(tpe_list, dtype=torch.int32, pin_memory=True)
+    gpu_tensor = torch.empty_like(cpu_tensor, device=device)
+    current_stream = torch.cuda.current_stream(device)
+
+    (err,) = cudart.cudaMemcpyAsync(
+        gpu_tensor.data_ptr(),
+        cpu_tensor.data_ptr(),
+        cpu_tensor.nbytes if hasattr(cpu_tensor, "nbytes") else cpu_tensor.size * cpu_tensor.itemsize,
+        cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
+        getattr(current_stream, "stream_base", current_stream).cuda_stream,
+    )
+    assert err == cudart.cudaError_t.cudaSuccess, f"cudaMemcpyAsync failed: {err}"
+
+    event = torch.cuda.Event()
+    event.record()
+    pin_memory_queue.append((cpu_tensor, event))
+
+    while pin_memory_queue:
+        _, event = pin_memory_queue[0]
+        if event.query():
+            pin_memory_queue.popleft()
+        else:
+            break
+
+    return gpu_tensor
+
+
 # ── CUDA topk implementation ─────────────────────────────────────────────────
 
 
@@ -373,7 +407,7 @@ def _deepep_topk_to_sonic_metadata_cuda(
         tpe_dev.copy_(tokens_per_expert.to(device=device, dtype=torch.int32))
     else:
         tpe_list = list(tokens_per_expert)
-        tpe_dev = _copy_tpe_h2d_async(tpe_list, device)
+        tpe_dev = _copy_tpe_h2d_async(tokens_per_expert, device)
 
     TK = sum(tpe_list)
     # Compute TK_padded (padded sum)
@@ -388,20 +422,16 @@ def _deepep_topk_to_sonic_metadata_cuda(
         empty_i = torch.empty(0, dtype=torch.int32, device=device)
         empty_f = torch.empty(0, dtype=torch.float32, device=device)
         naept = torch.zeros(N_recv + 1, dtype=torch.int32, device=device)
-        return efo, empty_i, empty_i, empty_i, naept, empty_f, 0, 0, N_recv, empty_i
+        return efo, empty_i, empty_i, empty_i, naept, empty_f, 0, 0, N_recv
 
-    # Cached intermediate buffers — these are workspace tensors that are
-    # consumed by the kernel call below within this same stream-sequential
-    # block.  They MUST NOT be saved into autograd ctx (they aren't returned).
-    # Output tensors below are allocated fresh per call so they survive
-    # other layers' forward passes when fwd/bwd are interleaved across layers
-    # (e.g. pipeline parallel, gradient checkpointing).
-    seg_starts = _TOPK_CACHE.get_or_alloc(
-        "seg_starts", (E,), torch.int32, device, zero=False,
-    )
-    real_bases = _TOPK_CACHE.get_or_alloc(
-        "real_bases", (E,), torch.int32, device, zero=False,
-    )
+    expert_offsets = torch.empty([E + 1], dtype=torch.int32)
+    seg_starts = torch.empty([E], dtype=torch.int32)
+    real_bases = torch.empty([E], dtype=torch.int32)
+    x_gather_idx = torch.zeros([TK_padded], dtype=torch.int32)
+    s_scatter_idx = torch.empty([TK_padded], dtype=torch.int32)
+    s_reverse_scatter_idx = torch.empty([TK], dtype=torch.int32)
+    topk_scores = torch.zeros([TK_padded], dtype=torch.float32)
+    naept = torch.empty([N_recv + 1], dtype=torch.int32)
 
     # ── Output tensors (saved on autograd ctx) — MUST be per-call ────────────
     # Bug 2026-04: when two MoE layers' forwards run before any backward (true
@@ -421,9 +451,7 @@ def _deepep_topk_to_sonic_metadata_cuda(
     # Workspace: block_hist[B*E] + block_offset[B*E] + block_naept_sum[B] +
     # block_naept_base[B] + 1 (legacy completion_flag tail).
     num_blocks = (N_recv + 31) // 32  # ROWS_PER_BLOCK = 32
-    cumsum_workspace = _TOPK_CACHE.get_or_alloc(
-        "cumsum_workspace", (2 * num_blocks * E + 2 * num_blocks + 1,), torch.int32, device, zero=False,
-    )
+    cumsum_workspace = torch.empty([2 * num_blocks * E + 1], dtype=torch.int32)
 
     _stream_obj = torch.cuda.current_stream(device)
     stream = _stream_obj.stream_base.raw_stream if hasattr(_stream_obj, "stream_base") else _stream_obj.cuda_stream
