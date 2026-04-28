@@ -111,6 +111,52 @@ Commits on `myrepo/race-fix-paddle`:
 - 78 µs gap to PyTorch FP8 baseline: probably in routing-region pre-quant; needs a
   per-kernel NCU sweep on the new 4-kernel deepep path. Not chased this session.
 
+### S72.7 — NCU-driven quant kernel optimization (clock-control=none)
+
+**What landed**: tightened the two hottest e8m0 packing kernels in
+`sonicmoe/quack_utils/blockscaled_fp8_gemm.py` to run within ~7-10% of the
+practical HBM ceiling on B30Z, with **byte-identical output** to S72.6.
+
+**Physical limit measured** (memcpy 512MB R+W on B30Z):
+**6258 GB/s practical HBM peak** (~78% of nominal HBM3e). Used as the ceiling.
+
+**`_quantize_and_pack_kernel` (row, e8m0):**
+- Simplified E8M0 math: `where(biased_exp>0, ., 0) → max(.,0)` fused; dropped
+  redundant `clamp(quant_biased_exp, 1, 254)` (proven safe for bf16: e8m0 ≤ 247
+  always, so quant_biased_exp ∈ [7, 254]). 3 fewer ALU ops per group.
+- Bumped `BLOCK_ROWS 32→64`, halving waves/SM (20.76 → 10.38) → less tail effect.
+- Result @ TK=65536 K=H=3072: prod 102.8 → v2 100.6 µs, **+2.1%, 5840 GB/s = 93%
+  of peak.** Across H=3072 / I=1536 / TK ∈ {16k, 32k, 64k}: +0.2%–+2.1%.
+
+**`_colwise_quantize_and_pack_kernel` (col, ISA-packed e8m0):**
+- Same E8M0 simplification.
+- New `GROUPS_PER_BLOCK` constexpr (default 2; falls back to 1 when
+  `num_groups % 2 != 0`) wraps the body in `tl.static_range`, amortizing the
+  dim-related ISA index math (`row_tiles`, `row_in_tile`, `row_base`) across
+  two consecutive K-groups per program.
+- Result @ TK=65536 dim=H=3072: prod 108.6 → v2 104.7 µs, **+3.6%, 5650 GB/s
+  = 90% of peak.** Across H/I × TK ∈ {16k, 32k, 64k}: +0.4%–+3.9%.
+- `num_warps=1` retained (S72 NCU finding still holds: 141-reg blocks need
+  small thread count for occupancy).
+
+**Verification**:
+- Bit-exact via `git worktree add /tmp/sonic-ref HEAD` + side-by-side diff
+  across 13 shape combos including non-aligned (TK=12345, dim=1500), tiny
+  (TK=1, K=32), and gather-fused (TK=65536, src=100k, random gather_idx).
+  All 13 cases: `fp8 bytes==True, scale bytes==True`.
+- Quant test suite: `tests/ops/{test_colwise,test_rowwise,test_fused}_quant.py`
+  → **91 pass**.
+- E2E: `tests/ops/bench_mlpnode_topk_nsys.py` GPU-projection
+  **2787.6 µs/iter** (S72.6 baseline 2793.1 µs) — slight win, no regression.
+  Shipped as `reports/session73_quant_opt.nsys-rep`.
+
+**What it cost / what's left**:
+The kernels are now at 90-93% of practical HBM peak. Further gains would need
+either (a) reducing memory traffic itself (e.g., fuse with adjacent GEMM
+epilogue — already done where possible via `dual_quantize` and the gated
+quant epilogues), or (b) compute-side wins, but ALU% is already 40-50%
+(co-bound), not the headline bottleneck. Diminishing returns from here.
+
 ---
 
 
