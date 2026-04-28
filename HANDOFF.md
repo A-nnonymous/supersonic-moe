@@ -1,7 +1,7 @@
-# HANDOFF — Session 67 (2026-04-29)
+# HANDOFF — Session 68 (2026-04-29)
 
 > **Single source of truth for project state.** `docs/HANDOFF.md` redirects here.
-> Earlier session content (S66 + audit history) preserved verbatim below the **Session 67** block.
+> Earlier session content (S67 + audit history) preserved verbatim below the **Session 68** block.
 
 **Branch**: `session60-ds-fix` on `myrepo` (PFCCLab/supersonic-moe)
 **Hardware**: NVIDIA B30Z (SM103, CUDA 13.0)
@@ -11,7 +11,68 @@
 
 ---
 
-## SESSION 67 DELIVERABLES (current)
+## SESSION 68 DELIVERABLES (current)
+
+Two coupled efforts: (1) attempt **Option B** for `recompute_z` (dedicated non-gated CUTLASS DSL kernel that skips y1/SwiGLU/PostAct in backward); (2) full nsys-timeline per-kernel audit of FP8 frontier overhead at the ERNIE shape.
+
+### S68.1 — Option B kernel implemented but BROKEN on non-uniform routing
+
+**What landed**: a new non-gated `BlockscaledQuantOnlyMixin(GemmDefaultEpiMixin)` (`sonicmoe/quack_utils/gemm_gated.py` ~lines 300-405), concrete class `GemmSm100ZeroMatBlockscaledQuant` (`sonicmoe/quack_utils/gemm_sm100_fp8_zeromat.py`), wrapper `blockscaled_fp8_gemm_zeromat_quant(...)`, and a Layer-1 bit-exact test (`tests/ops/test_recompute_z_optionB.py`).
+
+**The bug**: standalone repro with **non-uniform** expert routing (random ERNIE-style or 80% hot) triggers `cudaErrorIllegalInstruction` the moment Path B runs. With uniform round-robin routing the kernel runs and produces bit-identical bytes vs the gated reference. Inside the live MlpNodeV2 backward path the kernel does not crash but produces all-different output bytes (~24 M / 25 M mismatch) → all gradients become garbage (cos≈0, rrmse≈1.5).
+
+**Suspected cause** (unproven, left for future debug): `_GemmSm100ZeroMatMixin.__call__` builds the SFA layout assuming the gated postact epilogue (which always allocates `mPostAct` smem + `epi_c_smem_layout_staged`); the non-gated mixin omits both. The interaction between zero-mat SFA layout and a no-postact epilogue likely corrupts addressing on non-uniform tile distributions.
+
+**Decision**: Default `_recompute_z_fp8` to **Option A** (rerun gated forward, discard y1 — verified correct). Option B is preserved verbatim and gated by `SONIC_MOE_FP8_RECOMPUTE_OPT_B=1` for future debugging. **Do NOT enable Option B in production.**
+
+### S68.2 — Recompute_z (Option A) end-to-end correctness + cost
+
+- `tests/ops/test_recompute_z.py`: cos=1.000000 / rrmse=0.000000 on out, dx, ds, dw1, dw2 vs no-recompute reference. Forward peak −26 MB.
+- `tests/ops/test_mlpnode_correctness_large.py` with `SONIC_MOE_FP8_RECOMPUTE_Z=1`: **9/9 cases PASS** including `skew80_seq8K_E8`, `extreme_seq8K_E32`, `holes_seq8K_E32`, `tiny_N128_K4_E8`, T up to 16K.
+- nsys cost (T=8192 K=8 E=8 ERNIE shape, 20 iters):
+
+  | Mode | GPU-projection | Δ |
+  |---|---:|---:|
+  | Baseline (recompute_z=False) | **2864.7 µs/iter** | — |
+  | recompute_z=True (Option A) | **3311.4 µs/iter** | **+446.7 (+15.6 %)** |
+
+  Delta exactly = +1 fwd up-proj GEMM (+452 µs) + 1 extra activation FP8 quant (+20 µs) + 1 extra isa-packed gather (+8 µs). 100 % attributable.
+
+### S68.3 — FP8 frontier per-kernel audit
+
+Full report: `reports/session68_overhead_audit.md`. Raw traces:
+`reports/session68_baseline.nsys-rep`, `reports/session68_recompute.nsys-rep`.
+
+Top kernels at baseline (T=8192 K=8 E=8, 2864.7 µs/iter):
+
+| Rank | Kernel | µs/iter | % |
+|----:|---|---:|---:|
+| 1 | quack `GemmDefaultSm100` (wgrad/dgrad-w) | 1234.1 | 43.2 % |
+| 2 | `GemmGatedSm100ZeroMatBlockscaledQuant` (fwd up-proj fused gated+epi-quant) | 449.1 | 15.7 % |
+| 3 | `GemmDGatedFP8CLoad` (bwd down-proj dgrad fused SwiGLU') | 399.8 | 14.0 % |
+| 4 | `_colwise_quantize_and_pack_kernel` (FP8 transpose+quant) | 247.5 | 8.6 % |
+| 5 | `_dual_varlen_quantize_kernel` | 163.1 | 5.7 % |
+| 6 | `token_gather_sum_kernel` | 148.2 | 5.2 % |
+| 7 | `_quantize_and_pack_kernel` | 79.7 | 2.8 % |
+
+**Cutlass GEMMs = 73 %**. **Quant/pack/transpose tax = 506 µs/iter (17.7 %)**.
+All FP8 frontier features verified in trace (fused-epilogue maingrad-add wgrad,
+blockscaled gated fwd, blockscaled dgrad with fused SwiGLU').
+
+### S68.4 — Top improvement opportunities (ranked by ROI)
+
+1. **Fuse FP8 transpose+quant into wgrad B-loader** — eliminate the 247 µs/iter `_colwise_quantize_and_pack` round-trip via in-kernel TMA + on-chip transpose. Effort: 2-3 weeks CUTLASS DSL. Projected: 150-200 µs/iter saved.
+2. **Merge the 3 quant kernels into one varlen pass** — the trio (`_dual_varlen_quantize` + `_quantize_and_pack` + `_gather_isa_packed_scales` = 259 µs/iter) traverses the same TK×H tensor 3×. Effort: 1 week triton. Projected: 70-100 µs/iter.
+3. **Fix Option B for recompute_z** — would reclaim ~170 µs/iter of the +447 recompute overhead. Effort: 3 days once SFA-layout vs no-postact interaction is understood.
+4. **Token-gather-sum** (148 µs/iter): replace bf16 scatter-reduce with warp shuffle + block prefix. Effort: 3 days. Projected: 60-90 µs/iter.
+
+Realistic combined savings ~390-470 µs/iter → frontier could land at **2400-2475 µs/iter** (10 % faster than the Session 53 PyTorch reference 2715).
+
+---
+
+## SESSION 67 DELIVERABLES (preserved)
+
+
 
 Two coupled efforts: (1) audit + retire 32×32 isotropic blockscale weight quant, (2) add an opt-in **`recompute_z`** mode that skips storing `z_fp8` in forward and re-runs the up-proj GEMM in backward.
 
