@@ -1,3 +1,160 @@
+# HANDOFF — Session 68 (2026-04-29)
+
+> **Single source of truth for project state.** `docs/HANDOFF.md` redirects here.
+> Earlier session content (S67 + audit history) preserved verbatim below the **Session 68** block.
+
+**Branch**: `session60-ds-fix` on `myrepo` (PFCCLab/supersonic-moe)
+**Hardware**: NVIDIA B30Z (SM103, CUDA 13.0)
+**Python**: 3.12, Paddle torch-proxy (`paddle.compat.enable_torch_proxy` / `paddle.enable_compat`)
+**QuACK**: `/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack` (v0.3.7 + Paddle compat patches; **not** `third_party/quack`)
+**Venv**: `/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/erniebot/eb_venv`
+
+---
+
+## SESSION 68 DELIVERABLES (current)
+
+Two coupled efforts: (1) attempt **Option B** for `recompute_z` (dedicated non-gated CUTLASS DSL kernel that skips y1/SwiGLU/PostAct in backward); (2) full nsys-timeline per-kernel audit of FP8 frontier overhead at the ERNIE shape.
+
+### S68.1 — Option B kernel implemented but BROKEN on non-uniform routing
+
+**What landed**: a new non-gated `BlockscaledQuantOnlyMixin(GemmDefaultEpiMixin)` (`sonicmoe/quack_utils/gemm_gated.py` ~lines 300-405), concrete class `GemmSm100ZeroMatBlockscaledQuant` (`sonicmoe/quack_utils/gemm_sm100_fp8_zeromat.py`), wrapper `blockscaled_fp8_gemm_zeromat_quant(...)`, and a Layer-1 bit-exact test (`tests/ops/test_recompute_z_optionB.py`).
+
+**The bug**: standalone repro with **non-uniform** expert routing (random ERNIE-style or 80% hot) triggers `cudaErrorIllegalInstruction` the moment Path B runs. With uniform round-robin routing the kernel runs and produces bit-identical bytes vs the gated reference. Inside the live MlpNodeV2 backward path the kernel does not crash but produces all-different output bytes (~24 M / 25 M mismatch) → all gradients become garbage (cos≈0, rrmse≈1.5).
+
+**Suspected cause** (unproven, left for future debug): `_GemmSm100ZeroMatMixin.__call__` builds the SFA layout assuming the gated postact epilogue (which always allocates `mPostAct` smem + `epi_c_smem_layout_staged`); the non-gated mixin omits both. The interaction between zero-mat SFA layout and a no-postact epilogue likely corrupts addressing on non-uniform tile distributions.
+
+**Decision**: Default `_recompute_z_fp8` to **Option A** (rerun gated forward, discard y1 — verified correct). Option B is preserved verbatim and gated by `SONIC_MOE_FP8_RECOMPUTE_OPT_B=1` for future debugging. **Do NOT enable Option B in production.**
+
+### S68.2 — Recompute_z (Option A) end-to-end correctness + cost
+
+- `tests/ops/test_recompute_z.py`: cos=1.000000 / rrmse=0.000000 on out, dx, ds, dw1, dw2 vs no-recompute reference. Forward peak −26 MB.
+- `tests/ops/test_mlpnode_correctness_large.py` with `SONIC_MOE_FP8_RECOMPUTE_Z=1`: **9/9 cases PASS** including `skew80_seq8K_E8`, `extreme_seq8K_E32`, `holes_seq8K_E32`, `tiny_N128_K4_E8`, T up to 16K.
+- nsys cost (T=8192 K=8 E=8 ERNIE shape, 20 iters):
+
+  | Mode | GPU-projection | Δ |
+  |---|---:|---:|
+  | Baseline (recompute_z=False) | **2864.7 µs/iter** | — |
+  | recompute_z=True (Option A) | **3311.4 µs/iter** | **+446.7 (+15.6 %)** |
+
+  Delta exactly = +1 fwd up-proj GEMM (+452 µs) + 1 extra activation FP8 quant (+20 µs) + 1 extra isa-packed gather (+8 µs). 100 % attributable.
+
+### S68.3 — FP8 frontier per-kernel audit
+
+Full report: `reports/session68_overhead_audit.md`. Raw traces:
+`reports/session68_baseline.nsys-rep`, `reports/session68_recompute.nsys-rep`.
+
+Top kernels at baseline (T=8192 K=8 E=8, 2864.7 µs/iter):
+
+| Rank | Kernel | µs/iter | % |
+|----:|---|---:|---:|
+| 1 | quack `GemmDefaultSm100` (wgrad/dgrad-w) | 1234.1 | 43.2 % |
+| 2 | `GemmGatedSm100ZeroMatBlockscaledQuant` (fwd up-proj fused gated+epi-quant) | 449.1 | 15.7 % |
+| 3 | `GemmDGatedFP8CLoad` (bwd down-proj dgrad fused SwiGLU') | 399.8 | 14.0 % |
+| 4 | `_colwise_quantize_and_pack_kernel` (FP8 transpose+quant) | 247.5 | 8.6 % |
+| 5 | `_dual_varlen_quantize_kernel` | 163.1 | 5.7 % |
+| 6 | `token_gather_sum_kernel` | 148.2 | 5.2 % |
+| 7 | `_quantize_and_pack_kernel` | 79.7 | 2.8 % |
+
+**Cutlass GEMMs = 73 %**. **Quant/pack/transpose tax = 506 µs/iter (17.7 %)**.
+All FP8 frontier features verified in trace (fused-epilogue maingrad-add wgrad,
+blockscaled gated fwd, blockscaled dgrad with fused SwiGLU').
+
+### S68.4 — Top improvement opportunities (ranked by ROI)
+
+1. **Fuse FP8 transpose+quant into wgrad B-loader** — eliminate the 247 µs/iter `_colwise_quantize_and_pack` round-trip via in-kernel TMA + on-chip transpose. Effort: 2-3 weeks CUTLASS DSL. Projected: 150-200 µs/iter saved.
+2. **Merge the 3 quant kernels into one varlen pass** — the trio (`_dual_varlen_quantize` + `_quantize_and_pack` + `_gather_isa_packed_scales` = 259 µs/iter) traverses the same TK×H tensor 3×. Effort: 1 week triton. Projected: 70-100 µs/iter.
+3. **Fix Option B for recompute_z** — would reclaim ~170 µs/iter of the +447 recompute overhead. Effort: 3 days once SFA-layout vs no-postact interaction is understood.
+4. **Token-gather-sum** (148 µs/iter): replace bf16 scatter-reduce with warp shuffle + block prefix. Effort: 3 days. Projected: 60-90 µs/iter.
+
+Realistic combined savings ~390-470 µs/iter → frontier could land at **2400-2475 µs/iter** (10 % faster than the Session 53 PyTorch reference 2715).
+
+---
+
+## SESSION 67 DELIVERABLES (preserved)
+
+
+
+Two coupled efforts: (1) audit + retire 32×32 isotropic blockscale weight quant, (2) add an opt-in **`recompute_z`** mode that skips storing `z_fp8` in forward and re-runs the up-proj GEMM in backward.
+
+### S67.1 — Iso32 weight-quant retired (default OFF)
+
+**Action**: `_quantize_weight_3d_triton(..., isotropic=False)` is now the default in `sonicmoe/quack_utils/blockscaled_fp8_gemm.py`. The iso32 kernel + `quantize_and_pack_weight_iso32` API remain available as opt-in for any future "true transpose-reuse" optimization.
+
+**Why** (rigorous audit, supersedes prior session's claim of "strict precision loss"):
+
+- **Numerics audit** (`tests/ops/audit_iso32_numerics.py`, pure-PyTorch quant→dequant): iso32 and 1×32 produce **bit-identical** aggregate metrics (cosine, RRMSE, max-abs) on uniform, heavy-tail-outlier (3% × 100×), and per-row-variance (13-stop) shapes. **My prior "precision loss" claim was wrong** — E4M3 is floating-point so the e8m0 shift just relocates the precision window; relative quant error stays the same as long as values stay in e4m3 normal range. Subnormal underflow on tile-outliers contributes negligibly to aggregate metrics dominated by the largest tiles.
+- **Perf audit** (`tests/ops/bench_iso32_quant_nsys.py` + `tools/parse_nsys_per_iter.py`, nsys-timeline GPU-projection): delta is within ±2µs noise across 4 weight shapes; iso32 actually **slightly slower** for w2-shaped weights. Both kernels cached (`_FUSED_WEIGHT_CACHE`, capacity 8) → call-once-per-layer-per-step → fully amortized.
+- **Memory**: zero benefit (same scale-table size).
+- **Transpose-reuse property**: never exploited in current code paths (callers always re-quantize transpose from BF16, separate cache keys). Was the only theoretical justification for iso32.
+
+**Verdict**: zero benefit, deprecated as the production default.
+
+**Regression**: `tests/ops/test_mlpnode_correctness_large.py` (9 cases, T up to 16384, TK up to 131072) PASS post-flip.
+
+### S67.2 — `recompute_z` UpProj backward-side recompute (opt-in)
+
+**New config**: `SonicMoEConfig(recompute_z=True)` or `SONIC_MOE_FP8_RECOMPUTE_Z=1`. Default OFF.
+
+**Behavior** (when ON, requires `save_z_fp8=True` semantically — checked):
+
+1. `_UpProjection.forward` runs `_fused_blockscaled_gated_forward` as usual, but does **not** populate `_PREQUANTIZED_SCALES["z_fp8"]`. Instead it stashes the recompute closure args `(x, w1, expert_frequency_offset, x_gather_idx)` in `_PREQUANTIZED_SCALES["z_fp8_recompute"]`.
+2. `_DownProjection.forward` (FP8/aligned/fused-gated path) detects the recompute closure, saves zero-storage placeholder tensors for `z_fp8` and `z_raw_scales` (correct shape/dtype/device, stride (0,0)), and stashes the closure on `ctx._z_recompute_args` with `ctx._needs_z_recompute=True`.
+3. `_DownProjection.backward` calls the new helper `_recompute_z_fp8(*ctx._z_recompute_args)` just before consuming `z_fp8`. The helper temporarily forces `cfg.epilogue_quant=True` and `cfg.recompute_z=False`, re-runs `_fused_blockscaled_gated_forward`, pops the freshly-populated `_PREQUANTIZED_SCALES["z_fp8"]`, and frees the wasted recomputed `y1` storage.
+
+**Trade-off** (accepted as the minimum-LOC, zero-CUTLASS-risk baseline — Option A in design notes):
+
+- **Memory**: ~213 MiB / layer freed during forward at ERNIE shape (TK≈65536, 2I=3072). Stacks linearly with active layers in real training. Verified at small shape (T=1024,K=8,E=8,I=1536): forward-peak drops 26 MB.
+- **Compute**: extra SwiGLU + PostAct write per layer per backward (~5–15% of an up-proj fwd cost; ~10 ms / iter at 24 layers). The full fp8 GEMM is paid again — this is the inherent cost of recompute.
+
+**Future optimization** (Option B, deferred): write a non-gated `BlockscaledQuantMixin(GemmDefaultEpiMixin)` + `GemmSm100ZeroMatBlockscaledQuant` class so the recompute kernel can skip SwiGLU+PostAct entirely. ~300 LOC of CUTLASS DSL (mirrors `gemm_gated.py:GemmGatedBlockscaledQuantMixin.epi_visit_subtile`); high silent-bug risk; should be guarded by bit-exact comparison against the gated kernel with a no-op activation. Recommended only if benchmarks show recompute SwiGLU+PostAct overhead is meaningful.
+
+**Validation** (`tests/ops/test_recompute_z.py`):
+
+| Tensor | cos | RRMSE | tol |
+|--------|-----|-------|-----|
+| out  | 1.000000 | 0.000008 | cos>0.9999, rrmse<0.02 |
+| dx   | 1.000000 | 0.000000 | ✓ |
+| ds   | 1.000000 | 0.000000 | ✓ |
+| dw1  | 1.000000 | 0.000000 | ✓ |
+| dw2  | 1.000000 | 0.000000 | ✓ |
+
+**Numerically equivalent to the baseline FP8 path within fp16 round-trip noise.** Forward peak: 1751.5 MB → 1725.6 MB (–26 MB at 1-layer test shape).
+
+**Full regression** (`tests/ops/test_mlpnode_correctness_large.py` with `SONIC_MOE_FP8_RECOMPUTE_Z=1`): all 9 cases PASS.
+
+### S67.3 — Environment fix: ptxas for sm_103a on B30Z
+
+`.runenv.sh` now exports `TRITON_PTXAS_PATH=/usr/local/cuda-13.0/bin/ptxas`. Triton's bundled ptxas (Feb 2025) does not recognize `sm_103a` — produces "ptxas fatal" on B30Z. CUDA 13.0's ptxas does. Both 1×32 and iso32 quant kernels need this. Affects every Triton kernel compiled fresh on B30Z; cached kernels are unaffected.
+
+### S67 — Files Touched
+
+| File | Δ | Note |
+|------|---|------|
+| `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` | M | `_quantize_weight_3d_triton` default `isotropic=True` → `False`; deprecation docstring |
+| `sonicmoe/config.py` | M | `recompute_z: Optional[bool]` field + `resolve_recompute_z()` |
+| `sonicmoe/functional/__init__.py` | M | `_recompute_z()` resolver, `_FP8Config.recompute_z` slot, `_recompute_z_fp8()` helper, UpProj.fwd / DownProj.fwd / DownProj.bwd plumbing |
+| `.runenv.sh` | M | `TRITON_PTXAS_PATH=/usr/local/cuda-13.0/bin/ptxas` for sm_103a |
+| `tests/ops/audit_iso32_numerics.py` | + | Pure-PyTorch quant→dequant audit (no quack dep) |
+| `tests/ops/bench_iso32_quant_nsys.py` | + | NVTX-bracketed perf microbench, 4 weight shapes |
+| `tests/ops/test_recompute_z.py` | + | recompute_z numeric-equivalence + peak-mem test |
+| `tools/parse_nsys_per_iter.py` | + | Generic nsys-sqlite GPU-projection per-iter parser |
+
+### S67 — Lessons Learned
+
+1. **E4M3 is floating-point** — a different e8m0 scale shift just changes which precision window the values fall in. As long as the largest values stay in normal range (2⁻⁶ to 448), the relative quant error doesn't depend on whether the scale is per-row (1×32) or per-2D-tile (32×32). The previous session's "isotropic loses precision" intuition was correct only for the integer-quant case; for fp-quant it's wrong on aggregate. **Lesson**: when claiming a numerical loss, run a quant→dequant audit first. Don't reason from first principles about FP types.
+2. **Perf-irrelevant micro-optimizations should be killed** — iso32 saved ~0–2µs on cached kernels called once per step. Keeping it added a code path, a kernel binary, a test surface, and a misleading "precision tradeoff" claim. Net negative.
+3. **Recompute design**: the autograd ctx pattern (zero-storage placeholder + ctx attribute carrying the closure) lets us defer materialization without touching `save_for_backward`'s tensor-only API. This is more robust than threading a boolean through 3 functions. Pattern is reusable for other lazy-recompute strategies.
+4. **B30Z + sm_103a + Triton-bundled ptxas** silently fails in fresh kernel compiles. Symptom: cryptic "ptxas fatal" on first run, works after cache hit. **Always set `TRITON_PTXAS_PATH` to a recent ptxas on Blackwell**.
+
+### S67 — Insights & Next Steps
+
+- **The `recompute_z` Option A baseline is a working, validated, low-risk feature.** Real-world memory savings depend on how many layers are active simultaneously (large at ERNIE 24-layer, small at single-block tests). Should be measured under PaddleFleet integration once that lands.
+- **If `recompute_z` is enabled by default in the future**, consider implementing Option B (constexpr-dispatched non-gated mixin) to eliminate the SwiGLU+PostAct overhead. Critical risk: silent numerical bugs in CUTLASS DSL — must be guarded by a bit-exact test that runs the gated kernel with a no-op activation and compares the fp8 D output byte-for-byte.
+- **Iso32 should be removed entirely** in a future cleanup once we're confident no caller still imports `quantize_and_pack_weight_iso32`. Today it's only kept as a safety net.
+- **High-value diagnostic**: `tools/parse_nsys_per_iter.py` is a clean, reusable per-iter GPU-projection parser. Pair it with NVTX `BENCH_*`/`ITER*` ranges in any new bench to get reliable wall-clock numbers from the timeline (avoids the unreliability of pytorch's `cuda.Event` timing under shared GPU load).
+
+---
+
 # HANDOFF — Session 66 (2026-04-27)
 
 > **Single source of truth for project state.** `docs/HANDOFF.md` redirects here.

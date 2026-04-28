@@ -41,8 +41,8 @@ template <int TOPK>
 __global__ __launch_bounds__(BLOCK_DIM)
 void histogram_kernel(
     const int*   __restrict__ dispatched_indices,   // [N_recv, topk]
-    int*         __restrict__ block_hist,            // [scatter_blocks * E] output
-    int*         __restrict__ naept,                 // [N_recv+1] output (entries [1..N_recv])
+    int*         __restrict__ block_hist,            // [E * scatter_blocks] output
+    int*         __restrict__ block_naept_sum,       // [scatter_blocks] output: sum of valid_counts in this block
     int          N_recv,
     int          num_experts,
     int          topk_param)
@@ -84,48 +84,151 @@ void histogram_kernel(
     }
     __syncthreads();
 
-    // Write naept per-token count
-    if (row_valid) {
-        naept[global_row + 1] = reg_valid_count;
+    // ── Emit per-block sum of valid_counts (Fusion v2) ────────────────────
+    // Each lane = one row in this block (32 rows/block); reg_valid_count is
+    // identical across all 8 warps for a given lane (recomputed redundantly),
+    // so we only reduce within warp 0. naept[i+1] is NOT written here — the
+    // global exclusive prefix is materialized later by scatter_and_fixup.
+    if (warp_id == 0) {
+        int my_count = row_valid ? reg_valid_count : 0;
+        int sum = my_count;
+        #pragma unroll
+        for (int d = 16; d > 0; d >>= 1) {
+            sum += __shfl_xor_sync(0xFFFFFFFF, sum, d);
+        }
+        if (lane_id == 0) {
+            block_naept_sum[blockIdx.x] = sum;
+        }
     }
 
     // Write per-expert counts for this block to block_hist
+    // Layout: expert-major [E * scatter_blocks] — gives coalesced reads in
+    // block_offset_scan_kernel where each block scans one expert's row.
     for (int e = warp_id; e < num_experts; e += warp_num) {
         int count = __popc(expert_bitmask[e]);
         if (lane_id == 0) {
-            block_hist[blockIdx.x * num_experts + e] = count;
+            block_hist[e * gridDim.x + blockIdx.x] = count;
         }
     }
 }
 
 // ============================================================================
-//  Kernel 1b: Prefix sums (Phase B) — single block, depends on histogram_kernel
+//  Kernel 1b: Per-expert exclusive prefix scan of block_hist row.
 //
-//  Launched with grid=(1, 1, 1), block=(BLOCK_DIM=256, 1, 1) on the same
-//  CUDA stream as histogram_kernel.  Stream ordering gives an implicit
-//  grid-wide barrier between Phase A and Phase B with no spin-wait.
+//  Replaces the serialized B.2 column-scan from the legacy single-block
+//  prefix_sums_kernel.  Grid = E (one block per expert) gives full GPU
+//  occupancy on E ≤ 256.  With expert-major block_hist layout the per-block
+//  read is fully coalesced.
 //
-//  Computes:
-//    B.1  expert_offsets / seg_starts / real_bases  (sequential, thread 0)
-//    B.2  column-wise exclusive prefix sum of block_hist → block_offset
-//    B.3  exclusive prefix sum of naept[1..N_recv] → naept[0..N_recv]
+//  Algorithm: 3-phase block-wide scan
+//    (a) Each thread serially sums its strided chunk → partial[tid].
+//    (b) Block-wide exclusive scan of partial[] using two-level
+//        (warp shuffle + cross-warp shared scan).
+//    (c) Each thread writes per-element exclusive scan starting from its
+//        partial-base into block_offset.
+//
+//  No spin-wait, no cross-block dependencies — fully deterministic.
+// ============================================================================
+static __device__ __forceinline__ int warp_exclusive_scan(int v) {
+    // Hillis-Steele warp-level inclusive scan via __shfl_up_sync, then convert
+    // to exclusive by shifting.
+    const int lane = threadIdx.x & 31;
+    int x = v;
+    #pragma unroll
+    for (int d = 1; d < 32; d <<= 1) {
+        int y = __shfl_up_sync(0xFFFFFFFF, x, d);
+        if (lane >= d) x += y;
+    }
+    // inclusive → exclusive: subtract own value
+    return x - v;
+}
+
+__global__ __launch_bounds__(BLOCK_DIM)
+void block_offset_scan_kernel(
+    const int* __restrict__ block_hist,    // [E * scatter_blocks]
+    int*       __restrict__ block_offset,  // [E * scatter_blocks]
+    int scatter_blocks)
+{
+    const int expert = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    constexpr int warp_num = BLOCK_DIM >> 5;
+
+    const int* hist_row = block_hist  + expert * scatter_blocks;
+    int*       off_row  = block_offset + expert * scatter_blocks;
+
+    extern __shared__ char smem_so[];
+    int* warp_totals = reinterpret_cast<int*>(smem_so);  // [warp_num]
+
+    // Blocked partition: thread tid handles [chunk_lo, chunk_hi) of the row.
+    int chunk_size = (scatter_blocks + BLOCK_DIM - 1) / BLOCK_DIM;
+    int chunk_lo = tid * chunk_size;
+    int chunk_hi = chunk_lo + chunk_size;
+    if (chunk_hi > scatter_blocks) chunk_hi = scatter_blocks;
+    if (chunk_lo > scatter_blocks) chunk_lo = scatter_blocks;
+
+    // Phase (a): each thread sums its contiguous chunk of the row.
+    int partial = 0;
+    for (int i = chunk_lo; i < chunk_hi; i++) {
+        partial += hist_row[i];
+    }
+
+    // Phase (b1): warp-level inclusive scan of partials, then collect totals.
+    int warp_excl = warp_exclusive_scan(partial);
+    int warp_incl = warp_excl + partial;
+    if (lane == 31) warp_totals[warp] = warp_incl;
+    __syncthreads();
+
+    // Phase (b2): exclusive scan of warp totals (one warp).
+    if (warp == 0) {
+        int t = (lane < warp_num) ? warp_totals[lane] : 0;
+        int e = warp_exclusive_scan(t);
+        if (lane < warp_num) warp_totals[lane] = e;
+    }
+    __syncthreads();
+
+    int my_base = warp_totals[warp] + warp_excl;
+
+    // Phase (c): per-thread serial scan over its contiguous chunk.
+    int running = my_base;
+    for (int i = chunk_lo; i < chunk_hi; i++) {
+        int v = hist_row[i];
+        off_row[i] = running;
+        running += v;
+    }
+}
+
+// ============================================================================
+//  Kernel 1c: Tail prefix sums (B.1 expert_offsets + block_naept_sum scan).
+//
+//  Fusion v2: instead of scanning naept[1..N_recv] (~116K elements), we scan
+//  block_naept_sum[0..scatter_blocks] (~3625 elements, 32× smaller). The
+//  per-row exclusive prefix WITHIN each block is then computed on-the-fly by
+//  scatter_and_fixup_kernel from registers and offset by block_naept_base.
+//
+//  Single block, BLOCK_DIM threads.  3-phase block-wide scan
+//  (per-thread serial sum → warp-shuffle exclusive scan of warp totals →
+//   per-thread serial scatter).  Output array block_naept_base holds the
+//   exclusive prefix of block_naept_sum.
 // ============================================================================
 __global__ __launch_bounds__(BLOCK_DIM)
 void prefix_sums_kernel(
     const int*   __restrict__ tokens_per_expert,    // [E]
-    int*         __restrict__ block_hist,            // [scatter_blocks * E] in
-    int*         __restrict__ block_offset,          // [scatter_blocks * E] out
+    const int*   __restrict__ block_naept_sum,       // [scatter_blocks] in
     int*         __restrict__ expert_offsets,        // [E+1] out
     int*         __restrict__ seg_starts,            // [E] out
     int*         __restrict__ real_bases,            // [E] out
-    int*         __restrict__ naept,                 // [N_recv+1] in/out
+    int*         __restrict__ block_naept_base,      // [scatter_blocks] out: exclusive prefix
+    int*         __restrict__ naept,                 // [N_recv+1] (only naept[0] and naept[N_recv] written here)
     int          N_recv,
+    int          scatter_blocks,
     int          num_experts,
-    int          alignment,
-    int          scatter_blocks)
+    int          alignment)
 {
     extern __shared__ char smem[];
-    int* scan_buf = reinterpret_cast<int*>(smem);
+    int* warp_totals = reinterpret_cast<int*>(smem);  // [warp_num]
+    constexpr int warp_num = BLOCK_DIM >> 5;
 
     // --- B.1: Expert offsets (thread 0, O(E) — typically 8..128) ---
     if (threadIdx.x == 0) {
@@ -140,90 +243,62 @@ void prefix_sums_kernel(
             real_cum += count;
             expert_offsets[e + 1] = padded_cum;
         }
-        naept[0] = 0;  // moved out of histogram_kernel — written here for clarity
+        naept[0] = 0;
     }
 
-    // --- B.2: Column-wise exclusive prefix sum of block_hist → block_offset ---
-    // G = BLOCK_DIM / num_experts threads per column; each scans a chunk.
-    // E ≤ 256 assumed (otherwise G == 0).
-    const int G = (num_experts > 0 && num_experts <= BLOCK_DIM)
-                  ? (BLOCK_DIM / num_experts) : 1;
-    const int col_id = threadIdx.x / G;
-    const int local_tid = threadIdx.x % G;
+    // --- B.3 (v2): exclusive prefix scan of block_naept_sum ---
+    //   block_naept_sum has scatter_blocks entries (~3625 at user shape).
+    //   Use BLOCKED partition so each thread owns a contiguous chunk.
+    const int tid  = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
 
-    if (col_id < num_experts) {
-        const int rows_per_thread = (scatter_blocks + G - 1) / G;
-        const int row_start = local_tid * rows_per_thread;
-        const int row_end_val = row_start + rows_per_thread;
-        const int row_end = row_end_val < scatter_blocks ? row_end_val : scatter_blocks;
+    int chunk_size = (scatter_blocks + BLOCK_DIM - 1) / BLOCK_DIM;
+    int chunk_lo = tid * chunk_size;
+    int chunk_hi = chunk_lo + chunk_size;
+    if (chunk_hi > scatter_blocks) chunk_hi = scatter_blocks;
+    if (chunk_lo > scatter_blocks) chunk_lo = scatter_blocks;
 
-        int local_sum = 0;
-        for (int b = row_start; b < row_end; b++) {
-            local_sum += block_hist[b * num_experts + col_id];
+    // (a) per-thread serial sum over contiguous chunk (read-only — no race).
+    int partial = 0;
+    for (int i = chunk_lo; i < chunk_hi; i++) {
+        partial += block_naept_sum[i];
+    }
+
+    // (b1) warp-level exclusive scan of partials.
+    int warp_excl = warp_exclusive_scan(partial);
+    int warp_incl = warp_excl + partial;
+    if (lane == 31) warp_totals[warp] = warp_incl;
+    __syncthreads();
+
+    // (b2) cross-warp exclusive scan + grand total (single warp).
+    __shared__ int grand_total;
+    if (warp == 0) {
+        int t = (lane < warp_num) ? warp_totals[lane] : 0;
+        int e = warp_exclusive_scan(t);
+        if (lane < warp_num) warp_totals[lane] = e;
+        int last_e = __shfl_sync(0xFFFFFFFF, e, warp_num - 1);
+        int last_t = __shfl_sync(0xFFFFFFFF, t, warp_num - 1);
+        if (lane == 0) {
+            grand_total = last_e + last_t;
         }
-
-        scan_buf[threadIdx.x] = local_sum;
-    } else {
-        scan_buf[threadIdx.x] = 0;
     }
     __syncthreads();
 
-    if (col_id < num_experts && local_tid == 0) {
-        int acc = 0;
-        for (int i = 0; i < G; i++) {
-            int val = scan_buf[col_id * G + i];
-            scan_buf[col_id * G + i] = acc;
-            acc += val;
-        }
+    int my_base = warp_totals[warp] + warp_excl;
+
+    // (c) per-thread serial exclusive scatter into block_naept_base
+    //     (separate output buffer → no races).
+    int running = my_base;
+    for (int i = chunk_lo; i < chunk_hi; i++) {
+        int v = block_naept_sum[i];
+        block_naept_base[i] = running;
+        running += v;
     }
-    __syncthreads();
 
-    if (col_id < num_experts) {
-        const int rows_per_thread = (scatter_blocks + G - 1) / G;
-        const int row_start = local_tid * rows_per_thread;
-        const int row_end_val = row_start + rows_per_thread;
-        const int row_end = row_end_val < scatter_blocks ? row_end_val : scatter_blocks;
-
-        int running = scan_buf[threadIdx.x];
-        for (int b = row_start; b < row_end; b++) {
-            int val = block_hist[b * num_experts + col_id];
-            block_offset[b * num_experts + col_id] = running;
-            running += val;
-        }
-    }
-    __syncthreads();  // ensure scan_buf reusable for B.3
-
-    // --- B.3: naept exclusive prefix sum (one block, BLOCK_DIM threads) ---
-    {
-        const int chunk = (N_recv + BLOCK_DIM - 1) / BLOCK_DIM;
-        const int start_idx = threadIdx.x * chunk;
-        const int end_idx_raw = start_idx + chunk;
-        const int end_idx = end_idx_raw < N_recv ? end_idx_raw : N_recv;
-
-        int partial_sum = 0;
-        for (int i = start_idx; i < end_idx; i++) {
-            partial_sum += naept[i + 1];
-        }
-        scan_buf[threadIdx.x] = partial_sum;
-        __syncthreads();
-
-        if (threadIdx.x == 0) {
-            int acc = 0;
-            for (int i = 0; i < BLOCK_DIM; i++) {
-                int val = scan_buf[i];
-                scan_buf[i] = acc;
-                acc += val;
-            }
-            naept[N_recv] = acc;
-        }
-        __syncthreads();
-
-        int running = scan_buf[threadIdx.x];
-        for (int i = start_idx; i < end_idx; i++) {
-            int val = naept[i + 1];
-            naept[i] = running;
-            running += val;
-        }
+    // Total valid count goes into naept[N_recv] (read by downstream consumers).
+    if (tid == 0) {
+        naept[N_recv] = grand_total;
     }
 }
 
@@ -239,15 +314,17 @@ __global__ __launch_bounds__(BLOCK_DIM)
 void scatter_and_fixup_kernel(
     const int*   __restrict__ dispatched_indices,   // [N_recv, topk]
     const float* __restrict__ dispatched_probs,     // [N_recv, topk]
-    const int*   __restrict__ block_offset,          // [scatter_blocks * E]
+    const int*   __restrict__ block_offset,          // [E * scatter_blocks]
+    const int*   __restrict__ block_naept_base,      // [scatter_blocks] (Fusion v2)
     const int*   __restrict__ expert_offsets,        // [E+1] (padded cumsum)
     const int*   __restrict__ seg_starts,            // [E]
     const int*   __restrict__ tokens_per_expert,    // [E]
-    const int*   __restrict__ naept,                 // [N_recv+1]
+    int*         __restrict__ naept,                 // [N_recv+1] OUT (we materialize naept[global_row])
     int*         __restrict__ x_gather_idx,          // [TK_padded] output
     int*         __restrict__ s_scatter_idx,         // [TK_padded] output
     int*         __restrict__ s_reverse_scatter_idx, // [TK] output
     float*       __restrict__ topk_scores,           // [TK_padded] output
+    int*         __restrict__ score_src_idx,         // [TK] output (int32: row*topk + col)
     int          N_recv,
     int          num_experts,
     int          topk_param,
@@ -269,7 +346,7 @@ void scatter_and_fixup_kernel(
         // Load this block's precomputed offsets + init bitmask
         for (int i = threadIdx.x; i < num_experts; i += BLOCK_DIM) {
             expert_bitmask[i] = 0u;
-            my_offset[i] = block_offset[blockIdx.x * num_experts + i];
+            my_offset[i] = block_offset[i * scatter_blocks + blockIdx.x];
         }
         __syncthreads();
 
@@ -287,6 +364,7 @@ void scatter_and_fixup_kernel(
             reg_prob[k] = 0.0f;
         }
 
+        int reg_valid_count = 0;
         #pragma unroll
         for (int col = 0; col < TOPK; col++) {
             if (col >= topk_param) break;
@@ -302,9 +380,26 @@ void scatter_and_fixup_kernel(
                 }
                 reg_expert[col] = expert;
                 reg_prob[col] = prob;
+                reg_valid_count++;
             }
         }
         __syncthreads();
+
+        // ── Fusion v2: per-row exclusive prefix of valid_count within block ──
+        //   Each lane = one row; warp_id 0 owns the canonical row→prefix mapping.
+        //   We also publish naept[global_row] for downstream consumers (e.g.
+        //   score_src_idx tests). Within a block: lane-disjoint writes (no race);
+        //   across blocks: scatter_blocks blocks each write 32 disjoint cells of
+        //   naept[0..N_recv) → no inter-block race. naept[N_recv] is written by
+        //   prefix_sums_kernel and is stream-ordered before scatter.
+        //   reg_valid_count is identical across all 8 warps (each warp recomputed
+        //   from registers using the same data), so warp 0's scan is canonical.
+        int my_count = row_valid ? reg_valid_count : 0;
+        int local_excl = warp_exclusive_scan(my_count);  // exclusive prefix within warp
+        const int naept_base = block_naept_base[blockIdx.x] + local_excl;
+        if (warp_id == 0 && row_valid) {
+            naept[global_row] = naept_base;
+        }
 
         // Assign positions using ballot prefix count (deterministic, stable)
         int reg_padded_pos[MAX_TOPK];
@@ -342,8 +437,6 @@ void scatter_and_fixup_kernel(
         // Compute rank = count of valid expert slots with smaller expert_id
         // to give stable ascending-expert ordering within each token.
         if (row_valid) {
-            const int naept_base = naept[global_row];
-
             #pragma unroll
             for (int k = 0; k < TOPK; k++) {
                 if (k >= topk_param) break;
@@ -368,6 +461,10 @@ void scatter_and_fixup_kernel(
                     s_scatter_idx[padded_pos] = token_major_pos;
                     s_reverse_scatter_idx[token_major_pos] = padded_pos;
                     topk_scores[token_major_pos] = reg_prob[k];
+                    // Score-source flat index: token-major rank → original
+                    // (row * topk + col) flat index into dispatched_probs.
+                    // Bit-exact replacement for _build_score_src_idx_kernel.
+                    score_src_idx[token_major_pos] = global_row * topk_param + k;
                 }
             }
         }
@@ -418,6 +515,7 @@ void deepep_topk_metadata_cuda(
     torch::Tensor& topk_scores,
     torch::Tensor& naept,
     torch::Tensor& global_block_cumsum,  // reused as workspace
+    torch::Tensor& score_src_idx,
     int64_t N_recv,
     int64_t E,
     int64_t topk,
@@ -445,21 +543,26 @@ void deepep_topk_metadata_cuda(
     int* workspace = global_block_cumsum.data_ptr<int>();
     int* block_hist = workspace;
     int* block_offset = workspace + scatter_blocks * E;
+    int* block_naept_sum = workspace + 2 * scatter_blocks * E;
+    int* block_naept_base = workspace + 2 * scatter_blocks * E + scatter_blocks;
 
     // Shared memory for histogram_kernel: expert_bitmask[E]
     int smem_hist = static_cast<int>(E * sizeof(uint32_t));
-    // Shared memory for prefix_sums_kernel: scan_buf[BLOCK_DIM]
-    int smem_prefix = static_cast<int>(BLOCK_DIM * sizeof(int));
+    // Shared memory for block_offset_scan_kernel: warp_totals[warp_num]
+    int smem_scan = static_cast<int>((BLOCK_DIM >> 5) * sizeof(int));
+    // Shared memory for prefix_sums_kernel (tail): warp_totals[warp_num]
+    int smem_prefix = static_cast<int>((BLOCK_DIM >> 5) * sizeof(int));
 
     dim3 grid1(scatter_blocks);
     dim3 block1(BLOCK_DIM);
+    dim3 block_prefix(BLOCK_DIM);
 
-    // ── Kernel 1a: Phase A — per-block histogram (no inter-block sync) ───────
+    // ── Kernel 1a: Phase A — per-block histogram + per-block naept sum ───────
     #define LAUNCH_HIST(TV) \
         histogram_kernel<TV><<<grid1, block1, smem_hist, stream>>>( \
             dispatched_indices.data_ptr<int>(), \
             block_hist, \
-            naept.data_ptr<int>(), \
+            block_naept_sum, \
             static_cast<int>(N_recv), static_cast<int>(E), \
             static_cast<int>(topk));
 
@@ -468,18 +571,21 @@ void deepep_topk_metadata_cuda(
     else { LAUNCH_HIST(16); }
     #undef LAUNCH_HIST
 
-    // ── Kernel 1b: Phase B — prefix sums (single block, runs after 1a) ───────
-    // Stream ordering between 1a and 1b provides the inter-phase grid barrier
-    // that the legacy combined kernel implemented with an ad-hoc spin-wait.
-    prefix_sums_kernel<<<dim3(1), block1, smem_prefix, stream>>>(
+    // ── Kernel 1b: Per-expert column scan of block_hist (parallel grid=E) ────
+    block_offset_scan_kernel<<<dim3(static_cast<int>(E)), block1, smem_scan, stream>>>(
+        block_hist, block_offset, scatter_blocks);
+
+    // ── Kernel 1c: Tail prefix sums (B.1 expert_offsets + scan over per-block sums) ──
+    prefix_sums_kernel<<<dim3(1), block_prefix, smem_prefix, stream>>>(
         tokens_per_expert.data_ptr<int>(),
-        block_hist, block_offset,
+        block_naept_sum,
         expert_offsets.data_ptr<int>(),
         seg_starts.data_ptr<int>(),
         real_bases.data_ptr<int>(),
+        block_naept_base,
         naept.data_ptr<int>(),
-        static_cast<int>(N_recv), static_cast<int>(E),
-        static_cast<int>(alignment), scatter_blocks);
+        static_cast<int>(N_recv), scatter_blocks, static_cast<int>(E),
+        static_cast<int>(alignment));
 
     // ── Kernel 2: Scatter + fixup ────────────────────────────────────────────
     // Grid must cover ALL scatter blocks: scatter phase relies on blockIdx.x
@@ -507,6 +613,7 @@ void deepep_topk_metadata_cuda(
             dispatched_indices.data_ptr<int>(), \
             dispatched_probs.data_ptr<float>(), \
             block_offset, \
+            block_naept_base, \
             expert_offsets.data_ptr<int>(), \
             seg_starts.data_ptr<int>(), \
             tokens_per_expert.data_ptr<int>(), \
@@ -515,6 +622,7 @@ void deepep_topk_metadata_cuda(
             s_scatter_idx.data_ptr<int>(), \
             s_reverse_scatter_idx.data_ptr<int>(), \
             topk_scores.data_ptr<float>(), \
+            score_src_idx.data_ptr<int>(), \
             static_cast<int>(N_recv), static_cast<int>(E), \
             static_cast<int>(topk), static_cast<int>(TK), \
             static_cast<int>(TK_padded), scatter_blocks);
@@ -541,6 +649,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("topk_scores"),
           py::arg("naept"),
           py::arg("global_block_cumsum"),
+          py::arg("score_src_idx"),
           py::arg("N_recv"),
           py::arg("E"),
           py::arg("topk"),

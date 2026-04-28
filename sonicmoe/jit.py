@@ -45,16 +45,28 @@ def _get_cpp_function(function_name: str, module_name: str, source_files: list[s
 
         lock_path = os.path.join(build_directory, f"{module_name}.lock")
         with FileLock(lock_path):
-            module = load_cpp_extension(
-                module_name,
-                sources=source_files,
-                # with_cuda=True,
-                extra_cxx_cflags=extra_cflags,
-                extra_cuda_cflags=extra_cuda_cflags,
-                extra_include_paths=extra_include_paths,
-                build_directory=build_directory,
-                verbose=True,
-            )
+            try:
+                module = load_cpp_extension(
+                    module_name,
+                    sources=source_files,
+                    # with_cuda=True,
+                    extra_cxx_cflags=extra_cflags,
+                    extra_cuda_cflags=extra_cuda_cflags,
+                    extra_include_paths=extra_include_paths,
+                    build_directory=build_directory,
+                    verbose=True,
+                )
+            except TypeError:
+                # Paddle compat shim only accepts the older `extra_cflags`.
+                module = load_cpp_extension(
+                    module_name,
+                    sources=source_files,
+                    extra_cflags=extra_cflags,
+                    extra_cuda_cflags=extra_cuda_cflags,
+                    extra_include_paths=extra_include_paths,
+                    build_directory=build_directory,
+                    verbose=True,
+                )
 
         _ALL_COMPILED_MODULES[module_name] = module
 

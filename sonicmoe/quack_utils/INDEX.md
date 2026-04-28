@@ -19,7 +19,7 @@
 | File | Summary | Notes |
 | --- | --- | --- |
 | `__init__.py` | Package marker and re-export surface. | — |
-| `blockscaled_fp8_gemm.py` | Hot-path Triton FP8 quantization, packing, and cache utilities. | — |
+| `blockscaled_fp8_gemm.py` | Hot-path Triton FP8 quantization, packing, and cache utilities. Includes `precompute_weight_fp8_warmup(w1, w2)` — a fused single-pass Triton pair-quantize kernel that emits all 4 transposed FP8 layouts + ISA-packed scales for w1/w2 in one HBM read per weight (~3.2x faster than the legacy 4-call sequence; bit-exact). | — |
 | `cute_blockscaled_quant.py` | CuTe DSL colwise blockscaled FP8 quantize — v5 with gather + ISA packing. | — |
 | `cute_dual_quant.py` | CuTe DSL dual blockscaled FP8 quantize — [32][33] padded smem design. | — |
 | `epi_blockscaled_quant.py` | Python module for epi blockscaled quant. | — |

@@ -46,6 +46,7 @@ from .blockscaled_fp8_gemm import (
     precompute_weight_fp8_for_direct_fused_dgated,
     precompute_weight_fp8_for_fused_dgated,
     precompute_weight_fp8_for_fused_gated,
+    precompute_weight_fp8_warmup,
     quantize_and_pack_activation,
 )
 from .gemm_interface import gemm_dgated, gemm_gated
