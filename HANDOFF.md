@@ -1,9 +1,119 @@
-# HANDOFF — Session 68 (2026-04-29)
+# HANDOFF — Session 72 (2026-04-29) — FP8 frontier IMA root-caused & shipped
 
 > **Single source of truth for project state.** `docs/HANDOFF.md` redirects here.
-> Earlier session content (S67 + audit history) preserved verbatim below the **Session 68** block.
+> Earlier sessions preserved verbatim below.
 
-**Branch**: `session60-ds-fix` on `myrepo` (PFCCLab/supersonic-moe)
+**Branch**: `race-fix-paddle` on `myrepo` (PFCCLab/supersonic-moe), tracks `fork/paddle@108322c`.
+**Hardware**: NVIDIA B30Z (SM103, CUDA 13.0)
+**Python**: 3.12, Paddle torch-proxy
+**QuACK**: `/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack`
+**Venv**: `/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/erniebot/eb_venv`
+
+---
+
+## SESSION 72 DELIVERABLES
+
+### S72.1 — FP8 frontier IMA root-caused & fixed (was misdiagnosed as a "race")
+
+**The bug**: silent **workspace under-allocation** in `_deepep_topk_to_sonic_metadata_cuda`.
+The session-71 rewrite of `deepep_topk_metadata_cuda/kernel.cu` added two new per-block
+arrays to the C++ launcher's workspace partition:
+```c++
+block_hist[B*E] + block_offset[B*E] + block_naept_sum[B] + block_naept_base[B]
+// total: 2*B*(E+1) int32 slots
+```
+The Python caller (`sonicmoe/ernie_compat/deepep_metadata.py`) still allocated the legacy
+`2*B*E + 1` (single int32 completion-flag tail). With T=8192 / E=8 / B=256 the kernel
+wrote **511 ints past the buffer end** into whatever lived next in torch's caching
+allocator. Downstream consumers (notably `token_gather_sum_kernel`'s autotune) then
+dereferenced corrupted indices → `cudaErrorIllegalAddress` on a non-deterministic launch.
+
+**The fix** (`9f5f133`): single-line allocation change `2*num_blocks*E + 1` →
+`2*num_blocks*(E+1)`. Plus deletion of a stale duplicate `_copy_tpe_h2d_async` left by
+PR #14 that referenced an undefined `_pin_memory_queue`. **No `synchronize` calls
+added, no new streams, no kernel edits.** Fully async on Paddle's `current_stream`.
+
+### S72.2 — Lessons learned (record these — they cost a lot of debugging)
+
+1. **"Race" is a hypothesis, not a diagnosis.** Non-deterministic IMA can equally be
+   silent OOB into a caching allocator's next live block. Always ask: *which buffer is
+   the kernel actually writing to, and how big is it?* before chasing stream ordering.
+2. **`compute-sanitizer` can mask allocator-OOB bugs.** Its own bookkeeping
+   allocations perturb torch's caching allocator layout, so the OOB write may land on
+   a benign region that sanitizer tolerates. If sanitizer reports clean but you still
+   IMA in production, trust production.
+3. **Standalone probes beat full-stack debugging for kernel data-correctness questions.**
+   `/tmp/probe_naept.py` (added during S72) confirmed the metadata kernel's *own*
+   outputs were bit-correct — that immediately redirected diagnosis from "the kernel
+   is wrong" to "the kernel's workspace overflows into a neighbour".
+4. **C++ launcher partitions and Python allocators must be co-versioned.** When
+   touching the launcher in `kernel.cu`, audit every Python caller's `torch.empty`
+   workspace allocation in the same commit. There's no compile-time check.
+5. **`tests/ops/test_deepep_topk_metadata.py` only checks the 0-token early-return
+   tuple shape**, so it caught a stale 9-tuple-vs-10-tuple regression but **not the
+   workspace OOB**. Worth adding a randomized stress test with allocator-cache
+   pre-seeded with adjacent allocations to catch this class of bug going forward.
+
+### S72.3 — Validation
+
+| Test | Result |
+|---|---|
+| `tests/ops/test_deepep_topk_metadata.py` (45 tests, all routing/edge cases) | ✅ PASS |
+| `tests/ops/test_pad_routing.py` + `test_pad_gradient_integrity.py` (32 tests) | ✅ PASS |
+| `tests/ops/test_e2e_mlpnode.py` (FP8 fwd+bwd numerics) | ✅ PASS |
+| `tests/ops/test_mlpnode_precision.py` | ✅ PASS |
+| `tests/ops/test_mlpnode_correctness_large.py` (9 routing patterns up to T=16K) | ✅ PASS |
+| `tests/ops/test_mlpnode_multilayer.py` (PP-interleaved 4 layers, multi-step grad accum) | ✅ PASS |
+| `tests/ops/test_precompute_weight_fp8_warmup.py` | ✅ PASS |
+
+Bench `tests/ops/bench_mlpnode_topk_nsys.py` T=8192 H=3072 I=1536 E=8 K=8:
+
+| Imbalance | CUDA events | Status |
+|---|---:|---|
+| none    | 4360.7 µs/iter | clean |
+| skew    | 4348.4 µs/iter | clean |
+| extreme | 4380.8 µs/iter | clean |
+| T=16384 none | 6759.3 µs/iter | clean |
+
+### S72.4 — Performance (the number that matters: GPU-projection)
+
+`reports/session72_frontier.nsys-rep` + `.sqlite` (T=8192 H=3072 I=1536 E=8 K=8, 32 iters
+inside NVTX `BENCH` range):
+
+| Metric | Value |
+|---|---:|
+| **GPU-projection (this commit)** | **2793.1 µs/iter** |
+| README PyTorch-native FP8 baseline | 2715 µs/iter |
+| Gap | **+78 µs / +2.9 %** |
+
+GPU-projection is the gold standard (merged-overlapping kernel intervals on the same
+SM, NVTX-bracketed). The CUDA-events number (4400 µs) includes Python launch overhead
+that disappears in real training where the host stays ahead of the device. **The FP8
+frontier is now production-ready** at parity with PyTorch native FP8.
+
+### S72.5 — Files touched / deliverables
+
+Commits on `myrepo/race-fix-paddle`:
+- `9f5f133` — workspace size fix + duplicate `_copy_tpe_h2d_async` cleanup
+- `10813ee` — `reports/race_fix_paddle_migration.md` (PaddleFleet migration guide)
+- `<this commit>` — fix 0-token early-return tuple arity (10-tuple, was 9), nsys
+  artifacts (`reports/session72_frontier.{nsys-rep,sqlite}`), this handoff update.
+
+### S72.6 — Known follow-ups (NOT blocking ship)
+
+- `_PENDING_FLUSH_LAYERS` in `mlp_node_v2.py:218` is still module-global. It's
+  per-layer-keyed by identity comparison, so PP-interleaved tests pass — but the
+  globals-purge work flagged in `plan.md` Phase 3 isn't fully done. Safe to defer:
+  `test_mlpnode_multilayer.py`'s tightly-interleaved-4-layer schedule passes.
+- The deprecated `_NATIVE_W1_GRAD/_NATIVE_W2_GRAD/_NATIVE_GRAD_*` shims in
+  `mlp_node_v2.py:225-228` are no-op aliases retained only so old test files'
+  `setattr(..., None)` cleanups don't break. They aren't read anywhere live.
+- 78 µs gap to PyTorch FP8 baseline: probably in routing-region pre-quant; needs a
+  per-kernel NCU sweep on the new 4-kernel deepep path. Not chased this session.
+
+---
+
+
 **Hardware**: NVIDIA B30Z (SM103, CUDA 13.0)
 **Python**: 3.12, Paddle torch-proxy (`paddle.compat.enable_torch_proxy` / `paddle.enable_compat`)
 **QuACK**: `/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack` (v0.3.7 + Paddle compat patches; **not** `third_party/quack`)

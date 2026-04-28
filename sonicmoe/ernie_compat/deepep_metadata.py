@@ -206,7 +206,7 @@ def deepep_topk_to_sonic_metadata(
         empty_i = torch.empty(0, dtype=torch.int32, device=device)
         empty_f = torch.empty(0, dtype=torch.float32, device=device)
         naept = torch.zeros(N_recv + 1, dtype=torch.int32, device=device)
-        return efo, empty_i, empty_i, empty_i, naept, empty_f, 0, 0, N_recv
+        return efo, empty_i, empty_i, empty_i, naept, empty_f, 0, 0, N_recv, None
 
     # ── Phase 2: Sort by expert (argsort) ──────────────────────────────
     # sort_perm: expert-sorted position → token-major position
@@ -384,7 +384,7 @@ def _deepep_topk_to_sonic_metadata_cuda(
         empty_i = torch.empty(0, dtype=torch.int32, device=device)
         empty_f = torch.empty(0, dtype=torch.float32, device=device)
         naept = torch.zeros(N_recv + 1, dtype=torch.int32, device=device)
-        return efo, empty_i, empty_i, empty_i, naept, empty_f, 0, 0, N_recv
+        return efo, empty_i, empty_i, empty_i, naept, empty_f, 0, 0, N_recv, None
 
     expert_offsets = torch.empty([E + 1], dtype=torch.int32)
     seg_starts = torch.empty([E], dtype=torch.int32)
