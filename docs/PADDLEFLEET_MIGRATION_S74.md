@@ -108,8 +108,34 @@ New public API surface:
 | Method                      | Purpose                                                   |
 | --------------------------- | --------------------------------------------------------- |
 | `node.forward(...)`         | unchanged                                                 |
-| `node.step()`               | flushes wgrads + invalidates per-instance caches          |
-| `node.flush_grads()` *new*  | flushes wgrads only, keeps caches (for harnesses + PP)    |
+| `node.step()`               | flushes wgrads (native CUTLASS layout → ERNIE split-half layout) into `expert.weight.main_grad`. **MUST be called BEFORE `optimizer.step()`** — the optimizer reads the same storage that `step()` writes. |
+| `node.flush_grads()` *alias*| same as `node.step()` (kept for harness compatibility)    |
+| `node.invalidate_caches()`  | optional: drop per-instance `_w_cache` + FP8 weight-cache entries (only needed under memory pressure; cache keys are version-tagged so in-place optimizer updates auto-invalidate) |
+
+#### `node.step()` ordering contract
+
+```python
+# CORRECT: flush native→ernie wgrad layout BEFORE optimizer reads main_grad
+loss.backward()
+for node in all_sonic_nodes:
+    node.step()           # writes into expert.weight.main_grad (in-place)
+optimizer.step()          # reads expert.weight.main_grad
+optimizer.clear_grad()    # zeros main_grad for next iter
+```
+
+The previous (S73) docstring said "after `optimizer.step()`" — that was wrong;
+flushing AFTER the optimizer would mean the optimizer applied a wrongly-laid-out
+grad. The fix has been applied in code; please mirror the ordering in any
+PaddleFleet harness that calls into `SonicMoEMlpNode`.
+
+#### Lazy `main_grad` allocation (memory saver)
+
+`expert.weight.main_grad` (shape `[E, H, 2I]` for w1, `[E, H, I]` for w2) is now
+**allocated on first backward**, not on first forward. Inference / warmup-only
+flows pay zero `main_grad` memory. Allocation is idempotent and version-safe:
+`_alloc_main_grad_w{1,2}` only allocates when the per-expert main_grad is
+absent. No behaviour change for training; only a memory savings (~tens of MiB
+at small shapes, hundreds at production shapes).
 
 ### Impact on the current PaddleFleet integration
 

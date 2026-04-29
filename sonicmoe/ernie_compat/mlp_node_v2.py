@@ -262,20 +262,17 @@ def invalidate_weight_caches() -> None:
 
 def _stack_w1_into(
     cache: dict, experts: Sequence[Any], H: int, I: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Build (or fetch) the ``[2I, H, E]`` logical view of stacked W1, plus
-    the ``[E, H, 2I]`` fp32 ``main_grad`` alias buffer.
+) -> torch.Tensor:
+    """Build (or fetch) the ``[2I, H, E]`` logical view of stacked W1.
 
-    Per-expert ``up_gate_proj.weight.main_grad`` is aliased to a strided slice
-    of the shared buffer so the optimizer sees the conventional per-expert
-    layout without any copy.
-
-    Returns ``(w1_logical, w1_main_grad)``.
+    *No main_grad allocation* — call :func:`_alloc_main_grad_w1` lazily from
+    the backward path (or :meth:`SonicMoEMlpNode.step`) so memory is only
+    paid when gradients are actually accumulated.
     """
     key = ("w1",) + _cache_key(*(e.up_gate_proj.weight for e in experts))
     cached = cache.get(key)
     if cached is not None:
-        return cached, cache[("w1_mg",) + key[1:]]
+        return cached
     E = len(experts)
     stacked = torch.stack([e.up_gate_proj.weight for e in experts])  # [E, H, 2I]
     gate, up = stacked[:, :, :I], stacked[:, :, I:]
@@ -288,25 +285,20 @@ def _stack_w1_into(
     w1 = physical.permute(1, 2, 0)  # logical [2I, H, E]
     w1.stop_gradient = False
     cache[key] = w1
-
-    mg = paddle.zeros([E, H, 2 * I], dtype="float32")
-    cache[("w1_mg",) + key[1:]] = mg
-    for e_idx, exp in enumerate(experts):
-        exp.up_gate_proj.weight.main_grad = mg[e_idx]
-    return w1, mg
+    return w1
 
 
 def _stack_w2_into(
     cache: dict, experts: Sequence[Any],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Same as ``_stack_w1_into`` but for the down-projection weight.
+) -> torch.Tensor:
+    """Build (or fetch) the ``[H, I, E]`` logical view of stacked W2.
 
-    Returns ``(w2_logical [H, I, E], w2_main_grad [E, I, H])``.
+    *No main_grad allocation* — see :func:`_stack_w1_into`.
     """
     key = ("w2",) + _cache_key(*(e.down_proj.weight for e in experts))
     cached = cache.get(key)
     if cached is not None:
-        return cached, cache[("w2_mg",) + key[1:]]
+        return cached
     physical = (
         torch.stack([e.down_proj.weight for e in experts])
             .permute(0, 2, 1)
@@ -315,28 +307,60 @@ def _stack_w2_into(
     w2 = physical.permute(1, 2, 0)  # logical [H, I, E]
     w2.stop_gradient = False
     cache[key] = w2
+    return w2
 
+
+def _alloc_main_grad_w1(
+    cache: dict, experts: Sequence[Any], H: int, I: int,
+) -> torch.Tensor:
+    """Lazily allocate the ``[E, H, 2I]`` fp32 ``main_grad`` accumulator for
+    W1 and alias each expert's ``up_gate_proj.weight.main_grad`` to its slice.
+
+    Triggered on the first backward (via ``_w1_native_view``) or the first
+    call to :meth:`SonicMoEMlpNode.step`. Idempotent within a step; cleared
+    by :meth:`SonicMoEMlpNode.invalidate_caches`.
+    """
+    key = ("w1_mg",) + _cache_key(*(e.up_gate_proj.weight for e in experts))
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
     E = len(experts)
-    I = w2.shape[1]
-    H = w2.shape[0]
+    mg = paddle.zeros([E, H, 2 * I], dtype="float32")
+    cache[key] = mg
+    for e_idx, exp in enumerate(experts):
+        exp.up_gate_proj.weight.main_grad = mg[e_idx]
+    return mg
+
+
+def _alloc_main_grad_w2(
+    cache: dict, experts: Sequence[Any],
+) -> torch.Tensor:
+    """Lazily allocate the ``[E, I, H]`` fp32 ``main_grad`` accumulator for W2."""
+    key = ("w2_mg",) + _cache_key(*(e.down_proj.weight for e in experts))
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    w0 = experts[0].down_proj.weight
+    # down_proj.weight shape is [I, H] (Paddle linear: [in, out])
+    I, H = int(w0.shape[0]), int(w0.shape[1])
+    E = len(experts)
     mg = paddle.zeros([E, I, H], dtype="float32")
-    cache[("w2_mg",) + key[1:]] = mg
+    cache[key] = mg
     for e_idx, exp in enumerate(experts):
         exp.down_proj.weight.main_grad = mg[e_idx]
-    return w2, mg
+    return mg
 
 
 def stack_ernie_w1(experts: Sequence[Any], H: int, I: int) -> torch.Tensor:
     """Legacy shim — prefer ``SonicMoEMlpNode``. Returns the ``[2I, H, E]``
-    logical view of stacked W1 (cached process-wide for back-compat)."""
-    w1, _ = _stack_w1_into(_LEGACY_W_CACHE, experts, H, I)
-    return w1
+    logical view of stacked W1 (cached process-wide for back-compat).
+    No main_grad is allocated by this call."""
+    return _stack_w1_into(_LEGACY_W_CACHE, experts, H, I)
 
 
 def stack_ernie_w2(experts: Sequence[Any]) -> torch.Tensor:
     """Legacy shim — prefer ``SonicMoEMlpNode``."""
-    w2, _ = _stack_w2_into(_LEGACY_W_CACHE, experts)
-    return w2
+    return _stack_w2_into(_LEGACY_W_CACHE, experts)
 
 
 def _flush_native_grads_for(mg1: torch.Tensor, mg2: torch.Tensor) -> None:
@@ -434,19 +458,19 @@ class SonicMoEMlpNode:
     # ── Weight layout helpers (instance-scoped) ─────────────────────────────
 
     def _stacked_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
-        w1, _ = _stack_w1_into(self._w_cache, self._experts, self._H, self._I)
-        w2, _ = _stack_w2_into(self._w_cache, self._experts)
+        w1 = _stack_w1_into(self._w_cache, self._experts, self._H, self._I)
+        w2 = _stack_w2_into(self._w_cache, self._experts)
         return w1, w2
 
     def _w1_main_grad(self) -> torch.Tensor:
-        """Per-instance fp32 buffer: shape ``[E, H, 2I]``, alias of every
-        ``expert.up_gate_proj.weight.main_grad``."""
-        _, mg = _stack_w1_into(self._w_cache, self._experts, self._H, self._I)
-        return mg
+        """Lazy: returns the ``[E, H, 2I]`` fp32 buffer aliased to every
+        ``expert.up_gate_proj.weight.main_grad``.  Allocated on first call."""
+        return _alloc_main_grad_w1(self._w_cache, self._experts, self._H, self._I)
 
     def _w2_main_grad(self) -> torch.Tensor:
-        _, mg = _stack_w2_into(self._w_cache, self._experts)
-        return mg
+        """Lazy: returns the ``[E, I, H]`` fp32 buffer aliased to every
+        ``expert.down_proj.weight.main_grad``.  Allocated on first call."""
+        return _alloc_main_grad_w2(self._w_cache, self._experts)
 
     def _w1_native_view(self) -> torch.Tensor:
         """Storage of ``_w1_main_grad`` reinterpreted as ``[E, 2I, H]`` —
@@ -605,21 +629,39 @@ class SonicMoEMlpNode:
         )
 
     def step(self) -> None:
-        """Call after ``optimizer.step()``.  Flushes wgrad layout and
-        invalidates this instance's weight + FP8 caches.
+        """Commit deferred wgrads into per-expert ``main_grad``.
+
+        **Call BEFORE** ``optimizer.step()`` — the optimizer reads
+        ``weight.main_grad`` and that buffer is only in the correct
+        ERNIE-native layout *after* this flush.
 
         Training-loop contract::
 
             for microbatch in microbatches:
                 out = node(x, tpe, indices, probs)
                 out.backward(grad)
-            optimizer.step()
-            node.step()                 # ← here
-            optimizer.zero_grad()
+            node.step()                 # ← flush wgrads (this method)
+            optimizer.step()            #   reads weight.main_grad
+            optimizer.zero_grad()       #   zeros main_grad in place
+
+        Cache invalidation is *not* needed here: ``_w_cache`` and the FP8
+        weight cache are keyed by ``(data_ptr, _inplace_version)``, which
+        bumps automatically when the optimizer updates the weights, so the
+        next forward naturally misses and rebuilds.  Use
+        :meth:`invalidate_caches` if you need eager release for memory
+        pressure (e.g. parameter swap-out).
         """
         self._flush_native_grads()
-        # Drop weight cache so next forward rebuilds aliases against the
-        # post-step weight tensors (data_ptrs may have changed).
+        self._warmed_for_step = False
+
+    def invalidate_caches(self) -> None:
+        """Eagerly drop this instance's stacked-weight / main_grad cache and
+        the process-wide FP8 weight quant + topk caches.  Optional — only
+        useful for memory pressure or when weight tensors are swapped out.
+
+        Note: the ``main_grad`` buffer is dropped here, so it will be
+        re-allocated (and zeroed) on the next backward.
+        """
         self._w_cache.clear()
         clear_all_fp8_weight_caches()
         invalidate_topk_cache()

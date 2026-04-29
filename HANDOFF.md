@@ -81,10 +81,16 @@ Triton kernel `_scatter_router_grad_kernel`. Bit-exact verified vs. baseline on
 * `_warmed_for_step: bool` — JIT/cache warmup gate per global step
 
 **New public API**:
-| Method                | Purpose                                                     |
-| --------------------- | ----------------------------------------------------------- |
-| `node.flush_grads()`  | flush wgrads only (keeps cache; for PP cross-microbatch)    |
-| `node.step()`         | flush wgrads + invalidate caches (call at optimizer step)   |
+| Method                       | Purpose                                                     |
+| ---------------------------- | ----------------------------------------------------------- |
+| `node.step()`                | flush native→ERNIE wgrad layout into `expert.weight.main_grad`. **MUST run BEFORE `optimizer.step()`** (the optimizer reads the same storage). |
+| `node.flush_grads()`         | alias of `node.step()` (kept for harness back-compat)       |
+| `node.invalidate_caches()`   | optional; drops `_w_cache` + per-instance FP8 weight cache. Cache keys are `(data_ptr, _inplace_version(w))` so in-place optimizer updates auto-invalidate — only call this under memory pressure. |
+
+**Lazy `main_grad` allocation (S74 follow-up)**: `_stack_w{1,2}_into` no longer
+allocate `main_grad` at first forward. Allocation moved to `_alloc_main_grad_w{1,2}`
+which fires only from `_w*_native_view()` (backward) and `_w*_main_grad()` (flush).
+Saves tens-of-MiB-to-hundreds-of-MiB on inference / warmup-only paths.
 
 Module-level `flush_native_grads()` / `stack_ernie_w1` / `stack_ernie_w2` are
 *kept as legacy back-compat shims* operating on a separate `_LEGACY_W_CACHE` /
