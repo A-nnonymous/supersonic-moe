@@ -52,6 +52,17 @@ def _run_subprocess(body: str, cache_dir: Path, *, env_extra=None) -> tuple[int,
     env = os.environ.copy()
     env["SONIC_MOE_CACHE_DIR"] = str(cache_dir)
     env.setdefault("CUDA_VISIBLE_DEVICES", env.get("CUDA_VISIBLE_DEVICES", "0"))
+    # quack lives outside the importing interpreter's site-packages on this
+    # host; tests/ops/* benches inject it via sys.path.insert. Mirror that
+    # for every JIT-bench subprocess so /usr/local/bin/python (no quack
+    # installed) can still import sonicmoe.
+    _QUACK = ("/root/paddlejob/share-storage/gpfs/system-public/"
+              "zhangyichen/sonicmoe_for_ernie/quack")
+    if os.path.isdir(_QUACK):
+        prev = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = (
+            _QUACK + (os.pathsep + prev if prev else "")
+        )
     if env_extra:
         env.update(env_extra)
     t0 = time.perf_counter()
@@ -66,6 +77,13 @@ def _run_subprocess(body: str, cache_dir: Path, *, env_extra=None) -> tuple[int,
 # ── phase bodies ──────────────────────────────────────────────────────────────
 _BODY_WARMUP = """
 import os, sys, json, time
+# Match production import order: enable torch-proxy BEFORE importing sonicmoe.
+# sonicmoe.jit binds ``torch.utils.cpp_extension.load`` at module-import time;
+# without this the JIT compiles a torch-pybind .so that rejects paddle.Tensor
+# with TypeError(incompatible function arguments) on first kernel call.
+import paddle
+paddle.compat.enable_torch_proxy(scope={'sonicmoe', 'quack', 'triton'}, silent=True)
+
 from sonicmoe.cache_manager import setup_cache, clear_all_caches, clear_warmup_sentinel
 from sonicmoe.jit_warmup import warmup_jit
 
@@ -92,6 +110,8 @@ print(json.dumps({'phase': mode, 'ran': bool(ran), 'elapsed_s': dt}))
 
 _BODY_REUSE = """
 import os, sys, json, time
+import paddle
+paddle.compat.enable_torch_proxy(scope={'sonicmoe', 'quack', 'triton'}, silent=True)
 import torch
 from sonicmoe.cache_manager import setup_cache
 setup_cache(os.environ['SONIC_MOE_CACHE_DIR'])
@@ -158,7 +178,8 @@ def _gate(label, value, budget, warn, unit, results):
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--phase", default="all",
-                   choices=["all", "cold", "warm", "reload", "reuse"])
+                   choices=["all", "cold", "warm", "reload", "reuse",
+                            "parallel-cold"])
     p.add_argument("--baselines", default=str(REPO / "tools/ci/baselines.json"))
     p.add_argument("--cache-dir", default=None,
                    help="Per-run cache root; default = tempdir.")
@@ -183,35 +204,24 @@ def main() -> int:
     results: list[dict] = []
     fail = False
 
-    def run_phase(mode: str) -> dict | None | str:
+    def run_phase(mode: str) -> dict | None:
         rc, out, _ = _run_subprocess(
             _BODY_WARMUP, cache,
             env_extra={**env_shape, "JIT_BENCH_MODE": mode},
         )
         rec = _parse_json_line(out)
-        if rec is None and "paddle.utils.hipify" in out:
-            return "skip-hipify"
         if rc != 0 or rec is None:
             print(_red(f"[{mode}] subprocess failed rc={rc}"))
             sys.stdout.write(out[-2000:] + "\n")
             return None
         return rec
 
-    def _maybe_skip_hipify(label: str, rec) -> bool:
-        if rec == "skip-hipify":
-            print(_yel(f"  [{label}] SKIP — paddle.utils.hipify env bug "
-                       f"(unrelated to sonicmoe code; see HANDOFF S76)"))
-            results.append({"label": label, "status": "skip",
-                            "reason": "paddle.utils.hipify"})
-            return True
-        return False
-
-    phases = ["cold", "warm", "reload", "reuse"] if args.phase == "all" else [args.phase]
+    phases = ["cold", "warm", "reload", "reuse", "parallel-cold"] \
+        if args.phase == "all" else [args.phase]
 
     if "cold" in phases:
         rec = run_phase("cold")
-        if _maybe_skip_hipify("cold_warmup_s", rec): pass
-        elif rec is None: fail = True
+        if rec is None: fail = True
         else:
             b = base["jit"]["cold_warmup_s"]
             if not _gate("cold_warmup_s", rec["elapsed_s"],
@@ -220,8 +230,7 @@ def main() -> int:
 
     if "warm" in phases:
         rec = run_phase("warm")
-        if _maybe_skip_hipify("warm_sentinel_skip_s", rec): pass
-        elif rec is None: fail = True
+        if rec is None: fail = True
         else:
             b = base["jit"]["warm_sentinel_skip_s"]
             if rec["ran"]:
@@ -232,8 +241,7 @@ def main() -> int:
 
     if "reload" in phases:
         rec = run_phase("reload")
-        if _maybe_skip_hipify("cross_process_reload_s", rec): pass
-        elif rec is None: fail = True
+        if rec is None: fail = True
         else:
             b = base["jit"]["cross_process_reload_s"]
             assert rec["ran"], "reload must actually re-run warmup_jit"
@@ -245,15 +253,7 @@ def main() -> int:
             _BODY_REUSE, cache, env_extra=env_shape,
         )
         rec = _parse_json_line(out)
-        # Detect known paddle-torch-compat env bug (paddle.utils.hipify
-        # missing under torch.utils.cpp_extension JIT). Treat as SKIP, not
-        # FAIL — it's environment-level, not a sonicmoe regression.
-        if rec is None and "paddle.utils.hipify" in out:
-            print(_yel("  [reuse] SKIP — paddle.utils.hipify env bug "
-                       "(unrelated to sonicmoe code; see HANDOFF S76)"))
-            results.append({"label": "in_process_reuse_us", "status": "skip",
-                            "reason": "paddle.utils.hipify"})
-        elif rc != 0 or rec is None:
+        if rc != 0 or rec is None:
             print(_red(f"[reuse] subprocess failed rc={rc}"))
             sys.stdout.write(out[-2000:] + "\n")
             fail = True
@@ -263,6 +263,47 @@ def main() -> int:
                          b["budget_us"], b["warn_us"], "µs", results):
                 fail = True
             print(f"  [reuse] first-call cold-in-proc = {rec.get('first_call_us', 0):.0f} µs")
+
+    if "parallel-cold" in phases:
+        # Wipe cache so this is a true cold parallel.
+        import shutil as _sh
+        for sub in ("triton", "quack", "sonicmoe"):
+            _sh.rmtree(cache / sub, ignore_errors=True)
+        try:
+            (cache / "warm.sentinel").unlink()
+        except FileNotFoundError:
+            pass
+
+        body = """
+import os, json, time
+import paddle
+paddle.compat.enable_torch_proxy(scope={'sonicmoe','quack','triton'}, silent=True)
+from sonicmoe.cache_manager import setup_cache
+setup_cache(os.environ['SONIC_MOE_CACHE_DIR'])
+from sonicmoe.jit_warmup import warmup_jit_parallel
+E, H, I = int(os.environ['E']), int(os.environ['H']), int(os.environ['I'])
+ks = [E*128, E*256, E*512, E*1024]
+W = int(os.environ.get('PARALLEL_WORKERS','2'))
+t0 = time.perf_counter()
+dt = warmup_jit_parallel(E=E, H=H, I=I, fp8=True,
+                         total_K_list=ks, workers=W)
+print(json.dumps({'phase':'parallel-cold','elapsed_s':dt,'workers':W,
+                  'shapes':len(ks)}))
+"""
+        rc, out, _ = _run_subprocess(
+            body, cache,
+            env_extra={**env_shape, "PARALLEL_WORKERS": "2"},
+        )
+        rec = _parse_json_line(out)
+        if rc != 0 or rec is None:
+            print(_red(f"[parallel-cold] subprocess failed rc={rc}"))
+            sys.stdout.write(out[-2000:] + "\n")
+            fail = True
+        else:
+            b = base["jit"].get("parallel_cold_s", {"budget": 900, "warn": 600})
+            if not _gate("parallel_cold_s", rec["elapsed_s"],
+                         b["budget"], b["warn"], "s", results):
+                fail = True
 
     if args.json:
         Path(args.json).write_text(json.dumps(

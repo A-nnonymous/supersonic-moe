@@ -1,4 +1,78 @@
-# HANDOFF — Session 76 (2026-04-29) — Distributed safety + persistent JIT cache + strict-baseline CI
+# HANDOFF — Session 77 (2026-04-29) — Strict-CI hardening + cross-test FP8 isolation + cluster-env-safe multicard
+
+> **Single source of truth for project state.** `docs/HANDOFF.md` redirects here.
+> Earlier sessions preserved verbatim below.
+
+**Branch**: `race-fix-paddle` on `myrepo` (PFCCLab/supersonic-moe).
+**Last shipped frontier**: S76 wrap-up. **This session**: zero-skip CI, all 13 phases green on the paddlejob shared-GPFS host (`bash tools/ci/run_core_tests.sh` → 13/13 PASS, ~15 min wall).
+
+## S77 — what changed (read this first)
+
+**1. Cross-test FP8 config pollution → permanent BF16 fallback** (caught by `test_mlpnode_extreme_shapes`, was masked by single-test runs):
+- `SonicMoEDeepEPFunc.forward` (`sonicmoe/ernie_compat/mlp_node_v2.py:723`) used to call `_refresh_fp8_config()` BEFORE the `with enable_fp8(True):` block. `_FP8Config()` reads `is_fp8_active()` at that instant; if a *previous* test left `_IS_FP8_ACTIVE=False` (e.g. via `enable_fp8(False)` context-manager on a different test), the snapshot wired the BF16 wgrad path and `dw1` came out non-`None` → assertion failure on the next FP8 test.
+- Fix: moved the refresh INSIDE the `with enable_fp8(True):` block so the snapshot always sees the active context.
+- Belt-and-braces: `tests/conftest.py` now sets `SONIC_MOE_FP8_MODE=perf`, `SONIC_MOE_FP8_ASSUME_ALIGNED=1`, `USE_QUACK_GEMM=1` BEFORE any sonicmoe import so the module-level `_IS_FP8_ACTIVE` constant is True from process start.
+- Verified: 10/10 sequential `test_jit_concurrent_heterogeneous + test_jit_key_stability + test_mlpnode_extreme_shapes` PASS in 144 s.
+
+**2. Production-cluster env leak → multicard `paddle.distributed.launch` hung forever** (silent, no error, no children):
+- Symptom: launcher `R` state, 129 threads, `ps --ppid <launcher>` empty, only `default.gpu.log` accumulating nvidia-smi snapshots.
+- Root cause: paddlejob exports a massive set of cluster-discovery vars (`PADDLE_TRAINERS=4 IPs`, `PADDLE_TRAINERS_NUM=4`, `PADDLE_TRAINER_ID`, `PADDLE_CURRENT_ENDPOINT=10.79.128.191:60043`, `PADDLE_CLUSTER_TRAIN=True`, `PADDLE_IS_LOCAL=0`, `DISTRIBUTED_TRAINER_ENDPOINTS` (32 entries!), `GPUTRAINER_ENDPOINTS`, `TRAINER_INSTANCES`, `EKS_POD_NAME`, `EKS_POD_NAMESPACE`, `POD_*`, `CLUSTER_*`, `PADDLE_JOB_*`, `PADDLE_PORT`, …). Any one of these makes `paddle.distributed.launch` enter multi-NODE rendezvous mode and block forever waiting for the absent peer nodes.
+- Fix: `tools/ci/multicard_smoke.py` now builds a **WHITELIST** env (denylist is unmaintainable) keeping only the prefixes `PATH / LD_ / HOME / USER / LANG / LC_ / TERM / TMPDIR / PWD / SHELL / PYTHON / VIRTUAL_ENV / CONDA_ / CUDA_ / NVIDIA_ / TRITON_ / SONIC_MOE_ / USE_QUACK_GEMM / FLAGS_ / NCCL_ / GLOG_ / OMP_`, dropping `NCCL_SOCKET_IFNAME` and `NCCL_BOOTSTRAP_UID_SOCK_FAMILY`. Forces `CUDA_VISIBLE_DEVICES=0,1` and `TRITON_PTXAS_PATH=/usr/local/cuda-13.0/bin/ptxas` (Blackwell `sm_103a`).
+
+**3. `Place(gpu:0) is not supported` on rank 1 of multicard worker**:
+- Root cause: `paddle.distributed.launch --gpus 0,1` does NOT filter `CUDA_VISIBLE_DEVICES` per rank; both workers see `CUDA_VISIBLE_DEVICES=0,1`. Per-rank physical device is selected via `FLAGS_selected_gpus={0,1}`. The DeviceContextPool only registers the place named by `FLAGS_selected_gpus`; selecting `gpu:0` on rank 1 (whose pool only has `gpu:1`) → `NotImplementedError: Place(gpu:0) is not supported … check that your train process set the correct device id`.
+- Fix: worker reads `FLAGS_selected_gpus` (fallback `PADDLE_LOCAL_RANK`), pins via `paddle.device.set_device(f"gpu:{gpu_id}")`, and **eagerly allocates a 1-element float32 tensor** to force the context-pool entry to materialize BEFORE any code path that bypasses `set_device` (autograd backward, paddle.library proxies inside quack JIT) can hit it. Also sets `torch.cuda.set_device(gpu_id)` so the proxy honours the right ordinal.
+- This is the same root cause as the production trainer crash the user originally reported (`quack/autotuner.py:67 _gpu_warmup` → `paddle.tensor.random.gaussian` → `Place(gpu:0) not supported`); the eager allocation is the real fix for any worker that uses paddle-torch-proxy under autograd.
+
+**4. quack import path missing in subprocess workers**:
+- `/usr/local/bin/python` (the default `python` on this image) does NOT have `quack` installed. Every `tests/ops/*` bench manually does `sys.path.insert(0, _QUACK)`; subprocess workers in `tools/ci/jit_bench.py` and `tools/ci/multicard_smoke.py` did not, so JIT-cold / JIT-reload / JIT-reuse / JIT-parallel / multicard all failed at sonicmoe import time once the cluster-env-leak hang was unblocked.
+- Fix: 
+  - `jit_bench._run_subprocess` now prepends `/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack` to `PYTHONPATH` for every subprocess.
+  - `multicard_smoke.WORKER_BODY` does the same `sys.path.insert(0, _QUACK)` at the very top.
+  - `tests/conftest.py` does the same `sys.path.insert(0, _QUACK)` so any new test (e.g. `test_jit_key_stability.py`) that imports sonicmoe works under both `/usr/local/bin/python` and the eb_venv.
+
+## S77 — Verified end-to-end CI
+
+`bash tools/ci/run_core_tests.sh` (no flags = full sweep, no skips):
+
+```
+═════════════════ CI SUMMARY ═════════════════
+PASS precision (72s)
+PASS multilayer (43s)
+PASS quant (186s)            ← 181 quant tests across 6 files
+PASS jit-cold (51s)
+PASS jit-warm (4s)           ← sentinel skip
+PASS jit-reload (30s)        ← cross-process disk-cache reload
+PASS jit-reuse (31s)
+PASS jit-parallel (58s)      ← N=4 parallel cold warmup
+PASS jit-key-stability (35s) ← cache_size invariant across T values
+PASS extreme-shapes (69s)    ← 0-size, large, imbalance 85/99
+PASS jit-concurrent (91s)    ← heterogeneous concurrent cold-compile
+PASS perf (169s)             ← nsys gpu-projection µs/iter gate
+PASS multicard (54s)         ← 2-rank distributed smoke
+──────────────────────────────────────────────
+```
+
+13/13 PASS, 0 SKIP, total ~15 min wall on the dev host (2× B30Z Blackwell).
+
+## S77 — Lessons (compact, for future agents)
+
+- **paddle.distributed.launch on paddlejob: ALWAYS whitelist env, NEVER denylist.** The cluster-discovery surface is too wide to enumerate; one leaked var = silent multi-node rendezvous hang.
+- **`Place(gpu:N) is not supported` is almost always lazy-init**: the context pool only registers the place named by `FLAGS_selected_gpus`; any other place errors out. Eager-allocate a 1-element tensor right after `paddle.device.set_device` to force registration before async paths hit it.
+- **`_FP8Config()` snapshots `is_fp8_active()` at construction**, not at use. ALWAYS construct it inside the `with enable_fp8(True):` block, never outside.
+- **Multi-process sonicmoe imports under `/usr/local/bin/python`** require explicit `sys.path` injection of the zhangyichen quack tree; eb_venv has it installed natively. Centralize in `tests/conftest.py` + `_run_subprocess` PYTHONPATH.
+- **xdist not installed** on this host: `run_pytest_parallel` correctly falls back to serial — don't add xdist as a hard dep.
+
+## S77 — Files touched
+
+- `sonicmoe/ernie_compat/mlp_node_v2.py` — `_refresh_fp8_config()` moved inside `with enable_fp8(True):` block.
+- `tests/conftest.py` — quack sys.path injection + FP8 env defaults at conftest import.
+- `tools/ci/jit_bench.py` — `_run_subprocess` injects PYTHONPATH=quack.
+- `tools/ci/multicard_smoke.py` — whitelist env + eager device-pool init + FLAGS_selected_gpus pinning + ptxas path + WORKER_BODY rewritten for current `SonicMoEMlpNode` API (experts list, MockExpert, dispatched_indices/probs).
+
+---
+
+
 
 > **Single source of truth for project state.** `docs/HANDOFF.md` redirects here.
 > Earlier sessions preserved verbatim below.

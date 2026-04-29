@@ -18,10 +18,19 @@
       "warn": 240
     },
     "in_process_reuse_us": {
-      "_what": "Same process, second forward through SonicMoEMlpNode. Pure dispatch overhead — no compile.",
-      "budget_us": 8000,
-      "warn_us": 6000
+      "_what": "Same process, repeated fwd+bwd through SonicMoEMlpNode (full kernel work + paddle dispatch). Average over 5 iters after first cold-in-proc primes the in-memory CuTe cache.",
+      "budget_us": 20000,
+      "warn_us": 16000
+    },
+    "parallel_cold_s": {
+      "_what": "rm -rf cache; warmup_jit_parallel(workers=2) over 4 total_K shapes. Validates that multi-process cold compile shares disk cache safely and finishes within budget. Subprocess overhead added — budget intentionally larger than a single cold.",
+      "budget": 900,
+      "warn": 700
     }
+  },
+  "coverage": {
+    "_what": "sonicmoe package coverage gate from `coverage report --fail-under`. Bumped only with HANDOFF justification.",
+    "target_pct": 50
   },
   "perf": {
     "shape": "T8192-H3072-I1536-E8-K8",

@@ -25,6 +25,7 @@ For the **topk** path (``deepep_topk_to_sonic_metadata``):
 from __future__ import annotations
 
 import math
+import os
 from typing import Sequence
 
 import torch
@@ -296,6 +297,25 @@ def deepep_topk_to_sonic_metadata(
 # ── CUDA topk implementation ─────────────────────────────────────────────────
 
 
+def _normalize_device(device):
+    """Normalize torch.device / paddle Place / str → 'cuda:N' string.
+
+    Under paddle.compat torch-proxy, `torch.empty_like(..., device=...)`
+    routes through paddle which only accepts strings or `core.Place`.
+    Pre-normalizing here keeps callers (mlp_node_v2 passing `x.device`)
+    proxy-agnostic.
+    """
+    if device is None or isinstance(device, str):
+        return device
+    idx = getattr(device, "index", None)
+    if idx is None:
+        try:
+            idx = device.gpu_device_id()
+        except Exception:
+            idx = 0
+    return f"cuda:{int(idx) if idx is not None else 0}"
+
+
 def _copy_tpe_h2d_async(tpe_list, device):
     """Async pinned-memory H2D copy for tokens_per_expert.
 
@@ -304,6 +324,7 @@ def _copy_tpe_h2d_async(tpe_list, device):
     Pinned tensors are queued and recycled once their copy event completes.
     Falls back to the legacy sync path if cuda.bindings is unavailable.
     """
+    device = _normalize_device(device)
     if not _HAS_CUDA_ART:
         return torch.tensor(tpe_list, dtype=torch.int32, device=device)
 
@@ -359,6 +380,25 @@ def _deepep_topk_to_sonic_metadata_cuda(
     """
     N_recv = dispatched_indices.shape[0]
     topk = dispatched_indices.shape[1]
+    device = _normalize_device(device)
+
+    # Optional contract check (debug only — sm-level scan, ~5µs):
+    # dispatched_indices[i, :] must contain UNIQUE expert IDs. Real DeepEP
+    # dispatch enforces this; duplicates would collapse two slots onto one
+    # token-major position in s_reverse_scatter_idx and orphan padded slots,
+    # eventually causing IMA in router_forward / wgrad gather. Enable via
+    # SONIC_MOE_VALIDATE_DISPATCH=1 (off by default for production perf).
+    if os.environ.get("SONIC_MOE_VALIDATE_DISPATCH") == "1" and N_recv > 0 and topk > 1:
+        sorted_idx, _ = dispatched_indices.sort(dim=-1)
+        # Adjacent-equal among non-negative (-1 = masked is allowed multi-occurrence).
+        dup_mask = (sorted_idx[:, 1:] == sorted_idx[:, :-1]) & (sorted_idx[:, 1:] >= 0)
+        if dup_mask.any():
+            bad_row = int(dup_mask.any(dim=-1).nonzero()[0].item())
+            raise ValueError(
+                f"dispatched_indices contract violation: row {bad_row} has "
+                f"duplicate expert IDs {dispatched_indices[bad_row].tolist()}. "
+                "Each token's topk slots must be unique experts."
+            )
 
     # Compute TK and TK_padded on host (need tokens_per_expert list)
     if isinstance(tokens_per_expert, torch.Tensor):

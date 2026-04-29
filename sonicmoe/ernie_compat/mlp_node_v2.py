@@ -186,6 +186,9 @@ def _differentiable_router_scores(
     """
     N_recv, topk = dispatched_indices.shape
     device = dispatched_indices.device
+    if hasattr(device, "type") and not isinstance(device, str):
+        idx = getattr(device, "index", None) or 0
+        device = f"cuda:{int(idx)}"
 
     if dispatched_indices.stride(1) != 1:
         raise ValueError("dispatched_indices must be contiguous in last dim")
@@ -197,7 +200,7 @@ def _differentiable_router_scores(
         raise ValueError(f"naept: expected shape ({N_recv+1},), got {naept.shape}")
 
     if TK == 0:
-        return torch.zeros(TK_padded, dtype=dispatched_probs.dtype, device=device)
+        return dispatched_probs.new_zeros(TK_padded)
 
     if score_src_idx is not None:
         if score_src_idx.shape[0] != TK:
@@ -717,11 +720,13 @@ class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
         activation_type: ActivationType = ActivationType.SWIGLU,
         stream_id: int = 0,
     ) -> torch.Tensor:
-        _refresh_fp8_config()
-
         # ── UpProjection forward (via FakeCtx) ───────────────────────────
         up_ctx = _FakeCtx()
         with enable_fp8(True):
+            # Refresh FP8 config inside the enable_fp8(True) block so the
+            # snapshot sees ``_IS_FP8_ACTIVE=True`` regardless of the global
+            # state any prior caller / test may have left behind.
+            _refresh_fp8_config()
             y1, z = _UpProjection.forward(
                 up_ctx,
                 hidden_states, w1, None,        # x, w1, b1

@@ -19,40 +19,96 @@ REPO = Path(__file__).resolve().parents[2]
 
 WORKER_BODY = r"""
 import os, sys, math
+print(f"[pre-import] CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')!r} "
+      f"PADDLE_LOCAL_RANK={os.environ.get('PADDLE_LOCAL_RANK')!r} "
+      f"FLAGS_selected_gpus={os.environ.get('FLAGS_selected_gpus')!r}", flush=True)
+
+# Some Python interpreters (e.g. /usr/local/bin/python in this image) do not
+# have quack on the import path; sonicmoe imports it eagerly. Inject the same
+# location every other tests/ops/* benchmark uses.
+_QUACK = "/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack"
+if os.path.isdir(_QUACK) and _QUACK not in sys.path:
+    sys.path.insert(0, _QUACK)
+
 import paddle
-from paddle.distributed import fleet, init_parallel_env
-
-# Ensure each rank pins to its own device BEFORE any sonicmoe import — the
-# Phase A device-fix relies on torch.cuda.current_device() being correct.
 local_rank = int(os.environ.get("PADDLE_LOCAL_RANK", os.environ.get("RANK", "0")))
-paddle.device.set_device(f"gpu:{local_rank}")
+# paddle.distributed.launch with --gpus 0,1 keeps CUDA_VISIBLE_DEVICES="0,1"
+# for both workers but injects a per-rank FLAGS_selected_gpus. Pin the
+# device to that physical id so the context pool registers the correct
+# place; "gpu:0" on rank 1 is REJECTED because FLAGS_selected_gpus=1 told
+# paddle to register only place gpu:1 in the pool.
+gpu_id = int(os.environ.get("FLAGS_selected_gpus", str(local_rank)))
+paddle.device.set_device(f"gpu:{gpu_id}")
+# Force-instantiate the context pool entry BEFORE init_parallel_env or any
+# import that triggers a tensor allocation through a path that bypasses
+# set_device (autograd backward, paddle.library proxies inside quack JIT).
+_warm = paddle.empty([1], dtype="float32")
+del _warm
+
+from paddle.distributed import init_parallel_env  # noqa: E402
 init_parallel_env()
+paddle.enable_compat()
 
-# Now import sonicmoe stack
-import torch
-import sonicmoe  # noqa: triggers _quack_compat patch
-from sonicmoe.ernie_compat.mlp_node_v2 import SonicMoEMlpNode
+import torch  # noqa: E402
+torch.cuda.set_device(gpu_id)
 
-torch.manual_seed(123 + local_rank)
+import sonicmoe.functional as functional  # noqa: E402
+from sonicmoe.ernie_compat import (  # noqa: E402
+    SonicMoEMlpNode,
+    invalidate_weight_caches,
+)
+
+functional._ALIGNMENT_ASSUMED = True
+functional._ALIGNMENT_STREAK = 100
 
 E, H, I, T, K = 4, 1024, 512, 1024, 2
-node = SonicMoEMlpNode(num_experts=E, hidden_size=H, intermediate_size=I,
-                        fp8=True).cuda()
 
-x = torch.randn(T, H, dtype=torch.bfloat16, device="cuda", requires_grad=True)
-gate = torch.randn(T, E, dtype=torch.float32, device="cuda")
-topk_idx = torch.topk(gate, K, dim=-1).indices
-topk_weight = torch.softmax(torch.gather(gate, -1, topk_idx), dim=-1)
+def _make_experts():
+    out = []
+    for e in range(E):
+        paddle.seed(1000 + e + local_rank * 17)
+        up = type("P", (), {
+            "weight": paddle.randn([H, 2 * I], dtype="bfloat16") / math.sqrt(H),
+        })()
+        dn = type("P", (), {
+            "weight": paddle.randn([I, H], dtype="bfloat16") / math.sqrt(I),
+        })()
+        up.weight.stop_gradient = False
+        dn.weight.stop_gradient = False
+        out.append(type("Expert", (), {"up_gate_proj": up, "down_proj": dn})())
+    return out
 
-out = node(x, topk_idx, topk_weight)
-loss = out.float().mean()
-loss.backward()
+invalidate_weight_caches()
+functional.clear_all_fp8_weight_caches()
+experts = _make_experts()
+node = SonicMoEMlpNode(experts=experts, n_experts=E,
+                       hidden_size=H, intermediate_size=I)
 
-om = float(out.detach().float().mean().cpu())
-print(f"[rank{local_rank}] out_mean={om:.6f} grad_norm={float(x.grad.float().norm().cpu()):.4f}", flush=True)
+paddle.seed(7 + local_rank)
+x_p = paddle.randn([T, H], dtype="bfloat16") * 0.02
+g_p = paddle.randn([T, H], dtype="bfloat16") * 0.01
+x_in = torch.from_dlpack(x_p.detach())
+x_in.stop_gradient = False
 
-# Cross-rank check: collect both rank means and assert they differ (different
-# seed → different output) but neither is NaN/Inf.
+torch.manual_seed(123 + local_rank)
+raw_p = paddle.randn([T, E], dtype="float32")
+raw = torch.from_dlpack(raw_p.detach())
+top = raw.topk(K, dim=-1).indices.int()
+di = top
+dp_p = paddle.uniform([T, K], dtype="float32", min=0.5, max=1.0)
+dp = torch.from_dlpack(dp_p.detach())
+dp = dp / dp.sum(dim=1, keepdim=True)
+tpe = [int((di == e).sum().item()) for e in range(E)]
+
+out = node.forward(x_in, tpe, dispatched_indices=di, dispatched_probs=dp)
+out.backward(torch.from_dlpack(g_p.detach()).clone())
+node.flush_grads()
+
+assert out.shape[0] == T
+om = float(torch.from_dlpack(out.detach()).float().mean().cpu())
+assert math.isfinite(om), f"non-finite output mean: {om}"
+print(f"[rank{local_rank}] out_mean={om:.6f}", flush=True)
+
 import paddle.distributed as dist
 t = paddle.to_tensor([om], dtype="float32")
 gathered = []
@@ -84,8 +140,42 @@ def main() -> int:
         "--gpus", "0,1",
         worker,
     ]
-    env = os.environ.copy()
-    env.setdefault("CUDA_VISIBLE_DEVICES", "0,1")
+    # The paddlejob runtime exports an extensive set of cluster discovery env
+    # vars (PADDLE_TRAINERS=4 IPs, PADDLE_TRAINER_ENDPOINTS, POD_*, EKS_POD_*,
+    # GPUTRAINER_ENDPOINTS, DISTRIBUTED_TRAINER_ENDPOINTS, TRAINER_INSTANCES,
+    # PADDLE_CLUSTER_TRAIN, PADDLE_IS_LOCAL=0 …). If any of these reach
+    # paddle.distributed.launch, it enters multi-node rendezvous mode and
+    # blocks forever waiting for the 3 absent peer nodes. Build a whitelist
+    # env instead of a denylist — the smoke test is single-node, 2-rank.
+    KEEP_PREFIXES = (
+        "PATH", "LD_", "HOME", "USER", "LANG", "LC_", "TERM", "TMPDIR",
+        "PWD", "SHELL", "PYTHON", "VIRTUAL_ENV", "CONDA_",
+        "CUDA_", "NVIDIA_",  # GPU runtime
+        "TRITON_",            # triton cache / ptxas
+        "SONIC_MOE_", "USE_QUACK_GEMM",
+        "FLAGS_",             # paddle internal flags
+        "NCCL_",              # NCCL config (excluding bootstrap-from-cluster)
+        "GLOG_", "OMP_",
+    )
+    DROP_NCCL = {
+        # NCCL bootstrap settings keyed to the multi-node IB fabric; safe to
+        # drop for an in-host smoke test.
+        "NCCL_SOCKET_IFNAME",
+        "NCCL_BOOTSTRAP_UID_SOCK_FAMILY",
+    }
+    env: dict[str, str] = {}
+    for k, v in os.environ.items():
+        if any(k.startswith(p) for p in KEEP_PREFIXES) and k not in DROP_NCCL:
+            env[k] = v
+    env["CUDA_VISIBLE_DEVICES"] = "0,1"
+    # Triton's bundled ptxas does not know about Blackwell sm_103a; prefer the
+    # system CUDA 13 ptxas if available so JIT compilation works on B200/RTX
+    # PRO 6000 hosts.
+    if "TRITON_PTXAS_PATH" not in env:
+        for cand in ("/usr/local/cuda-13.0/bin/ptxas", "/usr/local/cuda/bin/ptxas"):
+            if os.path.isfile(cand):
+                env["TRITON_PTXAS_PATH"] = cand
+                break
     print("[multicard] +", " ".join(cmd))
     import subprocess
     rc = subprocess.call(cmd, env=env, cwd=str(REPO))

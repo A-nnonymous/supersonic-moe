@@ -33,16 +33,27 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--I", type=int, required=True, help="intermediate_size")
     p.add_argument(
         "--total-K", type=int, action="append", default=None,
-        help="Tokens per expert workload (default E*128). Repeatable.",
+        help="Tokens per expert workload (default: production sweep "
+             "{E*64, E*128, E*256, E*512, E*1024}). Repeatable.",
     )
     p.add_argument("--no-fp8", action="store_true", help="bf16 path only")
+    p.add_argument(
+        "--also-bf16", action="store_true",
+        help="In addition to the FP8 path, also warm the BF16 path "
+             "(doubles compile time but covers fall-back kernels).",
+    )
     p.add_argument(
         "--cache-dir", type=str, default=None,
         help="Override SONIC_MOE_CACHE_DIR for this run.",
     )
     p.add_argument(
         "--max-workers", type=int, default=0,
-        help="Parallel CuTe compile workers (0 = auto).",
+        help="Parallel CuTe compile workers (0 = auto). Within-process.",
+    )
+    p.add_argument(
+        "--workers", type=int, default=1,
+        help="Number of warmup subprocesses (process-level partitioning of "
+             "--total-K shapes across the disk cache).",
     )
     p.add_argument(
         "--force", action="store_true",
@@ -77,17 +88,45 @@ def main(argv: list[str] | None = None) -> int:
         clear_all_caches()
         logging.info("[warmup-cli] Cleared cache root %s", get_cache_root())
 
-    from sonicmoe.jit_warmup import warmup_jit
+    from sonicmoe.jit_warmup import warmup_jit, warmup_jit_parallel
 
-    ran = warmup_jit(
-        E=args.E,
-        H=args.H,
-        I=args.I,
-        fp8=not args.no_fp8,
-        total_K_list=args.total_K,
-        max_workers=args.max_workers,
-        force=args.force,
-    )
+    # Default production sweep covers the seqlen × topk regimes that the
+    # dynamic-dim JIT keys still re-tune for (small/medium/large total_K).
+    if args.total_K is None:
+        ks = [args.E * mult for mult in (64, 128, 256, 512, 1024)]
+    else:
+        ks = list(args.total_K)
+    fp8_modes = []
+    if not args.no_fp8:
+        fp8_modes.append(True)
+    if args.also_bf16 or args.no_fp8:
+        fp8_modes.append(False)
+    fp8_modes = list(dict.fromkeys(fp8_modes))  # dedupe, preserve order
+
+    ran_any = False
+    if args.workers > 1:
+        for fp8 in fp8_modes:
+            dt = warmup_jit_parallel(
+                E=args.E, H=args.H, I=args.I, fp8=fp8,
+                total_K_list=ks, workers=args.workers,
+                cache_dir=args.cache_dir,
+            )
+            ran_any = True
+            logging.info("[warmup-cli] parallel cold warmup fp8=%s %.1fs",
+                         fp8, dt)
+        ran = ran_any
+    else:
+        ran = False
+        for fp8 in fp8_modes:
+            ran = warmup_jit(
+                E=args.E,
+                H=args.H,
+                I=args.I,
+                fp8=fp8,
+                total_K_list=ks,
+                max_workers=args.max_workers,
+                force=args.force,
+            ) or ran
     stats = cache_stats()
     logging.info("[warmup-cli] cache_root = %s", get_cache_root())
     logging.info("[warmup-cli] stats      = %s", stats)

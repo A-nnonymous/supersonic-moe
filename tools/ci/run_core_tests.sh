@@ -86,6 +86,29 @@ run_pytest() {
   fi
 }
 
+# Parallel pytest helper. Each xdist worker is pinned to a distinct GPU by
+# tests/conftest.py BEFORE any cuda init. Coverage is collected per worker
+# (`coverage` recognises xdist via parallel=True in .coveragerc).
+PYTEST_PAR_N="${PYTEST_PAR_N:-}"
+if [[ -z "$PYTEST_PAR_N" ]]; then
+  GC_PAR="$(nvidia-smi --query-gpu=count --format=csv,noheader,nounits 2>/dev/null | head -1 || echo 1)"
+  PYTEST_PAR_N="${GC_PAR:-1}"
+fi
+run_pytest_parallel() {
+  local n="$PYTEST_PAR_N"
+  if (( n < 2 )) || ! python -c "import xdist" 2>/dev/null; then
+    run_pytest "$@"
+    return
+  fi
+  if [[ "$DO_COVERAGE" == "1" ]] && command -v coverage >/dev/null 2>&1; then
+    COVERAGE_PROCESS_START="$ROOT/.coveragerc" \
+      coverage run --append --source=sonicmoe -m pytest \
+        -n "$n" --dist=loadfile "$@" 2>&1 | tail -200
+  else
+    python -m pytest -n "$n" --dist=loadfile "$@" 2>&1 | tail -200
+  fi
+}
+
 run_script() {
   if [[ "$DO_COVERAGE" == "1" ]] && command -v coverage >/dev/null 2>&1; then
     coverage run --append --source=sonicmoe "$@" 2>&1 | tail -200
@@ -109,11 +132,11 @@ fi
 phase precision run_script tests/ops/test_mlpnode_precision.py
 
 # ── 2. Multilayer / PP / multistep ───────────────────────────────────────────
-phase multilayer run_pytest tests/ops/test_mlpnode_multilayer.py -x -q
+phase multilayer run_pytest_parallel tests/ops/test_mlpnode_multilayer.py -x -q
 
 # ── 3. Quant kernels (full only) ─────────────────────────────────────────────
 if [[ "$FAST" == "0" ]]; then
-  phase quant run_pytest \
+  phase quant run_pytest_parallel \
     tests/ops/test_dual_quant.py \
     tests/ops/test_fused_quant.py \
     tests/ops/test_colwise_quant.py \
@@ -144,10 +167,16 @@ if [[ "$DO_JIT" == "1" ]]; then
     phase jit-warm   python tools/ci/jit_bench.py --phase warm   "${JIT_ARGS[@]}"
     phase jit-reload python tools/ci/jit_bench.py --phase reload "${JIT_ARGS[@]}"
     phase jit-reuse  python tools/ci/jit_bench.py --phase reuse  "${JIT_ARGS[@]}"
+    phase jit-parallel python tools/ci/jit_bench.py --phase parallel-cold "${JIT_ARGS[@]}"
   fi
 else
   skip jit "--no-jit"
 fi
+
+# ── 4b. JIT key stability + extreme-shape robustness ─────────────────────────
+phase jit-key-stability run_pytest_parallel tests/ops/test_jit_key_stability.py -x -q
+phase extreme-shapes    run_pytest_parallel tests/ops/test_mlpnode_extreme_shapes.py -q
+phase jit-concurrent    run_pytest tests/ops/test_jit_concurrent_heterogeneous.py -q
 
 # ── 5. Perf gate (canonical T8192-H3072-I1536-E8-K8) ─────────────────────────
 if [[ "$DO_PERF" == "1" ]]; then
@@ -175,13 +204,25 @@ else
   skip multicard "--no-multicard"
 fi
 
-# ── Coverage report ──────────────────────────────────────────────────────────
+# ── Coverage report + gate ───────────────────────────────────────────────────
 if [[ "$DO_COVERAGE" == "1" ]]; then
   echo
   echo "${YEL}── [coverage] ──${RST}"
+  coverage combine 2>/dev/null || true   # merge per-xdist-worker .coverage.*
   coverage report --skip-covered 2>&1 | tail -100 || true
   coverage html -d "$ROOT/.coverage_html" 2>/dev/null && \
     echo "[ci] HTML report: $ROOT/.coverage_html/index.html"
+  COVERAGE_TARGET="$(python -c "import json; print(json.load(open('$BASELINES')).get('coverage',{}).get('target_pct', 0))")"
+  if [[ "${COVERAGE_TARGET:-0}" -gt 0 ]]; then
+    if coverage report --fail-under="$COVERAGE_TARGET" >/dev/null 2>&1; then
+      echo "${GREEN}[coverage-gate] PASS (≥${COVERAGE_TARGET}%)${RST}"
+      PASS_ROWS+=("coverage-gate (≥${COVERAGE_TARGET}%)")
+    else
+      ACTUAL="$(coverage report 2>/dev/null | tail -1 | awk '{print $NF}')"
+      echo "${RED}[coverage-gate] FAIL — got ${ACTUAL}, need ≥${COVERAGE_TARGET}%${RST}"
+      FAIL_ROWS+=("coverage-gate ${ACTUAL}<${COVERAGE_TARGET}%")
+    fi
+  fi
 fi
 
 # ── Summary ──────────────────────────────────────────────────────────────────

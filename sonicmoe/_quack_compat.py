@@ -52,11 +52,80 @@ def _install_gpu_warmup_noop() -> bool:
     return True
 
 
+def _install_paddle_torch_proxy_blockers() -> bool:
+    """Tell paddle's torch-compat proxy NOT to intercept ``torch.utils.hipify``,
+    AND eagerly import it so the ``from .hipify import hipify_python`` lookup
+    inside ``torch.utils.cpp_extension._jit_compile`` always hits ``sys.modules``.
+
+    Bug reproducer (paddle ≤ 3.x compat-proxy):
+
+        $ python -c "import paddle; from torch.utils.hipify import hipify_python"
+        ModuleNotFoundError: No module named 'paddle.utils.hipify'
+
+    ``torch.utils.cpp_extension._jit_compile`` always does
+    ``from .hipify import hipify_python`` which Python resolves as
+    ``torch.utils.hipify``. Paddle's ``TorchProxyMetaFinder`` is on
+    ``sys.meta_path`` and tries to redirect every ``torch.*`` import to the
+    matching ``paddle.*`` name; ``paddle.utils.hipify`` doesn't exist, so any
+    sonicmoe op that goes through the cpp-extension JIT path crashes —
+    silently masking real CI signal as SKIP.
+
+    Two layers of defense:
+      1. ``extend_torch_proxy_blocked_modules({"torch.utils.hipify"})`` —
+         the proxy will fall back to the real torch resolver for that name
+         (and its submodules).
+      2. Eager import — pre-populate ``sys.modules['torch.utils.hipify']``
+         and ``sys.modules['torch.utils.hipify.hipify_python']`` so that
+         downstream ``import`` statements never even reach the meta_path
+         finders.
+    """
+    import sys
+
+    ok = False
+    try:
+        import paddle.compat as _pc  # type: ignore
+        extender = getattr(_pc, "extend_torch_proxy_blocked_modules", None)
+        if extender is not None:
+            # Block both the parent and the leaf module — paddle's TorchProxy
+            # intercepts dotted lookups recursively so we must list every
+            # name that might appear in `from torch.utils.hipify import X`.
+            extender({
+                "torch.utils.hipify",
+                "torch.utils.hipify.hipify_python",
+            })
+            ok = True
+    except Exception:
+        pass
+
+    # Eager-import so sys.modules has them before any subsequent lookup.
+    for mod_name in (
+        "torch.utils.hipify",
+        "torch.utils.hipify.hipify_python",
+    ):
+        if mod_name not in sys.modules:
+            try:
+                __import__(mod_name)
+                ok = True
+            except Exception:
+                pass
+
+    return ok
+
+
 def install_quack_paddle_compat() -> bool:
-    """Install all defensive patches. Returns True if at least one applied."""
+    """Install all defensive patches. Returns True if at least one applied.
+
+    Safe to call multiple times — each helper checks-and-installs idempotently.
+    Callers that depend on the patches being live (e.g. JIT cpp_jit) should
+    re-invoke this immediately before any paddle ``cpp_extension.load`` to
+    cover the case where ``paddle.enable_compat()`` was called *after* the
+    initial ``import sonicmoe``.
+    """
     if os.environ.get("SONIC_MOE_NO_QUACK_COMPAT_PATCH"):
         return False
-    return _install_gpu_warmup_noop()
+    a = _install_gpu_warmup_noop()
+    b = _install_paddle_torch_proxy_blockers()
+    return a or b
 
 
 _PATCHED = install_quack_paddle_compat()

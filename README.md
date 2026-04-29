@@ -115,6 +115,53 @@ Three tiers of caching, each with different invalidation strategies:
 
 **Design principle**: `compile_key` contains only static model dimensions — never `TK`, `total_M`, `total_K`, `capacity`, or any token-count-dependent value. Dynamic token dimensions are handled at runtime via CuTe's `mark_layout_dynamic`. This ensures **zero CuTe recompilation** when batch size or routing distribution changes.
 
+### Multi-process JIT cache on shared GPFS (production)
+
+Production deploys 1 process per GPU; every rank on every node sees the
+same `build/` directory and `SONIC_MOE_CACHE_DIR` over GPFS. The JIT layer
+is fully race-safe under concurrent cold start across ranks:
+
+| Layer | Race-safety mechanism |
+|---|---|
+| **C++ extensions** (`sonicmoe/jit.py`) | Cross-process `FileLock` at `<parent>/.{module_name}.lock` (stable inode survives `build/<module>/` wipe). After lock acquisition the worker first tries `_try_import_prebuilt` — directly `dlopen`-imports `<build_dir>/<name>/<name>.so` (PYBIND11) bypassing paddle's racy `load()` whenever the artifact already exists. Only the first rank actually compiles; later ranks fast-path import. |
+| **Triton kernels** (`~/.triton/cache`, or `$TRITON_CACHE_DIR`) | Per-key subdirs; same-key concurrent writes use Triton's atomic temp+rename. |
+| **Quack / CuTe autotuner** (`autotuner.py:check_disk_cache`) | `sha256(VERSION + tuning_key + configs)` → per-key file. Different shapes write to different files; same-key writes are atomic. Once any rank has tuned a (dtype, K, config) combination, all other ranks read the same JSON on the next iteration. |
+| **`paddle.enable_compat()` ordering** | `_get_cpp_function` re-arms the `torch.utils.hipify` proxy blocker (`install_quack_paddle_compat()`) **inside the FileLock immediately before `cpp_extension.load()`**, so the patches are live regardless of whether the consumer imported sonicmoe before or after `paddle.enable_compat()`. |
+
+Heterogeneous-shape concurrent cold starts (e.g. GPU0 hits `total_K=4096`,
+GPU1 hits `total_K=8192` simultaneously on a fresh cache) are explicitly
+covered by `tests/ops/test_jit_concurrent_heterogeneous.py` and gated in CI
+under phase `jit-concurrent`.
+
+**Recommended deployment**: pre-warm once per cluster, then point every rank
+at the shared cache:
+
+```bash
+python -m sonicmoe.cli.warmup --E 32 --H 3072 --I 1536 \
+    --cache-dir /gpfs/.../sonicmoe_jit_e32_h3072_i1536
+# every rank
+export SONIC_MOE_CACHE_DIR=/gpfs/.../sonicmoe_jit_e32_h3072_i1536
+```
+
+Skipping pre-warm is also safe: ranks will JIT-compile in parallel under the
+locks above; the cluster pays the cold-start cost once and converges to
+steady-state on iteration ≥ 2.
+
+### Custom integration (PaddleFleet / external trainers)
+
+1. Call `paddle.enable_compat()` (or `paddle.compat.enable_torch_proxy(scope={"sonicmoe", "quack", "triton"})`) **before** `import sonicmoe`. The reverse order is also tolerated — `_get_cpp_function` re-arms patches lazily — but the recommended order avoids a duplicate proxy install on the hot path.
+2. Set `SONIC_MOE_CACHE_DIR` to a shared GPFS path so all ranks reuse Triton/Quack disk caches; otherwise each rank caches under `~/.cache/sonicmoe`.
+3. Construct one `SonicMoEMlpNode` per fused expert group (see Paddle Integration above). Call `node.step()` BEFORE `optimizer.step()` each microbatch; this flushes native-layout wgrad into per-expert `main_grad`.
+4. For diagnostics: `SONIC_MOE_VALIDATE_DISPATCH=1` enables an O(T) per-row uniqueness check on `dispatched_indices` before kernel launch (catches malformed routing in custom dispatchers).
+
+### Lessons learned (S77 strict CI hardening)
+
+- **Hipify proxy install order matters**. paddle's torch-proxy intercepts `torch.utils.hipify.hipify_python` lookups and raises `KeyError`. Fix: pre-import the real `torch.utils.hipify[.hipify_python]` and add it to `paddle.compat.extend_torch_proxy_blocked_modules`. Re-arm inside the JIT lock so the patch applies regardless of `import sonicmoe` vs `paddle.enable_compat()` ordering.
+- **Blackwell ptxas mismatch**. Bundled Triton 3.5 ptxas does not recognize `sm_103a`. Tests/CI globally export `TRITON_PTXAS_PATH=/usr/local/cuda-13.0/bin/ptxas` (handled in `tests/conftest.py::_ensure_blackwell_ptxas`). Production deployment should set this if running on B300.
+- **`dispatched_indices` per-row uniqueness contract**. The kernel (`sonicmoe/ernie_compat/deepep_topk_metadata_cuda/kernel.cu` L315-333) assumes each row of `dispatched_indices` contains pairwise-distinct expert ids. Real DeepEP dispatch always satisfies this; custom test fixtures must. The optional contract validator at `deepep_metadata.py` (gated by `SONIC_MOE_VALIDATE_DISPATCH=1`) catches violations early.
+- **paddle's `cpp_extension.load()` writes a wrapper `.py` whose `__bootstrap__` references `*_pd_.so`**. In this paddle build the file is plain `*.so` and the wrapper is non-functional; importing the `.so` directly via `spec_from_file_location` (PYBIND11 handles symbol export) is the correct fast-path.
+- **Stable lock paths matter**. paddle's `load()` may wipe its `build_directory` mid-cycle. The FileLock must live in the *parent* dir so the lock inode survives.
+
 ### Gradient Contract
 
 | Gradient | Mechanism | Verified |
