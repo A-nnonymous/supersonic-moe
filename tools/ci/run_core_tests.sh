@@ -131,6 +131,9 @@ fi
 # ── 1. Precision ─────────────────────────────────────────────────────────────
 phase precision run_script tests/ops/test_mlpnode_precision.py
 
+# ── 1b. Import smoke (cheap; lifts coverage of optional kernels) ─────────────
+phase import-smoke run_pytest_parallel tests/ops/test_import_smoke.py -q
+
 # ── 2. Multilayer / PP / multistep ───────────────────────────────────────────
 phase multilayer run_pytest_parallel tests/ops/test_mlpnode_multilayer.py -x -q
 
