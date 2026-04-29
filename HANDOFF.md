@@ -70,6 +70,91 @@ PASS multicard (54s)         ← 2-rank distributed smoke
 - `tools/ci/jit_bench.py` — `_run_subprocess` injects PYTHONPATH=quack.
 - `tools/ci/multicard_smoke.py` — whitelist env + eager device-pool init + FLAGS_selected_gpus pinning + ptxas path + WORKER_BODY rewritten for current `SonicMoEMlpNode` API (experts list, MockExpert, dispatched_indices/probs).
 
+## S77 — Project state snapshot (single source of truth for next agent)
+
+**Branch / tracking**: `myrepo/race-fix-paddle` ← PFCCLab/supersonic-moe; tracks `fork/paddle@108322c`. Last commit on this branch: `S77: race-safe JIT + FP8 config isolation + cluster-env-safe multicard` (`86babf4`+).
+
+**Frontier path** (production-ready, default-on):
+- FP8 fused-v2 (epilogue blockscaled quant + fused-gated up-proj + TMA reduce-add wgrad + FP8 saved z + sonic-meta CUDA topk-metadata).
+- `SonicMoEMlpNode` (sonicmoe/ernie_compat/mlp_node_v2.py) with `experts=…, n_experts=E, hidden_size=H, intermediate_size=I` API, `node.forward(x_in, tpe, dispatched_indices=di, dispatched_probs=dp)`, then `node.flush_grads()` (or `node.step()` at optimizer-step time).
+- **`node.step()` MUST run BEFORE `optimizer.step()`** — flushes the per-microbatch native-layout wgrad accumulators into the per-expert `main_grad` buffers used by the optimizer.
+- `main_grad` is **lazily allocated** at first `node.step()` call (NOT in `stack_ernie_w1`) — saves ~ memory across mostly-zero windows in PP/grad-acc.
+- Single-stream from deepep-fwd → deepep-bwd; post-warmup zero `cuda.synchronize()` calls (verified via nsys).
+
+**Performance** (nsys 2026.2.1.210, sqlite GPU-projection, B30Z idle, T=8192 E=8 K=8 I=1536 H=3072):
+- mlpnode-only BENCH range / n_iters: **2823 µs/iter**.
+- per-ITER NVTX median (no in-loop flush): **2463 µs**.
+- per-iter flush (non-default; `grad_acc=1`): 3110 µs.
+- realistic `grad_acc_steps=8` per microbatch: ~**2519 µs** → **−7.2% vs S53 pure-torch FP8 baseline (2715 µs)**.
+- Speedup vs BF16: 1.29×–1.70× (mean 1.53×) across the 27-shape S53 grid.
+
+**Precision** (S65, FP8 vs BF16 gold, TMA Reduce-Add epilogue, multilayer/multistep-correct):
+- output cosine ≥ 0.997 (RRMSE ≤ 0.076)
+- dx cosine ≥ 0.9975
+- ds cosine ≥ 0.9971
+- dw1 / dw2 cosine ≥ 0.9971
+- multilayer 4-step grad accumulation: bit-equivalent main_grad
+- 9/9 large-shape regression cases (`test_mlpnode_correctness_large.py`) PASS, including seq16K/E32, skew80, extreme_one, tpe0_holes.
+
+**Memory** (B30Z, ERNIE shape):
+- FP8 active overhead: +4.8% to +10.3% backward peak (FP8 shadow weight caches).
+- `SONIC_MOE_STAGEWISE_MEMORY=1` (`mem` mode): −24.5% peak vs `perf`, ~3-5% extra cost.
+- Lazy `main_grad` allocation saves ~`(num_experts × 2I × H + I × H) × sizeof(fp32)` per layer × (1 - active-window-fraction).
+- `SONIC_MOE_FP8_RECOMPUTE_Z=1`: −~213 MiB / active layer; +5-15% layer cost.
+
+**JIT cache**:
+- Cold warmup (full shape sweep, empty cache, ptxas + autotune + cute.compile): **≤ 600 s budget** (CI gate; warns at 480 s; current measurement on dev host: ~50 s for the gated single-shape bench, full sweep ~10-15 min).
+- Sentinel skip (warm hit): **≤ 5 s** (current: 4 s).
+- Cross-process disk reload: **≤ 300 s** (current: 30 s).
+- In-process re-dispatch: **≤ 8 ms** (current: < 1 ms after init).
+- Sentinel keyed on `(E, H, I, fp8, kernel_sig_v1, git_hash)` plus min on-disk file counts; override with `SONIC_MOE_WARMUP_IGNORE_GIT=1` for cross-commit cache reuse.
+- **Multi-process safety on shared GPFS**: `sonicmoe/jit.py` uses `FileLock` on a stable parent dir; per-key locking lets rank 0 / rank 1 compile different shapes concurrently without conflict.
+
+**CI gates (all green)** — `bash tools/ci/run_core_tests.sh` (full sweep, ~15 min):
+| Phase | Wall | Gates |
+|-------|------|-------|
+| precision | 72 s | 6-shape topk audit, cosine ≥ 0.997 |
+| multilayer | 43 s | 4-step PP main_grad accumulation |
+| quant | 186 s | 181 quant tests across 6 files |
+| jit-cold / warm / reload / reuse / parallel | 51 + 4 + 30 + 31 + 58 s | All 4 JIT axes vs `baselines.json` budgets |
+| jit-key-stability | 35 s | cache_size invariant across T values (no recompile on T change) |
+| extreme-shapes | 69 s | 0-size, large, 85% / 99% imbalance |
+| jit-concurrent | 91 s | heterogeneous concurrent cold-compile |
+| perf | 169 s | nsys GPU-projection µs/iter ≤ 4500 µs budget |
+| multicard | 54 s | 2-rank `paddle.distributed.launch` finite-output smoke |
+
+## S77 — Insights (compact, for next agent)
+
+1. **The CI is the project's nervous system now.** `bash tools/ci/run_core_tests.sh --fast` (~2 min) is the right pre-commit reflex; the full sweep is the right pre-push / pre-merge reflex. Bumping any budget in `tools/ci/baselines.json` requires a HANDOFF justification in the same commit.
+2. **Cross-test pollution is the dominant remaining bug class.** The S77 BF16-fallback bug was masked for sessions because each test passed in isolation. Anytime you add a `with enable_fp8(False):` (or any context-manager that flips a module-global), audit every site that takes a snapshot of the global afterwards.
+3. **Multi-rank correctness is gated by env-hygiene, not by code paths.** The hardest multicard bug this session was a paddlejob env leak that caused a silent hang. When in doubt, use a whitelist subprocess env, never inherit.
+4. **The lazy device-pool init pattern (eager 1-element allocation after `set_device`) belongs anywhere we hand control to autograd or paddle.library proxies.** Consider folding into `_quack_compat.py` so any production code that spawns sonicmoe in a fresh paddle context gets it for free.
+5. **Phase C (CuTe in-process pickle cache) remains BLOCKED** — see S76 for full RCA. The Triton + Quack disk caches + sentinel already recover the bulk of the wins; do NOT re-investigate without a documented user-visible regression.
+
+## S77 — Next steps / open work
+
+- **Phase C unblock attempt** (low priority): use cute-dsl AOT `export_to_c` for the ~6 `_COMPILE_CACHE*` sites in `blockscaled_fp8_gemm.py`; brittle to cute-dsl version upgrades.
+- **Wire `bash tools/ci/run_core_tests.sh` into nightly CI** (currently developer-local). The Coverage gate is collected but not enforced; raise the floor once the codebase stabilises.
+- **Fold the eager device-pool init into `_quack_compat.py`** so production code paths that import sonicmoe in a fresh paddle context auto-fix the `Place(gpu:N) is not supported` class.
+- **Investigate the paddle hipify-proxy bug** that causes subprocess JIT to crash on a fresh process (currently classified as SKIP in the `jit_bench` wrapper). Fix likely belongs in paddle-torch-proxy itself.
+- **Coverage**: dead-code prune driven by `coverage report` once the full sweep has been run on a clean checkout (the runner already wires `--source=sonicmoe` and omits `cli/` + `*_compat.py`).
+- **Production rollout**: ERNIE PaddleFleet integration (S74 doc) is ready but not yet validated end-to-end on a real training run. Next agent should coordinate with the Fleet team to run a 1k-step microbenchmark on the production cluster and compare loss curves to the BF16 baseline.
+
+## S77 — High-value information sources (consult before re-investigating)
+
+| Topic | Source |
+|-------|--------|
+| Project canonical state | Root `HANDOFF.md` (newest session at top) |
+| Production training contract | `docs/PADDLEFLEET_MIGRATION_S74.md` (`node.step()` ordering, lazy main_grad, Fleet pre-fused weights) |
+| FP8 architecture deep dive | `docs/KNOWLEDGE_BASE.md` |
+| Engineering history (Phases 1–26) | `reports/fp8_upgrade/engineering_log.md` (sessions ≥66 are HANDOFF.md only) |
+| nsys methodology + perf baseline | `reports/session53_breakdown.md` (pure-torch FP8 baseline 2715 µs); `tests/ops/bench_mlpnode_topk_nsys.py` (canonical bench harness) |
+| Multi-rank rendezvous failure modes | This S77 section + `tools/ci/multicard_smoke.py` whitelist |
+| Custom kernel landlmines | `engineering_log.md` Phase 26 lessons 91-95 (Class A/B kernel-launch bugs, BENCH-vs-ITER NVTX, contended-GPU artefacts) |
+| Environment / Paddle compat pitfalls | `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/env.md` |
+| quack interpreter location | `/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack` (sys.path injected by `tests/conftest.py`) |
+| eb_venv python (has quack natively) | `/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/erniebot/eb_venv/bin/python` |
+
 ---
 
 
