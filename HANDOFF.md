@@ -1,3 +1,144 @@
+# HANDOFF — Session 74 (2026-04-29) — Globals purge + Triton stream fix + router-grad opt
+
+> **Single source of truth for project state.** `docs/HANDOFF.md` redirects here.
+> Earlier sessions preserved verbatim below.
+
+**Branch**: `race-fix-paddle` on `myrepo` (PFCCLab/supersonic-moe), tracks `fork/paddle@108322c`.
+**Hardware**: NVIDIA B30Z (SM103, CUDA 13.0)
+**Python**: 3.12, Paddle torch-proxy
+**QuACK**: `/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack`
+**Venv**: `/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/erniebot/eb_venv`
+
+---
+
+## SESSION 74 DELIVERABLES
+
+### S74.1 — Triton kernels were launching on the CUDA NULL stream (CRITICAL)
+
+**Symptom (from `eb5_trainer_0 (7).nsys-rep`)**: every sonic-moe Triton kernel
+(`_quantize_and_pack_kernel`, `token_gather_sum_kernel`, `_quantize_pair_kernel`,
+`_gather_isa_packed_scales_kernel`) ran on **stream 7 = the CUDA legacy NULL stream**,
+while Paddle GEMMs / CUTLASS quack GEMMs / phi:: ops ran on **stream 13 = Paddle's
+compute stream**. NULL-stream launches have implicit cross-stream sync semantics →
+serialises everything + creates producer/consumer race hazards across the stream
+boundary.
+
+**Root cause**: `triton/backends/driver.py` binds
+`GPUDriver.get_current_stream = torch._C._cuda_getCurrentRawStream` at import time.
+That C function bypasses any Python-level `paddle-torch-compat` shim and always
+returns torch's NULL stream. (`torch.cuda.current_stream().cuda_stream == 0x0`
+inside a Paddle process — verified.)
+
+**Fix**: `sonicmoe/_triton_stream_compat.py` monkey-patches
+`triton.runtime.driver.driver.active.get_current_stream` to return
+`paddle.device.current_stream().stream_base.raw_stream`. Imported at the top of
+`sonicmoe/__init__.py` so it fires before any Triton kernel can launch. Idempotent;
+opt-out via `SONIC_MOE_NO_TRITON_STREAM_PATCH=1`; falls back to the original
+binding on any error. CUTLASS path was already correct — `_get_raw_cuda_stream`
+already unwraps the paddle proxy via `s.stream_base.raw_stream`, which is why the
+trace shows GEMMs on stream 13.
+
+**Verified**:
+```
+triton get_current_stream(0) → 0x5b5366aec7c0
+paddle current_stream         → 0x5b5366aec7c0   ← match
+torch  current_stream         → 0x0              ← unchanged
+```
+
+### S74.2 — `_differentiable_router_scores` backward CUB cascade replaced
+
+**Symptom**: backward of `dispatched_probs.reshape(-1)[gather_idx]` dispatched the
+generic Paddle advanced-indexing backward, which spawned per call:
+`cub::DeviceRadixSortHistogramKernel`, `cub::DeviceRadixSortExclusiveSumKernel`,
+3× `cub::DeviceRadixSortOnesweepKernel`, `IndexingBackwardKernel<float,4>`,
+`histogram_kernel<16>`, `prefix_sums_kernel`, `block_offset_scan_kernel`,
+`scatter_and_fixup_kernel<16>`. ≈ 0.3–0.5 ms / backward at production shape.
+
+**Why it was overkill**: `gather_idx` is a *permutation of distinct positions*
+(each `(token, slot)` pair appears at most once). No accumulate, no sort needed —
+plain scatter is correct.
+
+**Fix**: New `_GatherRouterScores` autograd Function whose backward is a single
+Triton kernel `_scatter_router_grad_kernel`. Bit-exact verified vs. baseline on
+`test_mlpnode_precision/multilayer/correctness_large` (4/4 pass).
+
+### S74.3 — `SonicMoEMlpNode` globals + FIFO purge (engineering-grade refactor)
+
+`sonicmoe/ernie_compat/mlp_node_v2.py` rewritten 910 → ~620 lines.
+
+**Removed from production path**:
+* module-level `_W_CACHE` dict
+* module-level `_PENDING_FLUSH_LAYERS` FIFO
+* `_NATIVE_W1_GRAD`, `_NATIVE_W2_GRAD`, `_NATIVE_GRAD_EXPERTS`, `_NATIVE_GRAD_I` globals
+* `_SonicMoEDeepEPFunc._topk` class-variable hack (now a regular forward arg)
+* `_ensure_native_grads`, `_accumulate_w1`, `_accumulate_w2`, `_mark_pending_flush`
+* legacy `SonicMoEFunc` PyLayer + `prepare_sonic_inputs` helper
+* BF16 fallback dead code in `_UpProjection.backward` (production always FP8)
+
+**New per-instance state** (each `SonicMoEMlpNode` owns its own copy):
+* `_w_cache: dict` — stacked-weight reuse across iters of *this* layer only
+* `_pending_flush: bool` — set by ctx in backward, cleared by `step()`
+* `_warmed_for_step: bool` — JIT/cache warmup gate per global step
+
+**New public API**:
+| Method                | Purpose                                                     |
+| --------------------- | ----------------------------------------------------------- |
+| `node.flush_grads()`  | flush wgrads only (keeps cache; for PP cross-microbatch)    |
+| `node.step()`         | flush wgrads + invalidate caches (call at optimizer step)   |
+
+Module-level `flush_native_grads()` / `stack_ernie_w1` / `stack_ernie_w2` are
+*kept as legacy back-compat shims* operating on a separate `_LEGACY_W_CACHE` /
+`_LEGACY_PENDING_FLUSH`. Used only by `jit_warmup.py` + a couple of standalone
+benchmark scripts. Production `SonicMoEMlpNode` instances never feed into them.
+
+### S74.4 — Pipeline-parallel + multi-layer correctness verified
+
+`tests/ops/test_mlpnode_multilayer.py` exercises 6 distinct interleaved
+F0/F1/F2/B0/B1/B2 schedules (canonical 1F1B, fwd-first/bwd-first, fully
+interleaved, …) over multiple optimizer steps with multi-microbatch grad
+accumulation. Per-instance `_pending_flush` carries the layer identity through
+arbitrary F/B orderings — no global FIFO can be poisoned.
+
+### S74.5 — Lessons (record — these cost real debugging budget)
+
+1. **Triton bypasses Python compat shims for stream resolution.** Anyone who
+   ports a Triton-using project from torch to paddle compat MUST monkey-patch
+   `driver.active.get_current_stream` — `torch.cuda.current_stream()` overrides
+   are insufficient because Triton imports the C symbol directly.
+2. **PyTorch advanced-indexing backward is a sorting cascade.** Whenever the
+   index is a permutation (no duplicates), bypass `IndexingBackward` with a
+   custom `Function` that does plain scatter — saves 5–10 cub kernels per call.
+3. **Global state in MoE wrappers breaks pipeline parallelism.** Per-instance
+   ownership is the only correct design once forward and backward of different
+   layers can be arbitrarily interleaved.
+
+### S74.6 — Validation matrix
+
+| Suite                                          | Result        |
+| ---------------------------------------------- | ------------- |
+| `tests/ops/test_mlpnode_precision.py`          | ✅ 1 passed   |
+| `tests/ops/test_mlpnode_multilayer.py`         | ✅ 2 passed   |
+| `tests/ops/test_mlpnode_correctness_large.py`  | ✅ 1 passed   |
+| `tests/ops/test_colwise_quant.py`              | ✅ 32 passed  |
+| `tests/ops/test_rowwise_quant.py`              | ✅ 45 passed  |
+| `tests/ops/test_fused_quant.py`                | ✅ 14 passed  |
+
+All bit-exact relative to S73 baseline (`2795dc0`).
+
+### S74.7 — Files changed
+
+* `sonicmoe/_triton_stream_compat.py` (new)
+* `sonicmoe/__init__.py` — install stream patch first thing
+* `sonicmoe/ernie_compat/mlp_node_v2.py` — rewrite + `_GatherRouterScores` + `_scatter_router_grad_kernel`
+* `sonicmoe/ernie_compat/__init__.py` — drop deleted exports
+* `tests/ops/test_mlpnode_multilayer.py` — migrate `flush_native_grads()` → `node.flush_grads()`
+* `tests/ops/test_mlpnode_audit.py`, `tests/ops/test_mlpnode_breakdown.py` — drop deprecated imports
+* `tests/ops/{test_cold_start_e2e,test_jit_optimization,bench_coldstart_nsys,mlpnode_nsys_worker,bench_deepep_topk_nsys,precision_compare_paths}.py` — strip `_NATIVE_*` pokes
+* `tests/ops/test_sonic_moe_func.py` — deleted (covered legacy `SonicMoEFunc`)
+* `docs/PADDLEFLEET_MIGRATION_S74.md` (new)
+
+---
+
 # HANDOFF — Session 72 (2026-04-29) — FP8 frontier IMA root-caused & shipped
 
 > **Single source of truth for project state.** `docs/HANDOFF.md` redirects here.
