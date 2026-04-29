@@ -526,7 +526,7 @@ class SonicMoEMlpNode:
         from sonicmoe.jit_warmup import warmup_jit
         warmup_jit(
             self._E, self._H, self._I,
-            device="cuda",
+            device=f"cuda:{torch.cuda.current_device()}",
             fp8=True,
             total_K_list=total_K_list,
             max_workers=max_workers,

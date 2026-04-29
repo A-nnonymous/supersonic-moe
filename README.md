@@ -227,6 +227,32 @@ with cfg.activate():
     output, aux_loss = moe(x, use_fp8=True)
 ```
 
+## CI & Pre-commit Hook
+
+Strict-baseline regression runner — every core mechanism (precision, multilayer/PP, quant kernels, JIT cold/warm/reload/reuse, nsys perf, multi-card) is measured and gated against `tools/ci/baselines.json`:
+
+```bash
+# fast pre-commit suite (~2 min on warm cache)
+bash tools/ci/run_core_tests.sh --fast
+
+# full suite — also runs jit-cold (~10 min), perf gate (nsys), multi-card
+bash tools/ci/run_core_tests.sh
+```
+
+Install the pre-commit hook once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Offline pre-warm the JIT cache (Triton + Quack disk caches + sentinel) so production training skips the multi-minute first-loss cost:
+
+```bash
+python -m sonicmoe.cli.warmup --E 32 --H 3072 --I 1536 \
+    --cache-dir /nfs/sonicmoe_jit_e32_h3072_i1536
+# then export SONIC_MOE_CACHE_DIR=/nfs/... on every training rank
+```
+
 ## Citation
 
 ```bibtex

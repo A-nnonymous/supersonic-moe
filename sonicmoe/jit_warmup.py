@@ -28,14 +28,19 @@ def warmup_jit(
     E: int,
     H: int,
     I: int,
-    device: torch.device | str = "cuda",
+    device: torch.device | str | None = None,
     *,
     fp8: bool = True,
     total_K_list: list[int] | None = None,
     max_workers: int = 0,
     cache_dir: str | None = None,
-):
+    skip_if_warm: bool = True,
+    force: bool = False,
+) -> bool:
     """Pre-compile all CuTe + Triton kernels with dummy data.
+
+    Returns ``True`` if compilation actually ran, ``False`` if it was skipped
+    because the disk-cache sentinel matched.
 
     After the compile_key fix (dynamic dims removed from cache key),
     a single warmup shape covers ALL future seqlens.
@@ -44,8 +49,11 @@ def warmup_jit(
     ----------
     E, H, I : int
         Model dimensions (num_experts, hidden_size, intermediate_size).
-    device : str or torch.device
-        CUDA device to warmup on.
+    device : str or torch.device, optional
+        CUDA device to warmup on. Defaults to the current rank's device
+        (``torch.device("cuda", torch.cuda.current_device())``); explicit
+        rank-aware addressing avoids ``DeviceContextPool::Get`` failures in
+        multi-rank / multi-machine setups under paddle-torch-compat.
     fp8 : bool
         Whether to warmup FP8 codepath (default True).
     total_K_list : list[int], optional
@@ -54,13 +62,29 @@ def warmup_jit(
         Parallel CuTe compile workers (0 = auto).
     cache_dir : str, optional
         Override SONIC_MOE_CACHE_DIR.
+    skip_if_warm : bool
+        If True (default), check the cache sentinel and skip compilation
+        when it indicates a previous warmup for this (E,H,I,fp8,kernel-sig,
+        git-hash) tuple has populated the disk caches. Ignored if ``force``.
+    force : bool
+        Run warmup even if the sentinel matches.
     """
-    from sonicmoe.cache_manager import setup_cache
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    from sonicmoe.cache_manager import setup_cache, is_warm, mark_warm
 
     if cache_dir:
         setup_cache(cache_dir)
     else:
         setup_cache()
+
+    if skip_if_warm and not force and is_warm(E, H, I, fp8):
+        _log.info(
+            f"[Warmup] sentinel hit (E={E}, H={H}, I={I}, fp8={fp8}); "
+            f"skipping compile. Set force=True or `clear_warmup_sentinel()` "
+            f"to override."
+        )
+        return False
 
     if max_workers == 0:
         max_workers = min(os.cpu_count() or 8, 16)
@@ -86,6 +110,8 @@ def warmup_jit(
 
     total = time.perf_counter() - t0
     _log.info(f"[Warmup] All done in {total:.1f}s")
+    mark_warm(E, H, I, fp8)
+    return True
 
 
 def _warmup_single(E: int, H: int, I: int, total_K: int, device, fp8: bool):
