@@ -64,12 +64,12 @@ python -m pytest tests/...
 
 ## Paddle Integration (ERNIE / PaddleFleet)
 
-The `session60-ds-fix` branch integrates SonicMoE into PaddleFleet via `paddle.compat.enable_torch_proxy`. Production entry point: `SonicMoEMlpNode`.
+The `race-fix-paddle` branch integrates SonicMoE into Paddle via `paddle.compat.enable_torch_proxy`. Production entry point: `SonicMoEMlpNode`.
 
-### Training Loop
+### Training Loop (S74+ contract — `node.step()` BEFORE `optimizer.step()`)
 
 ```python
-from sonicmoe.ernie_compat import SonicMoEMlpNode, flush_native_grads
+from sonicmoe.ernie_compat import SonicMoEMlpNode
 
 node = SonicMoEMlpNode(experts, n_experts=E, hidden_size=H, intermediate_size=I)
 
@@ -80,17 +80,17 @@ node = SonicMoEMlpNode(experts, n_experts=E, hidden_size=H, intermediate_size=I)
 
 for step in range(num_steps):
     for mb in microbatches:
-        # First fwd of each step transparently runs a fused single-pass FP8
-        # prequantize for w1/w2 (all 4 layouts, ~3x faster than the legacy
-        # 4-call sequence — ~297 µs vs. ~943 µs at H=3072 I=1536 E=8).
-        # To prefetch even earlier (e.g. overlap with comm), call
-        #   node.prequantize_weights()
         out = node(x, tokens_per_expert, dispatched_indices, dispatched_probs)
         out.backward(grad)
+    node.step()           # MUST run BEFORE optimizer.step():
+                          # converts native CUTLASS [E,2I,H] → ERNIE split-half
+                          # [E,H,2I] in-place into expert.weight.main_grad,
+                          # which the optimizer then reads.
     optimizer.step()
-    node.step()          # flush wgrad → main_grad + invalidate weight caches
-    optimizer.zero_grad()
+    optimizer.clear_grad()
 ```
+
+`main_grad` is **lazy-allocated on first backward** (S74 follow-up); inference / warmup-only flows pay zero `main_grad` memory. Weight cache invalidation is automatic via `(data_ptr, _inplace_version(w))` keys — no manual `clear_*` needed after in-place optimizer updates.
 
 ### Cold Start vs Hot Start
 
@@ -120,8 +120,8 @@ Three tiers of caching, each with different invalidation strategies:
 | Gradient | Mechanism | Verified |
 |----------|-----------|:--------:|
 | **dx** (d/d hidden_states) | Paddle autograd through `_SonicMoEDeepEPFunc.backward` | cos=0.9975 |
-| **ds** (d/d dispatched_probs) | Triton `_build_score_src_idx_kernel` → differentiable fancy-index → autograd | cos=0.9972 |
-| **dw1, dw2** | CUTLASS wgrad accumulate directly into `_NATIVE_W{1,2}_GRAD`; `flush_native_grads()` transposes to per-expert `main_grad` at step time | cos=0.9975/0.9972 |
+| **ds** (d/d dispatched_probs) | `_GatherRouterScores` PyLayer with custom Triton scatter (no CUB cascade) | cos=0.9971–0.9973 |
+| **dw1, dw2** | CUTLASS wgrad accumulates directly into the per-instance fused `[E, 2I, H]` / `[E, H, I]` native buffer (lazy-allocated on first backward); `node.step()` performs the in-place native→ERNIE split-half layout conversion into `expert.weight.main_grad` before `optimizer.step()` reads it. | cos=0.9975 / 0.9971 |
 
 ### Precision (Session 65, FP8 vs BF16 gold, TMA Reduce-Add epilogue)
 
@@ -192,16 +192,22 @@ See `HANDOFF.md` for full kernel breakdown and Session 53 baseline comparison.
 
 | Priority | Resource | Path |
 |:---:|----------|------|
-| 1 | **Handoff** | Root `HANDOFF.md` (Session 66) — current state, perf, bugs fixed, audit, next steps |
-| 2 | **This README** | Root `README.md` — architecture, cache design, training loop, test matrix |
-| 3 | **Knowledge Base** | `docs/KNOWLEDGE_BASE.md` — deep expert reference |
-| 4 | **Engineering Log** | `reports/fp8_upgrade/engineering_log.md` — Phases 1-26, 95 lessons |
-| 5 | **Environment** | `/panzhaowu/env.md` — machine setup, Paddle compat pitfalls, perf methodology |
+| 1 | **Handoff (current state)** | Root `HANDOFF.md` — top section is the active session, prior sessions preserved verbatim below |
+| 2 | **PaddleFleet migration** | `docs/PADDLEFLEET_MIGRATION_S74.md` — stream patch, `node.step()` ordering, lazy main_grad, Fleet's pre-fused-weight integration path |
+| 3 | **This README** | Root `README.md` — architecture, cache design, training loop, test matrix |
+| 4 | **Knowledge Base** | `docs/KNOWLEDGE_BASE.md` — deep expert reference |
+| 5 | **Engineering Log** | `reports/fp8_upgrade/engineering_log.md` — historical lesson log (Phases 1–26 only; superseded by HANDOFF.md sessions ≥66) |
+| 6 | **Environment** | `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/env.md` — machine setup, Paddle compat pitfalls, perf methodology |
 
-**For the audit / regression test introduced in Session 66**:
-run `tests/ops/test_mlpnode_correctness_large.py` (9 cases, subprocess + 600s timeout,
-validates out/dx/ds/dw1/dw2 against BF16 gold). Includes the bug-fix regression cases
-`seq16K_E8` and `seq16K_E32` (TK=131072).
+> **Project state (as of session 75)**: branch `myrepo/race-fix-paddle` (PFCCLab/supersonic-moe), tracks `fork/paddle@108322c`. FP8 frontier is **green**: precision (out/dx/dw1/dw2/ds) cos≥0.997, multilayer/multistep main_grad accumulation correct, single-stream from deepep-fwd to deepep-bwd, post-warmup zero `cuda.synchronize()`, `node.step()` MUST precede `optimizer.step()`, `main_grad` lazy-allocated.
+
+**Quick-validate the frontier before resuming work**:
+```bash
+source .runenv.sh
+python -m pytest tests/ops/test_mlpnode_multilayer.py tests/ops/test_mlpnode_correctness_large.py \
+                 tests/ops/test_colwise_quant.py tests/ops/test_rowwise_quant.py tests/ops/test_fused_quant.py
+python tests/ops/test_mlpnode_precision.py     # 6-shape topk precision audit
+```
 
 ## Native PyTorch Quick Start
 

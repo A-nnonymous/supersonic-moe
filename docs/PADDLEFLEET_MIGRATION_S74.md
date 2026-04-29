@@ -267,3 +267,84 @@ assert (
 Add this as a one-line invariant inside whichever existing PaddleFleet
 sonic-moe smoke test runs first; failure indicates the bump regressed the
 patch wiring.
+
+---
+
+## 6. Adopting `SonicMoEMlpNode` with Fleet's pre-fused weights
+
+Fleet's `GroupedMLPExpert` (in `paddlefleet/transformer/moe/moe_expert.py`)
+already stores **fused** parameters:
+
+```python
+# using_sonic_moe branch
+self.weight1 = paddle.create_parameter(shape=[E, 2I, H], ...)  # native CUTLASS layout
+self.weight2 = paddle.create_parameter(shape=[E, H,  I], ...)
+```
+
+`run_sonic_moe` then `permute([1,2,0])` them into `[2I,H,E]` / `[H,I,E]`
+logical views and feeds `_UpProjection.apply` / `_DownProjection.apply`.
+PyLayer.backward returns the wgrads as positional outputs and Paddle
+auto-aggregates them into `weight1.main_grad` / `weight2.main_grad`. **Zero
+intermediate buffer, zero stack op, zero per-expert aliasing.** Stays on this
+path — it is strictly more efficient than `SonicMoEMlpNode` for the
+pre-fused-weight case, and it is unaffected by the S74 refactor.
+
+### When (if ever) to switch to `SonicMoEMlpNode`
+
+The `SonicMoEMlpNode` wrapper exists to serve callers that hold a
+**Python `list` of per-expert `nn.Module`s** (e.g. ERNIE training script). Its
+constructor today reads `experts[i].up_gate_proj.weight` /
+`experts[i].down_proj.weight` and stacks/permutes them into the same logical
+view the `_UpProjection` / `_DownProjection` PyLayers expect. For Fleet, this
+would mean:
+
+1. Either re-wrap `weight1[E,2I,H]` into `E` fake-expert objects (wasteful;
+   forces a stack the first time; aliases per-expert into the fused buffer).
+2. Or extend `SonicMoEMlpNode` with a "pre-fused" constructor mode that takes
+   `weight1`/`weight2` directly, skips the stack, and writes wgrads straight
+   into `weight1.main_grad` / `weight2.main_grad`.
+
+**Recommendation: don't bother.** Option (1) is pure overhead and option (2)
+buys nothing that `_UpProjection.apply` direct call doesn't already provide.
+The Node wrapper's value-add is the per-instance `_pending_flush` /
+router-scatter / lazy main_grad story for the **list-of-experts** layout —
+none of which Fleet needs since it already owns the fused buffer.
+
+### Migration checklist (if Fleet adopts the Node anyway)
+
+If at some point Fleet wants the higher-level wrapper (e.g. to share
+testing/benchmark harness), here is the contract:
+
+| Concern                          | Fleet adapter requirement |
+| -------------------------------- | ------------------------- |
+| Expert param layout              | wrap each `weight1[e]`/`weight2[e]` slice as `expert.up_gate_proj.weight` / `expert.down_proj.weight`. Shapes: `[H, 2I]` and `[I, H]` (paddle linear `[in,out]`). |
+| `weight1.main_grad` aggregation  | `_alloc_main_grad_w{1,2}` allocates `[E,H,2I]`/`[E,I,H]` and aliases per-expert `.main_grad` views into it. **The fused `weight1.main_grad` itself becomes the slice-of-the-bigger-buffer view** — make sure Fleet's optimizer reads `expert.weight.main_grad` (not the fused tensor's main_grad). |
+| `node.step()` ordering           | MUST run BEFORE `optimizer.step()`. See §2 above. |
+| Lazy main_grad                   | First backward triggers allocation; inference / warmup-only flows pay zero. |
+| Cache invalidation               | Automatic via `(data_ptr, _inplace_version(w))` — no manual `clear_*` needed. |
+| Pipeline parallelism             | Per-instance `_pending_flush` carries layer identity through arbitrary F/B interleaving — safe out of the box. |
+
+### Direct-PyLayer path (current Fleet integration)
+
+These bullets summarise what Fleet **must** do (and what it already does) on
+the direct `_UpProjection.apply` / `_DownProjection.apply` path:
+
+* Pass `stream_id = paddle.device.cuda.current_stream().cuda_stream` —
+  already done. The S74 stream patch makes Triton honour the same stream.
+* `s_scatter_idx.stop_gradient = True` and other metadata stop_gradient flags
+  — already done.
+* `expert_frequency_offset` is `[E+1]` cumulative; `tokens_per_expert` is
+  `[E]`; `num_activated_expert_per_token_offset` is `[E]` — output of either
+  `general_routing_router_metadata` or `deepep_topk_to_sonic_metadata`. Both
+  helpers are async; no HtoD sync.
+* `weight1.permute([1,2,0])` / `weight2.permute([1,2,0])` materialise
+  `[2I,H,E]` / `[H,I,E]` logical views with stride-only changes (no copy).
+  The `_UpProjection` / `_DownProjection` PyLayers and the underlying
+  CUTLASS GEMMs accept these.
+* `weight1.main_grad` / `weight2.main_grad` aggregation is handled by
+  Paddle's PyLayer machinery from the wgrad positional outputs — no manual
+  aliasing needed.
+* No `node.step()` call needed; no native→ERNIE layout conversion since the
+  parameter layout already matches the CUTLASS write layout (`[E, 2I, H]` /
+  `[E, H, I]`).
+

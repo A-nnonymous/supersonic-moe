@@ -1,17 +1,267 @@
-# HANDOFF — Session 74 (2026-04-29) — Globals purge + Triton stream fix + router-grad opt
+# HANDOFF — Session 75 (2026-04-29) — Frontier wrap-up: lazy main_grad + step ordering + Fleet integration audit
 
 > **Single source of truth for project state.** `docs/HANDOFF.md` redirects here.
 > Earlier sessions preserved verbatim below.
 
 **Branch**: `race-fix-paddle` on `myrepo` (PFCCLab/supersonic-moe), tracks `fork/paddle@108322c`.
+**Last commit**: `0007b07` (push pending for this session — see end).
 **Hardware**: NVIDIA B30Z (SM103, CUDA 13.0)
-**Python**: 3.12, Paddle torch-proxy
+**Python**: 3.12, Paddle torch-proxy (`paddle.compat.enable_torch_proxy()` / `paddle.enable_compat()`)
 **QuACK**: `/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/sonicmoe_for_ernie/quack`
-**Venv**: `/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/erniebot/eb_venv`
+**Venv**: `/root/paddlejob/share-storage/gpfs/system-public/zhangyichen/erniebot/eb_venv` (yichen's; `source .runenv.sh` activates)
+**Run-script reference for nsys**: `tests/ops/bench_mlpnode_topk_nsys.py`
+**S53 perf baseline (BF16, no compat overhead)**: `reports/session53_breakdown.md`
+**User env doc**: `/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/env.md`
 
 ---
 
-## SESSION 74 DELIVERABLES
+## CURRENT PROJECT STATE — green frontier, ready for next agent
+
+### Frontier health (verified this session)
+
+| Aspect                                                     | Status                                                    |
+| ---------------------------------------------------------- | --------------------------------------------------------- |
+| Output / dx / dw1 / dw2 precision (FP8 vs BF16 gold)       | cos ≥ 0.9971, rrmse ≤ 0.076 across 6 topk shapes          |
+| ds (`dispatched_probs.grad`) precision                     | cos ≥ 0.9971, rrmse ≤ 0.076 across 3 shapes               |
+| Multilayer (2-layer chain) `main_grad` consistency         | ✅ `test_chain_two_layers_main_grad_consistency`          |
+| Pipeline-parallel (interleaved 1F1B / 6 schedules)         | ✅ `test_pipeline_parallel_interleaved`                   |
+| Multistep grad accumulation across optimizer steps         | ✅ `test_multistep_pp_accumulation`                       |
+| Per-instance `_pending_flush` (no global FIFO)             | ✅ S74 globals purge holds                                 |
+| Triton kernels on Paddle compute stream (not NULL)         | ✅ S74 stream patch (`sonicmoe/_triton_stream_compat.py`) |
+| Post-warmup `cuda.synchronize()` count in fwd→bwd→flush    | 0 (steady-state)                                          |
+| HtoD sync in `_GatherRouterScores.backward`                | 0 (code-inspected; all metadata is Python int)            |
+| `node.step()` ordering contract                            | MUST run BEFORE `optimizer.step()` — docstring fixed      |
+| `main_grad` allocation                                     | Lazy on first backward — saves MiB on inference / warmup  |
+
+### Performance (most recent measurements, `bench_mlpnode_topk_nsys.py`, B30Z, FP8 frontier)
+
+S53 baseline (pure-torch BF16, no compat, no main_grad accumulation):
+- `T8192 H3072 I1536 E8 K8`: **3644 µs/iter**
+
+Current FP8 frontier (S65 TMA-add wgrad epilogue, S74 stream patch + globals purge + S75 lazy main_grad):
+
+| Shape (H=3072 I=1536 K=8) | Median GPU-projection | Speedup vs S53 BF16 |
+| ------------------------- | --------------------: | ------------------: |
+| T=8192 E=8                | ~2820 µs              | **1.29×**           |
+| T=8192 E=32               | ~3283 µs              | **1.17×**           |
+| T=16384 E=8               | ~5548 µs              | **1.43×**           |
+| T=16384 E=32              | ~5916 µs              | **1.37×**           |
+
+*ERNIE-shape detail (E=32 H=3072 I=1536 K=8 EP=8 SEQ=4096)*: forward GPU-proj **625 µs**
+(CUTLASS GEMM 65%, FP8 quant 10%, router 14%); backward GPU-proj **1904 µs**
+(wgrad 78%, actgrad 13%, quant 5%); total **2530 µs/iter** (CV < 0.3%).
+
+### Memory
+
+- `main_grad` allocation switched to lazy (S75): on inference / warmup-only flows, the
+  `[E, 2I, H]` (w1) and `[E, I, H]` (w2) fp32 buffers are NOT created. At E=8 H=512 I=1024
+  this saves 48 MiB; at production shape (E=32 H=3072 I=1536) it saves ~675 MiB.
+- The fused weight buffer (FP8 quantized cache) is still allocated at first forward;
+  `(data_ptr, _inplace_version)` keys ensure it auto-invalidates on optimizer in-place updates.
+- `node.invalidate_caches()` is available for explicit memory reclaim under pressure;
+  not normally called in the training loop.
+
+---
+
+## SESSION 75 DELIVERABLES
+
+### S75.1 — `node.step()` ordering contract corrected
+
+**Bug**: pre-S75 docstring said "call `node.step()` AFTER `optimizer.step()`". This is
+**wrong** because `step()` does the in-place layout conversion native CUTLASS
+`[E, 2I, H]` → ERNIE split-half `[E, H, 2I]` directly into the storage that
+`expert.weight.main_grad` aliases. The optimizer reads the same storage. If `step()`
+runs after the optimizer, the optimizer applies a wrongly-laid-out gradient → silent
+training corruption (shows as cosine drop on the W view that is never tested in
+isolation; the small per-step delta would be invisible until convergence diverges).
+
+**Fix** (`sonicmoe/ernie_compat/mlp_node_v2.py`):
+```python
+# CORRECT
+loss.backward()
+node.step()           # writes correct ERNIE-layout grad into expert.weight.main_grad
+optimizer.step()      # reads expert.weight.main_grad
+optimizer.clear_grad()
+```
+Docstring rewritten; README + `docs/PADDLEFLEET_MIGRATION_S74.md` updated.
+
+### S75.2 — Lazy `main_grad` allocation
+
+**Before**: `_stack_w{1,2}_into` allocated `[E, H, 2I]` / `[E, I, H]` fp32 main_grad
+buffer at first forward, even when no backward would happen (inference, warmup-only).
+For ERNIE shape that's ~675 MiB wasted in evaluation runs.
+
+**After**: `_stack_w{1,2}_into` only stacks the bf16 weight view. New
+`_alloc_main_grad_w{1,2}` functions are called only from `_w*_native_view()` (backward
+path entry) and `_w*_main_grad()` (flush path). Per-expert `main_grad` slices are
+aliased into the fused buffer the same way as before — optimizer sees no API change.
+Allocation is idempotent; safe to call repeatedly.
+
+### S75.3 — Stale precision-test fixture fixed
+
+`tests/ops/test_mlpnode_precision.py` was using the legacy module-level
+`flush_native_grads()` which the S74 globals purge made a no-op for `SonicMoEMlpNode`
+instances (it now only flushes `_LEGACY_PENDING_FLUSH` which the per-instance node
+never populates). Result: stale `main_grad`, dw1 cos = 0.0006 (catastrophic). Fix:
+swap to `node.flush_grads()` (matches what `test_mlpnode_multilayer.py` already does).
+The frontier itself was correct; only the test harness was stale.
+
+### S75.4 — PaddleFleet integration audit
+
+Surveyed `paddlefleet/transformer/moe/{moe_expert.py,moe_layer.py}`. Conclusions:
+
+* Fleet stores **fused** parameters: `weight1.shape == [E, 2I, H]`,
+  `weight2.shape == [E, H, I]` (the `using_sonic_moe` branch in `GroupedMLPExpert`).
+* `run_sonic_moe` `permute([1, 2, 0])` them into `[2I, H, E]` / `[H, I, E]` and feeds
+  `_UpProjection.apply` / `_DownProjection.apply` directly. PyLayer.backward returns
+  wgrads as positional outputs; Paddle aggregates into `weight1.main_grad` /
+  `weight2.main_grad` automatically — **no `node.step()`, no native→ERNIE conversion,
+  no per-expert aliasing needed** (the parameter layout is already `[E, 2I, H]` =
+  the CUTLASS write layout).
+* Fleet is **API-compatible** with the S74 + S75 changes:
+  - Stream patch (S74): auto-installed at `import sonicmoe`. Fleet must ensure they
+    `import` the installed `sonicmoe` (not just the vendored `third_party/sonic-moe/`)
+    early enough; Triton must not have launched before patch fires.
+  - Globals purge (S74): N/A (Fleet bypasses `SonicMoEMlpNode`).
+  - Router-scatter optimization (S74): N/A for the same reason.
+  - `node.step()` ordering (S75): N/A (no Node).
+  - Lazy main_grad (S75): N/A (Fleet's main_grad lives on `weight1`/`weight2`
+    directly, allocated by Paddle when `weight1.main_grad = ...` is first set by
+    PyLayer aggregation).
+* **Recommendation**: keep Fleet on the direct `_UpProjection.apply` /
+  `_DownProjection.apply` path. The Node wrapper buys nothing for pre-fused weights;
+  it exists for the list-of-experts ERNIE training-script use case. Documented in
+  `docs/PADDLEFLEET_MIGRATION_S74.md` §6.
+
+### S75.5 — Validation matrix
+
+| Suite                                               | Result               |
+| --------------------------------------------------- | -------------------- |
+| `tests/ops/test_mlpnode_multilayer.py`              | ✅ 4 passed          |
+| `tests/ops/test_mlpnode_correctness_large.py`       | ✅ 1 passed          |
+| `tests/ops/test_mlpnode_precision.py` (6 topk shapes)| ✅ all PASS         |
+| ds-only standalone audit (3 shapes)                 | ✅ cos ≥ 0.9971       |
+| `tests/ops/test_colwise_quant.py`                   | ✅ 32 passed         |
+| `tests/ops/test_rowwise_quant.py`                   | ✅ 45 passed         |
+| `tests/ops/test_fused_quant.py`                     | ✅ 14 passed         |
+| Sync audit (steady-state fwd→bwd→flush)             | 0 `cuda.synchronize` |
+
+---
+
+## HIGH-VALUE INFORMATION SOURCES (use these — don't re-derive)
+
+1. **`/root/paddlejob/share-storage/gpfs/system-public/panzhaowu/env.md`** — venv path,
+   QuACK path, Paddle compat pitfalls, nsys `sqlite + GPU-projection` perf methodology.
+2. **`reports/session53_breakdown.md`** — pure-torch BF16 baseline (no compat, no
+   main_grad accumulation). Cite this as the BF16 reference; do NOT re-run on a
+   torch venv.
+3. **`tests/ops/bench_mlpnode_topk_nsys.py`** — canonical nsys harness. Wrap with
+   `nsys profile --resolve-symbols=false`, parse the resulting `.sqlite` for the
+   `GPU_PROJECTION` table, take per-iter median.
+4. **`docs/PADDLEFLEET_MIGRATION_S74.md`** — single-doc answer to "what does Fleet
+   need to change?". §6 covers Fleet's pre-fused-weight integration in detail.
+5. **`docs/KNOWLEDGE_BASE.md`** — deep reference on FP8 layout conventions,
+   blockscaled GEMM cache key design, swiglu activation grad math.
+6. **`docs/cute_dsl_optimization_guide.md`** + **`docs/wgrad_fp8_dual_quant_design.md`**
+   — for kernel-level optimization (NCU advice already absorbed; further wins are in
+   the deeper algorithmic territory rather than micro-tuning).
+7. **`PaddleFleet/src/paddlefleet/transformer/moe/{moe_expert.py,moe_layer.py}`** —
+   downstream consumer; do not assume PR review until you've checked these.
+8. **`fork/paddle@108322c`** — Paddle commit the Triton stream patch was developed
+   against. Reproducing this branch on a future cluster requires the same Paddle
+   build (or the patch in `sonicmoe/_triton_stream_compat.py` may need a rev bump
+   if Paddle's stream-base ABI changes).
+
+---
+
+## LESSONS THAT COST REAL DEBUGGING TIME (record — do not re-learn)
+
+1. **Paddle linear weight is `[in, out]`, not torch's `[out, in]`.** `up_gate_proj.weight`
+   is `[H, 2I]`; `down_proj.weight` is `[I, H]`. Multiple shape bugs traced to assuming
+   torch layout. `_alloc_main_grad_w2` must derive `I, H = w0.shape[0], w0.shape[1]`.
+2. **`flush_native_grads()` (legacy module function) is a no-op for `SonicMoEMlpNode`.**
+   It only walks `_LEGACY_PENDING_FLUSH` which `SonicMoEMlpNode` never appends to. Test
+   harnesses that call it after a `SonicMoEMlpNode` forward read **stale** `main_grad`.
+   Always use `node.flush_grads()` (or `node.step()`) instead.
+3. **`node.step()` order matters**: it MUST precede `optimizer.step()` because it does
+   in-place layout conversion writing into the same storage the optimizer reads.
+4. **Triton's `get_current_stream` is a C symbol** bound at import time from
+   `torch._C._cuda_getCurrentRawStream`. Python-level `torch.cuda.current_stream`
+   monkey-patching is insufficient. Must monkey-patch
+   `triton.runtime.driver.driver.active.get_current_stream` directly. See
+   `sonicmoe/_triton_stream_compat.py`.
+5. **`torch.cuda.Stream.synchronize` watcher perturbs Triton autotuner.** The autotuner
+   itself calls `di.synchronize()` to time benchmark configs. Putting a watcher on it
+   and triggering inside autotuning warmup can crash with cudaErrorInvalidAddressSpace
+   on some shapes. To do a clean sync audit: warm fully (so autotune cache is hit),
+   THEN install the watcher, THEN run steady-state iterations.
+6. **PyTorch advanced-indexing backward dispatches a CUB-sort cascade** even for
+   permutation indices. Replace with a custom Function + Triton scatter — saves ~5 cub
+   kernels per call. See `_GatherRouterScores` in `mlp_node_v2.py`.
+7. **Cache invalidation via `(data_ptr, _inplace_version(w))` is automatic.** Don't
+   call `clear_all_fp8_weight_caches()` in the training step — it adds JIT
+   re-compilation pressure for no reason. Optimizer in-place updates bump
+   `_inplace_version` → next forward misses → rebuilds. Only call cache clearing under
+   explicit memory pressure (`node.invalidate_caches()`).
+
+---
+
+## INSIGHT — what's left on the table
+
+* **Scatter kernel is at the launch-overhead floor** (~14.5 µs regardless of BLOCK).
+  At T=8192 K=8 → 256 KB scatter, B30Z 5 TB/s HBM → ~50 ns of pure compute is dwarfed
+  by ~14 µs launch overhead. **The only further win is fusing the scatter into a
+  larger upstream kernel** (e.g. fuse into `_GatherRouterScores.backward` along with
+  the router metadata derivation). Probably not worth the complexity unless an end-
+  to-end profile shows scatter as a bottleneck (it is not at any measured shape).
+* **`_differentiable_router_scores` backward used to dispatch a CUB-sort cascade**
+  (~5–10 kernels). Replaced in S74 by `_GatherRouterScores` + custom Triton scatter
+  (1 kernel). Verified zero HtoD sync on this path.
+* **JIT cold-start (~42s)** dominates first-iter latency. Mitigation: persistent disk
+  cache (`~/.triton/cache`) survives across processes; `sonicmoe.jit_warmup.warmup_jit`
+  pre-compiles all kernels for known shapes if you want fixed warmup latency.
+* **Alignment guard** (`SONIC_MOE_FP8_ASSUME_ALIGNED=1` + `SONIC_MOE_FP8_MODE=perf`)
+  is already on in the recommended env. Disabling it adds ~2% per-iter overhead from
+  per-kernel runtime checks. Leave on in production.
+* **Fleet integration**: stay on the direct `_UpProjection.apply` path; do not try to
+  retrofit `SonicMoEMlpNode` for the pre-fused-weight case (overhead with no benefit).
+* **Quant kernels (`quantize_and_pack`, `colwise_quantize_and_pack`)**: NCU full-process
+  profile already absorbed in S70–S72. Current implementation is at ~96% of B30Z HBM
+  bandwidth — further wins require either a different algorithm (e.g. fuse into
+  GEMM epilogue, which we do for forward) or hardware-specific tuning beyond what
+  Triton autotuner explores.
+
+---
+
+## NEXT STEPS — for the agent that picks this up
+
+Order of priority:
+
+1. **Real distributed training validation**. We have multilayer + multistep + PP
+   interleaved unit tests, but no end-to-end run with PaddleFleet at scale. Pick a
+   small ERNIE config (E=8 H=3072 I=1536 SEQ=4096 EP=8 PP=2) and run one full epoch
+   on a 4-node cluster. Verify: loss matches torch BF16 baseline within tolerance,
+   no IMA, no NCCL hang, `weight.main_grad` stays consistent across PP boundaries.
+   The S74 stream patch + S75 step ordering should hold; if anything regresses,
+   first suspect is Fleet's vendored `third_party/sonic-moe/` lagging behind the
+   installed snapshot.
+2. **`SONIC_MOE_FP8_ASSUME_ALIGNED=0` ablation**. Measure the cost of removing the
+   alignment guard. If it's <1% per iter at production shapes, consider making the
+   alignment guard the default for safety.
+3. **Quant kernel further work** is parked. If a future B-series GPU exposes new
+   stride/predicate features in `cuda::pipeline`, revisit.
+4. **Pipeline-parallel `node.step()` placement**: currently `step()` must run after
+   the LAST microbatch's backward and before optimizer. With 1F1B, this is the
+   expected `forall_layers: node.step()` after the bubble. Verify in a real PP
+   trace that this doesn't accidentally serialize across PP groups (it shouldn't —
+   `step()` only touches per-instance state).
+5. **`paddle.distributed` checkpoint compatibility**: ensure `expert.weight.main_grad`
+   shape `[H, 2I]` (per-expert view) round-trips through Paddle's checkpoint format
+   correctly. Has not been tested.
+
+---
+
+## SESSION 74 DELIVERABLES (preserved verbatim below)
 
 ### S74.1 — Triton kernels were launching on the CUDA NULL stream (CRITICAL)
 
