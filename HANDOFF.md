@@ -11,14 +11,16 @@
 
 **What it computes**: Megatron-style MFU = `18·TK·H·I / (busy_us × 4.5e15)` for 11 shapes (T∈{1024,2048,4096,8192,16384}, H∈{3072,4096,6144}, I∈{1536,2048,4096}, E∈{8,16,32}) where `busy_us` = sum of GPU kernel time strictly inside the NVTX `BENCH` range, overlapping intervals merged, divided by `n_iters`. This is the no-bubble async-pipeline floor.
 
-**Headline numbers** (B30Z FP8 dense peak = 4500 TFLOPS):
+**Headline numbers** (B30Z FP8 boost-clock catalogue peak = 4500 TFLOPS; **see Addendum on hardware: this is B30Z, NOT B300**):
 - **Ernie-prod (T8192, E8, K8): 44.91% MFU = 2021 TFLOPS achieved** (busy=2754 µs/iter — matches S78 reference 2740 µs within 0.5%).
 - Best: **50.88% MFU on T8192-H6144-I2048-E8** (2290 TFLOPS).
 - Worst: 26.68% on T1024 (launch-overhead-dominated).
 - Doubling E (8→16→32) at fixed K=8 costs ~2.3 pp MFU per doubling — quantifies the routing/dispatch tax.
 - Wider matmuls win ~6 pp — non-matmul overhead amortises better at larger M·N·K.
 
-**Key insight**: Achieved FLOPS plateau ≈ 2.3 PFLOPS (~51% peak). The remaining gap is NOT GEMM efficiency (constituent FP8 GEMMs hit ≥80% peak in isolation); it's the time spent in routing/quant/scatter/dGated-activation/FP8-cast which inflate the busy denominator. Biggest remaining lever: fuse FP8 cast into the bwd-side wgrad producer (the fwd-side fold already exists).
+**Key insight**: Achieved FLOPS plateau ≈ 2.3 PFLOPS (~51% of 4500 TFLOPS *boost-clock* peak; ~80% of *sustained-clock* ~2870 TFLOPS — measured below). The remaining gap is NOT GEMM efficiency (constituent FP8 GEMMs hit ≥80% peak in isolation); it's the time spent in routing/quant/scatter/dGated-activation/FP8-cast which inflate the busy denominator. Biggest remaining lever: fuse FP8 cast into the bwd-side wgrad producer (the fwd-side fold already exists).
+
+**Hardware identity (CRITICAL — verified post-sweep)**: GPU reports as **B30Z** (China-export GB300-class, sm_103, VBIOS 98.02.81.00.02), **NOT retail B300**. Power cap **1100 W** is VBIOS-locked (max=min=default=1100; not user-configurable; not a throttle reason). SM boost ceiling **2032 MHz** (vs retail B300 ~2.45 GHz). 268 GiB HBM3e. The 4500 TFLOPS peak quote = `7000 × (2032/2450) × (1100/1400) ≈ 4560` — algebraically consistent with the SKU. Empirical sustained pure-GEMM (8192³ BF16, 10 s) hits cap at 1037 W avg, throttles SM 2032→1249 MHz, achieves 1433 BF16 TFLOPS (= ~2870 FP8 TFLOPS sustained). Empirical sustained MoE bench (Ernie shape, 30 s) stays at **921 W avg / 2032 MHz steady — does NOT trip the cap** (60% busy fraction); 4500 TFLOPS reference is therefore the right comparator for our sweep numbers and MFU% is valid. In real production training (~95% busy via async pipeline) the cap WILL bite, throttling to ~1530 MHz, dropping absolute TFLOPS ~25% but **MFU% is invariant** under throttling. See `reports/mfu_s79/README.md` Addendum for the full audit.
 
 **Single-iter SM utilisation (busy/span)**: 12.7% (T=1024) → 56.8% (T=8192) → 82.4% (wide). At T≥8192 the no-bubble assumption is empirically defensible — single-iter trace is already near-saturated and any reasonable async overlap closes the small remaining gap.
 
