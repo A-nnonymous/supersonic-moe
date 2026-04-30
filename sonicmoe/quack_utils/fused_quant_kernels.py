@@ -32,7 +32,15 @@ from ._validate import check_tensor
 
 
 def _iso32_enabled() -> bool:
-    return os.environ.get("SONIC_MOE_DZ_ISO32", "0") == "1"
+    """iso32 dz quant default = ON.
+
+    Phase 0 audit (S80a) proved iso32 produces identical downstream-GEMM
+    RRMSE to 1×32 on real Ernie-shape dz (ratio 1.000× across 6 captures).
+    Phase 1B microbench: −60 µs/iter (−20.7%) in dz quant stage; multi-layer
+    nsys (reports/mfu_s80b/): 2754→2693 µs/iter, 44.91%→45.92% MFU.
+    Determinism CI passes. Set SONIC_MOE_DZ_ISO32=0 to fall back to 1×32.
+    """
+    return os.environ.get("SONIC_MOE_DZ_ISO32", "1") == "1"
 
 
 def fused_dual_colwise_quantize(

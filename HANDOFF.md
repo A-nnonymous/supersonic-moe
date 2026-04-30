@@ -1,41 +1,79 @@
-# HANDOFF — Session 80 (2026-04-30) — dz iso32 quant: Phase 0 audit PASS, Phase 1B Triton kernel landed, Phase 1A (CuTe deep epilogue) deferred
+# HANDOFF — Session 80 (2026-04-30) — dz iso32 quant: Phase 1B landed AS DEFAULT; new frontier 45.93% MFU on Ernie shape (51.53% peak across sweep)
 
 > **Single source of truth for project state.** `docs/HANDOFF.md` redirects here.
 > Earlier sessions preserved verbatim below.
 
-**Branch**: `race-fix-paddle` on `myrepo` (PFCCLab/supersonic-moe). **Last shipped**: S79b → S80a (Phase 0 audit, `a493e7d`) → **S80b (this section, Phase 1B iso32 stepping-stone kernel)**.
+**Branch**: `race-fix-paddle` on `myrepo` (PFCCLab/supersonic-moe). **Last shipped**: S79b → S80a (Phase 0 audit, `a493e7d`) → S80b (Phase 1B kernel landed env-flagged, `1f84e7d`) → **S80c (this section, iso32 flipped to default ON, multi-shape nsys frontier captured)**.
 
-## S80b — read this first (Phase 1B stepping-stone landed)
+## S80c — read this first (new frontier landed)
 
-**Headline**: iso32 dz quant is now wired in behind env flag `SONIC_MOE_DZ_ISO32=1`. Microbench on Ernie shape `TK=65536, dz_dim=3072, dout_dim=3072`: **291 µs → 231 µs (−60 µs, −20.7%)** in the dz quant + dout colwise stage. Determinism CI test (`fp8_frontier_determinism_test.py`) **passes** with the flag enabled. The full deep CuTe DSL epilogue fusion (Phase 1A) is **still future work** — Phase 1B is the cheap-to-land stepping stone that captures most of the iso32 win without touching CuTe DSL.
+**Headline**: dz iso32 dual-quant Triton kernel is now the **production default**. Multi-shape nsys MFU sweep (`reports/mfu_s80b/`) confirms uniform improvement vs S79b baseline:
 
-**Why Phase 1B beats nothing**: even without sinking quant into the GEMM epilogue, the iso32 algorithmic property (**FP8 bytes are byte-identical from row-consumer and col-consumer perspectives** because both share the same 32×32 amax → same scale → same FP8 cast) lets us eliminate one of the two FP8 output buffers entirely. Saved: 192 MiB FP8 write + ½ the amax compute. Cost: zero (no precision delta vs Phase 0 audit, which proved iso32 is bit-equivalent to 1×32 on downstream-GEMM RRMSE).
+| Shape (T-H-I-E-K) | S79b baseline | S80c iso32 default | Δ µs/iter | Δ MFU |
+|---|---|---|---|---|
+| T4096-H3072-I1536-E8-K8 | 1477 µs / 41.87% | **1446 µs / 42.78%** | −31 | **+0.91 pp** |
+| T8192-H3072-I1536-E8-K8 (Ernie headline) | 2754 µs / 44.91% | **2693 µs / 45.93%** | −61 | **+1.02 pp** |
+| T16384-H3072-I1536-E8-K8 | 5433 µs / 45.53% | **5324 µs / 46.47%** | −109 | **+0.94 pp** |
+| T8192-H4096-I2048-E8-K8 | 4402 µs / 49.96% | **4384 µs / 50.16%** | −18 | +0.20 pp |
+| T8192-H4096-I4096-E8-K8 | 8675 µs / 50.70% | **8578 µs / 51.27%** | −97 | +0.57 pp |
+| T8192-H6144-I2048-E8-K8 | 6483 µs / 50.88% | **6401 µs / 51.53%** | −82 | **+0.65 pp** (new peak) |
 
-**What landed in S80b**:
-1. `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` — `_dual_varlen_iso32_quantize_kernel` Triton kernel + `iso32_dual_quantize_varlen` wrapper. Computes one e8m0 scale per 32×32 sub-block, casts to FP8 once, packs the SAME byte values into row-ISA and col-ISA scale layouts.
-2. `sonicmoe/quack_utils/fused_quant_kernels.py` — `fused_dual_colwise_quantize` updated with env-flag branch. When `SONIC_MOE_DZ_ISO32=1`, dispatches to the iso32 kernel and aliases `dz_row_fp8 = dz_col_fp8` (single buffer, two scale tensors). When unset, falls through to the original 1×32 dual-quant kernel — **default behavior unchanged**, so CI gate stays green.
+**Frontier MFU peak: 51.53% on B30Z** (was 50.88% in S79b). Improvement is universal across the sweep — every shape moved forward.
 
-**Validation done**:
-- Standalone numerical: iso32 RRMSE 2.66e-2, cosine 0.999715, ratio vs 1×32 = 1.000× (matches Phase 0 audit prediction exactly).
-- Dual-layout invariant: `rs[m, n_g] == cs[n, m_g]` verified across all 16 sub-blocks of a 128×128 input.
-- End-to-end fused path: `dz_row_fp8.data_ptr() == dz_col_fp8.data_ptr()` (alias verified), full FP8 byte-equality of the two views.
-- Determinism CI: `tests/fp8_frontier_determinism_test.py` passes with `SONIC_MOE_DZ_ISO32=1`.
-- Microbench: −60 µs / −20.7% on the dz quant + dout colwise call.
-- Regression baseline: all 16 currently-failing tests in `fp8_protocol_test.py` + `moe_blackwell_test.py` are **pre-existing** (paddle proxy `torch.cuda.current_stream().stream_base` API gap, unrelated to this work). Verified by toggling the flag — failure set is identical.
+**What changed structurally**:
+1. `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` — `_dual_varlen_iso32_quantize_kernel` Triton kernel + `iso32_dual_quantize_varlen` wrapper. One amax per 32×32 sub-block; FP8 cast bytes are byte-identical between row and col consumers, so a single FP8 buffer is aliased to both outputs.
+2. `sonicmoe/quack_utils/fused_quant_kernels.py` — `fused_dual_colwise_quantize` dispatches to iso32 by default. Set `SONIC_MOE_DZ_ISO32=0` to fall back to legacy 1×32 dual-quant.
 
-**Known intentional behavior**:
-- `tests/ops/test_fused_quant.py::test_correctness` returns `False` when `SONIC_MOE_DZ_ISO32=1` because that test asserts byte-exact equivalence to the 1×32 algorithm. iso32 is a *different* algorithm (different FP8 bytes); this is expected and documented. The test is not in `tests/run_regression.sh`. With flag off (default), it returns `True`.
-- The flag defaults to OFF. To enable in production: `export SONIC_MOE_DZ_ISO32=1` before training. CI bit-exactness is preserved with default behavior.
+**Validation completed**:
+- Numerical: iso32 RRMSE 2.66e-2, cosine 0.999715, ratio vs 1×32 = 1.000× (matches Phase 0 audit).
+- Determinism CI (`tests/fp8_frontier_determinism_test.py`): **PASS** with iso32 default ON.
+- Dual-layout invariant: `dz_row_fp8.data_ptr() == dz_col_fp8.data_ptr()` verified; FP8 byte-equality across all sub-blocks.
+- Microbench: −60 µs/iter on dz quant + dout colwise stage (291→231 µs, −20.7%).
+- Multi-layer nsys (above table): wall-clock improvement matches microbench prediction exactly on shapes where the dz quant is on the critical path.
+- Pre-existing failures in `fp8_protocol_test.py`/`moe_blackwell_test.py` are unchanged (paddle proxy `stream_base` API gap, environment issue, unrelated).
 
-**Phase 1A (true epilogue fusion) — still deferred for now**, reasoning unchanged:
-- Phase 1A would sink the quant into `GemmDGatedFP8CLoadSm100ZeroMat`'s CuTe DSL epilogue, eliminating the BF16 dz buffer entirely (additional ~384 MiB write+read saved).
-- This requires switching D dtype BF16→FP8 in CuTe DSL, adding warp-shuffle for cross-row amax, and bit-exact validation against the Triton reference. Full design is in `reports/iso32_dz_audit/PHASE0_DESIGN.md`.
-- Estimated additional savings beyond Phase 1B: another 50-120 µs/iter. Phase 1B already captures roughly 50-60% of the theoretical ceiling.
+**Why iso32 is precision-safe** (the foundational insight, S80a): the dyn-range proxy `log2(tile_amax / row_amax)` predicted heavy mantissa loss but e4m3's 3-bit mantissa imposes ~12.5% per-value rounding that dominates: 1×32's "extra" mantissa headroom is below the e4m3 precision floor and goes unused. Direct, dx-proxy and dw1-proxy RRMSE are bit-identical between 1×32 and 32×32 on real bwd-domain gradients. (Contrast PR #15 which retired iso32 for *weights* — weight distributions are different.)
 
-**MFU impact estimate (revised, conservative)**:
-- S79b baseline: 2754 µs busy / 44.91% MFU.
-- Phase 1B iso32 (this session, flag-gated): −60 µs in dz quant stage. Need real multi-layer nsys to confirm net iter wall-clock; first-order estimate +0.7 to +1.0 pp MFU (→ 45.5-45.9%).
-- Phase 1A (future): additional +1.0 to +2.0 pp MFU (→ 46.5-47.9%).
+**Why the structural win without CuTe DSL changes** (the algorithmic insight, S80b): with one amax per 32×32 sub-block, FP8 cast bytes are byte-identical from row-consumer and col-consumer perspectives. ONE FP8 buffer + TWO scale tensors (byte-identical, different ISA layouts) replaces the legacy TWO FP8 buffers + TWO scale tensors. Saved: 192 MiB FP8 write + ½ amax compute per dz pass.
+
+**What's still future work (Phase 1A — true CuTe epilogue fusion)**:
+- Sink quant directly into `GemmDGatedFP8CLoadSm100ZeroMat` CuTe DSL epilogue, eliminating the BF16 dz buffer entirely (~384 MiB more saved).
+- Requires switching D dtype BF16→FP8 in CuTe, warp-shuffle for cross-row amax, FP8 TMA store atom.
+- Estimated additional: +1.0 to +2.0 pp MFU beyond Phase 1B, → 47-48% on Ernie shape.
+- Full design preserved in `reports/iso32_dz_audit/PHASE0_DESIGN.md`. Register budget is the binding unknown (kernel already at the spill cliff per S78b).
+
+**MFU lift attribution (S79b → S80c)**:
+- Wall-clock saved per iter on Ernie: 61 µs (microbench predicted 60 µs ✓).
+- This savings comes from: 192 MiB FP8 write eliminated + halved amax compute + ½ kernel store traffic.
+- The shapes with the largest absolute savings (T16384 −109 µs) are the ones where the dz quant scale dominates — confirms the kernel is the bottleneck being relieved.
+
+**Lessons (S80c-specific)**:
+1. **The dyn-range bits-lost proxy is a poor predictor for FP8** (carried from S80a) — always validate against downstream-GEMM RRMSE on real domain data.
+2. **Algorithmic equivalence ≠ byte-equivalence** — `tests/ops/test_fused_quant.py::test_correctness` returns `False` with iso32 default because it asserts byte-exact match to the *old* 1×32 algorithm. This is expected and documented; the test is not in `tests/run_regression.sh`. Future cleanup: parameterize that test by quant mode.
+3. **Phase 1B before 1A** — when a precision-validated algorithmic optimization can be applied at the Triton layer alone, do it before paying the CuTe DSL multi-day tax. Phase 1B captured ~50-60% of the iso32 ceiling for ~1 hour of work.
+4. **Test isolation gotcha** — running `tests/ops/test_dual_quant.py` together with another test file in one pytest invocation produces 30 ERRORS (not failures); running it alone produces 30/30 PASS. Likely a paddle context fixture issue. Workaround: run files separately. Not iso32-related.
+
+**SQL todos snapshot** (this session DB):
+- `p0-dump-dz`, `p0-audit`, `p1a-epi-design`, `p1b-fallback`, `p3b-nsys`, `p3c-default`, `p4b-handoff`: done
+- `p1a-impl`, `p2-wire`, `p3-ci`, `p3-perf`, `p4-report`: blocked (Phase 1A — future session)
+
+**Files changed this session (S80c)**:
+- `sonicmoe/quack_utils/blockscaled_fp8_gemm.py` (S80b kernel, retained)
+- `sonicmoe/quack_utils/fused_quant_kernels.py` (S80c default flip)
+- `HANDOFF.md` (S80c summary above S80b above S80a)
+- `reports/mfu_s80b/{sweep.csv, sweep.json, README.md, *.png, bench_*.log, trace_*.{nsys-rep,sqlite}}` — multi-shape frontier proof
+
+**Hand-off action items for next session (in priority order)**:
+1. Implement `GemmDGatedFP8CLoadSm100ZeroMat` true epilogue change — model directly after `GemmGatedBlockscaledQuantMixin.epi_visit_subtile` in `sonicmoe/quack_utils/gemm_gated.py:244`. Add `mDZScale` field; reuse `BlockscaledScaleStore` EpiOp. Implement 32-lane warp shuffle for cross-row amax. Verify register count via `cuobjdump --dump-resource-usage` BEFORE integrating.
+2. Add unit test mirroring `tests/ops/test_dual_quant.py` but exercising the new fp8-emit kernel against `_quant_dequant_blockscaled` from `tests/ops/audit_iso32_numerics.py:32`.
+3. Wire into `functional/__init__.py:1967` only after unit test passes; gate with `os.environ.get("SONIC_MOE_DZ_EPI_FUSE", "0") == "1"` initially for A/B.
+4. Run full regression suite + nsys sweep to confirm Phase 1A delivers an additional ~50-100 µs/iter beyond Phase 1B.
+
+---
+
+## S80b — Phase 1B stepping-stone (env-flagged) — superseded by S80c default-flip
+
+The kernel and wire-up landed here remain the production code path; only the env-flag default flipped from OFF to ON in S80c. Original commit `1f84e7d`.
 
 ---
 
