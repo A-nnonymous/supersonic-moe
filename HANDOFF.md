@@ -40,7 +40,8 @@
 - Sink quant directly into `GemmDGatedFP8CLoadSm100ZeroMat` CuTe DSL epilogue, eliminating the BF16 dz buffer entirely (~384 MiB more saved).
 - Requires switching D dtype BF16→FP8 in CuTe, warp-shuffle for cross-row amax, FP8 TMA store atom.
 - Estimated additional: +1.0 to +2.0 pp MFU beyond Phase 1B, → 47-48% on Ernie shape.
-- Full design preserved in `reports/iso32_dz_audit/PHASE0_DESIGN.md`. Register budget is the binding unknown (kernel already at the spill cliff per S78b).
+- **Full design + concrete next-agent task list now in `reports/iso32_dz_audit/PHASE0_DESIGN.md` (see "Phase 1A v2" section at bottom)**. Includes verified `cute.arch.warp_reduction_max` API, per-thread fragment layout (64 fp32, two iso32 sub-blocks), required new EpiOps (`FP8DZScatterStore`, `BlockscaledScaleStoreCol`), and the missing-piece ISA scale repack kernel.
+- Why not landed in S80c: genuine multi-day CuTe DSL bring-up that needs hardware-driven debug cycles. Done safely it requires not putting the working +1.02pp frontier at risk; the design groundwork is now complete so the next focused session can implement directly.
 
 **MFU lift attribution (S79b → S80c)**:
 - Wall-clock saved per iter on Ernie: 61 µs (microbench predicted 60 µs ✓).

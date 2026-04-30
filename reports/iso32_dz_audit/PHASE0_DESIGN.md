@@ -185,10 +185,139 @@ if the e8m0 encoding matches Triton — model after
 
 - [x] Phase 0.1 — dz capture infra
 - [x] Phase 0.2 — iso32 vs 1×32 + downstream-GEMM audit (PASS)
-- [ ] Phase 1A — Cutlass DSL epilogue change (designed; not yet
-      implemented — multi-day CuTe DSL work)
-- [ ] Phase 1B — fallback dual-amax epilogue (only if 1A fails register
-      budget)
-- [ ] Phase 2 — Python wire-up + scales_iso_rewrite kernel
-- [ ] Phase 3 — CI + nsys perf
-- [ ] Phase 4 — final report
+- [x] Phase 0.1/0.2 — capture + audit
+- [x] Phase 1B (interim frontier, S80b/c) — Triton iso32 dual-quant kernel,
+      default ON, +1.02 pp MFU on Ernie shape, 51.53% peak
+- [ ] Phase 1A — true CuTe DSL epilogue fusion (designed; not yet
+      implemented — genuine multi-day CuTe DSL bring-up)
+- [ ] Phase 2 — Python wire-up + ISA scale repack kernel (depends on 1A)
+- [ ] Phase 3 — CI + nsys perf (depends on 1A)
+- [ ] Phase 4 — final report (depends on 1A)
+
+---
+
+## Phase 1A v2 — pickup notes (S80c, after deeper code reading)
+
+This section adds the implementation-specific findings collected after
+S80c. Read it together with the earlier sections — it does not replace
+them, only sharpens the unknowns.
+
+### Newly verified API / layout facts
+
+1. **`cute.arch.warp_reduction_max(val, threads_in_group=32)`** is the
+   correct call for the iso32 cross-lane amax reduction. Works on
+   `Float32`. No need to hand-roll `shfl_xor_sync`.
+2. **Per-thread dXY fragment in the bwd FP8CLoad mixin is 64 fp32
+   values** (= one M-row × 32 D-elements; each D = 2 packed bf16-or-fp8
+   in 2I view). See `gemm_dgated.py:664-671` — the unroll loops over
+   `cute.size(tRS_rD) // 2` and writes `tRS_rdXY_f32x2[4*i .. 4*i+3]`
+   for each pair of D-elements.
+3. **iso32 sub-block split**: of the 64 fp32 values per thread, the
+   first 32 belong to the first iso32 N-block (fp8 cols `n_base*2 ..
+   n_base*2 + 31`) and the next 32 to the second (cols `+32 .. +63`).
+   So **two amaxes per thread per epi sub-tile**, two warp_reduction_max
+   calls, two e8m0 encodings, two quant_scales applied.
+4. **Per-thread coord access** for the FP8 scatter store is already
+   plumbed via `epi_loop_tensors["mFP8PreAct"]` →
+   `(fp8_tensor, scales_tensor, tDcD_sub, m_offset, m_base, n_base)`.
+   `tDcD_sub` gives the per-thread (row, col) D-coordinates; `n0 =
+   n_base + col*2` is the FP8 byte position. **Reuse the same
+   per-thread coord machinery for the dz output scatter store** —
+   add a parallel EpiOp `FP8DZScatterStore("mDZFP8")` modeled on
+   `FP8PreActLoad` that exposes the same coord tuple.
+
+### Newly identified missing piece: ISA scale repack
+
+The existing `BlockscaledScaleStore` (`gemm_gated.py:172`) writes
+**raw row-major (total_M, N//32)** uint8 — *not* the ISA-packed format
+the downstream GEMMs (`_run_cutlass_blockscaled_gemm_varlen_*`) expect.
+The fwd pipeline gets away with this because `gather_isa_packed_scales`
+runs after the kernel and converts to ISA layout.
+
+For Phase 1A's `dz_scales`:
+
+- **Option A**: emit raw row-major from epi, then run a tiny
+  `_gather_isa_packed_scales_kernel`-style pass to repack into ISA. Adds
+  ~10 µs back into the budget but keeps the EpiOp simple. Recommended
+  first cut.
+- **Option B**: write directly into ISA layout from the kernel. Requires
+  the EpiOp to compute the ISA byte offset from `(m_abs, n_group_abs)`
+  using `_SF_TILE_M=128, _SF_TILE_K=128, _SF_VEC_SIZE=32, _SF_TILE_STORAGE=512`
+  constants. Saves the post-pass but adds index arithmetic to every
+  thread's epilogue (likely register-budget-hostile).
+
+For the col-layout variant: **with iso32 the bytes are byte-identical
+between row and col layouts**, so the col layout's repack reads the same
+source uint8 and reorders it. A second tiny repack pass produces it.
+
+### Newly identified register-budget mitigation
+
+When the FP8 dz emit path is enabled, the BF16 D store can be skipped
+entirely (no caller needs the BF16 dz when `mDZFP8` is provided). The
+TMA-store-to-D-tensor still happens, but the destination tensor can be a
+1-element placeholder if we can teach the TMA atom that it's effectively
+a no-op. Worth checking: does the TMA atom honor `m_limit` / `n_limit`
+bounds via the existing varlen mechanism so a tiny placeholder won't OOB?
+If yes, the BF16 path is free to coexist; if no, we either keep the BF16
+write (~384 MiB allocation but no extra compute) or override
+`epi_load_and_partition_d` to skip the TMA store atom altogether.
+
+### Concrete task list (in execution order, for next agent)
+
+1. **Add EpiOps** in `gemm_dgated.py` (or new file
+   `epi_blockscaled_dz.py`):
+   - `FP8DZScatterStore("mDZFP8")` — same coord pattern as
+     `FP8PreActLoad`, but for output (registers → global FP8 bytes).
+   - `BlockscaledScaleStoreCol("mDZScaleCol")` — sibling of
+     `BlockscaledScaleStore` with col-layout coord (`(n_group_abs,
+     m_abs)` indexing).
+2. **New mixin** `GemmDGatedFP8CLoadIso32QuantMixin(GemmDGatedFP8CLoadMixin)`:
+   - Override `_epi_ops` to add the 3 new EpiOps.
+   - Override `EpilogueArguments` to add `mDZFP8`, `mDZScaleRow`,
+     `mDZScaleCol`.
+   - Override `epi_visit_subtile`: keep parent's body up to and
+     including `tRS_rdXY_f32x2` computation, then BEFORE the BF16
+     pack/store:
+     - Compute `amax_lo = max(|tRS_rdXY_f32x2[0..31]|)`, `amax_hi`.
+     - `amax_lo = cute.arch.warp_reduction_max(amax_lo,
+       threads_in_group=32)`; same for `amax_hi`.
+     - Apply integer+carry e8m0 (copy `gemm_gated.py:263-281` twice).
+     - `tRS_rdXY_f32x2[i] *= quant_scale_lo` for i<32, `quant_scale_hi`
+       for i>=32.
+     - `.to(Float8E4M3FN)` cast in registers.
+     - Scatter store FP8 bytes via `mDZFP8` EpiOp coords.
+     - Lane-0-of-32 (or accept benign race) writes e8m0 byte to row
+       scale tensor; same byte to col scale tensor at transposed offset.
+   - Conditionally keep or skip the BF16 store (start with: keep it for
+     safety; flip to skip once correctness proved).
+3. **New class** in `gemm_sm100_fp8_zeromat.py`:
+   `GemmDGatedFP8CLoadIso32QuantSm100ZeroMat(GemmDGatedFP8CLoadIso32QuantMixin,
+   _GemmSm100ZeroMatMixin, GemmSm100)`.
+4. **Python wire-up** at `functional/__init__.py:1974`:
+   - Behind env flag `SONIC_MOE_DZ_EPI_FUSE=1`:
+     - Allocate `dz_fp8` (TK, 2I) FP8 + raw `dz_scale_row` uint8.
+     - Pass `mDZFP8`, `mDZScaleRow`, `mDZScaleCol` into kernel.
+     - After kernel: run scale-ISA-repack kernel (modeled on
+       `_gather_isa_packed_scales_kernel`) to produce ISA-packed scales
+       for both row & col layouts.
+     - Skip the dz portion of `fused_dual_colwise_quantize` (only do
+       dout colwise).
+5. **Bit-exact validation** against the (default-ON) iso32 Triton
+   kernel — they MUST produce identical FP8 + scale bytes since both
+   use iso32 amax + integer+carry e8m0.
+6. **CI**: `tests/fp8_frontier_determinism_test.py` must keep passing.
+7. **nsys**: rerun multi-shape sweep with `SONIC_MOE_DZ_EPI_FUSE=1`.
+   Expected ceiling: another -50 to -120 µs/iter beyond Phase 1B → 47–48%
+   MFU on Ernie. Realistic floor (if scattered FP8 stores hurt
+   coalescing): may be smaller; honest data needed.
+
+### Why not done in S80c
+
+CuTe DSL bring-up of a new EpiOp + a register-bound kernel mixin is an
+inherently iterative process that requires hardware-driven debug cycles
+(compile errors are unhelpful, register spill is silent until profiled,
+warp-layout assumptions need empirical validation). Doing this safely
+under autopilot — without putting the working +1.02pp Phase 1B frontier
+at risk — requires a focused, interactive session. Phase 1B was kept on
+disk as the active frontier so the next agent inherits a clean,
+production-quality starting point with all design groundwork done.
