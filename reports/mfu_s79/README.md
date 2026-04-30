@@ -103,16 +103,23 @@ User flagged: "We expected B300 ≈ 7000 TFLOPS / 1400 W, but observe a 1100 W c
 
 ### Reconciling the 4500 TFLOPS peak with B300's 7000 TFLOPS spec
 
-The peak figure in `reports/cross_framework_report.md` is derived correctly from B30Z's frequency × power scaling against retail B300:
+**Correct first-principles formula** for tensor-core peak: `peak = N_SMs × MMA_ops_per_SM_per_cycle × clock_freq`. **Power is NOT in this formula** — it's the runtime *consequence* of operating at (SMs, clock), not a determinant.
+
+This GPU has **148 SMs** (`paddle.device.cuda.get_device_properties().multi_processor_count`), the same as retail B200/B300. So the only catalogue-level scaling factor vs retail B300 is the clock ratio:
 
 ```
-B300 retail FP8 dense peak ≈ 7000 TFLOPS @ ~2.45 GHz boost, 1400 W
-B30Z catalogue peak       = 7000 × (2032 / 2450) × (1100 / 1400)
-                          = 7000 × 0.829 × 0.786
-                          ≈ 4560 TFLOPS  (vs the 4500 quoted — within 1.3%)
+B30Z catalogue peak ≈ B300 peak × (2032 MHz / 2450 MHz)
+                    ≈ 7000 × 0.829
+                    ≈ 5800 TFLOPS  (clock-only scaling)
 ```
 
-So **4500 TFLOPS is the boost-clock catalogue peak** for this SKU.
+The 4500 TFLOPS figure in `reports/cross_framework_report.md` is **lower** than this clock-only estimate by ~22 %. Cross-checked against empirical short-burst BF16 8192³ probe (50 iters, 31 ms, no power-cap throttling, SM @ 2032 MHz): achieved **1800 BF16 TFLOPS**; assuming cuBLAS attains ~80 % of theoretical on large square GEMMs, theoretical BF16 peak ≈ 1800 / 0.80 = 2250 TFLOPS → FP8 peak ≈ **4500 TFLOPS**. So **4500 is the empirically-anchored boost-clock peak** for this SKU and is the right reference for the MFU sweep.
+
+The 22 % gap between 5800 (pure clock scaling) and 4500 (empirical) most likely comes from one of:
+1. The "B300 = 7000 TFLOPS FP8" figure includes 2× sparsity (NVIDIA marketing convention); the dense number is closer to ~3500 → at 2.45 GHz boost; rescaling to 2032 MHz gives ~2900, still not 4500.
+2. Per-SM tensor-core throughput is also reduced on B30Z (not just clock and power). Export-restricted SKUs historically cut more than just power (cf. H800 NVLink cut, A800 NVLink cut).
+
+Either way, the empirical 4500 is what matters and it's what we use. The earlier draft of this addendum mistakenly multiplied the clock ratio by the power ratio (`× 1100/1400`); that was a double-count — power doesn't enter the catalogue-peak formula. The two ratios collapsing onto 4500 was algebraic coincidence, not physics. **Power only enters the story at runtime, when the cap forces clock throttling under sustained load (next subsection).**
 
 ### Sustained-power audit — does the 1100 W cap ever bite?
 
