@@ -90,7 +90,7 @@ def gpu_projection_us(sqlite_path: str, n_iters: int) -> float:
     return total_ns / 1000.0 / n_iters  # ns → µs, per iter
 
 
-def run_benchmark(T, E, I, topk, n_warmup, n_iters, imbalance="none", seed=42):
+def run_benchmark(T, E, I, topk, n_warmup, n_iters, imbalance="none", seed=42, H=3072):
     """Run FP8 topk MlpNode benchmark (forward + backward)."""
     import paddle
     paddle.enable_compat()
@@ -106,7 +106,7 @@ def run_benchmark(T, E, I, topk, n_warmup, n_iters, imbalance="none", seed=42):
     functional._ALIGNMENT_ASSUMED = True
     functional._ALIGNMENT_STREAK = 100
 
-    H = 3072
+    H = H
     N_recv = T  # in topk dispatch, N_recv tokens each routed to topk experts
     device = "cuda"
 
@@ -204,6 +204,8 @@ def main():
                         help="N_recv tokens (Ernie shape: 8192)")
     parser.add_argument("--E", type=int, default=8)
     parser.add_argument("--I", type=int, default=1536)
+    parser.add_argument("--H", type=int, default=3072,
+                        help="Hidden size (Ernie shape: 3072)")
     parser.add_argument("--topk", type=int, default=8)
     parser.add_argument("--warmup", type=int, default=8)
     parser.add_argument("--iters", type=int, default=12)
@@ -222,7 +224,7 @@ def main():
         return
 
     run_benchmark(args.T, args.E, args.I, args.topk, args.warmup, args.iters,
-                  imbalance=args.imbalance, seed=args.seed)
+                  imbalance=args.imbalance, seed=args.seed, H=args.H)
 
 
 if __name__ == "__main__":

@@ -3,7 +3,33 @@
 > **Single source of truth for project state.** `docs/HANDOFF.md` redirects here.
 > Earlier sessions preserved verbatim below.
 
-**Branch**: `race-fix-paddle` on `myrepo` (PFCCLab/supersonic-moe). **Last shipped**: S78b (`41391c7`/`829c599`) → S79 (`d0c1e6a`, this section).
+**Branch**: `race-fix-paddle` on `myrepo` (PFCCLab/supersonic-moe). **Last shipped**: S78b (`41391c7`/`829c599`) → S79 (`d0c1e6a`, FP8 frontier determinism CI gate; `c04b651`, S79 cleanup) → **S79b (this section, `tools/mfu_sweep_s79.py` + `reports/mfu_s79/`, full multi-shape MFU sweep)**.
+
+## S79b — FP8 frontier MFU sweep (read this first)
+
+**Deliverable**: `tools/mfu_sweep_s79.py` + `reports/mfu_s79/{README.md, sweep.{csv,json}, *.png, bench_*.log}`.
+
+**What it computes**: Megatron-style MFU = `18·TK·H·I / (busy_us × 4.5e15)` for 11 shapes (T∈{1024,2048,4096,8192,16384}, H∈{3072,4096,6144}, I∈{1536,2048,4096}, E∈{8,16,32}) where `busy_us` = sum of GPU kernel time strictly inside the NVTX `BENCH` range, overlapping intervals merged, divided by `n_iters`. This is the no-bubble async-pipeline floor.
+
+**Headline numbers** (B30Z FP8 dense peak = 4500 TFLOPS):
+- **Ernie-prod (T8192, E8, K8): 44.91% MFU = 2021 TFLOPS achieved** (busy=2754 µs/iter — matches S78 reference 2740 µs within 0.5%).
+- Best: **50.88% MFU on T8192-H6144-I2048-E8** (2290 TFLOPS).
+- Worst: 26.68% on T1024 (launch-overhead-dominated).
+- Doubling E (8→16→32) at fixed K=8 costs ~2.3 pp MFU per doubling — quantifies the routing/dispatch tax.
+- Wider matmuls win ~6 pp — non-matmul overhead amortises better at larger M·N·K.
+
+**Key insight**: Achieved FLOPS plateau ≈ 2.3 PFLOPS (~51% peak). The remaining gap is NOT GEMM efficiency (constituent FP8 GEMMs hit ≥80% peak in isolation); it's the time spent in routing/quant/scatter/dGated-activation/FP8-cast which inflate the busy denominator. Biggest remaining lever: fuse FP8 cast into the bwd-side wgrad producer (the fwd-side fold already exists).
+
+**Single-iter SM utilisation (busy/span)**: 12.7% (T=1024) → 56.8% (T=8192) → 82.4% (wide). At T≥8192 the no-bubble assumption is empirically defensible — single-iter trace is already near-saturated and any reasonable async overlap closes the small remaining gap.
+
+**Bench tool addition**: `tests/ops/bench_mlpnode_topk_nsys.py` now accepts `--H` (was hardcoded 3072). Enables the wide-model rows above. Backward compatible (default still 3072).
+
+**Reproduce**: `source .runenv.sh && python tools/mfu_sweep_s79.py --iters 12 --warmup 8`. Total wall ~7 min on idle B30Z. Heavy nsys traces (`trace_*.{nsys-rep,sqlite}`, ~280 MB) are .gitignored under `reports/mfu_s79/.gitignore`.
+
+**See `reports/mfu_s79/README.md`** for the full table, scaling analysis, roofline, and figures.
+
+---
+
 **CI status (full sweep, last verified S78b)**: `bash tools/ci/run_core_tests.sh` → 14/14 PASS, 0 SKIP, ~14 min wall on the paddlejob host (2× B30Z Blackwell). S79 adds a 15th gate (`tests/fp8_frontier_determinism_test.py`) wired into `tests/run_regression.sh` as a HARD-fail entry; full `tools/ci/run_core_tests.sh` not re-run this session (no production-path code changed, only tests + docs + report bundle).
 
 ## S79 — read this first (concise truth)
