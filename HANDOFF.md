@@ -1,3 +1,63 @@
+# HANDOFF — Session 80 (2026-04-30) — dz iso32 epilogue-fusion: Phase 0 audit PASS, Phase 1A designed (kernel work staged for next session)
+
+> **Single source of truth for project state.** `docs/HANDOFF.md` redirects here.
+> Earlier sessions preserved verbatim below.
+
+**Branch**: `race-fix-paddle` on `myrepo` (PFCCLab/supersonic-moe). **Last shipped**: S79b → **S80 (this section, `tools/dump_real_dz.py` + `tools/audit_dz_iso32_quality.py` + `reports/iso32_dz_audit/`)**.
+
+## S80 — read this first
+
+**Headline result**: iso32 (32×32) blockscaled FP8 quant of dz produces **identical** downstream-GEMM RRMSE to the production 1×32 quant (ratio 1.000× across all 6 captures × 3 routing distributions, 2 iters each). This unblocks fusing the dz quant directly into the `GemmDGatedFP8CLoadSm100ZeroMat` Cutlass epilogue — root-eliminating the external `_dual_varlen_quantize_kernel` and the 384 MiB BF16 dz round-trip. Phase 1A (CuTe DSL kernel change) is now precision-gated and ready for the next session.
+
+**Why iso32 is a free lunch on FP8 dz** (calibrated insight): the dyn-range proxy `log2(tile_amax / row_amax)` predicted heavy mantissa loss for iso32 (frac>1bit ≈ 73% on real Ernie-shape dz). But e4m3's 3-bit mantissa imposes ~12.5% per-value rounding that dominates: 1×32's "extra" mantissa headroom is below the e4m3 precision floor and goes unused. **Direct, dx-proxy and dw1-proxy RRMSE are bit-identical between 1×32 and 32×32 on real bwd-domain gradients**. Contrast with PR #15 (iso32 retired for *weights*): weights are larger and more uniform, so the 1×32 mantissa bits there were not wasted — gradient distributions are different.
+
+**What landed (S80)**:
+1. `tools/dump_real_dz.py` — monkey-patches `sonicmoe.functional.gemm_dgated_kernel`, captures real bf16 dz `(TK=65536, 2I=3072)` from `SonicMoEMlpNode` bwd. Saves `.npy` (proxy-free torch consumption). Supports `--imbalance {none,skew,extreme}`. Realistic gradient amplitude (amax ≈ 3-4) — earlier audits with the 0.02-scaled fixture were uninformative (everything collapsed into one FP8 bin).
+2. `tools/audit_dz_iso32_quality.py` — pure-pytorch quant→dequant for both 1×32 and 32×32, computes cosine/RRMSE/max_abs and **downstream-GEMM RRMSE** for `dx = dz @ w1ᵀ` and `dw1 = dzᵀ @ x`. Downstream RRMSE ratio is the binding gate (≤ 2×). dyn-range bits-lost is reported as **advisory only** (it over-predicts for FP8).
+3. `reports/iso32_dz_audit/` — 6 captured dz tensors + `audit.md` (per-capture metrics) + `PHASE0_DESIGN.md` (full Phase 1A design with all pointers).
+
+**What is intentionally NOT in this session**: the actual Cutlass DSL epilogue change. Reasons:
+- The forward analog `GemmGatedBlockscaledQuantMixin` (`sonicmoe/quack_utils/gemm_gated.py:221`) is the production template — bit-exact 1×32 fp8-emit epilogue with `BlockscaledScaleStore` EpiOp. The bwd version needs (a) 32×32 amax via warp-shuffle across the 32 lanes holding different M-rows of one N-tile, (b) wider D shape `(TK, 2I)` not `(TK, I)`, (c) FP8 TMA store atom (8-bit StMatrix) — each non-trivial in CuTe DSL.
+- `GemmDGatedFP8CLoadSm100ZeroMat` is register-bound (S78b confirmed every register tweak landed neutral or regressed). Adding amax+e8m0+cast logic adds ~24-32 regs/thread; spill risk is the main Phase 1A unknown.
+- Bit-exact validation against Triton requires interactive iteration on hardware which exceeds clean-handoff scope.
+
+**Phase 1A design (read `reports/iso32_dz_audit/PHASE0_DESIGN.md`)**: target file `gemm_sm100_fp8_zeromat.py:397`, target mixin `gemm_dgated.py:510`, template `gemm_gated.py:221` (production fwd `BlockscaledQuant`), wire-up site `functional/__init__.py:1967`, ISA layout helpers `blockscaled_fp8_gemm.py:199` + top-of-file constants. Gate flag `mDZScale: Optional[cute.Tensor]` preserves BF16-emit fallback. Phase 1B fallback (dual-amax 1×32 epilogue + cheap colwise scale-rewrite) is a documented insurance plan if iso32 register pressure proves unworkable — note it would NOT eliminate the colwise-quant pass, only the rowwise one.
+
+**Performance ceiling (revised honest numbers, anchored on S79b 2754 µs busy / 44.91% MFU baseline)**:
+- Eliminated: dz BF16 (TK,2I) ≈ 384 MiB write + 384 MiB read + entire `_dual_varlen_quantize_kernel`.
+- Added: epilogue amax+cast ≈ 30-60 µs; FP8 TMA store (half BF16 bandwidth → cheaper).
+- Net realistic: **100-180 µs/iter savings → +1.5 to 3.0 pp MFU → 46.5-48.0%**.
+- Earlier "+5 pp" estimate (in the wgrad-fold answer) was over-optimistic — revised down here.
+
+**Lessons (S80-specific)**:
+1. **The dyn-range bits-lost proxy is a poor predictor for FP8.** Always validate against downstream-GEMM RRMSE on real domain data before making a precision decision. We almost rejected iso32 on a 73% frac>1bit reading that turned out to have zero downstream impact.
+2. **Audit fixtures must have realistic dynamic range.** The original `bench_mlpnode_topk_nsys.py` uses `x*0.02` and `grad_out*0.01` for stability; this collapses dz amax to ~3.6e-4 and makes FP8 quant indistinguishable from no-op. We unscaled to `paddle.randn()` to get amax in O(1) — closer to post-layernorm activation scale in real training.
+3. **Paddle torch-proxy gotchas reaffirmed**: `paddle.compat.enable_torch_proxy(silent=True)` MUST happen before `import torch`; once enabled, all torch ops route through paddle which lacks `clamp_min`, `e4m3` cast, etc. Best practice for tools that need both Paddle (for the model graph) and real torch (for math): write to `.npy` from the proxied tool, consume `.npy` from a separate stock-torch tool.
+4. **bf16 abs() on CPU tensors is unsupported in Paddle** — compute amax on GPU first, copy via `.to(dtype=float32, device="cpu").numpy()`.
+
+**Hand-off action items for next session (in priority order)**:
+1. Implement `GemmDGatedFP8CLoadSm100ZeroMat` epilogue change — model directly after `GemmGatedBlockscaledQuantMixin.epi_visit_subtile` in `gemm_gated.py:244`. Add `mDZScale` field; add `BlockscaledScaleStore` EpiOp (already exists, reuse). Implement 32-lane warp shuffle for cross-row amax. Verify register count via `cuobjdump --dump-resource-usage` on the compiled cubin before integrating.
+2. Add unit test mirroring `tests/ops/test_dual_quant.py` but exercising the new fp8-emit kernel against the pure-pytorch reference (use `_quant_dequant_blockscaled` from `tests/ops/audit_iso32_numerics.py:32`).
+3. Wire into `functional/__init__.py:1967` only after unit test passes; gate with `os.environ.get("SONIC_MOE_DZ_EPI_FUSE", "0") == "1"` initially so we can compare A/B in the same binary.
+4. Run `tests/run_regression.sh` (do NOT modify — user constraint). All 5 hard-fail tests must pass.
+5. Then nsys-bench against S79b baseline; expect 100-180 µs/iter savings.
+
+**SQL todos snapshot** (this session DB):
+- `p0-dump-dz`: done
+- `p0-audit`: done
+- `p1a-epi-design`: done (design + pointers in `PHASE0_DESIGN.md`)
+- `p1a-impl`, `p1a-utest`, `p2-wire`, `p3-ci`, `p3-perf`, `p4-report`: pending (next session)
+
+**Files added this session**:
+- `tools/dump_real_dz.py`
+- `tools/audit_dz_iso32_quality.py`
+- `reports/iso32_dz_audit/dz_*.npy` (6 captures, ~2.4 GiB total — `.gitignore` if needed)
+- `reports/iso32_dz_audit/audit.md`
+- `reports/iso32_dz_audit/PHASE0_DESIGN.md`
+- `reports/weekly_summary_2026W17.md` (carried over from earlier S80 turn — weekly summary of merged upstream PRs)
+
+---
+
 # HANDOFF — Session 79 (2026-04-30) — FP8 frontier determinism CI + dgrad1 optimization audit (no-go) + downstream JIT-cache triage
 
 > **Single source of truth for project state.** `docs/HANDOFF.md` redirects here.
