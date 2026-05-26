@@ -47,7 +47,7 @@ for _p in (_QUACK, _REPO):
 # Layer 1: kernel-level bit-exact comparison
 # ---------------------------------------------------------------------------
 
-def _kernel_bit_exact_child(T: int, K: int, E: int, H: int, I: int):
+def _kernel_bit_exact_child(T: int, K: int, E: int, H: int, I: int, routing: str):
     import torch
     import numpy as np
 
@@ -64,22 +64,56 @@ def _kernel_bit_exact_child(T: int, K: int, E: int, H: int, I: int):
     torch.manual_seed(0)
     device = "cuda"
 
-    TK = T * K
+    TK_real = T * K
     N2 = 2 * I  # the 2I dim of the up-projection (gated half size = N2//2 = I)
 
-    # Routing: round-robin tokens across experts so every expert gets work.
     x = torch.randn(T, H, dtype=torch.bfloat16, device=device) * 0.5
     w1 = torch.randn(N2, H, E, dtype=torch.bfloat16, device=device) * 0.05  # (2I, H, E)
 
-    expert_assign = torch.arange(TK, device=device, dtype=torch.int32) % E
+    def _make_assignments() -> torch.Tensor:
+        if routing == "uniform":
+            return torch.arange(TK_real, device=device, dtype=torch.int32) % E
+        if routing == "random":
+            scores = torch.randn(T, E, device=device)
+            return scores.topk(K, dim=-1).indices.reshape(-1).to(torch.int32)
+        if routing == "skew":
+            scores = torch.randn(T, E, device=device)
+            hot = torch.rand(T, device=device) < 0.80
+            scores[hot, 0] += 100.0
+            return scores.topk(K, dim=-1).indices.reshape(-1).to(torch.int32)
+        if routing == "holes":
+            active = max(K, E // 2)
+            scores = torch.randn(T, active, device=device)
+            return scores.topk(K, dim=-1).indices.reshape(-1).to(torch.int32)
+        raise ValueError(f"unknown routing={routing}")
+
+    expert_assign = _make_assignments()
+    if expert_assign.numel() != TK_real:
+        raise RuntimeError(f"routing={routing} produced {expert_assign.numel()} routes, expected {TK_real}")
     sorted_assign, perm = torch.sort(expert_assign)
     counts = torch.bincount(sorted_assign, minlength=E).to(torch.int32)
+    padded_counts = torch.where(counts > 0, ((counts + 127) // 128) * 128, counts)
     eFO = torch.zeros(E + 1, dtype=torch.int32, device=device)
-    eFO[1:] = torch.cumsum(counts, dim=0).to(torch.int32)
-    base_token = perm // K
-    x_gather_idx = base_token.to(torch.int32).contiguous()
+    eFO[1:] = torch.cumsum(padded_counts, dim=0).to(torch.int32)
+    TK = int(eFO[-1].item())
 
-    # --- Stage 1: quantize x at T-size + gather scales to TK ---
+    base_token_real = perm // K
+    x_gather_idx = torch.empty(TK, dtype=torch.int32, device=device)
+    write = 0
+    pad_rows = 0
+    for e in range(E):
+        real = int(counts[e].item())
+        padded = int(padded_counts[e].item())
+        if real:
+            rows = base_token_real[sorted_assign == e]
+            x_gather_idx[write:write + real] = rows.to(torch.int32)
+        if padded > real:
+            x_gather_idx[write + real:write + padded] = 0
+            pad_rows += padded - real
+        write += padded
+    x_gather_idx = x_gather_idx.contiguous()
+
+    # --- Stage 1: quantize x at T-size + gather scales to padded TK ---
     x_fp8, x_scales_t = quantize_and_pack_activation(x)
     k_tiles = _div_up(H, _SF_TILE_K)
     per_batch_tk = _storage_per_batch(TK, H)
@@ -105,7 +139,7 @@ def _kernel_bit_exact_child(T: int, K: int, E: int, H: int, I: int):
     PostAct_A = torch.empty((TK, N2 // 2), dtype=torch.bfloat16, device=device)
     z_scale_out_A = torch.empty((TK, N2 // 32), dtype=torch.uint8, device=device)
     gemm_gated(
-        x_fp8, w1_fp8,
+        x_fp8, w1_fp8.mT,
         z_fp8_A, None,
         PostAct_A,
         None,
@@ -119,9 +153,9 @@ def _kernel_bit_exact_child(T: int, K: int, E: int, H: int, I: int):
     )
     torch.cuda.synchronize()
 
-    # --- Path B: new non-gated quant-only kernel ---
+    # --- Path B: non-gated quant-only kernel ---
     z_fp8_B, z_scale_out_B = blockscaled_fp8_gemm_zeromat_quant(
-        x_fp8, w1_fp8,
+        x_fp8, w1_fp8.mT,
         cu_seqlens_m=eFO,
         A_idx=x_gather_idx,
         a_scales=x_scales_tk_e8m0,
@@ -138,11 +172,16 @@ def _kernel_bit_exact_child(T: int, K: int, E: int, H: int, I: int):
     z_diff = (a_z != b_z).sum()
     s_diff = (a_s != b_s).sum()
 
-    print(f"[bitexact T={T} K={K} E={E} H={H} I={I}] z_fp8 mismatched bytes: {z_diff}/{a_z.size}")
-    print(f"[bitexact T={T} K={K} E={E} H={H} I={I}] z_scale mismatched bytes: {s_diff}/{a_s.size}")
+    counts_cpu = counts.cpu().tolist()
+    print(
+        f"[bitexact routing={routing} T={T} K={K} E={E} H={H} I={I}] "
+        f"tpe(min/max/sum)={min(counts_cpu)}/{max(counts_cpu)}/{sum(counts_cpu)} "
+        f"pad_rows={pad_rows} TK_padded={TK}"
+    )
+    print(f"  z_fp8 mismatched bytes: {z_diff}/{a_z.size}")
+    print(f"  z_scale mismatched bytes: {s_diff}/{a_s.size}")
 
     if z_diff != 0 or s_diff != 0:
-        # Print a small mismatch sample for debugging.
         idx = np.argwhere(a_z != b_z)[:5]
         print("first z mismatches (idx, A, B):")
         for i in idx:
@@ -218,23 +257,49 @@ def main():
         label = sys.argv[2]
         if label == "kernel":
             T, K, E, H, I = (int(x) for x in sys.argv[3:8])
-            _kernel_bit_exact_child(T, K, E, H, I)
+            routing = sys.argv[8]
+            tile = sys.argv[9] if len(sys.argv) > 9 else "128"
+            os.environ["SONIC_MOE_QONLY_TILE"] = tile
+            _kernel_bit_exact_child(T, K, E, H, I, routing)
         sys.exit(0)
 
-    # Layer 1: kernel-level bit-exact across a few representative shapes.
-    shapes = [
-        (1024, 8, 8, 3072, 1536),
-        (4096, 8, 8, 3072, 1536),
-        (8192, 8, 8, 3072, 1536),
+    # Layer 1: kernel-level bit-exact across representative routing regimes.
+    # Each case: (T, K, E, H, I, routing, tile)
+    cases = [
+        (1024, 8, 8, 3072, 1536, "uniform", "128"),
+        (1024, 8, 8, 3072, 1536, "random", "128"),
+        (1024, 8, 8, 3072, 1536, "skew", "128"),
+        (1024, 8, 16, 3072, 1536, "holes", "128"),
+        (1024, 8, 16, 3072, 1536, "random", "128"),
+        (1024, 8, 32, 3072, 1536, "random", "128"),
+        (512, 4, 16, 1024, 1536, "random", "128"),
+        (512, 4, 16, 3072, 1024, "skew", "128"),
+        (4096, 8, 8, 3072, 1536, "skew", "128"),
+        (8192, 8, 8, 3072, 1536, "random", "128"),
+        # E=64, K=2 many-expert cases
+        (1024, 2, 64, 3072, 1536, "random", "128"),
+        (1024, 2, 64, 3072, 1536, "skew", "128"),
+        (1024, 2, 64, 3072, 1536, "holes", "128"),
+        (4096, 2, 64, 3072, 1536, "random", "128"),
+        # Taily: small per-expert counts near tile boundaries
+        (256, 8, 32, 3072, 1536, "random", "128"),
+        (128, 2, 64, 3072, 1536, "random", "128"),
+        # 256x256 tile for dense shapes
+        (8192, 8, 8, 3072, 1536, "random", "256"),
+        (4096, 8, 8, 3072, 1536, "skew", "256"),
+        # auto tile
+        (8192, 8, 8, 3072, 1536, "random", "auto"),
+        (1024, 2, 64, 3072, 1536, "random", "auto"),
     ]
-    for sh in shapes:
-        print(f"\n=== Layer 1 kernel bit-exact T={sh[0]} K={sh[1]} E={sh[2]} H={sh[3]} I={sh[4]} ===")
+    for case in cases:
+        T, K, E, H, I, routing, tile = case
+        print(f"\n=== Layer 1 kernel bit-exact T={T} K={K} E={E} H={H} I={I} routing={routing} tile={tile} ===")
         rc = subprocess.call(
-            [_PY, __file__, "--child", "kernel", *map(str, sh)],
+            [_PY, __file__, "--child", "kernel", str(T), str(K), str(E), str(H), str(I), routing, tile],
             timeout=300,
         )
         if rc != 0:
-            print(f"\033[31mFAIL kernel bit-exact at {sh}\033[0m")
+            print(f"\033[31mFAIL kernel bit-exact at {case}\033[0m")
             sys.exit(rc)
 
     print("\n\033[32mAll Option B bit-exact tests PASS.\033[0m")

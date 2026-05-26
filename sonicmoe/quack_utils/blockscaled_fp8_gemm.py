@@ -1560,6 +1560,96 @@ def _colwise_quantize_and_pack_kernel(
         tl.store(scale_ptrs, e8m0_byte, mask=dim_mask)
 
 
+@wrap_triton_kernel
+@triton.jit
+def _dequant_colwise_quantize_and_pack_from_isa_kernel(
+    src_fp8_ptr,
+    src_packed_ptr,
+    gather_idx_ptr,
+    dst_fp8_ptr,
+    dst_packed_ptr,
+    total_K,
+    dim,
+    src_stride_row,
+    src_stride_col,
+    dst_stride_row,
+    dst_stride_col,
+    src_k_tiles,
+    dst_k_tiles,
+    HAS_GATHER: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+    SF_TILE_M: tl.constexpr,
+    SF_TILE_K: tl.constexpr,
+    SF_TILE_STORAGE: tl.constexpr,
+    GROUPS_PER_BLOCK: tl.constexpr = 1,
+):
+    pid_group_blk = tl.program_id(0)
+    pid_dim = tl.program_id(1)
+
+    groups_per_k_tile: tl.constexpr = SF_TILE_K // GROUP_SIZE
+    dim_groups_per_block: tl.constexpr = BLOCK_DIM // GROUP_SIZE
+
+    for g_local in tl.static_range(0, GROUPS_PER_BLOCK):
+        pid_group = pid_group_blk * GROUPS_PER_BLOCK + g_local
+        k_offs = pid_group * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+        k_mask = k_offs < total_K
+
+        if HAS_GATHER:
+            src_rows = tl.load(gather_idx_ptr + k_offs, mask=k_mask, other=0).to(tl.int64)
+        else:
+            src_rows = k_offs.to(tl.int64)
+
+        src_row_tiles = src_rows // SF_TILE_M
+        src_row_in_tile = src_rows % SF_TILE_M
+        src_row_base = (src_row_in_tile % 32) * 16 + (src_row_in_tile // 32) * 4
+
+        dst_k_tiles_idx = pid_group // groups_per_k_tile
+        dst_k_in_tile = pid_group % groups_per_k_tile
+
+        for d_local in tl.static_range(0, dim_groups_per_block):
+            dim_offs = pid_dim * BLOCK_DIM + d_local * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+            dim_mask = dim_offs < dim
+            mask = k_mask[:, None] & dim_mask[None, :]
+
+            src_group_id = pid_dim * dim_groups_per_block + d_local
+            src_k_tiles_idx = src_group_id // groups_per_k_tile
+            src_k_in_tile = src_group_id % groups_per_k_tile
+            src_scale_offsets = (
+                (src_row_tiles * src_k_tiles + src_k_tiles_idx) * SF_TILE_STORAGE
+                + src_row_base
+                + src_k_in_tile
+            )
+            src_scale_u8 = tl.load(src_packed_ptr + src_scale_offsets, mask=k_mask, other=0)
+            src_scale = (src_scale_u8.to(tl.int32) << 23).to(tl.float32, bitcast=True)
+
+            fp8_ptrs = src_fp8_ptr + src_rows[:, None] * src_stride_row + dim_offs[None, :].to(tl.int64) * src_stride_col
+            fp8_vals = tl.load(fp8_ptrs, mask=mask, other=0.0)
+            values = fp8_vals.to(tl.float32) * src_scale[:, None]
+
+            block_amax = tl.max(tl.abs(values), axis=0)
+            amax_bits = block_amax.to(tl.int32, bitcast=True)
+            biased_exp = (amax_bits >> 23) & 0xFF
+            carry = (amax_bits & 0x7FFFFF) > 0x600000
+            e8m0_i32 = tl.maximum(biased_exp + carry.to(tl.int32) - 8, 0)
+            e8m0_byte = e8m0_i32.to(tl.uint8)
+            quant_scale = ((254 - e8m0_i32).to(tl.int32) << 23).to(tl.float32, bitcast=True)
+            quantized = (values * quant_scale[None, :]).to(tl.float8e4nv)
+
+            dst_ptrs = dst_fp8_ptr + k_offs[:, None].to(tl.int64) * dst_stride_row + dim_offs[None, :].to(tl.int64) * dst_stride_col
+            tl.store(dst_ptrs, quantized, mask=mask)
+
+            dst_row_tiles = dim_offs // SF_TILE_M
+            dst_row_in_tile = dim_offs % SF_TILE_M
+            dst_row_base = (dst_row_in_tile % 32) * 16 + (dst_row_in_tile // 32) * 4
+            dst_scale_offsets = (
+                (dst_row_tiles * dst_k_tiles + dst_k_tiles_idx) * SF_TILE_STORAGE
+                + dst_row_base
+                + dst_k_in_tile
+            )
+            tl.store(dst_packed_ptr + dst_scale_offsets.to(tl.int64), e8m0_byte, mask=dim_mask)
+
+
 # ---------------------------------------------------------------------------
 # Fused transpose + rowwise quantize for wgrad operands
 # ---------------------------------------------------------------------------
@@ -1740,6 +1830,73 @@ def fused_transpose_quantize_and_pack(
         SF_TILE_M=_SF_TILE_M,
         SF_TILE_STORAGE=_SF_TILE_STORAGE,
         GROUPS_PER_TILE=groups_per_tile,
+    )
+    return fp8_out, packed_scales.view(_E8M0_DTYPE)
+
+
+def dequant_colwise_quantize_and_pack_from_isa(
+    src_fp8: torch.Tensor,
+    src_packed_scales: torch.Tensor,
+    logical_rows: int,
+    logical_cols: int,
+    *,
+    gather_idx: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    check_tensor(src_fp8, "src_fp8", dtype=torch.float8_e4m3fn, ndim=2)
+    if src_packed_scales.dtype not in (torch.uint8, _E8M0_DTYPE):
+        raise ValueError(f"src_packed_scales must be uint8/e8m0, got {src_packed_scales.dtype}")
+    T, H_src = src_fp8.shape
+    H = logical_rows
+    TK = logical_cols
+    if H_src != H:
+        raise ValueError(f"src_fp8 second dim {H_src} != logical_rows {H}")
+    expected_src_scales = (1, _storage_per_batch(T, H))
+    if tuple(src_packed_scales.shape) != expected_src_scales:
+        raise ValueError(
+            f"src_packed_scales shape {tuple(src_packed_scales.shape)} != expected {expected_src_scales}"
+        )
+    if gather_idx is not None:
+        check_tensor(gather_idx, "gather_idx", ndim=1, stride0_1=True)
+        if gather_idx.shape[0] != TK:
+            raise ValueError(f"gather_idx length {gather_idx.shape[0]} != logical_cols {TK}")
+    elif T != TK:
+        raise ValueError(f"without gather_idx, src rows {T} must equal logical_cols {TK}")
+
+    GROUP_SIZE = _SF_VEC_SIZE
+    BLOCK_DIM = 128
+    fp8_out = torch.empty(TK, H, dtype=torch.float8_e4m3fn, device=src_fp8.device)
+    per_batch_storage = _storage_per_batch(H, TK)
+    if H % _SF_TILE_M == 0 and TK % _SF_TILE_K == 0:
+        packed_scales = torch.empty((1, per_batch_storage), dtype=torch.uint8, device=src_fp8.device)
+    else:
+        packed_scales = torch.full((1, per_batch_storage), 127, dtype=torch.uint8, device=src_fp8.device)
+
+    if TK == 0 or H == 0:
+        return fp8_out, packed_scales.view(_E8M0_DTYPE)
+
+    num_groups = _div_up(TK, GROUP_SIZE)
+    src_k_tiles = _div_up(H, _SF_TILE_K)
+    dst_k_tiles = _div_up(TK, _SF_TILE_K)
+    GROUPS_PER_BLOCK = 2 if (num_groups % 2 == 0) else 1
+    grid = (num_groups // GROUPS_PER_BLOCK, _div_up(H, BLOCK_DIM))
+    has_gather = gather_idx is not None
+    gather_ptr = gather_idx if has_gather else src_fp8
+
+    _dequant_colwise_quantize_and_pack_from_isa_kernel[grid](
+        src_fp8, src_packed_scales.view(torch.uint8), gather_ptr,
+        fp8_out, packed_scales,
+        TK, H,
+        src_fp8.stride(0), src_fp8.stride(1),
+        fp8_out.stride(0), fp8_out.stride(1),
+        src_k_tiles, dst_k_tiles,
+        HAS_GATHER=has_gather,
+        GROUP_SIZE=GROUP_SIZE,
+        BLOCK_DIM=BLOCK_DIM,
+        SF_TILE_M=_SF_TILE_M,
+        SF_TILE_K=_SF_TILE_K,
+        SF_TILE_STORAGE=_SF_TILE_STORAGE,
+        GROUPS_PER_BLOCK=GROUPS_PER_BLOCK,
+        num_warps=1,
     )
     return fp8_out, packed_scales.view(_E8M0_DTYPE)
 
@@ -3254,7 +3411,6 @@ def quantize_and_pack_activation(
     return fp8_out, packed_scales.view(_E8M0_DTYPE)
 
 
-
 # ---------------------------------------------------------------------------
 # Three-step optimized gather: T-quant -> fp8_gather -> scale_gather
 # ---------------------------------------------------------------------------
@@ -3906,11 +4062,15 @@ _ISO32_WEIGHT_CACHE: dict[
 
 def _iso32_weight_enabled() -> bool:
     """Check if ISO32 weight cache is active. Uses the centralized _FP8Config."""
+    from sonicmoe.config import get_active_config
     from sonicmoe.functional import _get_fp8_config
+    active_cfg = get_active_config()
+    if active_cfg is not None:
+        return active_cfg.resolve_iso32_weight()
     cfg = _get_fp8_config()
     if cfg.enabled and hasattr(cfg, 'iso32_weight'):
         return cfg.iso32_weight
-    return os.environ.get("SONIC_MOE_FP8_ISO32_WEIGHT", "0") == "1"
+    return os.environ.get("SONIC_MOE_FP8_ISO32_WEIGHT", "1") != "0"
 
 
 def precompute_weight_fp8_for_fused_gated(
@@ -4384,6 +4544,154 @@ def _cache_pair_w2(w2: torch.Tensor) -> None:
     # precompute_weight_fp8_for_direct_fused_dgated returns the contig tensor
     # but stores the .mT view in cache so fused_dgated still works.  Mirror.
     _FUSED_WEIGHT_CACHE[fused_key] = (B_fp8.mT, B_scales)
+
+
+def _simple_weight_key(w: torch.Tensor) -> tuple[int, int, tuple[int, ...], tuple[int, ...]]:
+    return (w.data_ptr(), _tensor_version(w), tuple(w.shape), tuple(w.stride()))
+
+
+def _check_fp8_weight_payload(
+    fp8: torch.Tensor,
+    scales: torch.Tensor,
+    *,
+    name: str,
+    fp8_shape: tuple[int, int, int],
+    scale_rows: int,
+    scale_cols: int,
+) -> None:
+    check_tensor(fp8, name, dtype=torch.float8_e4m3fn, ndim=3)
+    if tuple(fp8.shape) != fp8_shape:
+        raise ValueError(f"{name} shape {tuple(fp8.shape)} != expected {fp8_shape}")
+    if scales.dtype not in (torch.uint8, _E8M0_DTYPE):
+        raise ValueError(f"{name}_scales must be uint8/e8m0, got {scales.dtype}")
+    expected_scales = (1, _storage_per_batch(scale_rows, scale_cols))
+    if tuple(scales.shape) != expected_scales:
+        raise ValueError(
+            f"{name}_scales shape {tuple(scales.shape)} != expected {expected_scales}"
+        )
+    if fp8.device != scales.device:
+        raise ValueError(f"{name} fp8/scales must be on the same device")
+
+
+def install_iso32_weight_cache(
+    w: torch.Tensor,
+    fp8_enk: torch.Tensor,
+    row_scales: torch.Tensor,
+    col_scales: torch.Tensor,
+) -> None:
+    check_tensor(w, "w", dtype=torch.bfloat16, ndim=3)
+    dim0, dim1, E = (int(w.shape[0]), int(w.shape[1]), int(w.shape[2]))
+    _check_fp8_weight_payload(
+        fp8_enk, row_scales,
+        name="iso32_weight",
+        fp8_shape=(E, dim0, dim1),
+        scale_rows=E * dim0,
+        scale_cols=dim1,
+    )
+    expected_col_scales = (1, _storage_per_batch(dim1, E * dim0))
+    if col_scales.dtype not in (torch.uint8, _E8M0_DTYPE):
+        raise ValueError(f"iso32_weight_col_scales must be uint8/e8m0, got {col_scales.dtype}")
+    if tuple(col_scales.shape) != expected_col_scales:
+        raise ValueError(
+            f"iso32_weight_col_scales shape {tuple(col_scales.shape)} != expected {expected_col_scales}"
+        )
+    if col_scales.device != fp8_enk.device:
+        raise ValueError("iso32_weight col_scales must be on the same device as fp8")
+
+    _ISO32_WEIGHT_CACHE[_simple_weight_key(w)] = (fp8_enk, row_scales, col_scales)
+    wT = w.permute(1, 0, 2)
+    _ISO32_WEIGHT_CACHE[_simple_weight_key(wT)] = (
+        fp8_enk.permute(0, 2, 1), col_scales, row_scales,
+    )
+
+
+def install_1x32_weight_cache(
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_payload: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    w2_payload: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+) -> None:
+    check_tensor(w1, "w1", dtype=torch.bfloat16, ndim=3)
+    check_tensor(w2, "w2", dtype=torch.bfloat16, ndim=3)
+    two_I, H, E1 = (int(w1.shape[0]), int(w1.shape[1]), int(w1.shape[2]))
+    H2, I, E2 = (int(w2.shape[0]), int(w2.shape[1]), int(w2.shape[2]))
+    if E1 != E2 or H != H2:
+        raise ValueError(f"w1/w2 shape mismatch: w1={tuple(w1.shape)} w2={tuple(w2.shape)}")
+
+    w1_A, w1_A_scales, w1_B, w1_B_scales = w1_payload
+    w2_A, w2_A_scales, w2_B, w2_B_scales = w2_payload
+    _check_fp8_weight_payload(
+        w1_A, w1_A_scales,
+        name="w1_1x32_fused",
+        fp8_shape=(E1, two_I, H),
+        scale_rows=E1 * two_I,
+        scale_cols=H,
+    )
+    _check_fp8_weight_payload(
+        w1_B, w1_B_scales,
+        name="w1_1x32_varlen_t",
+        fp8_shape=(E1, H, two_I),
+        scale_rows=E1 * H,
+        scale_cols=two_I,
+    )
+    _check_fp8_weight_payload(
+        w2_A, w2_A_scales,
+        name="w2_1x32_varlen",
+        fp8_shape=(E2, H, I),
+        scale_rows=E2 * H,
+        scale_cols=I,
+    )
+    _check_fp8_weight_payload(
+        w2_B, w2_B_scales,
+        name="w2_1x32_dgated",
+        fp8_shape=(E2, I, H),
+        scale_rows=E2 * I,
+        scale_cols=H,
+    )
+
+    _FUSED_WEIGHT_CACHE[_simple_weight_key(w1)] = (w1_A.mT, w1_A_scales)
+    _VARLEN_WEIGHT_CACHE[_simple_weight_key(w1.permute(1, 0, 2))] = (w1_B, w1_B_scales)
+    _VARLEN_WEIGHT_CACHE[_simple_weight_key(w2)] = (w2_A, w2_A_scales)
+    _FUSED_WEIGHT_CACHE[_simple_weight_key(w2)] = (w2_B.mT, w2_B_scales)
+
+
+def quantize_native_fp8_weights(
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    *,
+    iso32: Optional[bool] = None,
+) -> dict[str, object]:
+    if iso32 is None:
+        iso32 = _iso32_weight_enabled()
+    if iso32:
+        return {
+            "format": "iso32",
+            "w1": iso32_dual_quantize_weight_3d(w1.permute(2, 0, 1)),
+            "w2": iso32_dual_quantize_weight_3d(w2.permute(2, 0, 1)),
+        }
+    return {
+        "format": "1x32",
+        "w1": _quantize_weight_pair_3d_triton(w1.permute(2, 0, 1)),
+        "w2": _quantize_weight_pair_3d_triton(w2.permute(2, 0, 1)),
+    }
+
+
+def install_native_fp8_weight_cache(
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    payload: dict[str, object],
+    *,
+    iso32: Optional[bool] = None,
+) -> None:
+    expected = "iso32" if (_iso32_weight_enabled() if iso32 is None else iso32) else "1x32"
+    fmt = payload.get("format")
+    if fmt != expected:
+        raise ValueError(f"native FP8 weight payload format {fmt!r} does not match active format {expected!r}")
+    if fmt == "iso32":
+        install_iso32_weight_cache(w1, *payload["w1"])
+        install_iso32_weight_cache(w2, *payload["w2"])
+    else:
+        install_1x32_weight_cache(w1, w2, payload["w1"], payload["w2"])
 
 
 def precompute_weight_fp8_warmup(

@@ -70,6 +70,7 @@ from .utils import enable_fp8, enable_quack_gemm, is_fp8_active, is_using_quack_
 _E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", torch.uint8)
 
 
+
 # ---------------------------------------------------------------------------
 # Standalone SwiGLU forward/backward (for blockscaled split path)
 # ---------------------------------------------------------------------------
@@ -81,7 +82,6 @@ from ..quack_utils.swiglu_triton import (
     dequantize_blockscaled_fp8,
 )
 from ..quack_utils.blockscaled_fp8_gemm import (
-    pack_blockscaled_1x32_scales,
     quantize_activation_blockscaled_fast,
 )
 
@@ -107,6 +107,8 @@ def _fused_blockscaled_gated_forward(
     x_gather_idx: torch.Tensor,
     *,
     w1_fp8_pre: tuple[torch.Tensor, torch.Tensor] | None = None,
+    x_fp8_pre: torch.Tensor | None = None,
+    x_scales_pre: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run blockscaled GEMM+SwiGLU with zero-materialization FP8.
 
@@ -138,7 +140,14 @@ def _fused_blockscaled_gated_forward(
         w1_fp8, w1_scales = precompute_weight_fp8_for_fused_gated(w1)
 
     # Step 1: Quantize at T-size (NOT TK)
-    x_fp8, x_scales_t = quantize_and_pack_activation(x)
+    if x_fp8_pre is not None or x_scales_pre is not None:
+        if x_fp8_pre is None or x_scales_pre is None:
+            raise ValueError("x_fp8_pre and x_scales_pre must be provided together")
+        x_fp8 = x_fp8_pre
+        x_scales_t = x_scales_pre
+        _PREQUANT_HIT_COUNT["activation_fwd"] += 1
+    else:
+        x_fp8, x_scales_t = quantize_and_pack_activation(x)
 
     # Step 2: Gather ISA-packed scales T->TK (~3-8µs)
     TK = x_gather_idx.shape[0]
@@ -222,44 +231,60 @@ def _recompute_z_fp8(
     w1: torch.Tensor,
     expert_frequency_offset: torch.Tensor,
     x_gather_idx: torch.Tensor,
+    x_fp8_pre: torch.Tensor | None = None,
+    x_scales_pre: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Re-run the up-proj GEMM to materialize z_fp8 + scales (Option B).
+    """Re-run up-proj to materialize only z_fp8 + scales for backward."""
+    from ..quack_utils.blockscaled_fp8_gemm import (
+        _gather_isa_packed_scales_kernel,
+        _div_up, _SF_TILE_K, _SF_TILE_M, _SF_TILE_STORAGE, _SF_VEC_SIZE,
+        _storage_per_batch,
+    )
+    from ..quack_utils.gemm_sm100_fp8_zeromat import blockscaled_fp8_gemm_zeromat_quant
 
-    Used by ``_DownProjection.backward`` when ``cfg.recompute_z`` was active
-    in forward (z_fp8 was deliberately not stored).
+    if "w1_fused" in _STASHED_FP8_WEIGHTS:
+        w1_fp8, w1_scales = _STASHED_FP8_WEIGHTS["w1_fused"]
+    else:
+        w1_fp8, w1_scales = precompute_weight_fp8_for_fused_gated(w1)
 
-    Default (Option A): rerun the gated forward kernel and discard y1.
-    Correct on all routing distributions (uniform & skewed).  Slight overhead:
-    one extra TK x I bf16 alloc + swiglu in registers per recompute call.
+    if x_fp8_pre is not None or x_scales_pre is not None:
+        if x_fp8_pre is None or x_scales_pre is None:
+            raise ValueError("x_fp8_pre and x_scales_pre must be provided together")
+        x_fp8 = x_fp8_pre
+        x_scales_t = x_scales_pre
+        _PREQUANT_HIT_COUNT["activation_recompute"] += 1
+    else:
+        if x is None:
+            raise ValueError("BF16 x is required when no prequant activation payload is provided")
+        x_fp8, x_scales_t = quantize_and_pack_activation(x)
+    TK = x_gather_idx.shape[0]
+    K = x_fp8.shape[1]
+    device = x_fp8.device
+    k_tiles = _div_up(K, _SF_TILE_K)
+    per_batch_tk = _storage_per_batch(TK, K)
+    x_scales_tk = (
+        torch.empty((1, per_batch_tk), dtype=torch.uint8, device=device)
+        if (TK % _SF_TILE_M == 0 and K % _SF_TILE_K == 0)
+        else torch.full((1, per_batch_tk), 127, dtype=torch.uint8, device=device)
+    )
+    block_rows = 128
+    _gather_isa_packed_scales_kernel[(_div_up(TK, block_rows), k_tiles)](
+        x_scales_t.view(torch.uint8), x_gather_idx, x_scales_tk, TK,
+        src_k_tiles=k_tiles, dst_k_tiles=k_tiles,
+        SF_TILE_M=_SF_TILE_M, SF_TILE_STORAGE=_SF_TILE_STORAGE,
+        BLOCK_ROWS=block_rows, GROUPS_PER_K_TILE=_SF_TILE_K // _SF_VEC_SIZE,
+    )
+    del x_scales_t
 
-    Opt-in (Option B, set ``SONIC_MOE_FP8_RECOMPUTE_OPT_B=1``): dispatches to
-    ``blockscaled_fp8_gemm_zeromat_quant`` — a dedicated non-gated CUTLASS DSL
-    kernel that emits ONLY z_fp8 + scales (no y1 alloc, no swiglu, no PostAct
-    smem/TMA/R2S/S2G).  KNOWN-BROKEN on non-uniform routing: produces an
-    illegal-instruction CUDA fault when expert load is skewed (verified by
-    standalone repro).  Layer-1 round-robin uniform test passes bit-exactly.
-    The DSL mixin lives in ``sonicmoe/quack_utils/gemm_gated.py``
-    (``BlockscaledQuantOnlyMixin``) and is preserved for future debugging.
-    Do NOT enable in production.
-
-    Returns (z_fp8, z_raw_scales) ready to plug into the fp8 backward path.
-    """
-    # Option A: rerun gated forward, discard y1, pop z_fp8 from epilogue cache.
-    cfg = _get_fp8_config()
-    saved_epi_q = cfg.epilogue_quant
-    saved_recompute = cfg.recompute_z
-    cfg.epilogue_quant = True
-    cfg.recompute_z = False
-    try:
-        _PREQUANTIZED_SCALES.pop("z_fp8", None)
-        _z_ph, _y1 = _fused_blockscaled_gated_forward(
-            x, w1, expert_frequency_offset, x_gather_idx,
-        )
-        z_fp8, z_raw_scales = _PREQUANTIZED_SCALES.pop("z_fp8")
-    finally:
-        cfg.epilogue_quant = saved_epi_q
-        cfg.recompute_z = saved_recompute
-    return z_fp8, z_raw_scales
+    z_fp8, z_raw_scales = blockscaled_fp8_gemm_zeromat_quant(
+        x_fp8,
+        w1_fp8.mT,
+        cu_seqlens_m=expert_frequency_offset,
+        A_idx=x_gather_idx,
+        a_scales=x_scales_tk.view(_E8M0_DTYPE),
+        b_scales=w1_scales,
+    )
+    return z_fp8, z_raw_scales.view(_E8M0_DTYPE)
 
 
 # ---------------------------------------------------------------------------
@@ -523,9 +548,8 @@ def _recompute_z() -> bool:
     When enabled and ``save_z_fp8`` is also enabled, ``_UpProjection.forward``
     runs the gated GEMM but does NOT populate ``_PREQUANTIZED_SCALES['z_fp8']``;
     ``_DownProjection.forward`` records a recompute closure on ctx; and
-    ``_DownProjection.backward`` re-runs the up-proj GEMM (discarding the
-    recomputed y1) just before consuming z_fp8.  Costs an extra SwiGLU + PostAct
-    write per layer per backward (~10 ms / iter at 24 layers, ERNIE shape).
+    ``_DownProjection.backward`` re-runs a quant-only up-proj GEMM that emits
+    ``z_fp8 + scales`` without recomputing SwiGLU/y1.
     """
     from ..config import get_active_config
     cfg = get_active_config()
@@ -567,8 +591,6 @@ _STASHED_FP8_WEIGHTS: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
 # Counter for pre-quantization hits (testing/diagnostics).
 _PREQUANT_HIT_COUNT: dict[str, int] = collections.defaultdict(int)
-
-
 
 def _matches_prequant_tensor(lhs: torch.Tensor | None, rhs: torch.Tensor | None) -> bool:
     if lhs is None or rhs is None:
@@ -711,7 +733,7 @@ class _FP8Config:
     __slots__ = (
         "enabled", "fused_gated", "save_z_fp8", "recompute_z", "fused_swiglu_quant",
         "epilogue_quant", "fp8_wgrad", "_fp8_wgrad_setting", "alignment_assumed",
-        "iso32_weight",
+        "iso32_weight", "dz_iso32",
     )
 
     def __init__(self) -> None:
@@ -724,7 +746,14 @@ class _FP8Config:
         self._fp8_wgrad_setting = _use_fp8_wgrad()  # True/False/None
         self.fp8_wgrad: bool = self._fp8_wgrad_setting or False  # resolved in resolve_wgrad
         self.alignment_assumed: bool = False
-        self.iso32_weight: bool = os.environ.get("SONIC_MOE_FP8_ISO32_WEIGHT", "0") == "1"
+        from ..config import get_active_config
+        active_cfg = get_active_config()
+        if active_cfg is not None:
+            self.iso32_weight = active_cfg.resolve_iso32_weight()
+            self.dz_iso32 = active_cfg.resolve_dz_iso32()
+        else:
+            self.iso32_weight = os.environ.get("SONIC_MOE_FP8_ISO32_WEIGHT", "1") != "0"
+            self.dz_iso32 = os.environ.get("SONIC_MOE_DZ_ISO32", "1") != "0"
 
     # Threshold below which FP8 wgrad quant overhead exceeds GEMM savings.
     # Session 53 re-benchmarked after cache fix + stash:
@@ -760,6 +789,7 @@ class _FP8Config:
         cfg._fp8_wgrad_setting = False
         cfg.alignment_assumed = False
         cfg.iso32_weight = False
+        cfg.dz_iso32 = False
         return cfg
 
 
@@ -1018,6 +1048,7 @@ class _UpProjection(torch.autograd.Function):
         activation_type: ActivationType,
         is_inference_mode_enabled: bool,
         use_low_precision_postact_buffer: bool = False,
+        prequant_activation_payload: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         T, H = x.shape
         I, H, E = w1.shape
@@ -1041,8 +1072,12 @@ class _UpProjection(torch.autograd.Function):
                 cfg.alignment_assumed = aligned
 
                 if aligned and cfg.fused_gated:
+                    x_fp8_pre = x_scales_pre = None
+                    if prequant_activation_payload is not None:
+                        x_fp8_pre, x_scales_pre = prequant_activation_payload
                     z, y1 = _fused_blockscaled_gated_forward(
-                        x, w1, expert_frequency_offset, x_gather_idx
+                        x, w1, expert_frequency_offset, x_gather_idx,
+                        x_fp8_pre=x_fp8_pre, x_scales_pre=x_scales_pre,
                     )
                     if cfg.save_z_fp8 and cfg.recompute_z:
                         # Discard the z_fp8 just produced (epilogue quant or otherwise);
@@ -1051,8 +1086,10 @@ class _UpProjection(torch.autograd.Function):
                         # can move them onto its ctx (avoids ctx-attr copy from
                         # UpProj.ctx — UpProj is a different autograd Function).
                         _PREQUANTIZED_SCALES.pop("z_fp8", None)
+                        x_recompute = None if x_fp8_pre is not None else x
                         _PREQUANTIZED_SCALES["z_fp8_recompute"] = (
-                            x, w1, expert_frequency_offset, x_gather_idx,
+                            x_recompute, w1, expert_frequency_offset, x_gather_idx,
+                            x_fp8_pre, x_scales_pre,
                         )
                         y1_fp8, y1_packed_scales = quantize_and_pack_activation(y1)
                     elif cfg.save_z_fp8 and "z_fp8" not in _PREQUANTIZED_SCALES:
@@ -1153,12 +1190,15 @@ class _UpProjection(torch.autograd.Function):
         # Track which optional tensor inputs were actually provided (for Paddle backward return count)
         ctx._has_b1 = b1 is not None
         ctx._has_num_activated = num_activated_expert_per_token_offset is not None
+        ctx._prequant_activation_payload = prequant_activation_payload is not None
 
         # Weight decoupling: in FP8+aligned mode, backward doesn't need bf16 w1 data
         # (only uses fp8 cache + metadata). This enables stash_bf16_to_cpu() to
         # resize_(0) the bf16 param storage without breaking backward.
         _fp8_aligned = (use_quack_gemm and cfg.enabled and cfg.alignment_assumed)
         ctx._w1_decoupled = _fp8_aligned
+        if _fp8_aligned and ctx._prequant_activation_payload and not cfg.fp8_wgrad:
+            raise RuntimeError("prequant activation payload requires FP8 wgrad because BF16 x is not retained")
         if _fp8_aligned:
             # Store metadata needed for dw1 allocation
             ctx._w1_shape = w1.shape  # (2I, H, E)
@@ -1169,16 +1209,32 @@ class _UpProjection(torch.autograd.Function):
             _w1T_fp8, _w1T_scales = _STASHED_FP8_WEIGHTS.get("w1T_varlen", None) or precompute_weight_fp8(w1.permute(1, 0, 2))
             ctx._w1T_fp8 = _w1T_fp8
             ctx._w1T_scales = _w1T_scales
-            ctx.save_for_backward(
-                x,
-                # w1 omitted — backward uses ctx._w1T_fp8 + metadata
-                b1,
-                expert_frequency_offset,
-                x_gather_idx,
-                None if use_quack_gemm else s_scatter_idx,
-                s_reverse_scatter_idx,
-                num_activated_expert_per_token_offset,
-            )
+            if ctx._prequant_activation_payload:
+                x_fp8_pre, x_scales_pre = prequant_activation_payload
+                x_saved = torch.empty(1, dtype=x.dtype, device=x.device).as_strided((T, H), (0, 0))
+                ctx.save_for_backward(
+                    x_saved,
+                    # w1 omitted — backward uses ctx._w1T_fp8 + metadata
+                    b1,
+                    expert_frequency_offset,
+                    x_gather_idx,
+                    None if use_quack_gemm else s_scatter_idx,
+                    s_reverse_scatter_idx,
+                    num_activated_expert_per_token_offset,
+                    x_fp8_pre,
+                    x_scales_pre,
+                )
+            else:
+                ctx.save_for_backward(
+                    x,
+                    # w1 omitted — backward uses ctx._w1T_fp8 + metadata
+                    b1,
+                    expert_frequency_offset,
+                    x_gather_idx,
+                    None if use_quack_gemm else s_scatter_idx,
+                    s_reverse_scatter_idx,
+                    num_activated_expert_per_token_offset,
+                )
         else:
             ctx.save_for_backward(
                 x,
@@ -1216,17 +1272,32 @@ class _UpProjection(torch.autograd.Function):
         stream_id = ctx.stream_id
         use_quack_gemm = ctx.use_quack_gemm
 
+        x_fp8_pre = x_scales_pre = None
         if ctx._w1_decoupled:
             # FP8+aligned: w1 not in saved_tensors; use metadata + fp8 cache.
-            (
-                x,
-                b1,
-                expert_frequency_offset,
-                x_gather_idx,
-                s_scatter_idx,
-                s_reverse_scatter_idx,
-                num_activated_expert_per_token_offset,
-            ) = ctx.saved_tensor()
+            saved = ctx.saved_tensor()
+            if ctx._prequant_activation_payload:
+                (
+                    x,
+                    b1,
+                    expert_frequency_offset,
+                    x_gather_idx,
+                    s_scatter_idx,
+                    s_reverse_scatter_idx,
+                    num_activated_expert_per_token_offset,
+                    x_fp8_pre,
+                    x_scales_pre,
+                ) = saved
+            else:
+                (
+                    x,
+                    b1,
+                    expert_frequency_offset,
+                    x_gather_idx,
+                    s_scatter_idx,
+                    s_reverse_scatter_idx,
+                    num_activated_expert_per_token_offset,
+                ) = saved
             w1_shape = ctx._w1_shape   # (2I, H, E)
             w1_dtype = ctx._w1_dtype
             w1_device = ctx._w1_device
@@ -1287,15 +1358,24 @@ class _UpProjection(torch.autograd.Function):
                     # (single HBM read of dz produced both row+col fp8).
                     from ..quack_utils.blockscaled_fp8_gemm import (
                         colwise_quantize_and_pack,
+                        dequant_colwise_quantize_and_pack_from_isa,
                         _run_cutlass_blockscaled_gemm_varlen_k,
                     )
                     bwd_col = _PREQUANTIZED_SCALES.pop("bwd_col", None)
 
                     # Sequential quant pipeline (all on default stream):
-                    x_col_fp8, x_col_scales = colwise_quantize_and_pack(
-                        x, logical_rows=H, logical_cols=TK,
-                        gather_idx=x_gather_idx,
-                    )
+                    if ctx._prequant_activation_payload:
+                        x_col_fp8, x_col_scales = dequant_colwise_quantize_and_pack_from_isa(
+                            x_fp8_pre, x_scales_pre,
+                            logical_rows=H, logical_cols=TK,
+                            gather_idx=x_gather_idx,
+                        )
+                        del x_fp8_pre, x_scales_pre
+                    else:
+                        x_col_fp8, x_col_scales = colwise_quantize_and_pack(
+                            x, logical_rows=H, logical_cols=TK,
+                            gather_idx=x_gather_idx,
+                        )
 
                     if bwd_col is not None:
                         # Use pre-computed col-fp8 from dual quant (zero extra HBM read)
@@ -1841,8 +1921,7 @@ class _DownProjection(torch.autograd.Function):
                 w2_dtype = w2.dtype
                 w2_device = w2.device
             if getattr(ctx, "_needs_z_recompute", False):
-                # Replace zero-storage placeholders with real fp8 z + scales
-                # by re-running the up-proj GEMM (discards recomputed y1).
+                # Replace zero-storage placeholders with real fp8 z + scales.
                 z_fp8, z_raw_scales = _recompute_z_fp8(*ctx._z_recompute_args)
                 ctx._z_recompute_args = None
             z_raw_scales_u8 = z_raw_scales.view(torch.uint8)
@@ -1923,7 +2002,22 @@ class _DownProjection(torch.autograd.Function):
                     else:
                         s_float = s.float()
 
-                    # dout-quant + scale_gather (all on default stream).
+                    if ctx._w2_decoupled:
+                        w2_fp8_enk = ctx._w2_dgated_fp8
+                        w2_scales = ctx._w2_dgated_scales
+                    else:
+                        w2_fp8_enk, w2_scales = precompute_weight_fp8_for_direct_fused_dgated(w2)
+                    config = gemm_dgated.default_config(dout.device)
+                    total_m = x_gather_idx.shape[0]  # TK
+                    n = w2_fp8_enk.shape[-2]
+                    dz = torch.empty((total_m, n * 2), dtype=torch.bfloat16, device=dout.device)
+                    y1s = torch.empty((total_m, n), dtype=torch.bfloat16, device=dout.device)
+                    colvec_reduce_partial = torch.empty(
+                        (total_m, (n + config.tile_n - 1) // config.tile_n),
+                        dtype=torch.float32,
+                        device=dout.device,
+                    )
+
                     dout_fp8, dout_scales_t = quantize_and_pack_activation(dout)
                     TK_bwd = x_gather_idx.shape[0]
                     K_bwd = dout.shape[1]
@@ -1942,27 +2036,11 @@ class _DownProjection(torch.autograd.Function):
                     )
                     dout_scales = dout_scales_tk.view(_E8M0_DTYPE)
                     del dout_scales_t, dout_scales_tk
-
-                    if ctx._w2_decoupled:
-                        w2_fp8_enk = ctx._w2_dgated_fp8
-                        w2_scales = ctx._w2_dgated_scales
-                    else:
-                        w2_fp8_enk, w2_scales = precompute_weight_fp8_for_direct_fused_dgated(w2)
-                    config = gemm_dgated.default_config(dout.device)
-                    total_m = x_gather_idx.shape[0]  # TK (not T — dout_fp8 is T-sized)
-                    n = w2_fp8_enk.shape[-2]
-                    dz = torch.empty((total_m, n * 2), dtype=torch.bfloat16, device=dout.device)
-                    y1s = torch.empty((total_m, n), dtype=torch.bfloat16, device=dout.device)
-                    colvec_reduce_partial = torch.empty(
-                        (total_m, (n + config.tile_n - 1) // config.tile_n),
-                        dtype=torch.float32,
-                        device=dout.device,
-                    )
                     gemm_dgated_kernel(
                         dout_fp8,
                         w2_fp8_enk,
                         dz,
-                        z if not use_fp8_preact else dz,  # PreAct: bf16 z when not fp8, ignored otherwise
+                        z if not use_fp8_preact else dz,
                         y1s,
                         None,
                         "swiglu",

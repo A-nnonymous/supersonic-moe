@@ -121,7 +121,7 @@ Important current insights:
 
 ### ISO32 Weight Cache Unification
 
-ISO32 (32×32 block) FP8 weight quantization stores **one buffer per weight** instead of two transposed copies by exploiting the byte-identical transpose invariant of isotropic block scaling. Forward and backward GEMM kernels consume the same physical buffer via zero-copy stride views. Controlled by `SONIC_MOE_FP8_ISO32_WEIGHT=1` (default OFF).
+ISO32 (32×32 block) FP8 weight quantization stores **one buffer per weight** instead of two transposed copies by exploiting the byte-identical transpose invariant of isotropic block scaling. Forward and backward GEMM kernels consume the same physical buffer via zero-copy stride views. Controlled by `SONIC_MOE_FP8_ISO32_WEIGHT` (default ON; set `0` for the 1×32 dual-layout path).
 
 **Memory saving**: 48.5% of weight FP8 cache (108 MiB at E=8, H=3072, I=1536).  
 **Precision**: Identical to baseline 1×32 path vs BF16 golden (ratio=1.0000, verified across 9 shapes).  
@@ -170,10 +170,26 @@ rm -rf $TORCH_EXTENSIONS_DIR/sonicmoe_deepep_topk_metadata_cuda  # (or matching 
 | `USE_QUACK_GEMM` | unset | **Required** on SM100 for CuTeDSL FP8 GEMMs. |
 | `SONIC_MOE_FP8_WGRAD` | unset | FP8 weight gradients (otherwise BF16 wgrad). Always `1` for production. |
 | `SONIC_MOE_FP8_ASSUME_ALIGNED` | `0` | Skip runtime padding-check H2D sync. Set `1` for zero-sync training (requires aligned token counts). |
-| `SONIC_MOE_FP8_ISO32_WEIGHT` | `0` | ISO32 weight cache unification: stores ONE fp8 buffer per weight (saves 48.5% weight cache memory). |
+| `SONIC_MOE_FP8_ISO32_WEIGHT` | `1` | Weight FP8 cache format. `1` = ISO32/32×32 single buffer per weight; `0` = directional 1×32 dual-layout buffers. |
+| `SONIC_MOE_DZ_ISO32` | `1` | Backward `dz` dual quant uses ISO32 single-FP8-buffer semantics. Set `0` to force the safer baseline 1x32 dual quant path. |
 | `SONIC_MOE_FP8_RECOMPUTE_Z` | `0` | Skip storing z_fp8 in fwd; rerun up-proj in bwd. Saves ~213 MiB/layer, costs ~5–15% extra time. |
 | `SONIC_MOE_STAGEWISE_MEMORY` | `0` | Free activations eagerly between stages. Saves ~1.0–1.5 GB at reference shape, costs 3–5%. |
 | `SONIC_MOE_CACHE_DIR` | `~/.cache/sonicmoe` | JIT compile-cache directory. |
+
+**Precision-sensitive performance flags**:
+
+| Env flag | Default | Performance strategy | Precision risk | Conservative setting |
+|---|:---:|---|---|---|
+| `SONIC_MOE_FP8_MODE` | unset | Enables FP8 training frontier when set to `perf`/`mem`. | High: switches BF16 GEMMs/activations to FP8 blockscaled kernels. | unset / empty for BF16. |
+| `SONIC_MOE_FP8_WGRAD` | auto | Uses FP8 operands for weight-gradient GEMMs. | Medium: quantizes `dz`, `x`, `dout`, `y1s` before wgrad. | `0` for BF16 wgrad. |
+| `SONIC_MOE_DZ_ISO32` | `1` | Quantizes backward `dz` with ISO32, one FP8 buffer shared by row/col consumers. | Medium: ISO32 uses one amax per 32x32 block, not the same scale granularity as baseline 1x32; current audits pass, but outlier future shapes should keep a rollback. | `0` for baseline 1x32 dual quant. |
+| `SONIC_MOE_FP8_ISO32_WEIGHT` | `1` | Selects weight FP8 cache format: ISO32/32×32 single-buffer when `1`, directional 1×32 dual-layout buffers when `0`. | Medium: ISO32 changes weight scale granularity to 32×32; 1×32 remains available as rollback and for A/B. | `0`. |
+| `SONIC_MOE_FP8_EPILOGUE_QUANT` | `1` in active frontier | Emits `z_fp8` and scales in the up-proj GEMM epilogue. | Low/medium: removes an intermediate BF16 `z` quantization point; OptionB tests require byte-equivalence vs quant-only recompute. | `0` only for debugging if supported by the active path. |
+| `SONIC_MOE_FP8_SAVE_Z_FP8` | `1` | Stores `z` as FP8 for backward. | Medium: backward consumes quantized preactivation instead of BF16 `z`. | `0` for BF16 `z` storage if supported by the active path. |
+| `SONIC_MOE_FP8_RECOMPUTE_Z` | `0` | Recomputes `z_fp8` in backward instead of saving it. | Low if OptionB equivalence holds; risk is kernel/indexing correctness, not intended numeric change. | `0`. |
+| `SONIC_MOE_FP8_FUSED_ZY1_QUANT` | `0` | Fuses z-save and y1 quantization. | Low/medium: changes quantization kernel implementation and peak live tensors. | `0`. |
+| `SONIC_MOE_STAGEWISE_MEMORY` | `0` | Frees/reuses activations between stages. | Low: should not change math, but can expose lifetime/cache bugs. | `0`. |
+| `SONIC_MOE_PADDING_REPAIR` | `0` | Reassigns low-margin routes to reduce padding. | High: changes routing semantics and can affect model quality. | `0`; use telemetry/shadow validation first. |
 
 **Hardcoded defaults** (always-on in the frontier path, no need to set):
 

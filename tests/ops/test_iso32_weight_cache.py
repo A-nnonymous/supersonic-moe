@@ -9,6 +9,7 @@ Validates:
 """
 
 import os
+
 import pytest
 import torch
 
@@ -25,6 +26,7 @@ from tests.ops.conftest import (
     requires_quack,
     rrmse,
     cosine_sim,
+    assert_byte_exact,
     assert_fp8_tolerance,
     gold_e8m0_iso32_quant,
     SEEDS,
@@ -182,6 +184,52 @@ class TestIso32WeightCache:
         key_after = (w1.data_ptr(), _tensor_version(w1), tuple(w1.shape), tuple(w1.stride()))
         assert key_after not in _ISO32_WEIGHT_CACHE
 
+    @pytest.mark.parametrize("iso32", [True, False], ids=["iso32_32x32", "one_by_32"])
+    def test_native_fp8_weight_install_populates_active_format(self, iso32):
+        from sonicmoe.quack_utils.blockscaled_fp8_gemm import (
+            clear_blockscaled_fp8_weight_cache,
+            install_native_fp8_weight_cache,
+            precompute_weight_fp8,
+            precompute_weight_fp8_for_direct_fused_dgated,
+            precompute_weight_fp8_for_fused_gated,
+            quantize_native_fp8_weights,
+        )
+
+        E, H, I = 2, 256, 128
+        w1 = torch.randn(2 * I, H, E, dtype=torch.bfloat16, device="cuda") * 0.05
+        w2 = torch.randn(H, I, E, dtype=torch.bfloat16, device="cuda") * 0.05
+        payload = quantize_native_fp8_weights(w1, w2, iso32=iso32)
+
+        os.environ["SONIC_MOE_FP8_ISO32_WEIGHT"] = "1" if iso32 else "0"
+        _refresh_fp8_config()
+
+        clear_blockscaled_fp8_weight_cache()
+        install_native_fp8_weight_cache(w1, w2, payload, iso32=iso32)
+        installed = {
+            "w1_fused": precompute_weight_fp8_for_fused_gated(w1),
+            "w1T_varlen": precompute_weight_fp8(w1.permute(1, 0, 2)),
+            "w2_varlen": precompute_weight_fp8(w2),
+            "w2_dgated": precompute_weight_fp8_for_direct_fused_dgated(w2),
+        }
+
+        clear_blockscaled_fp8_weight_cache()
+        from sonicmoe.quack_utils.blockscaled_fp8_gemm import precompute_weight_fp8_warmup
+        precompute_weight_fp8_warmup(w1, w2)
+        expected = {
+            "w1_fused": precompute_weight_fp8_for_fused_gated(w1),
+            "w1T_varlen": precompute_weight_fp8(w1.permute(1, 0, 2)),
+            "w2_varlen": precompute_weight_fp8(w2),
+            "w2_dgated": precompute_weight_fp8_for_direct_fused_dgated(w2),
+        }
+
+        for name in installed:
+            assert_byte_exact(installed[name][0], expected[name][0])
+            assert_byte_exact(installed[name][1], expected[name][1])
+
+        if iso32:
+            assert installed["w1_fused"][0].data_ptr() == installed["w1T_varlen"][0].data_ptr()
+        else:
+            assert installed["w1_fused"][0].data_ptr() != installed["w1T_varlen"][0].data_ptr()
 
 class TestIso32MemorySaving:
     """End-to-end GPU memory saving verification.

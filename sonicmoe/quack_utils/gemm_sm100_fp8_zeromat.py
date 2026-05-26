@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Optional, Type
 
 import cutlass
@@ -626,8 +627,25 @@ def blockscaled_fp8_gemm_zeromat_quant(
     assert device_cap[0] == 10, "Zero-mat quant-only kernel requires SM100"
     GemmCls = GemmSm100ZeroMatBlockscaledQuant
 
-    tile_M, tile_N = 128, 128
-    cluster_M, cluster_N = 1, 1
+    # Tile selection: SONIC_MOE_QONLY_TILE=auto|128|256
+    # 256x256 is faster for dense Ernie-like shapes but under-validated for
+    # many-expert/taily regimes (E>=64, K<=2, small per-expert counts).
+    # Default is conservative 128 until broader stress evidence exists.
+    _tile_env = os.environ.get("SONIC_MOE_QONLY_TILE", "128").lower()
+    E_local = int(cu_seqlens_m.numel()) - 1
+    if _tile_env == "256":
+        tile_M, tile_N, cluster_M, cluster_N = 256, 256, 2, 1
+    elif _tile_env == "auto":
+        # Use 256 only for dense shapes: large N, few experts, no tiny segments.
+        _seqlens = cu_seqlens_m.tolist()
+        _seg_lens = [_seqlens[i+1] - _seqlens[i] for i in range(E_local)]
+        _min_nonzero = min((s for s in _seg_lens if s > 0), default=0)
+        if N >= 2048 and E_local <= 32 and _min_nonzero >= 256:
+            tile_M, tile_N, cluster_M, cluster_N = 256, 256, 2, 1
+        else:
+            tile_M, tile_N, cluster_M, cluster_N = 128, 128, 1, 1
+    else:  # "128" or any unrecognized value
+        tile_M, tile_N, cluster_M, cluster_N = 128, 128, 1, 1
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N)
 
     for name, info in tensor_infos.items():
@@ -653,6 +671,7 @@ def blockscaled_fp8_gemm_zeromat_quant(
         tuple(B.shape), B.dtype,
         z_fp8_out.dtype,
         True,  # blockscaled
+        tile_M, tile_N, cluster_M, cluster_N,
     )
 
     cache = _zeromat_compile_cache

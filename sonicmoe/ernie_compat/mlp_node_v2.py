@@ -52,7 +52,12 @@ from sonicmoe.functional import (
     clear_all_fp8_weight_caches,
 )
 from sonicmoe.functional.utils import enable_fp8
-from sonicmoe.quack_utils import precompute_weight_fp8_warmup
+from sonicmoe.quack_utils import (
+    install_native_fp8_weight_cache,
+    precompute_weight_fp8_warmup,
+    quantize_native_fp8_weights,
+)
+from sonicmoe.quack_utils.blockscaled_fp8_gemm import _iso32_weight_enabled, _storage_per_batch
 
 
 # ── PyLayer ctx stub ──────────────────────────────────────────────────────────
@@ -465,6 +470,8 @@ class SonicMoEMlpNode:
         self._w_cache: dict[tuple, torch.Tensor] = {}
         self._pending_flush: bool = False
         self._warmed_for_step: bool = False
+        self._native_fp8_weight_payload: dict[str, object] | None = None
+        self._native_fp8_weight_iso32: bool | None = None
 
     # ── Weight layout helpers (instance-scoped) ─────────────────────────────
 
@@ -529,8 +536,30 @@ class SonicMoEMlpNode:
         if self._warmed_for_step:
             return
         w1, w2 = self._stacked_weights()
-        precompute_weight_fp8_warmup(w1, w2)
+        if self._native_fp8_weight_payload is None:
+            precompute_weight_fp8_warmup(w1, w2)
+        else:
+            install_native_fp8_weight_cache(
+                w1, w2, self._native_fp8_weight_payload,
+                iso32=self._native_fp8_weight_iso32,
+            )
         self._warmed_for_step = True
+
+    def install_native_fp8_weights(
+        self,
+        payload: dict[str, object] | None = None,
+        *,
+        iso32: bool | None = None,
+    ) -> dict[str, object]:
+        w1, w2 = self._stacked_weights()
+        active_iso32 = _iso32_weight_enabled() if iso32 is None else iso32
+        if payload is None:
+            payload = quantize_native_fp8_weights(w1, w2, iso32=active_iso32)
+        install_native_fp8_weight_cache(w1, w2, payload, iso32=active_iso32)
+        self._native_fp8_weight_payload = payload
+        self._native_fp8_weight_iso32 = active_iso32
+        self._warmed_for_step = True
+        return payload
 
     def warmup(self, total_K_list: list[int] | None = None, max_workers: int = 0):
         """Pre-compile all JIT kernels.  Call once after model construction."""
@@ -549,6 +578,10 @@ class SonicMoEMlpNode:
         tokens_per_expert: list[int] | torch.Tensor,
         dispatched_indices: torch.Tensor | None = None,
         dispatched_probs: torch.Tensor | None = None,
+        *,
+        dispatched_hidden_states_fp8: torch.Tensor | None = None,
+        dispatched_hidden_states_scales: torch.Tensor | None = None,
+        dispatched_hidden_states_scale_layout: str = "sonic_1x32_isa",
     ) -> torch.Tensor:
         """Run FP8 expert FFN on DeepEP-dispatched tokens.
 
@@ -573,6 +606,33 @@ class SonicMoEMlpNode:
         H = self._H
         I = self._I
 
+        fp8_payload = None
+        if dispatched_hidden_states_fp8 is not None or dispatched_hidden_states_scales is not None:
+            if dispatched_hidden_states_fp8 is None or dispatched_hidden_states_scales is None:
+                raise ValueError("FP8 activation data and scales must be provided together")
+            if dispatched_hidden_states_scale_layout != "sonic_1x32_isa":
+                raise ValueError(
+                    "SonicMoEMlpNode only accepts sonic_1x32_isa activation scales; "
+                    f"got {dispatched_hidden_states_scale_layout!r}"
+                )
+            if dispatched_hidden_states_fp8.dtype != torch.float8_e4m3fn:
+                raise ValueError(
+                    f"dispatched_hidden_states_fp8 must be torch.float8_e4m3fn, got {dispatched_hidden_states_fp8.dtype}"
+                )
+            if tuple(dispatched_hidden_states_fp8.shape) != tuple(x.shape):
+                raise ValueError(
+                    f"dispatched_hidden_states_fp8 shape {dispatched_hidden_states_fp8.shape} != x shape {x.shape}"
+                )
+            if dispatched_hidden_states_fp8.device != x.device or dispatched_hidden_states_scales.device != x.device:
+                raise ValueError("FP8 activation payload must be on the same device as dispatched_hidden_states")
+            expected_scale_shape = (1, _storage_per_batch(int(x.shape[0]), int(x.shape[1])))
+            if tuple(dispatched_hidden_states_scales.shape) != expected_scale_shape:
+                raise ValueError(
+                    "dispatched_hidden_states_scales must be Sonic ISA-packed 1x32 scales "
+                    f"with shape {expected_scale_shape}, got {dispatched_hidden_states_scales.shape}"
+                )
+            fp8_payload = (dispatched_hidden_states_fp8, dispatched_hidden_states_scales)
+
         # Topk path: real DeepEP dispatch with multi-expert routing.
         # Identity layout (K=1, pre-sorted) was removed — it had an
         # unfixable dx bug due to expert-sorted ↔ token-order mismatch
@@ -583,6 +643,9 @@ class SonicMoEMlpNode:
         assert dispatched_probs is not None, (
             "dispatched_probs required when dispatched_indices is given"
         )
+
+        topk = dispatched_indices.shape[1]
+
         (
             expert_frequency_offset,
             x_gather_idx,
@@ -609,7 +672,7 @@ class SonicMoEMlpNode:
         )
         # T_down = N_recv for the topk path.
         T_down = N_recv
-        topk = dispatched_indices.shape[1]
+        # topk already set above before repair
 
         # Stack weights (per-instance cache) + fused FP8 prequantize on first
         # microbatch of the step.
@@ -637,6 +700,7 @@ class SonicMoEMlpNode:
             E, N_recv, T_down, TK_padded, topk,
             self._activation_type,
             self._stream_id,
+            fp8_payload,
         )
 
     def step(self) -> None:
@@ -677,6 +741,8 @@ class SonicMoEMlpNode:
         clear_all_fp8_weight_caches()
         invalidate_topk_cache()
         self._warmed_for_step = False
+        self._native_fp8_weight_payload = None
+        self._native_fp8_weight_iso32 = None
 
     def __call__(
         self,
@@ -684,10 +750,17 @@ class SonicMoEMlpNode:
         tokens_per_expert: list[int] | torch.Tensor,
         dispatched_indices: torch.Tensor | None = None,
         dispatched_probs: torch.Tensor | None = None,
+        *,
+        dispatched_hidden_states_fp8: torch.Tensor | None = None,
+        dispatched_hidden_states_scales: torch.Tensor | None = None,
+        dispatched_hidden_states_scale_layout: str = "sonic_1x32_isa",
     ) -> torch.Tensor:
         return self.forward(
             dispatched_hidden_states, tokens_per_expert,
             dispatched_indices, dispatched_probs,
+            dispatched_hidden_states_fp8=dispatched_hidden_states_fp8,
+            dispatched_hidden_states_scales=dispatched_hidden_states_scales,
+            dispatched_hidden_states_scale_layout=dispatched_hidden_states_scale_layout,
         )
 
 
@@ -727,6 +800,7 @@ class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
         topk: int = 1,
         activation_type: ActivationType = ActivationType.SWIGLU,
         stream_id: int = 0,
+        fp8_activation_payload: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         # ── Determine FP8 vs BF16 mode ──────────────────────────────────
         # Respect the global FP8 mode setting:
@@ -751,6 +825,7 @@ class _SonicMoEDeepEPFunc(paddle.autograd.PyLayer):
                 activation_type,
                 False,                          # is_inference_mode_enabled
                 False,                          # use_low_precision_postact_buffer
+                fp8_activation_payload,
             )
 
         # ── DownProjection forward (via FakeCtx) ─────────────────────────
