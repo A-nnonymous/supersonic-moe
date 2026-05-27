@@ -781,6 +781,127 @@ class BlockscaledIso32QuantOnlyMixin(GemmDefaultEpiMixin):
 
 
 # ---------------------------------------------------------------------------
+# BlockscaledColQuantOnlyMixin (Session 1C — pure colwise quant)
+# ---------------------------------------------------------------------------
+#
+# Per-column-block-amax quantization fused into the GEMM epilogue.  Replaces
+# the standalone `_colwise_quantize_and_pack_kernel` (237 us at production
+# shape) by computing per-(32-rows-in-M × 1-col-in-N) amax via 32 successive
+# `warp_redux_sync` calls (one per N-col covered by the warp's 32-wide
+# fragment) and writing TWO outputs from a single MMA:
+#   - z_fp8       (e4m3, MxN) saturating cast per col scale
+#   - z_col_isa   col-axis ISA-pack SF buffer (one byte per (32-rows, 1-col))
+#
+# Layout invariant (same as 1A-ext col): lane k of each warp stores the
+# col-SF byte for n_abs = warp_n_base + k, m_group_abs = warp_m_base // 32.
+#
+# Reference: TE cudnn `grouped_gemm_quant.quant_sfd_col` — per-col warp
+# redux with e8m0 cast-roundtrip for scale quantization fidelity.
+# ---------------------------------------------------------------------------
+
+
+class BlockscaledColQuantOnlyMixin(GemmDefaultEpiMixin):
+    """GemmDefault + epi pure colwise blockscaled FP8 quant of D with
+    ISA-pack col-SF store.  Equivalent to `colwise_quantize_and_pack` but
+    fused into the GEMM epi (zero standalone kernel)."""
+
+    _epi_ops = (
+        *GemmDefaultEpiMixin._epi_ops,
+        BlockscaledIsaColScaleStore("mZScaleIsaCol"),
+    )
+
+    @mlir_namedtuple
+    class EpilogueArguments(NamedTuple):
+        alpha: Optional[Float32 | cute.Tensor] = None
+        beta: Optional[Float32 | cute.Tensor] = None
+        mRowVecBroadcast: Optional[cute.Tensor] = None
+        mColVecBroadcast: Optional[cute.Tensor] = None
+        add_to_output: cutlass.Constexpr[bool] = False
+        rounding_mode: cutlass.Constexpr[int] = 0
+        sr_seed: Optional[Int32 | cute.Tensor] = None
+        mZScaleIsaCol: Optional[cute.Tensor] = None
+
+    @cute.jit
+    def epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None):
+        GemmDefaultEpiMixin.epi_visit_subtile(
+            self, params, epi_loop_tensors, tRS_rD, tRS_rC
+        )
+
+        col_info = epi_loop_tensors["mZScaleIsaCol"]
+        if const_expr(col_info is not None):
+            col_tensor, m_warp_base, n_warp_base, lane_id, m_limit_c, n_limit_c = col_info
+            num_z = cute.size(tRS_rD)
+
+            # Per-col amax via per-col warp redux.  lane_id holds row
+            # m_warp_base + lane_id of one m_group; tRS_rD[k] is the value at
+            # N-col warp_n_base + k.  Reducing |tRS_rD[k]| MAX across 32
+            # lanes gives the block (32-rows × col k) amax.  The reduced
+            # value is returned uniformly to all lanes — lane k captures
+            # *its* col's e8m0 for the col-SF byte store after the loop.
+            #
+            # Each lane also keeps the 32 quant scales (one per col) to
+            # scale its 32 tRS_rD elements before the saturating fp8 cast.
+
+            my_col_e8m0 = Int32(0)
+
+            for k in cutlass.range(num_z, unroll_full=True):
+                val = tRS_rD[k]
+                neg = Float32(0.0) - val
+                abs_val = cute.arch.fmax(val, neg)
+                amax_k = cute.arch.warp_redux_sync(abs_val, "max")
+                amax_k = cute.arch.fmax(amax_k, Float32(1e-4))
+
+                # E8M0 integer+carry (matches Triton reference; same as iso32).
+                amax_bits = _f32_as_i32(amax_k)
+                biased_exp = (amax_bits >> Int32(23)) & Int32(0xFF)
+                mantissa_bits = amax_bits & Int32(0x7FFFFF)
+                has_carry = cutlass.Boolean(mantissa_bits > Int32(0x600000))
+                carry = Int32(1) if has_carry else Int32(0)
+                e8m0_k = biased_exp - Int32(8) + carry
+                is_normal = cutlass.Boolean(biased_exp > Int32(0))
+                e8m0_k = e8m0_k if is_normal else Int32(0)
+                is_pos = cutlass.Boolean(e8m0_k > Int32(0))
+                e8m0_k = e8m0_k if is_pos else Int32(0)
+
+                # Quant scale = 2^(254 - e8m0_k).
+                qexp = Int32(254) - e8m0_k
+                qexp_hi = cutlass.Boolean(qexp > Int32(254))
+                qexp = Int32(254) if qexp_hi else qexp
+                qexp_lo = cutlass.Boolean(qexp < Int32(1))
+                qexp = Int32(1) if qexp_lo else qexp
+                quant_scale_k = _i32_as_f32(qexp << Int32(23))
+
+                # Scale this col's value in every lane.
+                tRS_rD[k] = tRS_rD[k] * quant_scale_k
+
+                # Lane k captures e8m0 for col k = warp_n_base + k.
+                if lane_id == Int32(k):
+                    my_col_e8m0 = e8m0_k
+
+            # Col-SF store: lane k writes byte for n_abs = warp_n_base + k.
+            n_abs_lane = n_warp_base + lane_id
+            m_group_abs = m_warp_base // Int32(32)
+            in_bounds_c = (
+                cutlass.Boolean(n_abs_lane < n_limit_c)
+                & cutlass.Boolean(m_warp_base < m_limit_c)
+            )
+            if in_bounds_c:
+                col_n_tile = n_abs_lane // Int32(128)
+                col_row_in_tile = n_abs_lane % Int32(128)
+                col_k_tile_idx = m_group_abs // Int32(4)
+                col_k_in_tile = m_group_abs % Int32(4)
+                col_row_base = (col_row_in_tile % Int32(32)) * Int32(16) + (
+                    col_row_in_tile // Int32(32)
+                ) * Int32(4)
+                col_inner_off = col_row_base + col_k_in_tile
+                col_tensor[col_n_tile, col_k_tile_idx, col_inner_off] = cutlass.Int8(my_col_e8m0)
+
+        return None
+
+
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
 # GemmDGatedMixin (from gemm_dgated.py)
 # ---------------------------------------------------------------------------
 
