@@ -129,7 +129,7 @@ def fused_dual_colwise_quantize(
             GROUP_SIZE=GROUP_SIZE, BLOCK_DIM=BLOCK_DIM,
             SF_TILE_M=_SF_TILE_M, SF_TILE_K=_SF_TILE_K,
             SF_TILE_STORAGE=_SF_TILE_STORAGE,
-            num_warps=1,
+            num_warps=4,
         )
     else:
         # ── Kernel 1 (1×32 dual): row + col separate amaxes ──

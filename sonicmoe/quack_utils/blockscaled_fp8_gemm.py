@@ -2276,6 +2276,165 @@ def _dual_varlen_iso32_quantize_kernel(
     tl.store(col_scales_ptr + col_isa_offs.to(tl.int64), e8m0_per_dim, mask=dim_mask)
 
 
+# ---------------------------------------------------------------------------
+# ISO32 split kernels (S81) — row-only (FP8 + row SF) and col-only (col SF)
+#
+# Motivation (NCU-grounded, 2026-05-27):
+#   The dual-output kernel sits at 16% occupancy with 164 regs and 83% L2
+#   hit — i.e. compute-bound from the heavy interleaved store path, not
+#   DRAM-bound. Splitting into two narrower kernels reduces per-program
+#   reg pressure (each does ONE store layout), which raises occupancy
+#   enough to more than offset the doubled L2 read of src.
+#
+# Empirical wins (byte-exact vs the dual kernel across 7 shapes × 3 seeds):
+#   TK= 8192 D=3072 : 1.43×  (52.2 → 36.4 µs/call)
+#   TK= 8192 D=4096 : 1.34×  (47.7 → 35.5 µs/call)
+#   TK=32768 D=3072 : 1.31×  (114.9 → 87.7 µs/call)
+#
+# Selection: row_nw=4 col_nw=4 BLOCK_DIM=128 GROUP_SIZE=32 (uniform across
+# both halves; tied with row=2 col=4 within noise). Disable via env
+# SONICMOE_ISO32_SPLIT=0.
+# ---------------------------------------------------------------------------
+
+@wrap_triton_kernel
+@triton.jit
+def _iso32_row_only_quantize_kernel(
+    src_ptr,            # (TK, dim) bf16
+    fp8_ptr,            # (TK, dim) fp8
+    row_scales_ptr,     # ISA scales for logical (TK, dim) layout
+    TK, dim,
+    src_stride_row, src_stride_col,
+    row_k_tiles,
+    fp8_max: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+    SF_TILE_M: tl.constexpr,
+    SF_TILE_K: tl.constexpr,
+    SF_TILE_STORAGE: tl.constexpr,
+):
+    pid_tk_group = tl.program_id(0)
+    pid_dim_block = tl.program_id(1)
+    tk_offsets = pid_tk_group * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+    dim_offsets = pid_dim_block * BLOCK_DIM + tl.arange(0, BLOCK_DIM)
+    src_mask = (tk_offsets < TK)[:, None] & (dim_offsets < dim)[None, :]
+
+    vals_bf16 = tl.load(
+        src_ptr
+        + tk_offsets[:, None].to(tl.int64) * src_stride_row
+        + dim_offsets[None, :].to(tl.int64) * src_stride_col,
+        mask=src_mask, other=0.0,
+    )
+    vals_f32 = vals_bf16.to(tl.float32)
+
+    GROUPS_PER_DIM: tl.constexpr = BLOCK_DIM // GROUP_SIZE
+    abs_vals = tl.abs(vals_f32)
+    reshaped = tl.reshape(abs_vals, (GROUP_SIZE, GROUPS_PER_DIM, GROUP_SIZE))
+    amax = tl.max(tl.max(reshaped, axis=2), axis=0)  # (GROUPS_PER_DIM,)
+
+    amax_bits = amax.to(tl.int32, bitcast=True)
+    biased_exp = (amax_bits >> 23) & 0xFF
+    mantissa = amax_bits & 0x7FFFFF
+    carry = tl.where(mantissa > 0x600000, 1, 0)
+    e8m0_scale = tl.where(biased_exp > 0, biased_exp - 8 + carry, 0)
+    e8m0_scale = tl.maximum(e8m0_scale, 0)
+
+    quant_exp = tl.maximum(tl.minimum(254 - e8m0_scale, 254), 1)
+    quant_scale = (quant_exp << 23).to(tl.float32, bitcast=True)
+    quant_scale_3d = quant_scale[None, :, None] + tl.zeros(
+        (GROUP_SIZE, GROUPS_PER_DIM, GROUP_SIZE), dtype=tl.float32
+    )
+    quant_scale_2d = tl.reshape(quant_scale_3d, (GROUP_SIZE, BLOCK_DIM))
+    fp8_vals = (vals_f32 * quant_scale_2d).to(tl.float8e4nv)
+    tl.store(
+        fp8_ptr
+        + tk_offsets[:, None].to(tl.int64) * dim
+        + dim_offsets[None, :].to(tl.int64),
+        fp8_vals, mask=src_mask,
+    )
+
+    # Row SF (ISA-pack, i32-broadcast across the 32 TK rows of this program)
+    subblock_idx = tl.arange(0, GROUPS_PER_DIM)
+    shifted = e8m0_scale.to(tl.int32) << (subblock_idx * 8)
+    packed_i32 = tl.sum(shifted, axis=0)
+    row_tile = tk_offsets // SF_TILE_M
+    row_in_tile = tk_offsets % SF_TILE_M
+    row_row_base = (row_in_tile % 32) * 16 + (row_in_tile // 32) * 4
+    row_tile_base = (row_tile * row_k_tiles + pid_dim_block) * SF_TILE_STORAGE
+    row_packed_offset = (row_tile_base + row_row_base) // 4
+    packed_broadcast = tl.zeros([GROUP_SIZE], dtype=tl.int32) + packed_i32
+    row_scales_i32 = row_scales_ptr.to(tl.pointer_type(tl.int32))
+    tl.store(
+        row_scales_i32 + row_packed_offset.to(tl.int64),
+        packed_broadcast,
+        mask=(tk_offsets < TK),
+    )
+
+
+@wrap_triton_kernel
+@triton.jit
+def _iso32_col_only_quantize_kernel(
+    src_ptr,            # (TK, dim) bf16
+    col_scales_ptr,     # ISA scales for logical (dim, TK) layout
+    TK, dim,
+    src_stride_row, src_stride_col,
+    col_k_tiles,
+    GROUP_SIZE: tl.constexpr,
+    BLOCK_DIM: tl.constexpr,
+    SF_TILE_M: tl.constexpr,
+    SF_TILE_K: tl.constexpr,
+    SF_TILE_STORAGE: tl.constexpr,
+):
+    pid_tk_group = tl.program_id(0)
+    pid_dim_block = tl.program_id(1)
+    tk_offsets = pid_tk_group * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+    dim_offsets = pid_dim_block * BLOCK_DIM + tl.arange(0, BLOCK_DIM)
+    src_mask = (tk_offsets < TK)[:, None] & (dim_offsets < dim)[None, :]
+
+    vals_bf16 = tl.load(
+        src_ptr
+        + tk_offsets[:, None].to(tl.int64) * src_stride_row
+        + dim_offsets[None, :].to(tl.int64) * src_stride_col,
+        mask=src_mask, other=0.0,
+    )
+    vals_f32 = vals_bf16.to(tl.float32)
+
+    GROUPS_PER_DIM: tl.constexpr = BLOCK_DIM // GROUP_SIZE
+    GROUPS_PER_K: tl.constexpr = SF_TILE_K // GROUP_SIZE
+    abs_vals = tl.abs(vals_f32)
+    reshaped = tl.reshape(abs_vals, (GROUP_SIZE, GROUPS_PER_DIM, GROUP_SIZE))
+    amax = tl.max(tl.max(reshaped, axis=2), axis=0)  # (GROUPS_PER_DIM,)
+
+    amax_bits = amax.to(tl.int32, bitcast=True)
+    biased_exp = (amax_bits >> 23) & 0xFF
+    mantissa = amax_bits & 0x7FFFFF
+    carry = tl.where(mantissa > 0x600000, 1, 0)
+    e8m0_scale = tl.where(biased_exp > 0, biased_exp - 8 + carry, 0)
+    e8m0_scale = tl.maximum(e8m0_scale, 0)
+
+    subblock_idx = tl.arange(0, GROUPS_PER_DIM)
+    dim_in_block = dim_offsets - pid_dim_block * BLOCK_DIM
+    sub_idx_per_dim = dim_in_block // GROUP_SIZE
+    sub_match = (sub_idx_per_dim[:, None] == subblock_idx[None, :]).to(tl.int32)
+    e8m0_per_dim = tl.sum(sub_match * e8m0_scale[None, :].to(tl.int32), axis=1)
+    e8m0_per_dim_u8 = e8m0_per_dim.to(tl.uint8)
+
+    col_row_tile = dim_offsets // SF_TILE_M
+    col_row_in_tile = dim_offsets % SF_TILE_M
+    col_k_tile_idx = pid_tk_group // GROUPS_PER_K
+    col_k_in_tile = pid_tk_group % GROUPS_PER_K
+    col_tile_base = (col_row_tile * col_k_tiles + col_k_tile_idx) * SF_TILE_STORAGE
+    col_row_base = (col_row_in_tile % 32) * 16 + (col_row_in_tile // 32) * 4
+    col_offset = col_tile_base + col_row_base + col_k_in_tile
+    tl.store(
+        col_scales_ptr + col_offset.to(tl.int64),
+        e8m0_per_dim_u8,
+        mask=(dim_offsets < dim),
+    )
+
+
+_ISO32_USE_SPLIT = os.environ.get("SONICMOE_ISO32_SPLIT", "1") == "1"
+
+
 def iso32_dual_quantize_varlen(
     src: torch.Tensor,
     TK: int,
@@ -2313,17 +2472,40 @@ def iso32_dual_quantize_varlen(
     row_k_tiles = _div_up(dim, _SF_TILE_K)
     col_k_tiles = _div_up(TK, _SF_TILE_K)
     grid = (_div_up(TK, GROUP_SIZE), _div_up(dim, BLOCK_DIM))
-    _dual_varlen_iso32_quantize_kernel[grid](
-        src, fp8, row_scales, col_scales,
-        TK, dim,
-        src.stride(0), src.stride(1),
-        row_k_tiles, col_k_tiles,
-        fp8_max=float(torch.finfo(torch.float8_e4m3fn).max),
-        GROUP_SIZE=GROUP_SIZE, BLOCK_DIM=BLOCK_DIM,
-        SF_TILE_M=_SF_TILE_M, SF_TILE_K=_SF_TILE_K,
-        SF_TILE_STORAGE=_SF_TILE_STORAGE,
-        num_warps=1,
-    )
+    if _ISO32_USE_SPLIT:
+        _iso32_row_only_quantize_kernel[grid](
+            src, fp8, row_scales,
+            TK, dim,
+            src.stride(0), src.stride(1),
+            row_k_tiles,
+            fp8_max=float(torch.finfo(torch.float8_e4m3fn).max),
+            GROUP_SIZE=GROUP_SIZE, BLOCK_DIM=BLOCK_DIM,
+            SF_TILE_M=_SF_TILE_M, SF_TILE_K=_SF_TILE_K,
+            SF_TILE_STORAGE=_SF_TILE_STORAGE,
+            num_warps=4,
+        )
+        _iso32_col_only_quantize_kernel[grid](
+            src, col_scales,
+            TK, dim,
+            src.stride(0), src.stride(1),
+            col_k_tiles,
+            GROUP_SIZE=GROUP_SIZE, BLOCK_DIM=BLOCK_DIM,
+            SF_TILE_M=_SF_TILE_M, SF_TILE_K=_SF_TILE_K,
+            SF_TILE_STORAGE=_SF_TILE_STORAGE,
+            num_warps=4,
+        )
+    else:
+        _dual_varlen_iso32_quantize_kernel[grid](
+            src, fp8, row_scales, col_scales,
+            TK, dim,
+            src.stride(0), src.stride(1),
+            row_k_tiles, col_k_tiles,
+            fp8_max=float(torch.finfo(torch.float8_e4m3fn).max),
+            GROUP_SIZE=GROUP_SIZE, BLOCK_DIM=BLOCK_DIM,
+            SF_TILE_M=_SF_TILE_M, SF_TILE_K=_SF_TILE_K,
+            SF_TILE_STORAGE=_SF_TILE_STORAGE,
+            num_warps=4,
+        )
     return fp8, row_scales.view(_E8M0_DTYPE), col_scales.view(_E8M0_DTYPE)
 
 
