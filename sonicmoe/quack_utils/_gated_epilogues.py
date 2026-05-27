@@ -384,6 +384,183 @@ class BlockscaledQuantOnlyMixin(GemmDefaultEpiMixin):
 
 
 # ---------------------------------------------------------------------------
+# BlockscaledIsaRowScaleStore EpiOp (Session 1A foundation block)
+# ---------------------------------------------------------------------------
+#
+# Writes UE8M0 scale bytes directly into the ISA-pack layout used downstream
+# by blockscaled FP8 GEMMs (and produced standalone today by
+# `_quantize_and_pack_kernel`).
+#
+# Layout (3D uint8 buffer `(num_m_tiles, k_tiles, 512)`):
+#   SF_TILE_M       = 128
+#   SF_TILE_K       = 128
+#   SF_TILE_STORAGE = 512  (== SF_TILE_M * SF_TILE_K // SF_VEC_SIZE)
+#   SF_VEC_SIZE     = 32
+#
+# Offset of one E8M0 byte for absolute (m_abs, n_group_abs):
+#   m_tile          = m_abs // 128
+#   row_in_tile     = m_abs %  128
+#   k_tile_idx      = n_group_abs // 4
+#   k_in_tile       = n_group_abs %  4
+#   row_base_offset = (row_in_tile % 32) * 16 + (row_in_tile // 32) * 4
+#   byte_at         = scale[m_tile, k_tile_idx, row_base_offset + k_in_tile]
+#
+# Single-byte stores (NOT the uint32 4-byte pack the Triton kernel uses) —
+# the cute epi loop visits one group at a time, so packing 4 groups into
+# uint32 would require cross-iteration buffering.  Single-byte stores still
+# coalesce within a warp (consecutive lanes write adjacent bytes when
+# k_in_tile sweeps 0..3).
+# ---------------------------------------------------------------------------
+
+class BlockscaledIsaRowScaleStore(EpiOp):
+    """EpiOp: writes UE8M0 scale bytes into ISA-pack layout.
+
+    Scale buffer shape: `(num_m_tiles, k_tiles, 512)` uint8, byte-equivalent
+    to the 1D packed scale buffer produced by `_quantize_and_pack_kernel`.
+
+    begin(): computes absolute M row and N-group base for this thread.
+    begin_loop(): returns (param, m_abs, n_group_abs, m_limit, n_group_limit).
+    The mixin's epi_visit_subtile writes the scale byte after bounds check.
+    """
+
+    def param_fields(self):
+        return [(self.name, object, None)]
+
+    def to_params(self, gemm, args):
+        tensor = getattr(args, self.name)
+        if tensor is not None:
+            return {self.name: assume_stride_divisibility(tensor)}
+        return {self.name: None}
+
+    @cute.jit
+    def begin(self, gemm, param, smem_tensor, ctx):
+        if const_expr(param is not None):
+            tile_M = gemm.cta_tile_shape_mnk[0]
+            tile_N = gemm.cta_tile_shape_mnk[1]
+            # Thread-to-M-row: SM100 Ld32x32bOp maps tidx -> M-row within tile.
+            m_in_tile = ctx.tidx % tile_M
+            if const_expr(ctx.varlen_manager.varlen_m):
+                batch_start = ctx.varlen_manager.params.cu_seqlens_m[ctx.tile_coord_mnkl[3]]
+                m_abs = batch_start + ctx.tile_coord_mnkl[0] * tile_M + m_in_tile
+                m_limit = ctx.varlen_manager.params.cu_seqlens_m[ctx.tile_coord_mnkl[3] + Int32(1)]
+            else:
+                m_abs = ctx.tile_coord_mnkl[0] * tile_M + m_in_tile
+                # m_limit derived from buffer shape: num_m_tiles * SF_TILE_M.
+                m_limit = param.shape[0] * Int32(128)
+            n_base = ctx.tile_coord_mnkl[1] * (tile_N // 32)
+            # n_group_limit derived from buffer shape: k_tiles * 4.
+            n_group_limit = param.shape[1] * Int32(4)
+            return (param, m_abs, n_base, m_limit, n_group_limit)
+        return None
+
+    @cute.jit
+    def begin_loop(self, gemm, state, epi_coord):
+        if const_expr(state is not None):
+            param, m_abs, n_base, m_limit, n_group_limit = state
+            if const_expr(isinstance(epi_coord, tuple)):
+                n_sub = epi_coord[1] if len(epi_coord) > 1 else epi_coord[0]
+            else:
+                n_sub = epi_coord
+            return (param, m_abs, n_base + n_sub, m_limit, n_group_limit)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# BlockscaledIsaQuantOnlyMixin (Session 1A foundation block)
+# ---------------------------------------------------------------------------
+
+class BlockscaledIsaQuantOnlyMixin(GemmDefaultEpiMixin):
+    """GemmDefault + epi blockscaled FP8 quant of D with ISA-pack scale store.
+
+    Parallel to `BlockscaledQuantOnlyMixin` but writes scales in ISA-pack
+    layout (shape `(num_m_tiles, k_tiles, 512)` uint8) instead of flat
+    `(M, N//32)`.  Same amax / E8M0 / quant_scale arithmetic — only the
+    final scale store differs.
+    """
+
+    _epi_ops = (
+        *GemmDefaultEpiMixin._epi_ops,
+        BlockscaledIsaRowScaleStore("mZScaleIsa"),
+    )
+
+    @mlir_namedtuple
+    class EpilogueArguments(NamedTuple):
+        alpha: Optional[Float32 | cute.Tensor] = None
+        beta: Optional[Float32 | cute.Tensor] = None
+        mRowVecBroadcast: Optional[cute.Tensor] = None
+        mColVecBroadcast: Optional[cute.Tensor] = None
+        add_to_output: cutlass.Constexpr[bool] = False
+        rounding_mode: cutlass.Constexpr[int] = 0
+        sr_seed: Optional[Int32 | cute.Tensor] = None
+        mZScaleIsa: Optional[cute.Tensor] = None
+
+    @cute.jit
+    def epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None):
+        GemmDefaultEpiMixin.epi_visit_subtile(
+            self, params, epi_loop_tensors, tRS_rD, tRS_rC
+        )
+
+        _z_scale_active = epi_loop_tensors["mZScaleIsa"]
+        if const_expr(_z_scale_active is not None):
+            num_z = cute.size(tRS_rD)
+
+            # Step 1: amax over the register tile.
+            amax = Float32(0.0)
+            for i in cutlass.range(num_z, unroll_full=True):
+                val = tRS_rD[i]
+                neg = Float32(0.0) - val
+                abs_val = cute.arch.fmax(val, neg)
+                amax = cute.arch.fmax(amax, abs_val)
+            amax = cute.arch.fmax(amax, Float32(1e-4))
+
+            # Step 2: integer+carry E8M0 (matches Triton reference).
+            amax_bits = _f32_as_i32(amax)
+            biased_exp = (amax_bits >> Int32(23)) & Int32(0xFF)
+            mantissa_bits = amax_bits & Int32(0x7FFFFF)
+            has_carry = cutlass.Boolean(mantissa_bits > Int32(0x600000))
+            carry = Int32(1) if has_carry else Int32(0)
+            e8m0 = biased_exp - Int32(8) + carry
+            is_normal = cutlass.Boolean(biased_exp > Int32(0))
+            e8m0 = e8m0 if is_normal else Int32(0)
+            is_pos = cutlass.Boolean(e8m0 > Int32(0))
+            e8m0 = e8m0 if is_pos else Int32(0)
+
+            # Step 3: quant_scale = 2^(254 - e8m0) (clamped to [1, 254]).
+            qexp = Int32(254) - e8m0
+            qexp_hi = cutlass.Boolean(qexp > Int32(254))
+            qexp = Int32(254) if qexp_hi else qexp
+            qexp_lo = cutlass.Boolean(qexp < Int32(1))
+            qexp = Int32(1) if qexp_lo else qexp
+            quant_scale = _i32_as_f32(qexp << Int32(23))
+
+            # Step 4: scale registers; saturating cast to fp8 at TMA store time.
+            for i in cutlass.range(num_z, unroll_full=True):
+                tRS_rD[i] = tRS_rD[i] * quant_scale
+
+            # Step 5: store UE8M0 byte at ISA-pack offset (bounds-checked).
+            z_scale_info = epi_loop_tensors["mZScaleIsa"]
+            if const_expr(z_scale_info is not None):
+                scale_tensor, m_abs, n_group_abs, m_limit, n_group_limit = z_scale_info
+                in_bounds = (
+                    cutlass.Boolean(m_abs < m_limit)
+                    & cutlass.Boolean(n_group_abs < n_group_limit)
+                )
+                if in_bounds:
+                    # ISA-pack offset math (mirrors _quantize_and_pack_kernel).
+                    m_tile = m_abs // Int32(128)
+                    row_in_tile = m_abs % Int32(128)
+                    k_tile_idx = n_group_abs // Int32(4)
+                    k_in_tile = n_group_abs % Int32(4)
+                    row_base = (row_in_tile % Int32(32)) * Int32(16) + (
+                        row_in_tile // Int32(32)
+                    ) * Int32(4)
+                    inner_off = row_base + k_in_tile
+                    scale_tensor[m_tile, k_tile_idx, inner_off] = cutlass.Int8(e8m0)
+
+        return None
+
+
+# ---------------------------------------------------------------------------
 # GemmDGatedMixin (from gemm_dgated.py)
 # ---------------------------------------------------------------------------
 
