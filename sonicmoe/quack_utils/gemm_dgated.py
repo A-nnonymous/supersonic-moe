@@ -47,6 +47,7 @@ from ._gated_epilogues import (
 from .gemm_sm100_fp8_zeromat import (
     GemmDGatedSm100ZeroMat,
     GemmDGatedFP8CLoadSm100ZeroMat,
+    GemmDGatedFP8CLoadIso32QuantSm100ZeroMat,
 )
 
 _E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", torch.uint8)
@@ -97,9 +98,19 @@ def gemm_dgated(
     b_scales: Optional[Tensor] = None,  # ISA-packed blockscaled scales for B
     preact_fp8: Optional[Tensor] = None,  # (total_m, 2n) fp8 — replaces PreAct when provided
     preact_scales: Optional[Tensor] = None,  # (total_m, 2n//32) uint8 — blockscaled scales for preact_fp8
+    iso32_dz_fp8: Optional[Tensor] = None,  # (total_m, 2n) fp8 — side-channel iso32 FP8 dXY output
+    iso32_dz_row_scales: Optional[Tensor] = None,  # ISA-pack row-axis SF (num_m_tiles, k_tiles, 512) uint8
+    iso32_dz_col_scales: Optional[Tensor] = None,  # ISA-pack col-axis SF (num_n_tiles, col_k_tiles, 512) uint8
 ) -> None:
     """If tile_count_semaphore is provided, it must already be zero'ed out."""
     fp8_preact_mode = preact_fp8 is not None and preact_scales is not None
+    iso32_dz_mode = (
+        iso32_dz_fp8 is not None
+        or iso32_dz_row_scales is not None
+        or iso32_dz_col_scales is not None
+    )
+    if iso32_dz_mode:
+        assert fp8_preact_mode, "iso32_dz fusion requires fp8_preact_mode"
     if cu_seqlens_m is not None:
         assert persistent, "varlen_m requires persistent=True"
         assert A.stride(-1) == 1, "varlen_m requires A to be k-major"
@@ -168,7 +179,10 @@ def gemm_dgated(
     if fp8_preact_mode:
         assert device_capacity[0] > 9, "FP8 PreAct only supported on SM100+"
         if gather_A and blockscaled_runtime:
-            GemmCls = GemmDGatedFP8CLoadSm100ZeroMat
+            if iso32_dz_mode:
+                GemmCls = GemmDGatedFP8CLoadIso32QuantSm100ZeroMat
+            else:
+                GemmCls = GemmDGatedFP8CLoadSm100ZeroMat
         else:
             GemmCls = GemmDGatedFP8CLoadSm100
     elif device_capacity[0] > 9 and gather_A and blockscaled_runtime:
@@ -203,6 +217,13 @@ def gemm_dgated(
     if fp8_preact_mode:
         epi_kwargs["mFP8PreAct_fp8"] = _make_cute_tensor_dynamic(preact_fp8, leading_dim=1)
         epi_kwargs["mFP8PreAct_scales"] = _make_cute_tensor_dynamic(preact_scales, leading_dim=1)
+    if iso32_dz_mode:
+        if iso32_dz_fp8 is not None:
+            epi_kwargs["mDZFp8Iso32_fp8"] = _make_cute_tensor_dynamic(iso32_dz_fp8, leading_dim=1)
+        if iso32_dz_row_scales is not None:
+            epi_kwargs["mDZFp8Iso32_row"] = _make_cute_tensor_dynamic(iso32_dz_row_scales, leading_dim=2)
+        if iso32_dz_col_scales is not None:
+            epi_kwargs["mDZFp8Iso32_col"] = _make_cute_tensor_dynamic(iso32_dz_col_scales, leading_dim=2)
     epi_args = GemmCls.EpilogueArguments(
         tensor_infos["PostAct"].cute_tensor,
         act_fn,
@@ -260,6 +281,7 @@ def gemm_dgated(
         A_idx is not None,
         blockscaled,
         fp8_preact_mode,
+        iso32_dz_mode,
         key_tensor_names=("A", "B", "D", "PostAct", "C"),
     )
     cache = gemm_dgated.compile_cache

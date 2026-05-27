@@ -1546,3 +1546,355 @@ class GemmDGatedFP8CLoadMixin(GemmDGatedMixin):
         tRS_rdXY_f16x2.store(tRS_rdXY_f32x2.load().to(pack_dtype))
         tRS_rD.store(cute.recast_tensor(tRS_rdXY_f16x2, Float32).load())
         return tRS_rOut
+
+
+# ---------------------------------------------------------------------------
+# Iso32DXYStore EpiOp (NEW — side-channel FP8 dXY + dual ISA SF for DGated)
+# ---------------------------------------------------------------------------
+#
+# Captures per-element (m_abs, n_dXY_abs) coordinates so the mixin can:
+#   * scatter-store FP8 dXY bytes to gmem  mDZFp8 [TK, 2I]  uint8
+#   * scatter-store row-axis ISA-pack SF bytes  mDZScaleIsaRow  uint8
+#   * scatter-store col-axis ISA-pack SF bytes  mDZScaleIsaCol  uint8
+#
+# Three optional kwargs (any subset can be None for A/B verification):
+#   mDZFp8Iso32_fp8   : (total_TK, 2I) uint8/Float8E4M3FN
+#   mDZFp8Iso32_row   : (num_m_tiles, k_tiles, 512) uint8  (row-ISA-pack, dXY-N domain)
+#   mDZFp8Iso32_col   : (num_n_tiles, col_k_tiles, 512) uint8  (col-ISA-pack)
+#
+# The single 32x32 iso32 amax (over the dXY-tensor) is shared between the
+# FP8 byte and BOTH scale bytes — this is the invariant that makes the
+# fusion correct vs `_dual_varlen_iso32_quantize_kernel`.
+# ---------------------------------------------------------------------------
+
+
+class Iso32DXYStore(EpiOp):
+    """EpiOp: captures coords for per-element scatter store of fp8 dXY +
+    dual ISA-pack SF bytes.  Mirrors :class:`FP8PreActLoad` but in the
+    write direction; passes a single tuple-payload through to the mixin's
+    ``epi_visit_subtile``.
+    """
+
+    def param_fields(self):
+        return [(self.name, object, None)]
+
+    def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile):
+        return 0
+
+    def to_params(self, gemm, args):
+        fp8 = getattr(args, self.name + "_fp8", None)
+        row = getattr(args, self.name + "_row", None)
+        col = getattr(args, self.name + "_col", None)
+        if fp8 is None and row is None and col is None:
+            return {self.name: None}
+        return {
+            self.name: (
+                assume_stride_divisibility(fp8) if fp8 is not None else None,
+                assume_stride_divisibility(row) if row is not None else None,
+                assume_stride_divisibility(col) if col is not None else None,
+            )
+        }
+
+    @cute.jit
+    def begin(self, gemm, param, smem_tensor, ctx):
+        if const_expr(param is not None):
+            fp8_t, row_t, col_t = param
+            tile_M = gemm.cta_tile_shape_mnk[0]
+            tile_N = gemm.cta_tile_shape_mnk[1]
+            if const_expr(ctx.varlen_manager.varlen_m):
+                m_offset = ctx.varlen_manager.params.cu_seqlens_m[ctx.tile_coord_mnkl[3]]
+                m_limit = ctx.varlen_manager.params.cu_seqlens_m[
+                    ctx.tile_coord_mnkl[3] + Int32(1)
+                ]
+            else:
+                m_offset = Int32(0)
+                # Non-varlen: use a sentinel so the bounds check is effectively
+                # always true (avoids Python `if` on a runtime value below).
+                m_limit = Int32(2_000_000_000)
+            m_base = ctx.tile_coord_mnkl[0] * tile_M
+            tDcD = ctx.partition_for_epilogue_fn(
+                cute.make_identity_tensor((tile_M, tile_N))
+            )
+            # dXY-N base in dXY logical coords (tile_N D-cols == 2*tile_N dXY-cols).
+            n_base_dxy = ctx.tile_coord_mnkl[1] * tile_N * 2
+            lane_id = ctx.tidx % Int32(32)
+            return (fp8_t, row_t, col_t, tDcD, m_offset, m_base, n_base_dxy, m_limit, lane_id)
+        return None
+
+    @cute.jit
+    def begin_loop(self, gemm, state, epi_coord):
+        if const_expr(state is not None):
+            fp8_t, row_t, col_t, tDcD, m_offset, m_base, n_base_dxy, m_limit, lane_id = state
+            tDcD_sub = cute.group_modes(tDcD, 3, cute.rank(tDcD))[None, None, None, epi_coord]
+            return (fp8_t, row_t, col_t, tDcD_sub, m_offset, m_base, n_base_dxy, m_limit, lane_id)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# GemmDGatedFP8CLoadIso32QuantMixin
+# ---------------------------------------------------------------------------
+#
+# Side-channel iso32 FP8-D quant for DGated FP8-C-load.  Keeps BF16 D path
+# fully intact; ADDITIONALLY writes:
+#   - dz_fp8   (Float8E4M3FN, varlen TK x 2I) via per-byte scatter
+#   - dz_sf_row  ISA-pack row-axis SF (in dXY-N domain)
+#   - dz_sf_col  ISA-pack col-axis SF
+#
+# Replaces the standalone `_dual_varlen_iso32_quantize_kernel(dz_bf16)`
+# (~102 us at production T=8192 E=8) once flag-wired in functional/__init__.py.
+#
+# Reference: TE `grouped_gemm_dswiglu_quant` epi pattern + 1A-ext mixin
+# invariants (block constancy / row=col SF equality at 32x32 blocks).
+# ---------------------------------------------------------------------------
+
+
+class GemmDGatedFP8CLoadIso32QuantMixin(GemmDGatedFP8CLoadMixin):
+    """GemmDGatedFP8CLoad + side-channel iso32 FP8 dXY quant (additive)."""
+
+    _epi_ops = (
+        *GemmDGatedFP8CLoadMixin._epi_ops,
+        Iso32DXYStore("mDZFp8Iso32"),
+    )
+
+    @mlir_namedtuple
+    class EpilogueArguments(NamedTuple):
+        mPostAct: cute.Tensor
+        act_bwd_fn: cutlass.Constexpr[Callable] = None
+        implicit_dtype: cutlass.Constexpr[type] = cutlass.BFloat16
+        alpha: Optional[Float32 | cute.Tensor] = None
+        beta: Optional[Float32 | cute.Tensor] = None
+        mRowVecBroadcast: Optional[cute.Tensor] = None
+        mColVecBroadcast: Optional[cute.Tensor] = None
+        mColVecReduce: Optional[cute.Tensor] = None
+        rounding_mode: cutlass.Constexpr[int] = 0
+        sr_seed: Optional[Int32 | cute.Tensor] = None
+        mFP8PreAct_fp8: Optional[cute.Tensor] = None
+        mFP8PreAct_scales: Optional[cute.Tensor] = None
+        mDZFp8Iso32_fp8: Optional[cute.Tensor] = None
+        mDZFp8Iso32_row: Optional[cute.Tensor] = None
+        mDZFp8Iso32_col: Optional[cute.Tensor] = None
+
+    @cute.jit
+    def epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None):
+        tDrColVec = epi_loop_tensors["mColVecBroadcast"]
+        tDrColVecReduce = epi_loop_tensors["mColVecReduce"]
+
+        if const_expr(self.c_dtype == cutlass.Int16):
+            tRS_rC_fp8 = cute.recast_tensor(tRS_rC, cutlass.Float8E4M3FN)
+            tRS_rXY_f32x2 = cute.make_rmem_tensor(tRS_rC_fp8.layout.shape, Float32)
+            tRS_rXY_f32x2.store(tRS_rC_fp8.load().to(Float32))
+            fp8_preact_info = epi_loop_tensors["mFP8PreAct"]
+            if const_expr(fp8_preact_info is not None):
+                fp8_tensor, scales_tensor, tDcD_sub, m_offset, m_base, n_base = fp8_preact_info
+                num_d = cute.size(tDcD_sub)
+                for i in cutlass.range(num_d, unroll_full=True):
+                    coord = tDcD_sub[i]
+                    row, col = coord[0], coord[1]
+                    m_abs = m_offset + m_base + row
+                    n0 = n_base + col * 2
+                    group_0 = n0 >> Int32(5)
+                    group_1 = (n0 + Int32(1)) >> Int32(5)
+                    scale_0 = _i32_as_f32(Int32(scales_tensor[m_abs, group_0]) << Int32(23))
+                    scale_1 = _i32_as_f32(Int32(scales_tensor[m_abs, group_1]) << Int32(23))
+                    tRS_rXY_f32x2[2 * i] = tRS_rXY_f32x2[2 * i] * scale_0
+                    tRS_rXY_f32x2[2 * i + 1] = tRS_rXY_f32x2[2 * i + 1] * scale_1
+        else:
+            assert tRS_rC is not None
+            implicit_dtype = params.implicit_dtype
+            tRS_rXY_f16x2 = cute.recast_tensor(tRS_rC, implicit_dtype)
+            tRS_rXY_f32x2 = cute.make_rmem_tensor(tRS_rXY_f16x2.layout, Float32)
+            tRS_rXY_f32x2.store(tRS_rXY_f16x2.load().to(Float32))
+
+        tRS_rdXY_f32x2 = cute.make_rmem_tensor_like(tRS_rXY_f32x2, Float32)
+        tRS_rOut = cute.make_rmem_tensor_like(tRS_rD, Float32)
+        tRS_rD_scaled = cute.make_rmem_tensor_like(tRS_rD)
+        if const_expr(tDrColVec is not None):
+            if const_expr(self.arch < 100):
+                tRS_rD_scaled.store(tRS_rD.load() * tDrColVec.load().to(tRS_rD.element_type))
+            else:
+                tDrColVec_mn = layout_utils.convert_layout_zero_stride(tDrColVec, tDrColVec.layout)
+                tRS_rD_mn = layout_utils.convert_layout_zero_stride(tRS_rD, tDrColVec.layout)
+                tRS_rD_scaled_mn = layout_utils.convert_layout_zero_stride(tRS_rD_scaled, tDrColVec.layout)
+                for m in cutlass.range(cute.size(tDrColVec_mn, mode=[0]), unroll_full=True):
+                    for n in cutlass.range(cute.size(tDrColVec_mn, mode=[1]) // 2, unroll_full=True):
+                        tRS_rD_scaled_mn[m, 2*n], tRS_rD_scaled_mn[m, 2*n+1] = cute.arch.mul_packed_f32x2(
+                            (tRS_rD_mn[m, 2*n], tRS_rD_mn[m, 2*n+1]),
+                            (tDrColVec_mn[m, 0], tDrColVec_mn[m, 0]),
+                        )
+        else:
+            tRS_rD_scaled.store(tRS_rD.load())
+        if const_expr(self.arch < 100):
+            for i in cutlass.range(cute.size(tRS_rD)):
+                tRS_rdXY_f32x2[2*i], tRS_rdXY_f32x2[2*i+1], tRS_rOut[i] = params.act_bwd_fn(
+                    tRS_rXY_f32x2[2*i], tRS_rXY_f32x2[2*i+1], tRS_rD_scaled[i])
+        else:
+            for i in cutlass.range(cute.size(tRS_rD) // 2):
+                (tRS_rdXY_f32x2[4*i], tRS_rdXY_f32x2[4*i+2]), \
+                (tRS_rdXY_f32x2[4*i+1], tRS_rdXY_f32x2[4*i+3]), \
+                (tRS_rOut[2*i], tRS_rOut[2*i+1]) = params.act_bwd_fn(
+                    (tRS_rXY_f32x2[4*i], tRS_rXY_f32x2[4*i+2]),
+                    (tRS_rXY_f32x2[4*i+1], tRS_rXY_f32x2[4*i+3]),
+                    (tRS_rD_scaled[2*i], tRS_rD_scaled[2*i+1]),
+                )
+        if const_expr(tDrColVecReduce is not None):
+            if const_expr(self.arch < 100):
+                for i in cutlass.range(cute.size(tDrColVecReduce), unroll_full=True):
+                    tDrColVecReduce[i] += tRS_rOut[i] * tRS_rD[i]
+            else:
+                tDrColVecReduce_mn = layout_utils.convert_layout_zero_stride(tDrColVecReduce, tDrColVecReduce.layout)
+                tRS_rD_mn = layout_utils.convert_layout_zero_stride(tRS_rD, tDrColVecReduce.layout)
+                tRS_rOut_mn = layout_utils.convert_layout_zero_stride(tRS_rOut, tDrColVecReduce.layout)
+                for m in cutlass.range(cute.size(tDrColVecReduce_mn, mode=[0]), unroll_full=True):
+                    row_sum = cute.arch.mul_packed_f32x2(
+                        (tRS_rD_mn[m, 0], tRS_rD_mn[m, 1]), (tRS_rOut_mn[m, 0], tRS_rOut_mn[m, 1]))
+                    for n in cutlass.range(1, cute.size(tDrColVecReduce_mn, mode=[1]) // 2, unroll_full=True):
+                        row_sum = cute.arch.fma_packed_f32x2(
+                            (tRS_rD_mn[m, 2*n], tRS_rD_mn[m, 2*n+1]),
+                            (tRS_rOut_mn[m, 2*n], tRS_rOut_mn[m, 2*n+1]), row_sum)
+                    tDrColVecReduce_mn[m, 0] += row_sum[0] + row_sum[1]
+        if const_expr(tDrColVec is not None):
+            if const_expr(self.arch < 100):
+                tRS_rOut.store(tRS_rOut.load() * tDrColVec.load().to(tRS_rD.element_type))
+            else:
+                tDrColVec_mn = layout_utils.convert_layout_zero_stride(tDrColVec, tDrColVec.layout)
+                tRS_rOut_mn = layout_utils.convert_layout_zero_stride(tRS_rOut, tDrColVec.layout)
+                for m in cutlass.range(cute.size(tDrColVec_mn, mode=[0]), unroll_full=True):
+                    for n in cutlass.range(cute.size(tDrColVec_mn, mode=[1]) // 2, unroll_full=True):
+                        tRS_rOut_mn[m, 2*n], tRS_rOut_mn[m, 2*n+1] = cute.arch.mul_packed_f32x2(
+                            (tRS_rOut_mn[m, 2*n], tRS_rOut_mn[m, 2*n+1]),
+                            (tDrColVec_mn[m, 0], tDrColVec_mn[m, 0]),
+                        )
+
+        # ── NEW: iso32 side-channel FP8 dXY quant ──
+        #
+        # tRS_rdXY_f32x2 holds 2*num_d f32 dXY values per lane, laid out so
+        # indices [4*i, 4*i+1, 4*i+2, 4*i+3] map to consecutive dXY-cols
+        # (2*col_D, 2*col_D+1, 2*(col_D+1), 2*(col_D+1)+1) for D-row coord
+        # (row_2i, row_2i+1).  We need iso32 32×32 blocks in the dXY-N domain:
+        # since each warp's 32 lanes span 32 contiguous M-rows AND share the
+        # same N-cols, the 32 lanes form a 32x(num_dxy_per_lane) iso32 block(s).
+        iso32_info = epi_loop_tensors["mDZFp8Iso32"]
+        if const_expr(iso32_info is not None):
+            fp8_t, row_t, col_t, tDcD_sub, m_offset, m_base, n_base_dxy, m_limit, lane_id = iso32_info
+            num_d = cute.size(tDcD_sub)
+            # num_dxy per lane = 2 * num_d (each D slot expands to 2 dXY cols).
+            # Group structure: 32 dXY cols == 1 iso32 group.  num_d must be
+            # a constexpr multiple of 16 so num_dxy_per_lane (= 2*num_d) is
+            # a multiple of 32.  Asserted at JIT time.
+            num_dxy = const_expr(2 * num_d)
+            assert num_dxy % 32 == 0, "Iso32 fusion requires 2*num_d_per_lane to be multiple of 32"
+            num_groups = const_expr(num_dxy // 32)
+
+            for g in cutlass.range(num_groups, unroll_full=True):
+                # Step 1: per-thread amax over 32 contiguous dXY vals.
+                amax = Float32(0.0)
+                for k in cutlass.range(32, unroll_full=True):
+                    v = tRS_rdXY_f32x2[g * 32 + k]
+                    neg = Float32(0.0) - v
+                    av = cute.arch.fmax(v, neg)
+                    amax = cute.arch.fmax(amax, av)
+                # Step 2: warp_redux across 32 lanes -> block (32x32) amax.
+                amax = cute.arch.warp_redux_sync(amax, "max")
+                amax = cute.arch.fmax(amax, Float32(1e-4))
+                # Step 3: integer+carry E8M0 (matches Triton reference).
+                amax_bits = _f32_as_i32(amax)
+                biased_exp = (amax_bits >> Int32(23)) & Int32(0xFF)
+                mantissa_bits = amax_bits & Int32(0x7FFFFF)
+                has_carry = cutlass.Boolean(mantissa_bits > Int32(0x600000))
+                carry = Int32(1) if has_carry else Int32(0)
+                e8m0 = biased_exp - Int32(8) + carry
+                is_normal = cutlass.Boolean(biased_exp > Int32(0))
+                e8m0 = e8m0 if is_normal else Int32(0)
+                is_pos = cutlass.Boolean(e8m0 > Int32(0))
+                e8m0 = e8m0 if is_pos else Int32(0)
+                # Step 4: quant_scale = 2^(254 - e8m0).
+                qexp = Int32(254) - e8m0
+                qexp_hi = cutlass.Boolean(qexp > Int32(254))
+                qexp = Int32(254) if qexp_hi else qexp
+                qexp_lo = cutlass.Boolean(qexp < Int32(1))
+                qexp = Int32(1) if qexp_lo else qexp
+                quant_scale = _i32_as_f32(qexp << Int32(23))
+
+                # Step 5: scale into 32-element f32 buffer, then vector cast
+                # to fp8 (DSL auto-packs to vec4 cvt_fptrunc).  Original
+                # tRS_rdXY_f32x2 is left untouched so the BF16 pack-back at
+                # the end of this function preserves the parent's contract.
+                src32 = cute.make_rmem_tensor(cute.make_layout(32), Float32)
+                dst32 = cute.make_rmem_tensor(cute.make_layout(32), cutlass.Float8E4M3FN)
+                if const_expr(True):
+                    for k in cutlass.range(32, unroll_full=True):
+                        src32[k] = tRS_rdXY_f32x2[g * 32 + k] * quant_scale
+                    dst32.store(src32.load().to(cutlass.Float8E4M3FN))
+
+                # Step 6a: per-byte FP8 scatter store of dXY (via Uint8 recast
+                # to avoid per-element fp8 scatter store quirks).
+                if const_expr(fp8_t is not None):
+                    fp8_t_u8 = cute.recast_tensor(fp8_t, cutlass.Uint8)
+                    dst32_u8 = cute.recast_tensor(dst32, cutlass.Uint8)
+                    for k in cutlass.range(32, unroll_full=True):
+                        dxy_idx = g * 32 + k
+                        d_idx = dxy_idx // 2
+                        subbit = dxy_idx % 2
+                        coord = tDcD_sub[d_idx]
+                        row = coord[0]
+                        col = coord[1]
+                        m_abs_e = m_offset + m_base + row
+                        n_dxy_abs = n_base_dxy + col * 2 + subbit
+                        ok_m = cutlass.Boolean(m_abs_e < m_limit)
+                        if ok_m:
+                            fp8_t_u8[m_abs_e, n_dxy_abs] = dst32_u8[k]
+                # Step 6b: row-ISA-pack SF store.
+                if const_expr(row_t is not None):
+                    d_idx0 = (g * 32) // 2
+                    coord0 = tDcD_sub[d_idx0]
+                    row0 = coord0[0]
+                    col0 = coord0[1]
+                    m_abs_r = m_offset + m_base + row0
+                    n_group_abs = (n_base_dxy + col0 * 2 + g * 32) >> Int32(5)
+                    n_group_limit = row_t.shape[1] * Int32(4)
+                    ok_r = (
+                        cutlass.Boolean(m_abs_r < m_limit)
+                        & cutlass.Boolean(n_group_abs < n_group_limit)
+                    )
+                    if ok_r:
+                        m_tile = m_abs_r // Int32(128)
+                        row_in_tile = m_abs_r % Int32(128)
+                        k_tile_idx = n_group_abs // Int32(4)
+                        k_in_tile = n_group_abs % Int32(4)
+                        row_base = (row_in_tile % Int32(32)) * Int32(16) + (row_in_tile // Int32(32)) * Int32(4)
+                        inner_off = row_base + k_in_tile
+                        row_t[m_tile, k_tile_idx, inner_off] = cutlass.Int8(e8m0)
+                # Step 6c: col-ISA-pack SF store.
+                if const_expr(col_t is not None):
+                    d_idx0 = (g * 32) // 2
+                    coord0 = tDcD_sub[d_idx0]
+                    row_lane = coord0[0]
+                    col_lane = coord0[1]
+                    m_abs_lane = m_offset + m_base + row_lane
+                    m_warp_base = m_abs_lane - lane_id
+                    warp_n_dxy_base_g = n_base_dxy + col_lane * 2 + g * 32
+                    n_abs_lane = warp_n_dxy_base_g + lane_id
+                    m_group_abs = m_warp_base // Int32(32)
+                    n_limit_c = col_t.shape[0] * Int32(128)
+                    ok_c = (
+                        cutlass.Boolean(n_abs_lane < n_limit_c)
+                        & cutlass.Boolean(m_warp_base < m_limit)
+                    )
+                    if ok_c:
+                        col_n_tile = n_abs_lane // Int32(128)
+                        col_row_in_tile = n_abs_lane % Int32(128)
+                        col_k_tile_idx = m_group_abs // Int32(4)
+                        col_k_in_tile = m_group_abs % Int32(4)
+                        col_row_base = (col_row_in_tile % Int32(32)) * Int32(16) + (col_row_in_tile // Int32(32)) * Int32(4)
+                        col_inner_off = col_row_base + col_k_in_tile
+                        col_t[col_n_tile, col_k_tile_idx, col_inner_off] = cutlass.Int8(e8m0)
+
+        # ── Write dXY back to BF16 D (unchanged from parent) ──
+        if const_expr(self.c_dtype == cutlass.Int16):
+            pack_dtype = cutlass.BFloat16
+        else:
+            pack_dtype = params.implicit_dtype
+        tRS_rdXY_f16x2 = cute.make_rmem_tensor(tRS_rdXY_f32x2.layout, pack_dtype)
+        tRS_rdXY_f16x2.store(tRS_rdXY_f32x2.load().to(pack_dtype))
+        tRS_rD.store(cute.recast_tensor(tRS_rdXY_f16x2, Float32).load())
+        return tRS_rOut

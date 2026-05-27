@@ -51,6 +51,7 @@ from ._gated_epilogues import (
     BlockscaledColQuantOnlyMixin,
     GemmDGatedMixin,
     GemmDGatedFP8CLoadMixin,
+    GemmDGatedFP8CLoadIso32QuantMixin,
 )
 
 from cutlass.utils import LayoutEnum
@@ -444,6 +445,22 @@ class GemmDGatedFP8CLoadSm100ZeroMat(GemmDGatedFP8CLoadMixin, _GemmSm100ZeroMatM
     pre-gathered scales have TK rows.  cu_seqlens_m offsets then map
     incorrectly — expert 0 works (offset 0) but experts 1-7 get wrong
     scale factors producing garbage dz output.
+    """
+    pass
+
+
+class GemmDGatedFP8CLoadIso32QuantSm100ZeroMat(
+    GemmDGatedFP8CLoadIso32QuantMixin, _GemmSm100ZeroMatMixin, GemmSm100
+):
+    """SM100 GemmDGated FP8-CLoad + side-channel iso32 FP8 dXY quant + ZeroMat.
+
+    Additive over ``GemmDGatedFP8CLoadSm100ZeroMat``: keeps the BF16 D
+    output intact AND optionally writes FP8 dXY + dual ISA SF tensors via
+    per-byte gmem scatter (no smem / TMA expansion needed).
+
+    Wire-up: set ``mDZFp8Iso32_fp8`` / ``mDZFp8Iso32_row`` / ``mDZFp8Iso32_col``
+    in the EpilogueArguments to enable the side-channel.  All-None leaves
+    behaviour byte-identical to the parent.
     """
     pass
 
