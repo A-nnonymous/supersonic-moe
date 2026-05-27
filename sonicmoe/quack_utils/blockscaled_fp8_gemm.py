@@ -2294,6 +2294,18 @@ def _dual_varlen_iso32_quantize_kernel(
 # Selection: row_nw=4 col_nw=4 BLOCK_DIM=128 GROUP_SIZE=32 (uniform across
 # both halves; tied with row=2 col=4 within noise). Disable via env
 # SONICMOE_ISO32_SPLIT=0.
+#
+# 2026-05-27 update (REGRESSION): re-measured via nsys (gold standard) at
+# TK=33280 D=3072: split=86.7 µs, single=51.2 µs (split is 1.69× SLOWER).
+# Also confirmed via torch.cuda.Event (500 iters min-of-3) across 3 shapes:
+# split is +19 to +48 µs slower than single in current Triton/ptxas env.
+# Hypothesis: Triton/ptxas/driver update since the original measurement
+# inverted the reg-pressure/occupancy trade-off — single kernel now wins.
+# Default flipped to "0" (single). Production impact is small: this is only
+# hit by weight-quant cold paths (_cache_iso32_w1/w2 + precompute_weight_fp8),
+# which are cached out of the BENCH region. The hot dz path uses
+# _dual_varlen_iso32_quantize_kernel directly via fused_quant_kernels.py.
+# Re-enable for A/B with SONICMOE_ISO32_SPLIT=1.
 # ---------------------------------------------------------------------------
 
 @wrap_triton_kernel
@@ -2432,7 +2444,7 @@ def _iso32_col_only_quantize_kernel(
     )
 
 
-_ISO32_USE_SPLIT = os.environ.get("SONICMOE_ISO32_SPLIT", "1") == "1"
+_ISO32_USE_SPLIT = os.environ.get("SONICMOE_ISO32_SPLIT", "0") == "1"
 
 
 def iso32_dual_quantize_varlen(
