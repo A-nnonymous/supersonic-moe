@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from .config import SonicMoEConfig, set_active_config
 from .count_cumsum import count_cumsum
 from .enums import ActivationType, KernelBackendMoE, is_glu
-from .functional import FP8Protocol, moe_TC_softmax_topk_layer, clear_all_fp8_weight_caches
+from .functional import FP8Protocol, moe_TC_softmax_topk_layer, clear_all_fp8_weight_caches, _STASHED_FP8_WEIGHTS
 from .functional.utils import enable_fp8
 from .quack_utils import (
     clear_blockscaled_fp8_weight_cache,
@@ -26,6 +26,7 @@ from .quack_utils import (
     precompute_weight_fp8_warmup,
     quantize_and_pack_activation,
 )
+from .quack_utils.blockscaled_fp8_gemm import _FUSED_WEIGHT_CACHE, _VARLEN_WEIGHT_CACHE, _quantize_weight_3d_triton
 
 
 try:
@@ -299,17 +300,17 @@ class MoE(nn.Module):
         precompute_weight_fp8_warmup(w1_perm, w2_perm)
 
         # Cache lookups (zero quantize work — everything was just populated above).
-        # Layout 1: w1 for fused_gated forward — reads fp8_weight_cache[fused]
+        # Layout 1: w1 for fused_gated forward — reads _FUSED_WEIGHT_CACHE
         self._fp8_w1_fused = precompute_weight_fp8_for_fused_gated(w1_perm)
 
-        # Layout 2: w2 for varlen down-proj forward — reads fp8_weight_cache[varlen]
+        # Layout 2: w2 for varlen down-proj forward — reads _VARLEN_WEIGHT_CACHE
         self._fp8_w2_varlen = precompute_weight_fp8(w2_perm)
 
-        # Layout 3: w2 for direct_fused_dgated backward — reads fp8_weight_cache[fused]
+        # Layout 3: w2 for direct_fused_dgated backward — reads _FUSED_WEIGHT_CACHE
         self._fp8_w2_dgated = precompute_weight_fp8_for_direct_fused_dgated(w2_perm)
 
-        # Layout 4: w1T for varlen actgrad backward — reads fp8_weight_cache[varlen]
-        self._fp8_w1T_varlen = precompute_weight_fp8(w1_perm, permute=(1, 0, 2))  # (H, 2I, E)
+        # Layout 4: w1T for varlen actgrad backward — reads _VARLEN_WEIGHT_CACHE
+        self._fp8_w1T_varlen = precompute_weight_fp8(w1_perm.permute(1, 0, 2))  # (H, 2I, E)
 
     @torch.no_grad()
     def has_fp8_shadow_weights(self) -> bool:
@@ -317,7 +318,7 @@ class MoE(nn.Module):
         # Shadow weights live in the runtime caches. If the cache was populated
         # by refresh_fp8_shadow_weights() with the current _version, hits are guaranteed.
         # We can't cheaply verify cache freshness, so just check if caches are non-empty.
-        return hasattr(self, "_fp8_w1_fused")
+        return len(_VARLEN_WEIGHT_CACHE) > 0 and len(_FUSED_WEIGHT_CACHE) > 0
 
     @torch.no_grad()
     def stash_bf16_to_cpu(self) -> None:
@@ -354,7 +355,6 @@ class MoE(nn.Module):
         # Publish fp8 references to the functional layer so that forward/backward
         # can bypass global cache lookups (whose keys depend on data_ptr which
         # will change when we replace .data below).
-        from .functional import _STASHED_FP8_WEIGHTS
         _STASHED_FP8_WEIGHTS["w1_fused"] = self._fp8_w1_fused
         _STASHED_FP8_WEIGHTS["w2_varlen"] = self._fp8_w2_varlen
         _STASHED_FP8_WEIGHTS["w2_dgated"] = self._fp8_w2_dgated
@@ -387,11 +387,9 @@ class MoE(nn.Module):
         self.c_proj.weight.data = self._cpu_w2.to(device, non_blocking=True)
         del self._cpu_w1, self._cpu_w2
         # Clear stashed fp8 references — next forward should use global cache
-        from .functional import _STASHED_FP8_WEIGHTS
         _STASHED_FP8_WEIGHTS.clear()
         # Clear FP8 weight caches — data_ptr changed after restore, old cache
         # entries would be stale and leak memory on next refresh.
-        from .functional import clear_all_fp8_weight_caches
         clear_all_fp8_weight_caches()
         self._stashed = False
 
@@ -460,7 +458,6 @@ class MoE(nn.Module):
                 )
                 # Quantization error: bf16 -> fp8 -> bf16 roundtrip
                 # Use the same quantize function as refresh_fp8_shadow_weights
-                from .quack_utils.blockscaled_fp8_gemm import _quantize_weight_3d_triton
                 enk = bf16_post.contiguous()  # (E, dim0, dim1) contiguous
                 fp8_3d, _ = _quantize_weight_3d_triton(enk)
                 # fp8_3d is (E, dim0, dim1) fp8. Dequant = cast back (loses scale info)

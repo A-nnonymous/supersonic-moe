@@ -13,6 +13,8 @@ from uuid import uuid4
 import torch
 from filelock import FileLock
 
+from ._quack_compat import install_quack_paddle_compat
+
 
 _CPP_MODULE_PREFIX = "sonicmoe"
 # _GLOBAL_RANK = int(os.getenv("RANK", 0))
@@ -115,7 +117,6 @@ def _get_cpp_function(function_name: str, module_name: str, source_files: list[s
         # guarantees the blocker is live by the time paddle's
         # ``cpp_extension.load()`` looks up ``torch.utils.hipify``.
         try:
-            from sonicmoe._quack_compat import install_quack_paddle_compat
             install_quack_paddle_compat()
         except Exception:
             pass
