@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from .config import SonicMoEConfig, set_active_config
 from .count_cumsum import count_cumsum
 from .enums import ActivationType, KernelBackendMoE, is_glu
-from .functional import FP8Protocol, moe_TC_softmax_topk_layer, clear_all_fp8_weight_caches, _STASHED_FP8_WEIGHTS
+from .functional import FP8Protocol, moe_TC_softmax_topk_layer, clear_all_fp8_weight_caches
 from .functional.utils import enable_fp8
 from .quack_utils import (
     clear_blockscaled_fp8_weight_cache,
@@ -352,14 +352,6 @@ class MoE(nn.Module):
         self._cpu_w1 = self.c_fc.weight.data.to('cpu', non_blocking=True).pin_memory()
         self._cpu_w2 = self.c_proj.weight.data.to('cpu', non_blocking=True).pin_memory()
 
-        # Publish fp8 references to the functional layer so that forward/backward
-        # can bypass global cache lookups (whose keys depend on data_ptr which
-        # will change when we replace .data below).
-        _STASHED_FP8_WEIGHTS["w1_fused"] = self._fp8_w1_fused
-        _STASHED_FP8_WEIGHTS["w2_varlen"] = self._fp8_w2_varlen
-        _STASHED_FP8_WEIGHTS["w2_dgated"] = self._fp8_w2_dgated
-        _STASHED_FP8_WEIGHTS["w1T_varlen"] = self._fp8_w1T_varlen
-
         # Replace parameter data with a 1-element expanded tensor (2 bytes).
         # This preserves the Parameter's shape (so .permute() works in the
         # autograd graph) while freeing ~216 MiB of GPU storage.
@@ -386,8 +378,6 @@ class MoE(nn.Module):
         self.c_fc.weight.data = self._cpu_w1.to(device, non_blocking=True)
         self.c_proj.weight.data = self._cpu_w2.to(device, non_blocking=True)
         del self._cpu_w1, self._cpu_w2
-        # Clear stashed fp8 references — next forward should use global cache
-        _STASHED_FP8_WEIGHTS.clear()
         # Clear FP8 weight caches — data_ptr changed after restore, old cache
         # entries would be stale and leak memory on next refresh.
         clear_all_fp8_weight_caches()
@@ -571,8 +561,17 @@ class MoE(nn.Module):
         with ExitStack() as stack:
             if active_config is not None:
                 stack.enter_context(active_config.activate())
+            fp8_weight_payload = None
             if use_fp8:
                 stack.enter_context(enable_fp8())
+                if not self.has_fp8_shadow_weights():
+                    raise RuntimeError("Sonic FP8 forward requires refresh_fp8_shadow_weights() before use_fp8=True")
+                fp8_weight_payload = {
+                    "w1_fused": self._fp8_w1_fused,
+                    "w2_varlen": self._fp8_w2_varlen,
+                    "w2_dgated": self._fp8_w2_dgated,
+                    "w1T_varlen": self._fp8_w1T_varlen,
+                }
 
             if kernel_backend_moe == KernelBackendMoE.sonicmoe and self.num_experts <= 32768:
                 hidden_states, router_logits, expert_frequency = moe_TC_softmax_topk_layer(
@@ -587,6 +586,7 @@ class MoE(nn.Module):
                     self.activation_function,
                     is_inference_mode or not self.training,
                     fp8_protocol,
+                    fp8_weight_payload,
                 )
             else:
                 # hidden_states -> (total_q, hidden_size)
