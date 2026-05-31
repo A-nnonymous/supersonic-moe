@@ -34,9 +34,15 @@ import torch  # noqa: E402
 # ---------------------------------------------------------------------------
 
 def _quantize_and_pack(bf16: torch.Tensor):
-    """Rowwise blockscaled FP8 + ISA-packed scales (matches production path)."""
+    """Rowwise blockscaled FP8 + ISA-packed scales (matches GEMM A/B inputs)."""
     from sonicmoe.quack_utils.blockscaled_fp8_gemm import quantize_and_pack_activation
     return quantize_and_pack_activation(bf16)
+
+
+def _quantize_raw(bf16: torch.Tensor):
+    """Rowwise blockscaled FP8 + raw scales (matches DGated preact input)."""
+    from sonicmoe.quack_utils.blockscaled_fp8_gemm import quantize_activation_blockscaled_fast
+    return quantize_activation_blockscaled_fast(bf16)
 
 
 def _build_inputs(TK: int, K: int, N: int, E: int, device="cuda"):
@@ -46,9 +52,9 @@ def _build_inputs(TK: int, K: int, N: int, E: int, device="cuda"):
     dout = torch.randn(TK, K, dtype=torch.bfloat16, device=device) * 0.1
     dout_fp8, dout_scales = _quantize_and_pack(dout)
 
-    # z (TK, 2N) bf16 -> FP8 + scales (the "preact" input)
+    # z (TK, 2N) bf16 -> FP8 + raw scales (the DGated preact input)
     z = torch.randn(TK, 2 * N, dtype=torch.bfloat16, device=device) * 0.5
-    z_fp8, z_scales = _quantize_and_pack(z)
+    z_fp8, z_scales = _quantize_raw(z)
     z_scales_u8 = z_scales.view(torch.uint8)
 
     # w (H, I, E)  -> per-expert FP8 weights packed for the GEMM, shape (E, N=I, K=H)
@@ -123,6 +129,31 @@ def _build_inputs(TK: int, K: int, N: int, E: int, device="cuda"):
         dz_row_scales_3d=dz_row_scales_3d,
         dz_col_scales_3d=dz_col_scales_3d,
     )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="needs CUDA"
+)
+def test_direct_dgated_uses_transposed_iso32_scales():
+    from sonicmoe.quack_utils.blockscaled_fp8_gemm import (
+        _ISO32_WEIGHT_CACHE,
+        _cache_iso32_w2,
+        _simple_weight_key,
+        precompute_weight_fp8_for_direct_fused_dgated,
+    )
+
+    H, I, E = 256, 384, 2
+    w2 = torch.randn(H, I, E, dtype=torch.bfloat16, device="cuda") * 0.1
+    _ISO32_WEIGHT_CACHE.clear()
+    _cache_iso32_w2(w2)
+    cached_fp8, row_scales, col_scales = _ISO32_WEIGHT_CACHE[_simple_weight_key(w2)]
+
+    w2_fp8, w2_scales = precompute_weight_fp8_for_direct_fused_dgated(w2)
+
+    assert w2_fp8.data_ptr() == cached_fp8.data_ptr()
+    assert tuple(w2_fp8.shape) == (E, I, H)
+    assert w2_scales.data_ptr() == col_scales.data_ptr()
+    assert w2_scales.data_ptr() != row_scales.data_ptr()
 
 
 @pytest.mark.skipif(

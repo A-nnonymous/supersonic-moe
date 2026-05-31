@@ -17,6 +17,7 @@ import torch
 from cutlass import Float32, Int32, const_expr
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
+from cutlass._mlir.dialects import math as _math
 from cutlass.cute.runtime import from_dlpack
 from quack.cute_dsl_utils import ParamsBase, mlir_namedtuple, torch2cute_dtype_map
 from quack.epi_ops import ColVecReduce, TileStore, EpiOp, assume_stride_divisibility
@@ -1095,6 +1096,144 @@ def _fp8e4m3_to_f32(x, *, loc=None, ip=None) -> Float32:
 
 
 # ---------------------------------------------------------------------------
+# Hardware-accelerated quant helpers (TE cudnn parity optimizations)
+# ---------------------------------------------------------------------------
+# These replace multi-instruction ALU sequences with native SM100 PTX
+# instructions, saving 6-10 registers per quant path.
+# ---------------------------------------------------------------------------
+
+@dsl_user_op
+def _hardware_f32_to_e8m0(x: Float32, *, loc=None, ip=None) -> Float32:
+    """PTX f32→ue8m0→f32 roundtrip using native BX8 instructions.
+
+    Replaces the manual integer+carry e8m0 computation (~10 ALU ops) with
+    a single PTX inline asm (2 native instructions).  Returns the e8m0
+    scale as a bf16→f32 value (approximately 2^e8m0).
+
+    Reference: TE cudnn ``cvt_f32_to_f8_to_f32``.
+    """
+    src = x.ir_value(loc=loc, ip=ip) if hasattr(x, 'ir_value') else x
+    asm_tmpl = (
+        "{\n"
+        "  .reg .b16 bf_lo;\n"
+        "  cvt.rp.satfinite.ue8m0x2.f32 bf_lo, 0f00000000, $1;\n"
+        "  cvt.rn.bf16x2.ue8m0x2  $0, bf_lo;\n"
+        "}"
+    )
+    result = llvm.inline_asm(
+        T.f32(), [src],
+        asm_tmpl,
+        "=f,f",
+        has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+    return Float32(result)
+
+
+@dsl_user_op
+def _hardware_f32x4_to_f8x4_i32(fp32x4, fp8_dtype, *, loc=None, ip=None):
+    """PTX vec4 f32→fp8 conversion, packed as int32.
+
+    Uses ``cvt.rn.satfinite.e4m3x2.f32`` (x2 PTX) to convert 4 f32 values
+    into 4 packed fp8 bytes in one int32.  Replaces the DSL generic
+    ``r4.load().to(Float8E4M3FN)`` path which requires 4×4-element rmem
+    allocation + cast + recast.
+    """
+    from cutlass._mlir.dialects import vector as _vector
+
+    # Extract individual f32 values from the 4-element rmem tensor
+    f32_vals = fp32x4.load()  # Vec4f32
+
+    # Each PTX cvt.rn.satfinite.e4m3x2.f32 handles 2 f32 → 2 fp8
+    asm_tmpl = (
+        "{\n"
+        "  .reg .b16 lo, hi;\n"
+        "  cvt.rn.satfinite.e4m3x2.f32 lo, $2, $1;\n"
+        "  cvt.rn.satfinite.e4m3x2.f32 hi, $4, $3;\n"
+        "  mov.b32 $0, {lo, hi};\n"
+        "}"
+    )
+    # Get IR values from the 4 elements
+    def _ir(v, idx):
+        if hasattr(f32_vals, 'ir_value'):
+            vec_ir = f32_vals.ir_value(loc=loc, ip=ip)
+            return Float32(_vector.extract(vec_ir, [], [idx])).ir_value(loc=loc, ip=ip)
+        # Fallback: direct element access
+        return Float32(fp32x4[idx]).ir_value(loc=loc, ip=ip)
+
+    src0, src1, src2, src3 = _ir(f32_vals, 0), _ir(f32_vals, 1), _ir(f32_vals, 2), _ir(f32_vals, 3)
+    packed = llvm.inline_asm(
+        T.i32(),
+        [src0, src1, src2, src3],
+        asm_tmpl,
+        "=r,f,f,f,f",
+        has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+    return packed
+
+
+# Pre-computed constant: POW_2_127 = 2^127 ≈ 1.7e38.
+# Builder pattern: _i32_as_f32(Int32(254) << Int32(23)).
+# Used with hardware e8m0: quant_scale = POW_2_127 * rcp_approx(e8m0_float).
+
+
+@dsl_user_op
+def dswiglu_te_exp2(
+    x,
+    y,
+    dout,
+    *,
+    loc=None,
+    ip=None,
+):
+    """TE cudnn dswiglu formula using exp2 + rcp_approx.
+
+    This is a local Sonic copy of TE's vectorized dswiglu inner loop:
+      sig = rcp_approx(1 + exp2(-x * log2(e)))
+      swish = x * sig
+      dy = dout * swish
+      dx = dout * y * sig * (1 + x * (1 - sig))
+      out = swish * y
+
+    It replaces quack.activation.dswiglu's tanh.approx path and keeps the
+    same return contract (dx, dy, swiglu_out).
+    """
+    LOG2_E = Float32(1.4426950408889634)
+    if const_expr(not isinstance(x, tuple)):
+        sig_rcp = cute.math.exp2(Float32(0.0) - x * LOG2_E, fastmath=True) + Float32(1.0)
+        sig = cute.arch.rcp_approx(sig_rcp)
+        swish = x * sig
+        dy = dout * swish
+        dsig = x * (Float32(1.0) - sig)
+        dx = dout * y * sig * (Float32(1.0) + dsig)
+        out = swish * y
+        return dx, dy, out
+    else:
+        neg_log2e = (-LOG2_E, -LOG2_E)
+        sig_rcp = cute.arch.mul_packed_f32x2(x, neg_log2e, rnd="rn", ftz=False)
+        sig_rcp = cute.arch.add_packed_f32x2(
+            (
+                cute.math.exp2(sig_rcp[0], fastmath=True),
+                cute.math.exp2(sig_rcp[1], fastmath=True),
+            ),
+            (Float32(1.0), Float32(1.0)),
+            rnd="rn",
+            ftz=False,
+        )
+        sig = (cute.arch.rcp_approx(sig_rcp[0]), cute.arch.rcp_approx(sig_rcp[1]))
+        swish = cute.arch.mul_packed_f32x2(x, sig, rnd="rn", ftz=False)
+        dy = cute.arch.mul_packed_f32x2(dout, swish, rnd="rn", ftz=False)
+        dx = cute.arch.mul_packed_f32x2(dout, y, rnd="rn", ftz=False)
+        dx = cute.arch.mul_packed_f32x2(dx, sig, rnd="rn", ftz=False)
+        dsig = cute.arch.mul_packed_f32x2(x, (Float32(1.0) - sig[0], Float32(1.0) - sig[1]), rnd="rn", ftz=False)
+        dsig = cute.arch.add_packed_f32x2(dsig, (Float32(1.0), Float32(1.0)), rnd="rn", ftz=False)
+        dx = cute.arch.mul_packed_f32x2(dx, dsig, rnd="rn", ftz=False)
+        out = cute.arch.mul_packed_f32x2(swish, y, rnd="rn", ftz=False)
+        return dx, dy, out
+
+
+# ---------------------------------------------------------------------------
 # FP8PreActLoad EpiOp (from gemm_dgated.py)
 # ---------------------------------------------------------------------------
 
@@ -1889,12 +2028,281 @@ class GemmDGatedFP8CLoadIso32QuantMixin(GemmDGatedFP8CLoadMixin):
                         col_inner_off = col_row_base + col_k_in_tile
                         col_t[col_n_tile, col_k_tile_idx, col_inner_off] = cutlass.Int8(e8m0)
 
-        # ── Write dXY back to BF16 D (unchanged from parent) ──
-        if const_expr(self.c_dtype == cutlass.Int16):
-            pack_dtype = cutlass.BFloat16
-        else:
-            pack_dtype = params.implicit_dtype
-        tRS_rdXY_f16x2 = cute.make_rmem_tensor(tRS_rdXY_f32x2.layout, pack_dtype)
-        tRS_rdXY_f16x2.store(tRS_rdXY_f32x2.load().to(pack_dtype))
-        tRS_rD.store(cute.recast_tensor(tRS_rdXY_f16x2, Float32).load())
+        # ── Write dXY back to BF16 D (only when iso32 is NOT active) ──
+        if const_expr(iso32_info is None):
+            if const_expr(self.c_dtype == cutlass.Int16):
+                pack_dtype = cutlass.BFloat16
+            else:
+                pack_dtype = params.implicit_dtype
+            tRS_rdXY_f16x2 = cute.make_rmem_tensor(tRS_rdXY_f32x2.layout, pack_dtype)
+            tRS_rdXY_f16x2.store(tRS_rdXY_f32x2.load().to(pack_dtype))
+            tRS_rD.store(cute.recast_tensor(tRS_rdXY_f16x2, Float32).load())
+        return tRS_rOut
+
+
+# ---------------------------------------------------------------------------
+# Y1sColQuantStore EpiOp — side-channel FP8 y1s + col-ISA SF for DGated
+# ---------------------------------------------------------------------------
+#
+# Captures per-element (m_abs, n_abs) coordinates for y1s so the mixin can:
+#   * scatter-store FP8 y1s bytes to gmem  mY1sFp8  [TK, I]  uint8
+#   * scatter-store col-axis ISA-pack SF bytes  mY1sScaleIsaCol  uint8
+#
+# Reference: TE cudnn `quant_sfd_col` — per-col warp redux with e8m0
+# cast-roundtrip.  Single warp_redux_sync per N-col, same invariant as
+# BlockscaledColQuantOnlyMixin but applied to DGated postact (tRS_rOut),
+# NOT to D output.
+# ---------------------------------------------------------------------------
+
+
+class Y1sColQuantStore(EpiOp):
+    """EpiOp: captures coords for per-element scatter store of fp8 y1s +
+    col-ISA SF bytes.  Mirrors :class:`FP8PreActLoad` but in the write
+    direction; passes a single tuple-payload through to the mixin's
+    ``epi_visit_subtile``.
+    """
+
+    def param_fields(self):
+        return [(self.name, object, None)]
+
+    def smem_bytes(self, arg_tensor, cta_tile_shape_mnk, epi_tile):
+        return 0
+
+    def to_params(self, gemm, args):
+        fp8 = getattr(args, self.name + "_fp8", None)
+        col = getattr(args, self.name + "_col", None)
+        if fp8 is None and col is None:
+            return {self.name: None}
+        return {
+            self.name: (
+                assume_stride_divisibility(fp8) if fp8 is not None else None,
+                assume_stride_divisibility(col) if col is not None else None,
+            )
+        }
+
+    @cute.jit
+    def begin(self, gemm, param, smem_tensor, ctx):
+        if const_expr(param is not None):
+            fp8_t, col_t = param
+            tile_M = gemm.cta_tile_shape_mnk[0]
+            tile_N = gemm.cta_tile_shape_mnk[1]
+            if const_expr(ctx.varlen_manager.varlen_m):
+                m_offset = ctx.varlen_manager.params.cu_seqlens_m[ctx.tile_coord_mnkl[3]]
+                m_limit = ctx.varlen_manager.params.cu_seqlens_m[
+                    ctx.tile_coord_mnkl[3] + Int32(1)
+                ]
+            else:
+                m_offset = Int32(0)
+                m_limit = Int32(2_000_000_000)
+            m_base = ctx.tile_coord_mnkl[0] * tile_M
+            n_base = ctx.tile_coord_mnkl[1] * tile_N
+            n_limit = col_t.shape[0] * Int32(128)  # total N for bounds check
+            tDcD = ctx.partition_for_epilogue_fn(
+                cute.make_identity_tensor((tile_M, tile_N))
+            )
+            lane_id = ctx.tidx % Int32(32)
+            return (fp8_t, col_t, tDcD, m_offset, m_base, n_base, n_limit, m_limit, lane_id)
+        return None
+
+    @cute.jit
+    def begin_loop(self, gemm, state, epi_coord):
+        if const_expr(state is not None):
+            fp8_t, col_t, tDcD, m_offset, m_base, n_base, n_limit, m_limit, lane_id = state
+            tDcD_sub = cute.group_modes(tDcD, 3, cute.rank(tDcD))[None, None, None, epi_coord]
+            return (fp8_t, col_t, tDcD_sub, m_offset, m_base, n_base, n_limit, m_limit, lane_id)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# GemmDGatedFP8CLoadY1sColQuantMixin
+# ---------------------------------------------------------------------------
+#
+# Side-channel FP8 y1s + col-ISA SF quant for DGated FP8-C-load.
+# Keeps BF16 y1s path fully intact; ADDITIONALLY writes:
+#   - y1s_fp8     (Float8E4M3FN, varlen TK x I) via per-byte scatter
+#   - y1s_sf_col   ISA-pack col-axis SF
+#
+# Replaces the standalone `_colwise_quantize_and_pack_kernel(y1s)`
+# (~79 us at production T=8192 E=8) once flag-wired.
+#
+# Reference: TE cudnn `quant_sfd_col` — per-col warp_redux_sync with
+# e8m0 roundtrip, same math as BlockscaledColQuantOnlyMixin but applied
+# to DGated postact (tRS_rOut) instead of D output (tRS_rD).
+# ---------------------------------------------------------------------------
+
+
+class GemmDGatedFP8CLoadY1sColQuantMixin(GemmDGatedFP8CLoadMixin):
+    """GemmDGatedFP8CLoad + side-channel y1s FP8 + col-SF quant (additive)."""
+
+    _epi_ops = (
+        *GemmDGatedFP8CLoadMixin._epi_ops,
+        Y1sColQuantStore("mY1sColQuant"),
+    )
+
+    @mlir_namedtuple
+    class EpilogueArguments(NamedTuple):
+        mPostAct: cute.Tensor
+        act_bwd_fn: cutlass.Constexpr[Callable] = None
+        implicit_dtype: cutlass.Constexpr[type] = cutlass.BFloat16
+        alpha: Optional[Float32 | cute.Tensor] = None
+        beta: Optional[Float32 | cute.Tensor] = None
+        mRowVecBroadcast: Optional[cute.Tensor] = None
+        mColVecBroadcast: Optional[cute.Tensor] = None
+        mColVecReduce: Optional[cute.Tensor] = None
+        rounding_mode: cutlass.Constexpr[int] = 0
+        sr_seed: Optional[Int32 | cute.Tensor] = None
+        mFP8PreAct_fp8: Optional[cute.Tensor] = None
+        mFP8PreAct_scales: Optional[cute.Tensor] = None
+        mY1sColQuant_fp8: Optional[cute.Tensor] = None
+        mY1sColQuant_col: Optional[cute.Tensor] = None
+
+    @cute.jit
+    def epi_visit_subtile(self, params, epi_loop_tensors, tRS_rD, tRS_rC=None):
+        # Run the parent epi_visit_subtile (FP8CLoad) to get tRS_rOut.
+        tRS_rOut = GemmDGatedFP8CLoadMixin.epi_visit_subtile(
+            self, params, epi_loop_tensors, tRS_rD, tRS_rC
+        )
+
+        # ── Side-channel: y1s colwise FP8 quant ──
+        y1s_info = epi_loop_tensors["mY1sColQuant"]
+        if const_expr(y1s_info is not None):
+            fp8_t, col_t, tDcD_sub, m_offset, m_base, n_base, n_limit, m_limit, lane_id = y1s_info
+            num_d = cute.size(tDcD_sub)
+
+            fp8_t_u8 = cute.recast_tensor(fp8_t, cutlass.Uint8) if const_expr(fp8_t is not None) else None
+
+            # Per-col amax + quant: group four N columns so the expensive FP8
+            # cast uses one vec4 conversion, matching TE's quant_sfd_col shape.
+            for j4 in cutlass.range(num_d // 4, unroll_full=True):
+                if const_expr(fp8_t is not None):
+                    qvals = cute.make_rmem_tensor(cute.make_layout(4), Float32)
+                e8m0s = cute.make_rmem_tensor(cute.make_layout(4), Int32)
+
+                for jj in cutlass.range(4, unroll_full=True):
+                    j = j4 * 4 + jj
+                    val = tRS_rOut[j]
+                    neg = Float32(0.0) - val
+                    abs_val = cute.arch.fmax(val, neg)
+                    amax_j = cute.arch.warp_redux_sync(abs_val, "max")
+                    amax_j = cute.arch.fmax(amax_j, Float32(1e-4))
+
+                    # Integer e8m0 for uint8 ISA SF store (must match consumer encoding).
+                    amax_bits = _f32_as_i32(amax_j)
+                    biased_exp = (amax_bits >> Int32(23)) & Int32(0xFF)
+                    mantissa_bits = amax_bits & Int32(0x7FFFFF)
+                    has_carry = cutlass.Boolean(mantissa_bits > Int32(0x600000))
+                    carry = Int32(1) if has_carry else Int32(0)
+                    e8m0 = biased_exp - Int32(8) + carry
+                    e8m0 = e8m0 if cutlass.Boolean(biased_exp > Int32(0)) else Int32(0)
+                    e8m0 = e8m0 if cutlass.Boolean(e8m0 > Int32(0)) else Int32(0)
+                    e8m0s[jj] = e8m0
+
+                    # Hardware-accelerated quant_scale (TE cudnn parity).
+                    # e8m0_float ≈ 2^actual_exp; scale = 256 * rcp = 2^(8-actual_exp).
+                    if const_expr(fp8_t is not None or self.postact_dtype == cutlass.Float8E4M3FN):
+                        qexp = Int32(254) - e8m0
+                        qexp_hi = cutlass.Boolean(qexp > Int32(254))
+                        qexp = Int32(254) if qexp_hi else qexp
+                        qexp_lo = cutlass.Boolean(qexp < Int32(1))
+                        qexp = Int32(1) if qexp_lo else qexp
+                        quant_scale = _i32_as_f32(qexp << Int32(23))
+                        if const_expr(fp8_t is not None):
+                            qvals[jj] = val * quant_scale
+                        else:
+                            tRS_rOut[j] = val * quant_scale
+
+                if const_expr(fp8_t is not None):
+                    qvals_fp8 = cute.make_rmem_tensor(cute.make_layout(4), cutlass.Float8E4M3FN)
+                    qvals_fp8.store(qvals.load().to(cutlass.Float8E4M3FN))
+                    qvals_u8 = cute.recast_tensor(qvals_fp8, cutlass.Uint8)
+
+                for jj in cutlass.range(4, unroll_full=True):
+                    j = j4 * 4 + jj
+                    coord = tDcD_sub[j]
+                    row = coord[0]
+                    col = coord[1]
+                    n_abs = n_base + col
+                    m_abs = m_offset + m_base + row
+                    m_warp_base = m_abs - lane_id
+                    m_group_abs = m_warp_base // Int32(32)
+                    if const_expr(col_t is not None):
+                        col_n_tile = n_abs // Int32(128)
+                        col_row_in_tile = n_abs % Int32(128)
+                        col_k_tile_idx = m_group_abs // Int32(4)
+                        col_k_in_tile = m_group_abs % Int32(4)
+                        col_row_base = (col_row_in_tile % Int32(32)) * Int32(16) + (
+                            col_row_in_tile // Int32(32)
+                        ) * Int32(4)
+                        col_inner_off = col_row_base + col_k_in_tile
+                        ok_c = (
+                            cutlass.Boolean(n_abs < n_limit)
+                            & cutlass.Boolean(m_warp_base < m_limit)
+                            & cutlass.Boolean(lane_id == Int32(0))
+                        )
+                        if ok_c:
+                            col_t[col_n_tile, col_k_tile_idx, col_inner_off] = cutlass.Int8(e8m0s[jj])
+
+                    if const_expr(fp8_t is not None):
+                        ok_m = cutlass.Boolean(m_abs < m_limit)
+                        if ok_m:
+                            fp8_t_u8[m_abs, n_abs] = qvals_u8[jj]
+
+            for j_tail in cutlass.range(num_d - (num_d % 4), num_d, unroll_full=True):
+                val = tRS_rOut[j_tail]
+                neg = Float32(0.0) - val
+                abs_val = cute.arch.fmax(val, neg)
+                amax_j = cute.arch.warp_redux_sync(abs_val, "max")
+                amax_j = cute.arch.fmax(amax_j, Float32(1e-4))
+                amax_bits = _f32_as_i32(amax_j)
+                biased_exp = (amax_bits >> Int32(23)) & Int32(0xFF)
+                mantissa_bits = amax_bits & Int32(0x7FFFFF)
+                has_carry = cutlass.Boolean(mantissa_bits > Int32(0x600000))
+                carry = Int32(1) if has_carry else Int32(0)
+                e8m0 = biased_exp - Int32(8) + carry
+                e8m0 = e8m0 if cutlass.Boolean(biased_exp > Int32(0)) else Int32(0)
+                e8m0 = e8m0 if cutlass.Boolean(e8m0 > Int32(0)) else Int32(0)
+                val_scaled = val
+                if const_expr(fp8_t is not None or self.postact_dtype == cutlass.Float8E4M3FN):
+                    qexp = Int32(254) - e8m0
+                    qexp_hi = cutlass.Boolean(qexp > Int32(254))
+                    qexp = Int32(254) if qexp_hi else qexp
+                    qexp_lo = cutlass.Boolean(qexp < Int32(1))
+                    qexp = Int32(1) if qexp_lo else qexp
+                    quant_scale = _i32_as_f32(qexp << Int32(23))
+                    val_scaled = val * quant_scale
+                    if const_expr(fp8_t is None):
+                        tRS_rOut[j_tail] = val_scaled
+                coord = tDcD_sub[j_tail]
+                row = coord[0]
+                col = coord[1]
+                n_abs = n_base + col
+                m_abs = m_offset + m_base + row
+                m_warp_base = m_abs - lane_id
+                m_group_abs = m_warp_base // Int32(32)
+                if const_expr(col_t is not None):
+                    col_n_tile = n_abs // Int32(128)
+                    col_row_in_tile = n_abs % Int32(128)
+                    col_k_tile_idx = m_group_abs // Int32(4)
+                    col_k_in_tile = m_group_abs % Int32(4)
+                    col_row_base = (col_row_in_tile % Int32(32)) * Int32(16) + (
+                        col_row_in_tile // Int32(32)
+                    ) * Int32(4)
+                    col_inner_off = col_row_base + col_k_in_tile
+                    ok_c = (
+                        cutlass.Boolean(n_abs < n_limit)
+                        & cutlass.Boolean(m_warp_base < m_limit)
+                        & cutlass.Boolean(lane_id == Int32(0))
+                    )
+                    if ok_c:
+                        col_t[col_n_tile, col_k_tile_idx, col_inner_off] = cutlass.Int8(e8m0)
+                if const_expr(fp8_t is not None):
+                    ok_m = cutlass.Boolean(m_abs < m_limit)
+                    if ok_m:
+                        r4 = cute.make_rmem_tensor(cute.make_layout(4), Float32)
+                        r4[0] = val_scaled
+                        r4_fp8 = cute.make_rmem_tensor(cute.make_layout(4), cutlass.Float8E4M3FN)
+                        r4_fp8.store(r4.load().to(cutlass.Float8E4M3FN))
+                        r4_u8 = cute.recast_tensor(r4_fp8, cutlass.Uint8)
+                        fp8_t_u8[m_abs, n_abs] = r4_u8[0]
+
         return tRS_rOut

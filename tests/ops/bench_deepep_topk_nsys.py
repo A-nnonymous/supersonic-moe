@@ -26,14 +26,13 @@ os.environ["SONIC_MOE_FP8_ASSUME_ALIGNED"] = "1"
 sys.path[:0] = {paths}
 
 import paddle
-paddle.compat.enable_torch_proxy(scope={{"sonicmoe","quack","triton"}}, silent=True)
+paddle.enable_compat()
 import torch
 
 from sonicmoe.enums import ActivationType
 from sonicmoe.functional import clear_all_fp8_weight_caches, _refresh_fp8_config
 from sonicmoe.functional.utils import enable_fp8
-from sonicmoe.ernie_compat.mlp_node_v2 import (
-    SonicMoEMlpNode, invalidate_weight_caches, flush_native_grads)
+from sonicmoe.ernie_compat.mlp_node_v2 import SonicMoEMlpNode, invalidate_weight_caches
 import sonicmoe.ernie_compat.mlp_node_v2 as _m
 
 class _FL:
@@ -43,6 +42,10 @@ class _FE:
         self.up_gate_proj = _FL(w1); self.down_proj = _FL(w2)
 
 T, H, I, E, K = {T}, {H}, {I}, {E}, {K}
+PREQUANT_DISPATCH = {prequant_dispatch}
+RECOMPUTE_Z = {recompute_z}
+os.environ["SONIC_MOE_FP8_SAVE_Z_FP8"] = "1"
+os.environ["SONIC_MOE_FP8_RECOMPUTE_Z"] = "1" if RECOMPUTE_Z else "0"
 paddle.seed(42)
 
 experts = []
@@ -58,19 +61,35 @@ node = SonicMoEMlpNode(experts=experts, n_experts=E, hidden_size=H,
 x = paddle.randn([T, H], dtype="bfloat16")
 out_grad = paddle.randn([T, H], dtype="bfloat16")
 
+def prequant_kwargs_for(x_tensor):
+    if not PREQUANT_DISPATCH:
+        return {{}}
+    from sonicmoe.quack_utils.blockscaled_fp8_gemm import quantize_and_pack_activation
+    x_torch = torch.from_dlpack(x_tensor.detach()).to(device="cuda")
+    x_fp8, x_scales = quantize_and_pack_activation(x_torch)
+    return {{
+        "dispatched_hidden_states_fp8": x_fp8,
+        "dispatched_hidden_states_scales": x_scales,
+        "dispatched_hidden_states_scale_layout": "sonic_1x32_isa",
+    }}
+
 di = paddle.zeros([T, K], dtype="int32")
 dp = paddle.full([T, K], 1.0/K, dtype="float32")
 for i in range(T):
     di[i] = paddle.randperm(E)[:K].cast("int32")
 tpe = paddle.bincount(di.reshape([-1]).cast("int64"), minlength=E).tolist()
 
-# Warmup (forward-only)
+# Steady-state input/payload: BENCH must only contain node fwd+bwd.
+x.stop_gradient = False
+prequant_kwargs = prequant_kwargs_for(x)
+
+# Warmup (fwd+bwd, cache/JIT warm)
 invalidate_weight_caches(); clear_all_fp8_weight_caches()
 for _ in range({warmup}):
-    xw = paddle.randn_like(x); xw.stop_gradient = False
     with enable_fp8(True):
         _refresh_fp8_config()
-        _ = node(xw, tpe, di, dp)
+        ot = node(x, tpe, di, dp, **prequant_kwargs)
+    ot.backward(out_grad)
 paddle.device.cuda.synchronize()
 
 # Memory
@@ -81,13 +100,10 @@ mem_pre = paddle.device.cuda.memory_allocated() / MiB
 # Measured iterations (cudaProfilerStart/Stop bracket)
 torch.cuda.cudart().cudaProfilerStart()
 for _ in range({iters}):
-    xt = paddle.randn_like(x); xt.stop_gradient = False
-    invalidate_weight_caches()
     with enable_fp8(True):
         _refresh_fp8_config()
-        ot = node(xt, tpe, di, dp)
+        ot = node(x, tpe, di, dp, **prequant_kwargs)
     ot.backward(out_grad)
-    flush_native_grads()
 torch.cuda.synchronize()
 torch.cuda.cudart().cudaProfilerStop()
 
@@ -163,7 +179,8 @@ def parse_sqlite(db_path, num_iters):
         "per_iter_us": round(gpu_us / num_iters, 1),
         "num_kernels": len(kernels),
         "kernels_per_iter": round(len(kernels) / num_iters, 1),
-        "top_kernels": breakdown[:20],
+        "top_kernels": breakdown[:40],
+        "all_kernels": breakdown,
     }
 
 
@@ -181,6 +198,10 @@ def main():
     p.add_argument("--warmup", type=int, default=5)
     p.add_argument("--iters", type=int, default=12)
     p.add_argument("--gpu", type=int, default=0)
+    p.add_argument("--prequant-dispatch", action="store_true",
+                   help="Pass pre-quantized dispatched_hidden_states FP8 payload into SonicMoEMlpNode")
+    p.add_argument("--recompute-z", action="store_true",
+                   help="Enable SONIC_MOE_FP8_RECOMPUTE_Z in the profiled worker")
     a = p.parse_args()
 
     label = f"T{a.T}_H{a.H}_I{a.I}_E{a.E}_K{a.K}"
@@ -194,6 +215,8 @@ def main():
         paths=[_QUACK, _REPO],
         T=a.T, H=a.H, I=a.I, E=a.E, K=a.K,
         warmup=a.warmup, iters=a.iters,
+        prequant_dispatch="True" if a.prequant_dispatch else "False",
+        recompute_z="True" if a.recompute_z else "False",
     )
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".py", delete=False, prefix=f"nsys_mlpnode_{label}_"
@@ -208,6 +231,8 @@ def main():
     cmd = [
         nsys_bin, "profile",
         "--trace=cuda,nvtx",
+        "--capture-range=cudaProfilerApi",
+        "--capture-range-end=stop",
         "--sample=none",
         "--backtrace=none",
         "--resolve-symbols=false",
@@ -219,7 +244,9 @@ def main():
 
     print(f"Shape: T={a.T} H={a.H} I={a.I} E={a.E} K={a.K}")
     print(f"Running {a.warmup}w + {a.iters}m iters on GPU {a.gpu}...")
-    print(f"  cmd: {' '.join(cmd[:6])} ...")
+    print(f"  prequant_dispatch={a.prequant_dispatch}")
+    print(f"  recompute_z={a.recompute_z}")
+    print(f"  cmd: {' '.join(cmd[:8])} ...")
 
     proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=env)
 
@@ -269,6 +296,12 @@ def main():
     print(f"\n  Top kernels (per iter):")
     for k in perf.get("top_kernels", [])[:10]:
         print(f"    {k['per_iter_us']:8.1f} µs  x{k['count']//a.iters:3d}  {k['name'][:80]}")
+
+    print(f"\n  Quant/transpose/index kernels (per iter):")
+    interesting = ("quant", "Quant", "TilingSwap", "transpose", "Transpose", "index", "Index", "gather", "Gather", "elementwise", "Elementwise")
+    for k in perf.get("all_kernels", []):
+        if any(s in k["name"] for s in interesting):
+            print(f"    {k['per_iter_us']:8.1f} µs  x{k['count']//a.iters:3d}  {k['name'][:100]}")
 
     json_path = os.path.join(out_dir, f"{label}.json")
     with open(json_path, "w") as f:

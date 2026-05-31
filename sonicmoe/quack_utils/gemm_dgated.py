@@ -3,6 +3,7 @@
 # ********************************************************************************
 
 from functools import partial
+import os
 from typing import Callable, NamedTuple, Optional
 
 import cutlass
@@ -42,12 +43,14 @@ from ._gated_epilogues import (
     FP8PreActLoad,
     GemmDGatedFP8PreActMixin,
     GemmDGatedFP8CLoadMixin,
+    dswiglu_te_exp2,
 )
 
 from .gemm_sm100_fp8_zeromat import (
     GemmDGatedSm100ZeroMat,
     GemmDGatedFP8CLoadSm100ZeroMat,
     GemmDGatedFP8CLoadIso32QuantSm100ZeroMat,
+    GemmDGatedFP8CLoadY1sColQuantSm100ZeroMat,
 )
 
 _E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", torch.uint8)
@@ -101,6 +104,8 @@ def gemm_dgated(
     iso32_dz_fp8: Optional[Tensor] = None,  # (total_m, 2n) fp8 — side-channel iso32 FP8 dXY output
     iso32_dz_row_scales: Optional[Tensor] = None,  # ISA-pack row-axis SF (num_m_tiles, k_tiles, 512) uint8
     iso32_dz_col_scales: Optional[Tensor] = None,  # ISA-pack col-axis SF (num_n_tiles, col_k_tiles, 512) uint8
+    y1s_col_fp8: Optional[Tensor] = None,  # (total_m, n) fp8 — side-channel FP8 y1s output
+    y1s_col_scales: Optional[Tensor] = None,  # ISA-pack col-axis SF (num_n_tiles, col_k_tiles, 512) uint8
 ) -> None:
     """If tile_count_semaphore is provided, it must already be zero'ed out."""
     fp8_preact_mode = preact_fp8 is not None and preact_scales is not None
@@ -109,8 +114,11 @@ def gemm_dgated(
         or iso32_dz_row_scales is not None
         or iso32_dz_col_scales is not None
     )
+    y1s_col_quant_mode = y1s_col_fp8 is not None or y1s_col_scales is not None
     if iso32_dz_mode:
         assert fp8_preact_mode, "iso32_dz fusion requires fp8_preact_mode"
+    if y1s_col_quant_mode:
+        assert fp8_preact_mode, "y1s_col fusion requires fp8_preact_mode"
     if cu_seqlens_m is not None:
         assert persistent, "varlen_m requires persistent=True"
         assert A.stride(-1) == 1, "varlen_m requires A to be k-major"
@@ -179,7 +187,9 @@ def gemm_dgated(
     if fp8_preact_mode:
         assert device_capacity[0] > 9, "FP8 PreAct only supported on SM100+"
         if gather_A and blockscaled_runtime:
-            if iso32_dz_mode:
+            if y1s_col_quant_mode:
+                GemmCls = GemmDGatedFP8CLoadY1sColQuantSm100ZeroMat
+            elif iso32_dz_mode:
                 GemmCls = GemmDGatedFP8CLoadIso32QuantSm100ZeroMat
             else:
                 GemmCls = GemmDGatedFP8CLoadSm100ZeroMat
@@ -212,7 +222,9 @@ def gemm_dgated(
                 info.tensor,
                 leading_dim=1 if info.major == major_configs[name][1] else 0,
             )
-    act_fn = dgate_fn_map[activation]
+    act_fn = dswiglu_te_exp2 if (
+        activation == "swiglu" and os.environ.get("SONIC_MOE_DSWIGLU_TE_EXP2", "0") == "1"
+    ) else dgate_fn_map[activation]
     epi_kwargs = {}
     if fp8_preact_mode:
         epi_kwargs["mFP8PreAct_fp8"] = _make_cute_tensor_dynamic(preact_fp8, leading_dim=1)
@@ -224,6 +236,11 @@ def gemm_dgated(
             epi_kwargs["mDZFp8Iso32_row"] = _make_cute_tensor_dynamic(iso32_dz_row_scales, leading_dim=2)
         if iso32_dz_col_scales is not None:
             epi_kwargs["mDZFp8Iso32_col"] = _make_cute_tensor_dynamic(iso32_dz_col_scales, leading_dim=2)
+    if y1s_col_quant_mode:
+        if y1s_col_fp8 is not None:
+            epi_kwargs["mY1sColQuant_fp8"] = _make_cute_tensor_dynamic(y1s_col_fp8, leading_dim=1)
+        if y1s_col_scales is not None:
+            epi_kwargs["mY1sColQuant_col"] = _make_cute_tensor_dynamic(y1s_col_scales, leading_dim=2)
     epi_args = GemmCls.EpilogueArguments(
         tensor_infos["PostAct"].cute_tensor,
         act_fn,
@@ -282,6 +299,7 @@ def gemm_dgated(
         blockscaled,
         fp8_preact_mode,
         iso32_dz_mode,
+        y1s_col_quant_mode,
         key_tensor_names=("A", "B", "D", "PostAct", "C"),
     )
     cache = gemm_dgated.compile_cache

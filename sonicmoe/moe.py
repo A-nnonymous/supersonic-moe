@@ -26,6 +26,7 @@ from .quack_utils import (
     precompute_weight_fp8_warmup,
     quantize_and_pack_activation,
 )
+from .quack_utils.blockscaled_fp8_gemm import _FUSED_WEIGHT_CACHE, _VARLEN_WEIGHT_CACHE, _quantize_weight_3d_triton
 
 
 try:
@@ -317,7 +318,6 @@ class MoE(nn.Module):
         # Shadow weights live in the runtime caches. If the cache was populated
         # by refresh_fp8_shadow_weights() with the current _version, hits are guaranteed.
         # We can't cheaply verify cache freshness, so just check if caches are non-empty.
-        from .quack_utils.blockscaled_fp8_gemm import _VARLEN_WEIGHT_CACHE, _FUSED_WEIGHT_CACHE
         return len(_VARLEN_WEIGHT_CACHE) > 0 and len(_FUSED_WEIGHT_CACHE) > 0
 
     @torch.no_grad()
@@ -352,15 +352,6 @@ class MoE(nn.Module):
         self._cpu_w1 = self.c_fc.weight.data.to('cpu', non_blocking=True).pin_memory()
         self._cpu_w2 = self.c_proj.weight.data.to('cpu', non_blocking=True).pin_memory()
 
-        # Publish fp8 references to the functional layer so that forward/backward
-        # can bypass global cache lookups (whose keys depend on data_ptr which
-        # will change when we replace .data below).
-        from .functional import _STASHED_FP8_WEIGHTS
-        _STASHED_FP8_WEIGHTS["w1_fused"] = self._fp8_w1_fused
-        _STASHED_FP8_WEIGHTS["w2_varlen"] = self._fp8_w2_varlen
-        _STASHED_FP8_WEIGHTS["w2_dgated"] = self._fp8_w2_dgated
-        _STASHED_FP8_WEIGHTS["w1T_varlen"] = self._fp8_w1T_varlen
-
         # Replace parameter data with a 1-element expanded tensor (2 bytes).
         # This preserves the Parameter's shape (so .permute() works in the
         # autograd graph) while freeing ~216 MiB of GPU storage.
@@ -387,12 +378,8 @@ class MoE(nn.Module):
         self.c_fc.weight.data = self._cpu_w1.to(device, non_blocking=True)
         self.c_proj.weight.data = self._cpu_w2.to(device, non_blocking=True)
         del self._cpu_w1, self._cpu_w2
-        # Clear stashed fp8 references — next forward should use global cache
-        from .functional import _STASHED_FP8_WEIGHTS
-        _STASHED_FP8_WEIGHTS.clear()
         # Clear FP8 weight caches — data_ptr changed after restore, old cache
         # entries would be stale and leak memory on next refresh.
-        from .functional import clear_all_fp8_weight_caches
         clear_all_fp8_weight_caches()
         self._stashed = False
 
@@ -461,7 +448,6 @@ class MoE(nn.Module):
                 )
                 # Quantization error: bf16 -> fp8 -> bf16 roundtrip
                 # Use the same quantize function as refresh_fp8_shadow_weights
-                from .quack_utils.blockscaled_fp8_gemm import _quantize_weight_3d_triton
                 enk = bf16_post.contiguous()  # (E, dim0, dim1) contiguous
                 fp8_3d, _ = _quantize_weight_3d_triton(enk)
                 # fp8_3d is (E, dim0, dim1) fp8. Dequant = cast back (loses scale info)
@@ -575,8 +561,17 @@ class MoE(nn.Module):
         with ExitStack() as stack:
             if active_config is not None:
                 stack.enter_context(active_config.activate())
+            fp8_weight_payload = None
             if use_fp8:
                 stack.enter_context(enable_fp8())
+                if not self.has_fp8_shadow_weights():
+                    raise RuntimeError("Sonic FP8 forward requires refresh_fp8_shadow_weights() before use_fp8=True")
+                fp8_weight_payload = {
+                    "w1_fused": self._fp8_w1_fused,
+                    "w2_varlen": self._fp8_w2_varlen,
+                    "w2_dgated": self._fp8_w2_dgated,
+                    "w1T_varlen": self._fp8_w1T_varlen,
+                }
 
             if kernel_backend_moe == KernelBackendMoE.sonicmoe and self.num_experts <= 32768:
                 hidden_states, router_logits, expert_frequency = moe_TC_softmax_topk_layer(
@@ -591,6 +586,7 @@ class MoE(nn.Module):
                     self.activation_function,
                     is_inference_mode or not self.training,
                     fp8_protocol,
+                    fp8_weight_payload,
                 )
             else:
                 # hidden_states -> (total_q, hidden_size)

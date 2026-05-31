@@ -52,6 +52,7 @@ from ._gated_epilogues import (
     GemmDGatedMixin,
     GemmDGatedFP8CLoadMixin,
     GemmDGatedFP8CLoadIso32QuantMixin,
+    GemmDGatedFP8CLoadY1sColQuantMixin,
 )
 
 from cutlass.utils import LayoutEnum
@@ -149,8 +150,9 @@ class _GemmSm100ZeroMatMixin:
             # ============================================================
             if const_expr(self.gather_A):
                 # mA is (T, K) but GEMM logically has TK output rows.
-                # Use (TK, K) = (mD.shape[0], mA.shape[1]) for SFA layout.
-                sfa_logical_shape = (mD.shape[0], mA.shape[1])
+                # Use D when present, otherwise mPostAct; both carry total_M.
+                total_m = mD.shape[0] if const_expr(mD is not None) else epilogue_args.mPostAct.shape[0]
+                sfa_logical_shape = (total_m, mA.shape[1])
                 sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(
                     sfa_logical_shape, self.sf_vec_size
                 )
@@ -461,6 +463,22 @@ class GemmDGatedFP8CLoadIso32QuantSm100ZeroMat(
     Wire-up: set ``mDZFp8Iso32_fp8`` / ``mDZFp8Iso32_row`` / ``mDZFp8Iso32_col``
     in the EpilogueArguments to enable the side-channel.  All-None leaves
     behaviour byte-identical to the parent.
+    """
+    pass
+
+
+class GemmDGatedFP8CLoadY1sColQuantSm100ZeroMat(
+    GemmDGatedFP8CLoadY1sColQuantMixin, _GemmSm100ZeroMatMixin, GemmSm100
+):
+    """SM100 GemmDGated FP8-CLoad + side-channel FP8 y1s + col-SF quant + ZeroMat.
+
+    Additive over ``GemmDGatedFP8CLoadSm100ZeroMat``: keeps the BF16 postact
+    output intact AND optionally writes FP8 y1s + col-ISA SF tensors via
+    per-element gmem scatter.
+
+    Wire-up: set ``mY1sColQuant_fp8`` / ``mY1sColQuant_col`` in the
+    EpilogueArguments to enable the side-channel.  All-None leaves behaviour
+    byte-identical to the parent.
     """
     pass
 

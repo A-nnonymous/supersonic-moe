@@ -110,7 +110,7 @@ def gpu_projection_us(sqlite_path: str, n_iters: int) -> float:
     return total_ns / 1000.0 / n_iters  # ns → µs, per iter
 
 
-def run_benchmark(T, E, I, topk, n_warmup, n_iters, imbalance="none", seed=42, H=3072, mode="fp8"):
+def run_benchmark(T, E, I, topk, n_warmup, n_iters, imbalance="none", seed=42, H=3072, mode="fp8", prequant_dispatch=False):
     """Run MlpNode benchmark (forward + backward) in specified mode."""
     import paddle
     paddle.enable_compat()
@@ -169,18 +169,30 @@ def run_benchmark(T, E, I, topk, n_warmup, n_iters, imbalance="none", seed=42, H
     dispatched_probs = torch.rand(N_recv, topk, device=device) * 0.5 + 0.5
     dispatched_probs = (dispatched_probs / dispatched_probs.sum(dim=1, keepdim=True)).float()
     tpe = [int((dispatched_indices == e).sum().item()) for e in range(E)]
-    print(f"  mode={mode} imbalance={imbalance} tpe(min/max/sum)={min(tpe)}/{max(tpe)}/{sum(tpe)}")
+    print(f"  mode={mode} imbalance={imbalance} prequant_dispatch={prequant_dispatch} tpe(min/max/sum)={min(tpe)}/{max(tpe)}/{sum(tpe)}")
 
     paddle.seed(0)
     x = paddle.randn([N_recv, H], dtype="bfloat16") * 0.02
     grad_out = paddle.randn([N_recv, H], dtype="bfloat16") * 0.01
+
+    prequant_kwargs = {}
+    if prequant_dispatch and mode == "fp8":
+        from sonicmoe.quack_utils.blockscaled_fp8_gemm import quantize_and_pack_activation
+        x_torch = torch.from_dlpack(x.detach()).to(device=device)
+        x_fp8, x_scales = quantize_and_pack_activation(x_torch)
+        prequant_kwargs = {
+            "dispatched_hidden_states_fp8": x_fp8,
+            "dispatched_hidden_states_scales": x_scales,
+            "dispatched_hidden_states_scale_layout": "sonic_1x32_isa",
+        }
 
     # Warmup (JIT compile + cache warm)
     print(f"Warmup ({n_warmup} iters)...")
     for _ in range(n_warmup):
         out = node.forward(x, tpe,
                            dispatched_indices=dispatched_indices,
-                           dispatched_probs=dispatched_probs)
+                           dispatched_probs=dispatched_probs,
+                           **prequant_kwargs)
         out.backward(grad_out)
     flush_native_grads()
     torch.cuda.synchronize()
@@ -196,7 +208,8 @@ def run_benchmark(T, E, I, topk, n_warmup, n_iters, imbalance="none", seed=42, H
     for _ in range(n_iters):
         out = node.forward(x, tpe,
                            dispatched_indices=dispatched_indices,
-                           dispatched_probs=dispatched_probs)
+                           dispatched_probs=dispatched_probs,
+                           **prequant_kwargs)
         out.backward(grad_out)
     end_ev.record()
     torch.cuda.synchronize()
@@ -247,6 +260,8 @@ def main():
     parser.add_argument("--mode", type=str, default="fp8",
                         choices=["fp8", "bf16"],
                         help="fp8 (FP8 frontier) or bf16 (BF16 baseline)")
+    parser.add_argument("--prequant-dispatch", action="store_true",
+                        help="Pass pre-quantized dispatched_hidden_states FP8 payload into SonicMoEMlpNode")
     args = parser.parse_args()
 
     if args.extract:
@@ -255,7 +270,8 @@ def main():
         return
 
     run_benchmark(args.T, args.E, args.I, args.topk, args.warmup, args.iters,
-                  imbalance=args.imbalance, seed=args.seed, H=args.H, mode=args.mode)
+                  imbalance=args.imbalance, seed=args.seed, H=args.H, mode=args.mode,
+                  prequant_dispatch=args.prequant_dispatch)
 
 
 if __name__ == "__main__":

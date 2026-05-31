@@ -28,6 +28,7 @@ from quack.gemm_default_epi import GemmDefaultSm100
 from quack.gemm_interface import default_config
 from quack.gemm_wrapper_utils import GemmTensorInfo, GemmWrapperBase
 
+from ..config import get_active_config
 from ..functional.fp8_protocol import FP8Protocol, FP8ScaleGranularity, validate_fp8_runtime_support
 from ..functional.fp8_quant import quantize_activation_blockwise, round_scale_to_e8m0
 
@@ -261,6 +262,172 @@ def pack_blockscaled_1x32_scales(scales: torch.Tensor, cols: int) -> torch.Tenso
     return packed
 
 
+@wrap_triton_kernel
+@triton.jit
+def _pack_scales_1x32_isa_kernel(
+    scales_ptr,
+    packed_ptr,
+    total_storage,
+    rows,
+    scale_cols,
+    k_tiles,
+    per_batch_storage,
+    scale_stride_batch,
+    scale_stride_row,
+    scale_stride_col,
+    SF_TILE_STORAGE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < total_storage
+
+    within_batch = offs % per_batch_storage
+    batch = offs // per_batch_storage
+    tile = within_batch // SF_TILE_STORAGE
+    tile_offset = within_batch % SF_TILE_STORAGE
+
+    row_tile = tile // k_tiles
+    k_tile = tile % k_tiles
+    row_mod32 = tile_offset // 16
+    row_quad = (tile_offset % 16) // 4
+    k_in_tile = tile_offset % 4
+
+    row = row_tile * 128 + row_quad * 32 + row_mod32
+    scale_col = k_tile * 4 + k_in_tile
+    valid_value = mask & (row < rows) & (scale_col < scale_cols)
+    src = (
+        batch * scale_stride_batch
+        + row * scale_stride_row
+        + scale_col * scale_stride_col
+    )
+    v = tl.load(scales_ptr + src, mask=valid_value, other=1).to(tl.uint8)
+    tl.store(packed_ptr + offs, v, mask=mask)
+
+
+def pack_blockscaled_1x32_scales_fast(scales: torch.Tensor, cols: int) -> torch.Tensor:
+    if scales.ndim not in (2, 3):
+        raise ValueError(f"expected 2D or 3D scales, got shape {tuple(scales.shape)}")
+    if scales.device.type != "cuda":
+        raise ValueError("blockscaled scale packing requires CUDA tensors")
+    if str(scales.dtype) not in (
+        "torch.uint8", "paddle.uint8", "uint8",
+        "torch.int32", "paddle.int32", "int32",
+    ):
+        return pack_blockscaled_1x32_scales(scales, cols)
+
+    if scales.ndim == 2:
+        scales = scales.unsqueeze(0)
+
+    batches, rows, scale_cols = scales.shape
+    expected_scale_cols = _div_up(cols, _SF_VEC_SIZE)
+    if scale_cols != expected_scale_cols:
+        raise ValueError(
+            f"scale cols mismatch: expected {expected_scale_cols} for cols={cols}, got {scale_cols}"
+        )
+
+    per_batch_storage = _storage_per_batch(rows, cols)
+    packed = torch.empty((batches, per_batch_storage), dtype=torch.uint8, device=scales.device)
+    total_storage = batches * per_batch_storage
+    BLOCK = 256
+    grid = (_div_up(total_storage, BLOCK),)
+    _pack_scales_1x32_isa_kernel[grid](
+        scales,
+        packed,
+        total_storage,
+        rows,
+        scale_cols,
+        _div_up(cols, _SF_TILE_K),
+        per_batch_storage,
+        scales.stride(0),
+        scales.stride(1),
+        scales.stride(2),
+        SF_TILE_STORAGE=_SF_TILE_STORAGE,
+        BLOCK=BLOCK,
+    )
+    return packed
+
+
+@wrap_triton_kernel
+@triton.jit
+def _gather_raw_scales_1x32_to_isa_kernel(
+    raw_scale_ptr,
+    gather_idx_ptr,
+    dst_scale_ptr,
+    TK,
+    scale_cols,
+    dst_k_tiles: tl.constexpr,
+    raw_stride_row,
+    raw_stride_col,
+    SF_TILE_M: tl.constexpr,
+    SF_TILE_STORAGE: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    GROUPS_PER_K_TILE: tl.constexpr,
+):
+    row_base = tl.program_id(0) * BLOCK_ROWS
+    k_tile_idx = tl.program_id(1)
+    row_ids = row_base + tl.arange(0, BLOCK_ROWS)
+    k_in = tl.arange(0, GROUPS_PER_K_TILE)
+    row_mask = row_ids < TK
+
+    gather_ids = tl.load(gather_idx_ptr + row_ids, mask=row_mask, other=0)
+    src_cols = k_tile_idx * GROUPS_PER_K_TILE + k_in
+    src = raw_scale_ptr + gather_ids[:, None] * raw_stride_row + src_cols[None, :] * raw_stride_col
+    valid = row_mask[:, None] & (src_cols[None, :] < scale_cols)
+    vals = tl.load(src, mask=valid, other=1).to(tl.uint8)
+
+    dst_row_tiles = row_ids // SF_TILE_M
+    dst_row_in_tile = row_ids % SF_TILE_M
+    dst_row_base_offset = (dst_row_in_tile % 32) * 16 + (dst_row_in_tile // 32) * 4
+    dst_tile_base = (dst_row_tiles * dst_k_tiles + k_tile_idx) * SF_TILE_STORAGE
+    dst = dst_scale_ptr + dst_tile_base[:, None] + dst_row_base_offset[:, None] + k_in[None, :]
+    tl.store(dst, vals, mask=row_mask[:, None])
+
+
+def gather_raw_blockscaled_1x32_scales_to_isa(
+    raw_scales: torch.Tensor,
+    gather_idx: torch.Tensor,
+    cols: int,
+) -> torch.Tensor:
+    if raw_scales.ndim == 3:
+        if raw_scales.shape[0] != 1:
+            raise ValueError(f"expected batch=1 raw scales, got shape {tuple(raw_scales.shape)}")
+        raw_scales = raw_scales.squeeze(0)
+    if raw_scales.ndim != 2:
+        raise ValueError(f"expected 2D raw scales, got shape {tuple(raw_scales.shape)}")
+
+    TK = int(gather_idx.shape[0])
+    scale_cols = int(raw_scales.shape[1])
+    expected_scale_cols = _div_up(cols, _SF_VEC_SIZE)
+    if scale_cols != expected_scale_cols:
+        raise ValueError(
+            f"scale cols mismatch: expected {expected_scale_cols} for cols={cols}, got {scale_cols}"
+        )
+
+    per_batch_storage = _storage_per_batch(TK, cols)
+    if TK % _SF_TILE_M == 0 and cols % _SF_TILE_K == 0:
+        packed = torch.empty((1, per_batch_storage), dtype=torch.uint8, device=raw_scales.device)
+    else:
+        packed = torch.full((1, per_batch_storage), 1, dtype=torch.uint8, device=raw_scales.device)
+    block_rows = 128
+    k_tiles = _div_up(cols, _SF_TILE_K)
+    _gather_raw_scales_1x32_to_isa_kernel[(_div_up(TK, block_rows), k_tiles)](
+        raw_scales,
+        gather_idx,
+        packed,
+        TK,
+        scale_cols,
+        dst_k_tiles=k_tiles,
+        raw_stride_row=raw_scales.stride(0),
+        raw_stride_col=raw_scales.stride(1),
+        SF_TILE_M=_SF_TILE_M,
+        SF_TILE_STORAGE=_SF_TILE_STORAGE,
+        BLOCK_ROWS=block_rows,
+        GROUPS_PER_K_TILE=_SF_TILE_K // _SF_VEC_SIZE,
+    )
+    return packed
+
+
 def _blockscaled_protocol(protocol: FP8Protocol) -> FP8Protocol:
     return replace(protocol, scale_granularity=FP8ScaleGranularity.BLOCK_1X32)
 
@@ -465,6 +632,7 @@ def _quantize_flat_v2_kernel(
     GROUP_SIZE: tl.constexpr,       # 32
     TILE_ROWS: tl.constexpr,        # 128
     TILE_COLS: tl.constexpr,        # 256
+    SCALE_OUT_INT32: tl.constexpr = False,
     SAFE_INT64: tl.constexpr = False,
 ):
     """High-BW blockscaled quantize: large tiles, vectorized, pipelined.
@@ -515,15 +683,18 @@ def _quantize_flat_v2_kernel(
         dst_ptrs = dst_fp8_ptr + row_offs[:, None] * dst_stride_row + col_offs[None, :] * dst_stride_col
         tl.store(dst_ptrs, quantized, mask=mask)
 
-        # Store scale byte
         group_id = (col_base // GROUP_SIZE) + g
         scale_ptrs = dst_scale_ptr + row_offs * scale_stride_row + group_id * scale_stride_col
-        tl.store(scale_ptrs, e8m0_byte, mask=row_mask)
+        if SCALE_OUT_INT32:
+            tl.store(scale_ptrs, e8m0_byte.to(tl.int32), mask=row_mask)
+        else:
+            tl.store(scale_ptrs, e8m0_byte, mask=row_mask)
 
 
 def quantize_activation_blockscaled_fast(
     x: torch.Tensor,
     group_size: int = 32,
+    scale_dtype=None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fast fused 1×group_size blockscaled quantization using a single Triton kernel.
 
@@ -535,7 +706,8 @@ def quantize_activation_blockscaled_fast(
     num_groups = _div_up(K, group_size)
 
     fp8_out = torch.empty(M, K, dtype=torch.float8_e4m3fn, device=x.device)
-    scale_out = torch.empty(M, num_groups, dtype=torch.uint8, device=x.device)
+    scale_out_int32 = str(scale_dtype) in ("torch.int32", "paddle.int32", "int32")
+    scale_out = torch.empty(M, num_groups, dtype=(torch.int32 if scale_out_int32 else torch.uint8), device=x.device)
 
     TILE_ROWS = 128  # Larger tile: fewer CTAs, better wave occupancy
     TILE_COLS = min(K, 256)
@@ -559,6 +731,7 @@ def quantize_activation_blockscaled_fast(
         GROUP_SIZE=group_size,
         TILE_ROWS=TILE_ROWS,
         TILE_COLS=TILE_COLS,
+        SCALE_OUT_INT32=scale_out_int32,
         SAFE_INT64=_needs_int64,
     )
     return fp8_out, scale_out
@@ -4135,16 +4308,16 @@ def _cache_iso32_w1(w1: torch.Tensor) -> None:
 def _cache_iso32_w2(w2: torch.Tensor) -> None:
     """ISO32 one-pass quantize w2 (H, I, E): ONE FP8 + dual scales.
 
-    Forward (varlen) needs (E,H,I) contiguous → use fp8_enk directly.
-    Backward (dgated) needs (E,I,H) contiguous → precompute transposed copy.
+    Forward (varlen) needs (E,H,I); direct dgated needs (E,I,H).
     """
     key = (w2.data_ptr(), _tensor_version(w2), tuple(w2.shape), tuple(w2.stride()))
-    if key in _ISO32_WEIGHT_CACHE:
+    if key in _ISO32_WEIGHT_CACHE and key in _VARLEN_WEIGHT_CACHE:
         return
-    fp8_enk, row_scales, col_scales = iso32_dual_quantize_weight_3d(
+    fp8_ehi, row_scales, col_scales = iso32_dual_quantize_weight_3d(
         w2.permute(2, 0, 1)
     )
-    _ISO32_WEIGHT_CACHE[key] = (fp8_enk, row_scales, col_scales)
+    _VARLEN_WEIGHT_CACHE[key] = (fp8_ehi, row_scales)
+    _ISO32_WEIGHT_CACHE[key] = (fp8_ehi.mT.contiguous(), row_scales, col_scales)
 
 
 def _quantize_weight_3d_triton(
@@ -4219,14 +4392,14 @@ def precompute_weight_fp8(
         tuple(w.shape),
         tuple(w.stride()),
     )
+    cached = _VARLEN_WEIGHT_CACHE.get(key)
+    if cached is not None:
+        return cached
     if _iso32_weight_enabled():
         iso_cached = _ISO32_WEIGHT_CACHE.get(key)
         if iso_cached is not None:
             fp8_enk, row_scales, _ = iso_cached
             return (fp8_enk, row_scales)
-    cached = _VARLEN_WEIGHT_CACHE.get(key)
-    if cached is not None:
-        return cached
 
     w_ehi = w.permute(2, 0, 1).contiguous()
     w_fp8, w_scales_packed = _quantize_weight_3d_triton(w_ehi)
@@ -4256,15 +4429,10 @@ _ISO32_WEIGHT_CACHE: dict[
 
 def _iso32_weight_enabled() -> bool:
     """Check if ISO32 weight cache is active. Uses the centralized _FP8Config."""
-    from sonicmoe.config import get_active_config
-    from sonicmoe.functional import _get_fp8_config
     active_cfg = get_active_config()
     if active_cfg is not None:
         return active_cfg.resolve_iso32_weight()
-    cfg = _get_fp8_config()
-    if cfg.enabled and hasattr(cfg, 'iso32_weight'):
-        return cfg.iso32_weight
-    return os.environ.get("SONIC_MOE_FP8_ISO32_WEIGHT", "1") != "0"
+    return os.environ.get("SONIC_MOE_FP8_ISO32_WEIGHT", "0") == "1"
 
 
 def precompute_weight_fp8_for_fused_gated(
@@ -4350,6 +4518,8 @@ def precompute_weight_fp8_for_fused_dgated(
         iso_cached = _ISO32_WEIGHT_CACHE.get(key)
         if iso_cached is not None:
             fp8_enk, _, col_scales = iso_cached
+            if tuple(fp8_enk.shape[1:]) == (int(w.shape[1]), int(w.shape[0])):
+                return (fp8_enk.mT, col_scales)
             return (fp8_enk, col_scales)
     cached = _FUSED_WEIGHT_CACHE.get(key)
     if cached is not None:
@@ -4391,13 +4561,12 @@ def precompute_weight_fp8_for_direct_fused_dgated(
         tuple(w.shape),
         tuple(w.stride()),
     )
-    if _iso32_weight_enabled():
-        iso_cached = _ISO32_WEIGHT_CACHE.get(key)
-        if iso_cached is not None:
-            fp8_enk, _, col_scales = iso_cached
-            # fp8_enk is (E,H,I). dgated needs (E,I,H) = permute view (zero-copy).
-            # CuTe handles strided FP8 via dynamic leading_dim detection.
-            return (fp8_enk.permute(0, 2, 1), col_scales)
+    iso_cached = _ISO32_WEIGHT_CACHE.get(key)
+    if iso_cached is not None:
+        fp8_enk, _, col_scales = iso_cached
+        if tuple(fp8_enk.shape[1:]) == (int(w.shape[1]), int(w.shape[0])):
+            return (fp8_enk, col_scales)
+        return (fp8_enk.mT, col_scales)
     # Check unified fused cache first (shared with precompute_weight_fp8_for_fused_dgated)
     cached = _FUSED_WEIGHT_CACHE.get(key)
     if cached is not None:

@@ -45,9 +45,11 @@ from .blockscaled_fp8_gemm import (
     dequant_colwise_quantize_and_pack_from_isa,
     evict_fp8_weight_cache_entry,
     fast_gather_quantize_and_pack_activation,
+    gather_raw_blockscaled_1x32_scales_to_isa,
     install_native_fp8_weight_cache,
     make_blockscaled_grouped_reverse_scatter_idx,
     pack_blockscaled_1x32_scales,
+    pack_blockscaled_1x32_scales_fast,
     prefetch_blockscaled_w2_fp8,
     precompute_weight_fp8,
     quantize_native_fp8_weights,
@@ -55,6 +57,7 @@ from .blockscaled_fp8_gemm import (
     precompute_weight_fp8_for_fused_dgated,
     precompute_weight_fp8_for_fused_gated,
     precompute_weight_fp8_warmup,
+    quantize_activation_blockscaled_fast,
     quantize_and_pack_activation,
 )
 from .gemm_interface import gemm_dgated, gemm_gated
