@@ -54,6 +54,14 @@ from .gemm_sm100_fp8_zeromat import (
 )
 
 _E8M0_DTYPE = getattr(torch, "float8_e8m0fnu", torch.uint8)
+_DGATED_FAST_PATH: dict[tuple, tuple] = {}
+_MAX_DGATED_FAST_PATH_ENTRIES = 32
+
+
+def _current_cu_stream() -> cuda.CUstream:
+    stream = torch.cuda.current_stream()
+    raw = stream.stream_base.raw_stream if hasattr(stream, "stream_base") else stream.cuda_stream
+    return cuda.CUstream(raw)
 
 
 class GemmDGatedSm90(GemmDGatedMixin, GemmSm90):
@@ -115,6 +123,84 @@ def gemm_dgated(
         or iso32_dz_col_scales is not None
     )
     y1s_col_quant_mode = y1s_col_fp8 is not None or y1s_col_scales is not None
+    blockscaled = a_scales is not None and b_scales is not None
+    gather_A = A_idx is not None
+    fast_key = None
+    if (
+        cu_seqlens_m is not None
+        and gather_A
+        and blockscaled
+        and colvec_scale is not None
+        and colvec_reduce is not None
+        and tile_count_semaphore is None
+        and persistent
+        and cluster_N == 1
+    ):
+        fast_key = (
+            A.dtype, B.dtype, Out.dtype, PostAct.dtype, activation,
+            tile_M, tile_N, cluster_M, cluster_N, pingpong, max_swizzle_size,
+            fp8_preact_mode, iso32_dz_mode, y1s_col_quant_mode,
+            A.shape[1], B.shape[0], B.shape[1], B.shape[2], tuple(B.stride()),
+        )
+        cached = _DGATED_FAST_PATH.get(fast_key)
+        if cached is not None:
+            compiled, GemmCls, act_fn, scheduler_args, implicit_dtype = cached
+            AB_swapped = not Out.stride(-1) == 1
+            out_tensor = Out
+            preact_tensor = PreAct
+            if fp8_preact_mode:
+                if cu_seqlens_m is not None or not AB_swapped:
+                    out_tensor = Out.view(torch.float32)
+                else:
+                    out_tensor = Out.mT.view(torch.float32).mT
+                preact_tensor = preact_fp8.view(torch.int16)
+            else:
+                if cu_seqlens_m is not None or not AB_swapped:
+                    out_tensor = Out.view(torch.float32)
+                    preact_tensor = PreAct.view(torch.float32)
+                else:
+                    out_tensor = Out.mT.view(torch.float32).mT
+                    preact_tensor = PreAct.mT.view(torch.float32).mT
+            a_cute = _make_cute_tensor_dynamic(A, 1)
+            b_tensor = B.permute(1, 2, 0)
+            b_leading_dim = 1 if b_tensor.stride(1) == 1 else 0
+            b_cute = _make_cute_tensor_dynamic(b_tensor, b_leading_dim)
+            out_cute = _make_cute_tensor_dynamic(out_tensor, 1)
+            preact_cute = _make_cute_tensor_dynamic(preact_tensor, 1)
+            post_cute = _make_cute_tensor_dynamic(PostAct, 1)
+            epi_kwargs = {}
+            if fp8_preact_mode:
+                epi_kwargs["mFP8PreAct_fp8"] = _make_cute_tensor_dynamic(preact_fp8, leading_dim=1)
+                epi_kwargs["mFP8PreAct_scales"] = _make_cute_tensor_dynamic(preact_scales, leading_dim=1)
+            if iso32_dz_mode:
+                if iso32_dz_fp8 is not None:
+                    epi_kwargs["mDZFp8Iso32_fp8"] = _make_cute_tensor_dynamic(iso32_dz_fp8, leading_dim=1)
+                if iso32_dz_row_scales is not None:
+                    epi_kwargs["mDZFp8Iso32_row"] = _make_cute_tensor_dynamic(iso32_dz_row_scales, leading_dim=2)
+                if iso32_dz_col_scales is not None:
+                    epi_kwargs["mDZFp8Iso32_col"] = _make_cute_tensor_dynamic(iso32_dz_col_scales, leading_dim=2)
+            if y1s_col_quant_mode:
+                if y1s_col_fp8 is not None:
+                    epi_kwargs["mY1sColQuant_fp8"] = _make_cute_tensor_dynamic(y1s_col_fp8, leading_dim=1)
+                if y1s_col_scales is not None:
+                    epi_kwargs["mY1sColQuant_col"] = _make_cute_tensor_dynamic(y1s_col_scales, leading_dim=2)
+            epi_args = GemmCls.EpilogueArguments(
+                post_cute,
+                act_fn,
+                implicit_dtype=implicit_dtype,
+                mColVecBroadcast=from_dlpack(colvec_scale.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0),
+                mColVecReduce=from_dlpack(colvec_reduce.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=1),
+                **epi_kwargs,
+            )
+            varlen_args = GemmWrapperBase.create_varlen_args(cu_seqlens_m, None, A_idx)
+            a_scale_cute = _make_cute_tensor_dynamic(a_scales, leading_dim=1)
+            b_scale_cute = _make_cute_tensor_dynamic(b_scales, leading_dim=1)
+            compiled(
+                a_cute, b_cute, out_cute, preact_cute,
+                epi_args, scheduler_args, varlen_args, _current_cu_stream(),
+                a_scale_cute, b_scale_cute,
+            )
+            return
     if iso32_dz_mode:
         assert fp8_preact_mode, "iso32_dz fusion requires fp8_preact_mode"
     if y1s_col_quant_mode:
@@ -270,8 +356,7 @@ def gemm_dgated(
         A_idx,
     )
 
-    _stream_obj = torch.cuda.current_stream()
-    current_stream = cuda.CUstream(_stream_obj.stream_base.raw_stream if hasattr(_stream_obj, "stream_base") else _stream_obj.cuda_stream)
+    current_stream = _current_cu_stream()
 
     blockscaled = a_scales is not None and b_scales is not None
     sf_vec_size = 32 if blockscaled else None
@@ -327,7 +412,12 @@ def gemm_dgated(
             a_scale_cute,
             b_scale_cute,
         )
-    cache[compile_key](
+    compiled = cache[compile_key]
+    if fast_key is not None:
+        if len(_DGATED_FAST_PATH) > _MAX_DGATED_FAST_PATH_ENTRIES:
+            _DGATED_FAST_PATH.clear()
+        _DGATED_FAST_PATH[fast_key] = (compiled, GemmCls, act_fn, scheduler_args, implicit_dtype)
+    compiled(
         tensor_infos["A"].cute_tensor,
         tensor_infos["B"].cute_tensor,
         tensor_infos["D"].cute_tensor,  # Out

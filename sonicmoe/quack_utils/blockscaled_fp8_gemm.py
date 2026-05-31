@@ -1695,6 +1695,8 @@ def _colwise_quantize_and_pack_kernel(
     row_in_tile = dim_offs % SF_TILE_M
     row_base = (row_in_tile % 32) * 16 + (row_in_tile // 32) * 4
 
+    packed_scale_i32 = tl.zeros([BLOCK_DIM], dtype=tl.int32)
+
     for g_local in tl.static_range(0, GROUPS_PER_BLOCK):
         pid_group = pid_group_blk * GROUPS_PER_BLOCK + g_local
         k_offs = pid_group * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
@@ -1723,14 +1725,20 @@ def _colwise_quantize_and_pack_kernel(
         dst_ptrs = dst_fp8_ptr + k_offs[:, None].to(tl.int64) * dst_stride_row + dim_offs[None, :].to(tl.int64) * dst_stride_col
         tl.store(dst_ptrs, quantized, mask=mask)
 
-        k_tiles_idx = pid_group // groups_per_k_tile
-        k_in_tile = pid_group % groups_per_k_tile
+        if GROUPS_PER_BLOCK == 4:
+            packed_scale_i32 = packed_scale_i32 | ((e8m0_i32 & 0xFF) << (g_local * 8))
+        else:
+            k_tiles_idx = pid_group // groups_per_k_tile
+            k_in_tile = pid_group % groups_per_k_tile
+            tile_base = (row_tiles * k_tiles + k_tiles_idx) * SF_TILE_STORAGE
+            isa_index = tile_base + row_base + k_in_tile
+            tl.store(dst_packed_ptr + isa_index.to(tl.int64), e8m0_byte, mask=dim_mask)
 
+    if GROUPS_PER_BLOCK == 4:
+        k_tiles_idx = pid_group_blk
         tile_base = (row_tiles * k_tiles + k_tiles_idx) * SF_TILE_STORAGE
-        isa_index = tile_base + row_base + k_in_tile
-
-        scale_ptrs = dst_packed_ptr + isa_index.to(tl.int64)
-        tl.store(scale_ptrs, e8m0_byte, mask=dim_mask)
+        scale_ptr_i32 = dst_packed_ptr.to(tl.pointer_type(tl.int32))
+        tl.store(scale_ptr_i32 + ((tile_base + row_base) // 4).to(tl.int64), packed_scale_i32, mask=dim_mask)
 
 
 @wrap_triton_kernel
@@ -1764,8 +1772,8 @@ def _dequant_colwise_quantize_and_pack_from_isa_kernel(
     dim_groups_per_block: tl.constexpr = BLOCK_DIM // GROUP_SIZE
 
     for g_local in tl.static_range(0, GROUPS_PER_BLOCK):
-        pid_group = pid_group_blk * GROUPS_PER_BLOCK + g_local
-        k_offs = pid_group * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+        pid_group = (pid_group_blk * GROUPS_PER_BLOCK + g_local).to(tl.int64)
+        k_offs = pid_group * GROUP_SIZE + tl.arange(0, GROUP_SIZE).to(tl.int64)
         k_mask = k_offs < total_K
 
         if HAS_GATHER:
@@ -1781,18 +1789,18 @@ def _dequant_colwise_quantize_and_pack_from_isa_kernel(
         dst_k_in_tile = pid_group % groups_per_k_tile
 
         for d_local in tl.static_range(0, dim_groups_per_block):
-            dim_offs = pid_dim * BLOCK_DIM + d_local * GROUP_SIZE + tl.arange(0, GROUP_SIZE)
+            dim_offs = (pid_dim * BLOCK_DIM + d_local * GROUP_SIZE + tl.arange(0, GROUP_SIZE)).to(tl.int64)
             dim_mask = dim_offs < dim
             mask = k_mask[:, None] & dim_mask[None, :]
 
-            src_group_id = pid_dim * dim_groups_per_block + d_local
+            src_group_id = (pid_dim * dim_groups_per_block + d_local).to(tl.int64)
             src_k_tiles_idx = src_group_id // groups_per_k_tile
             src_k_in_tile = src_group_id % groups_per_k_tile
             src_scale_offsets = (
                 (src_row_tiles * src_k_tiles + src_k_tiles_idx) * SF_TILE_STORAGE
                 + src_row_base
                 + src_k_in_tile
-            )
+            ).to(tl.int64)
             src_scale_u8 = tl.load(src_packed_ptr + src_scale_offsets, mask=k_mask, other=0)
             src_scale = (src_scale_u8.to(tl.int32) << 23).to(tl.float32, bitcast=True)
 
@@ -2036,7 +2044,7 @@ def dequant_colwise_quantize_and_pack_from_isa(
         raise ValueError(f"without gather_idx, src rows {T} must equal logical_cols {TK}")
 
     GROUP_SIZE = _SF_VEC_SIZE
-    BLOCK_DIM = 128
+    BLOCK_DIM = 64
     fp8_out = torch.empty(TK, H, dtype=torch.float8_e4m3fn, device=src_fp8.device)
     per_batch_storage = _storage_per_batch(H, TK)
     if H % _SF_TILE_M == 0 and TK % _SF_TILE_K == 0:
@@ -2115,11 +2123,9 @@ def colwise_quantize_and_pack(
 
     num_groups = _div_up(TK, GROUP_SIZE)
     k_tiles = _div_up(TK, _SF_TILE_K)
-    # NCU-tuned: GROUPS_PER_BLOCK=2 amortizes dim-related index math across 2
-    # consecutive K-groups -> ~3-4% gain at TK=65536. Requires num_groups to be
-    # a multiple of GROUPS_PER_BLOCK; fall back to 1 otherwise (preserves
-    # bit-exactness for arbitrary shapes).
-    GROUPS_PER_BLOCK = 2 if (num_groups % 2 == 0) else 1
+    # NCU-tuned: GROUPS_PER_BLOCK=4 writes one int32 scale packet per row/tile
+    # when TK is 128-aligned; fall back to 2/1 for arbitrary shapes.
+    GROUPS_PER_BLOCK = 4 if (num_groups % 4 == 0) else (2 if (num_groups % 2 == 0) else 1)
     grid = (num_groups // GROUPS_PER_BLOCK, _div_up(H, BLOCK_DIM))
 
     has_gather = gather_idx is not None
