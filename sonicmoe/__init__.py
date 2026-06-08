@@ -91,3 +91,11 @@ from .moe import MoE
 from .quack_utils import make_blockscaled_grouped_reverse_scatter_idx, pack_blockscaled_1x32_scales
 from .ernie_compat.deepep_metadata import deepep_to_sonic_metadata, deepep_topk_to_sonic_metadata
 from .ernie_compat.mlp_node_v2 import _differentiable_router_scores
+from . import jit_warmup as _jit_warmup
+from .ernie_compat import mlp_node_v2 as _mlp_node_v2
+
+_jit_warmup._bind_mlp_node_warmup_deps(
+    _mlp_node_v2.SonicMoEMlpNode,
+    _mlp_node_v2.invalidate_weight_caches,
+    _mlp_node_v2.flush_native_grads,
+)

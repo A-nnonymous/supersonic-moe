@@ -26,21 +26,11 @@ _ALL_COMPILED_MODULES = {}
 def _resolve_cpp_extension_load() -> Callable:
     """Resolve ``torch.utils.cpp_extension.load`` lazily.
 
-    sonicmoe is consumed under two import orders:
-
-      1. **Production** — ``paddle.compat.enable_torch_proxy(...)`` is called
-         BEFORE ``import sonicmoe``. ``torch.utils.cpp_extension`` is then a
-         proxy onto ``paddle.utils.cpp_extension`` and the returned ``load``
-         produces a paddle-native ``_pd_.so`` that accepts ``paddle.Tensor``.
-
-      2. **CI / warmup** — sonicmoe is imported first; the proxy is enabled
-         later (e.g. inside ``warmup_jit``). If we cached ``load`` at
-         module-import time we'd hold real torch's ``load`` forever, which
-         JIT-compiles a torch-pybind ``.so`` whose pybind binding rejects
-         ``paddle.Tensor`` with the misleading
-         ``TypeError: deepep_topk_metadata_cuda(): incompatible function arguments``.
-
-    Resolving lazily on each compile makes both paths work correctly.
+    PaddleFleet installs its ecosystem compatibility layer before importing
+    Sonic-MoE, then migrates loaded modules to the ``paddlefleet_ops`` namespace.
+    Resolving the extension loader at compile time keeps the metadata JIT path on
+    that PaddleFleet-managed loader instead of caching a raw-torch loader during
+    module import.
     """
     from torch.utils.cpp_extension import load as _load
     return _load
@@ -116,23 +106,32 @@ def _get_cpp_function(function_name: str, module_name: str, source_files: list[s
     os.makedirs(parent_dir, exist_ok=True)
     lock_path = os.path.join(parent_dir, f".{module_name}.lock")
 
-    # Production model: one process per rank, exclusive ownership of
-    # ``build_directory`` (or a shared dir populated by a single warmup
-    # process before workers fork). FileLock guards the rare case where two
-    # producers race to create the artifacts. The fast-path import after lock
-    # acquisition handles the case where another process already built it.
-    with FileLock(lock_path):
-        # Re-arm the paddle/torch-proxy blockers (idempotent). The initial
-        # ``import sonicmoe`` may have happened BEFORE the consumer called
-        # ``paddle.enable_compat()``; in that order our hipify blocker is
-        # a no-op because the proxy didn't exist yet. Re-running here
-        # guarantees the blocker is live by the time paddle's
-        # ``cpp_extension.load()`` looks up ``torch.utils.hipify``.
-        try:
-            install_quack_paddle_compat()
-        except Exception:
-            pass
+    rank = os.environ.get("RANK", os.environ.get("PADDLE_TRAINER_ID", "?"))
+    pid = os.getpid()
+    timeout = int(os.environ.get("SONIC_MOE_JIT_LOCK_TIMEOUT", "600"))
 
+    # Fast path under a short critical section: once warmup has populated the
+    # build directory, every rank should only import the prebuilt wrapper.  Do
+    # not run heavyweight compatibility imports while holding this lock.
+    with FileLock(lock_path, timeout=timeout):
+        mod = _try_import_prebuilt(module_name, build_directory, source_files)
+        if mod is not None and hasattr(mod, function_name):
+            _ALL_COMPILED_MODULES[module_name] = mod
+            return getattr(mod, function_name)
+
+    # Re-arm Paddle torch-proxy blockers outside the file lock. This is
+    # idempotent and keeps other ranks free to reuse already-built extensions.
+    try:
+        install_quack_paddle_compat()
+    except Exception as exc:
+        if os.environ.get("SONIC_MOE_JIT_VERBOSE", "0") == "1":
+            print(
+                f"[sonicmoe-jit] rank={rank} pid={pid} compat skipped "
+                f"module={module_name} error={exc!r}",
+                flush=True,
+            )
+
+    with FileLock(lock_path, timeout=timeout):
         mod = _try_import_prebuilt(module_name, build_directory, source_files)
         if mod is not None and hasattr(mod, function_name):
             _ALL_COMPILED_MODULES[module_name] = mod
