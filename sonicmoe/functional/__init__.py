@@ -550,7 +550,7 @@ def _recompute_z() -> bool:
     ``_DownProjection.forward`` records a recompute closure on ctx; and
     ``_DownProjection.backward`` re-runs the up-proj GEMM (discarding the
     recomputed y1) just before consuming z_fp8.  Costs an extra SwiGLU + PostAct
-    write per layer per backward (~10 ms / iter at 24 layers, ERNIE shape).
+    write per layer per backward (~10 ms / iter at 24 layers, reference shape).
     """
     from ..config import get_active_config
     cfg = get_active_config()
@@ -1094,7 +1094,7 @@ class _UpProjection(torch.autograd.Function):
                         else:
                             # Split quantization: z first, free z bf16, then y1.
                             # This avoids z_bf16+y1_bf16+z_fp8+y1_fp8 all coexisting
-                            # and reduces forward peak by ~96 MiB at Ernie shape.
+                            # and reduces forward peak by ~96 MiB at reference shape.
                             z_fp8, z_raw_scales = quantize_activation_blockscaled_fast(z)
                             _PREQUANTIZED_SCALES["z_fp8"] = (z_fp8, z_raw_scales)
                             # z.untyped_storage().resize_(0)
@@ -1424,7 +1424,7 @@ class _UpProjection(torch.autograd.Function):
                             dynamic_scheduler=False,
                         )
 
-                # Phase 2: Free dz bf16 storage (~384 MiB at Ernie shape).
+                # Phase 2: Free dz bf16 storage (~384 MiB at reference shape).
                 # FP8 wgrad already freed it in step 2 above; BF16 path frees here.
                 if not ctx._fp8_cfg.fp8_wgrad:
                     # dz.untyped_storage().resize_(0)
@@ -1693,7 +1693,7 @@ class _DownProjection(torch.autograd.Function):
         ctx._topk_scores_needs_grad = True
 
         # Memory optimization: store z in FP8 to save ~50% of z's memory.
-        # At Ernie shape (TK=65536, 2I=3072), z is 384MB BF16 -> ~213MB FP8 = ~171MB saved.
+        # At reference shape (TK=65536, 2I=3072), z is 384MB BF16 -> ~213MB FP8 = ~171MB saved.
         # Accept fp8 z when prequant cache already holds the fp8+scales pair
         # (e.g. epilogue quant produced them), even if z.dtype is no longer bf16.
         z_has_prequant = "z_fp8" in _PREQUANTIZED_SCALES
